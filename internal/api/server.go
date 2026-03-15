@@ -9,16 +9,18 @@ import (
 	"github.com/RandomCodeSpace/argus/internal/realtime"
 	"github.com/RandomCodeSpace/argus/internal/storage"
 	"github.com/RandomCodeSpace/argus/internal/telemetry"
+	"github.com/RandomCodeSpace/argus/internal/vectordb"
 )
 
 // Server handles HTTP API requests.
 type Server struct {
-	repo     *storage.Repository
-	hub      *realtime.Hub
-	eventHub *realtime.EventHub
-	metrics  *telemetry.Metrics
-	cache    *cache.TTLCache
-	graph    *graph.Graph // in-memory service dependency graph (may be nil before first build)
+	repo      *storage.Repository
+	hub       *realtime.Hub
+	eventHub  *realtime.EventHub
+	metrics   *telemetry.Metrics
+	cache     *cache.TTLCache
+	graph     *graph.Graph     // in-memory service dependency graph (may be nil before first build)
+	vectorIdx *vectordb.Index  // TF-IDF semantic log search index
 }
 
 // NewServer creates a new API server.
@@ -33,9 +35,13 @@ func NewServer(repo *storage.Repository, hub *realtime.Hub, eventHub *realtime.E
 }
 
 // SetGraph wires the in-memory service graph into the API server.
-// Called from main after the graph is created so startup order is flexible.
 func (s *Server) SetGraph(g *graph.Graph) {
 	s.graph = g
+}
+
+// SetVectorIndex wires the TF-IDF vector index for semantic log search.
+func (s *Server) SetVectorIndex(idx *vectordb.Index) {
+	s.vectorIdx = idx
 }
 
 // RegisterRoutes registers API endpoints on the provided mux.
@@ -61,6 +67,7 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	// Logs
 	mux.HandleFunc("GET /api/logs", s.handleGetLogs)
 	mux.HandleFunc("GET /api/logs/context", s.handleGetLogContext)
+	mux.HandleFunc("GET /api/logs/similar", s.handleGetSimilarLogs)
 	mux.HandleFunc("GET /api/logs/{id}/insight", s.handleGetLogInsight)
 
 	// Admin & System

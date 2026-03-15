@@ -32,9 +32,12 @@ type Aggregator struct {
 	droppedBatches  int64
 
 	// Cardinality controls
-	maxCardinality     int          // 0 = unlimited
-	cardinalityOverflow func()       // called when overflow bucket is used (for metrics)
-	overflowKey        string       // constant key for the overflow bucket
+	maxCardinality      int    // 0 = unlimited
+	cardinalityOverflow func() // called when overflow bucket is used (for metrics)
+	overflowKey         string // constant key for the overflow bucket
+
+	// Ring buffer accelerator (optional)
+	ring *RingBuffer
 }
 
 const persistenceWorkers = 3
@@ -62,6 +65,14 @@ func (a *Aggregator) SetCardinalityLimit(max int, onOverflow func()) {
 	defer a.mu.Unlock()
 	a.maxCardinality = max
 	a.cardinalityOverflow = onOverflow
+}
+
+// SetRingBuffer attaches a RingBuffer that receives every ingested data point.
+// Dashboard queries for recent data (last 1h) can read from the ring directly.
+func (a *Aggregator) SetRingBuffer(rb *RingBuffer) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.ring = rb
 }
 
 // Start begins the aggregation background processes.
@@ -98,6 +109,11 @@ func (a *Aggregator) Ingest(m RawMetric) {
 	// Pre-compute key outside the lock — json.Marshal is CPU-bound and must not hold mu.
 	attrJSON, _ := json.Marshal(m.Attributes)
 	key := fmt.Sprintf("%s|%s|%s", m.ServiceName, m.Name, string(attrJSON))
+
+	// Feed ring buffer outside the lock (RingBuffer is independently thread-safe).
+	if a.ring != nil {
+		a.ring.Record(m.Name, m.ServiceName, m.Value, m.Timestamp)
+	}
 
 	a.mu.Lock()
 	defer a.mu.Unlock()

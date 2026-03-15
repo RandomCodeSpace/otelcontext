@@ -30,6 +30,7 @@ type TraceServer struct {
 	minSeverity      int
 	allowedServices  map[string]bool
 	excludedServices map[string]bool
+	sampler          *Sampler // nil = no sampling (keep all)
 	coltracepb.UnimplementedTraceServiceServer
 }
 
@@ -66,6 +67,11 @@ func NewTraceServer(repo *storage.Repository, metrics *telemetry.Metrics, cfg *c
 // SetLogCallback sets the function to call when a new log is synthesized from a trace.
 func (s *TraceServer) SetLogCallback(cb func(storage.Log)) {
 	s.logCallback = cb
+}
+
+// SetSampler enables adaptive trace sampling. Pass nil to disable.
+func (s *TraceServer) SetSampler(sm *Sampler) {
+	s.sampler = sm
 }
 
 func NewLogsServer(repo *storage.Repository, metrics *telemetry.Metrics, cfg *config.Config) *LogsServer {
@@ -218,6 +224,16 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 					statusStr := "STATUS_CODE_UNSET"
 					if span.Status != nil {
 						statusStr = span.Status.Code.String()
+					}
+
+					// Adaptive sampling: drop healthy traces at configured rate.
+					if s.sampler != nil {
+						isError := statusStr == "STATUS_CODE_ERROR"
+						durationMs := float64(duration) / 1000.0
+						if !s.sampler.ShouldSample(serviceName, isError, durationMs) {
+							localSpans = localSpans[:len(localSpans)-1]
+							continue
+						}
 					}
 
 					tModel := storage.Trace{

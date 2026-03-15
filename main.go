@@ -83,14 +83,14 @@ func main() {
 		replayInterval = 5 * time.Minute
 	}
 
-	dlq, err := queue.NewDLQ(cfg.DLQPath, replayInterval, func(data []byte) error {
+	dlq, err := queue.NewDLQWithLimits(cfg.DLQPath, replayInterval, func(data []byte) error {
 		// Replay handler: try to deserialize and re-insert logs
 		var logs []storage.Log
 		if err := json.Unmarshal(data, &logs); err != nil {
 			return fmt.Errorf("DLQ replay unmarshal failed: %w", err)
 		}
 		return repo.BatchCreateLogs(logs)
-	})
+	}, cfg.DLQMaxFiles, int64(cfg.DLQMaxDiskMB), cfg.DLQMaxRetries)
 	if err != nil {
 		log.Fatalf("Failed to initialize DLQ: %v", err)
 	}
@@ -116,7 +116,7 @@ func main() {
 	go eventHub.Start(ctxEvents, 5*time.Second, 500*time.Millisecond)
 	slog.Info("⚡ Event notification hub started (5s snapshots, 500ms batches)")
 
-	// 4c. Initialize TSDB Aggregator
+	// 4c. Initialize TSDB Aggregator + Ring Buffer
 	tsdbAgg := tsdb.NewAggregator(repo, 30*time.Second)
 	if cfg.MetricMaxCardinality > 0 {
 		tsdbAgg.SetCardinalityLimit(cfg.MetricMaxCardinality, func() {
@@ -124,6 +124,11 @@ func main() {
 		})
 		slog.Info("📈 TSDB cardinality limit set", "max", cfg.MetricMaxCardinality)
 	}
+	// Attach ring buffer: 120 × 30s = 1 hour of per-metric sliding windows
+	ringBuf := tsdb.NewRingBuffer(120, 30*time.Second)
+	tsdbAgg.SetRingBuffer(ringBuf)
+	slog.Info("📈 TSDB ring buffer attached (120 slots × 30s = 1h retention)")
+
 	ctxTSDB, cancelTSDB := context.WithCancel(context.Background())
 	defer cancelTSDB()
 	go tsdbAgg.Start(ctxTSDB)
@@ -175,6 +180,7 @@ func main() {
 	// 6. Initialize API Server
 	apiServer := api.NewServer(repo, hub, eventHub, metrics)
 	apiServer.SetGraph(svcGraph)
+	apiServer.SetVectorIndex(vectorIdx)
 
 	// 6b. Initialize MCP Server (HTTP Streamable, JSON-RPC 2.0 + SSE)
 	mcpServer := mcp.New(repo, metrics, svcGraph, vectorIdx)
@@ -184,6 +190,17 @@ func main() {
 	traceServer := ingest.NewTraceServer(repo, metrics, cfg)
 	logsServer := ingest.NewLogsServer(repo, metrics, cfg)
 	metricsServer := ingest.NewMetricsServer(repo, metrics, tsdbAgg, cfg)
+
+	// Wire adaptive sampler (only when rate < 1.0 to avoid unnecessary overhead)
+	if cfg.SamplingRate > 0 && cfg.SamplingRate < 1.0 {
+		sampler := ingest.NewSampler(cfg.SamplingRate, cfg.SamplingAlwaysOnErrors, float64(cfg.SamplingLatencyThresholdMs))
+		traceServer.SetSampler(sampler)
+		slog.Info("🎯 Adaptive trace sampling enabled",
+			"rate", cfg.SamplingRate,
+			"always_errors", cfg.SamplingAlwaysOnErrors,
+			"latency_threshold_ms", cfg.SamplingLatencyThresholdMs,
+		)
+	}
 
 	// Wire up live log streaming + AI + DLQ metrics
 	logHandler := func(l storage.Log) {
