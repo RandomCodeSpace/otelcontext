@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
+  <defs>
+    <linearGradient id="pulse-gradient-2" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#22d3ee;stop-opacity:1" /> <!-- Cyan -->
+      <stop offset="50%" style="stop-color:#3b82f6;stop-opacity:1" /> <!-- Blue -->
+      <stop offset="100%" style="stop-color:#8b5cf6;stop-opacity:1" /> <!-- Violet -->
+    </linearGradient>
+    <filter id="neon-glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="2.5" result="coloredBlur"/>
+      <feMerge>
+        <feMergeNode in="coloredBlur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <g transform="translate(0, 50)">
+    <!-- Main Pulse Line -->
+    <!-- Flat, small dip, sharp rise, sharp fall, small rise, flat -->
+    <path d="M5 0 L25 0 L30 5 L35 -5 L45 25 L55 -25 L65 5 L70 -5 L75 0 L95 0" 
+          stroke="url(#pulse-gradient-2)" 
+          stroke-width="3" 
+          filter="url(#neon-glow)"
+          fill="none">
+    </path>
+
+    <!-- Traveling Signal / "Packet" -->
+    <circle r="4" fill="#ffffff" filter="url(#neon-glow)">
+      <animateMotion dur="2.5s" repeatCount="indefinite" path="M5 0 L25 0 L30 5 L35 -5 L45 25 L55 -25 L65 5 L70 -5 L75 0 L95 0" />
+      <animate attributeName="opacity" values="0;1;1;1;0" keyTimes="0;0.1;0.5;0.9;1" dur="2.5s" repeatCount="indefinite" />
+    </circle>
+  </g>
+</svg>
