@@ -193,7 +193,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to listen on :%s: %v", cfg.GRPCPort, err)
 	}
-	grpcServer := grpc.NewServer()
+	grpcServer := grpc.NewServer(
+		grpc.UnaryInterceptor(metricsUnaryInterceptor(metrics)),
+	)
 	coltracepb.RegisterTraceServiceServer(grpcServer, traceServer)
 	collogspb.RegisterLogsServiceServer(grpcServer, logsServer)
 	colmetricspb.RegisterMetricsServiceServer(grpcServer, metricsServer)
@@ -205,6 +207,10 @@ func main() {
 			log.Fatalf("Failed to serve gRPC: %v", err)
 		}
 	}()
+
+	// Start runtime metrics sampling (every 15s)
+	metrics.StartRuntimeMetrics()
+	slog.Info("📊 Runtime metrics sampling started")
 
 	// 8. Start HTTP Server
 	mux := http.NewServeMux()
@@ -249,7 +255,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:    ":" + cfg.HTTPPort,
-		Handler: mux,
+		Handler: api.MetricsMiddleware(metrics, mux),
 	}
 
 	go func() {
@@ -281,6 +287,29 @@ func main() {
 	eventHub.Stop() // Note: New Stop() method should be called if implemented, otherwise context handles it
 
 	slog.Info("✅ ARGUS V5.4 shutdown complete")
+}
+
+// metricsUnaryInterceptor records argus_grpc_requests_total and argus_grpc_request_duration_seconds
+// for every unary gRPC call.
+func metricsUnaryInterceptor(m *telemetry.Metrics) grpc.UnaryServerInterceptor {
+	return func(
+		ctx context.Context,
+		req interface{},
+		info *grpc.UnaryServerInfo,
+		handler grpc.UnaryHandler,
+	) (interface{}, error) {
+		start := time.Now()
+		resp, err := handler(ctx, req)
+		duration := time.Since(start).Seconds()
+
+		status := "ok"
+		if err != nil {
+			status = "error"
+		}
+		m.GRPCRequestsTotal.WithLabelValues(info.FullMethod, status).Inc()
+		m.GRPCRequestDuration.WithLabelValues(info.FullMethod).Observe(duration)
+		return resp, err
+	}
 }
 
 func printBanner() {
