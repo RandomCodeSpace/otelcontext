@@ -112,5 +112,7 @@ go.work.sum
 .dev-pids
 
 *argus*.db*
+/argus
+/argus.exe
 
 .agent/
