@@ -179,6 +179,17 @@ data/cold/
 
 ---
 
+## Phase 4+5: Embedded DBs + System Graph API ✅ DONE (commit 98800ce)
+
+**Changes delivered:**
+- `internal/graph/service_graph.go` *(new)* — in-memory adjacency graph rebuilt every 30s from last 5min of spans; health scores, p99 latency, RPS per node; call count + error rate per edge
+- `internal/tsdb/ringbuffer.go` *(new)* — per-metric circular buffer with pre-computed p50/p95/p99; 120×30s = 1h retention; RWMutex snapshot path
+- `internal/vectordb/index.go` *(new)* — TF-IDF cosine-similarity semantic log search; pure Go, no CGO; indexes only ERROR/WARN/FATAL; FIFO eviction at 100k entries
+- `internal/storage/graph_repo.go` *(new)* — `GetSpansForGraph` lightweight JOIN projection, µs→ms conversion, IsError from trace status
+- `internal/api/graph_handler.go` — `GET /api/system/graph` uses in-memory graph snapshot (zero DB queries); DB fallback before first build
+- `internal/api/server.go` — `graph *graph.Graph` field; `SetGraph()` wiring
+- `main.go` — graph lifecycle with 5m window / 30s refresh
+
 ## Phase 4: AI-Consumable System Graph API
 
 ### 4.1 New endpoint: `GET /api/system/graph`

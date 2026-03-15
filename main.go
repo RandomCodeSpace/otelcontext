@@ -20,11 +20,13 @@ import (
 	"github.com/RandomCodeSpace/argus/internal/config"
 	"github.com/RandomCodeSpace/argus/internal/graph"
 	"github.com/RandomCodeSpace/argus/internal/ingest"
+	"github.com/RandomCodeSpace/argus/internal/mcp"
 	"github.com/RandomCodeSpace/argus/internal/queue"
 	"github.com/RandomCodeSpace/argus/internal/realtime"
 	"github.com/RandomCodeSpace/argus/internal/storage"
 	"github.com/RandomCodeSpace/argus/internal/telemetry"
 	"github.com/RandomCodeSpace/argus/internal/tsdb"
+	"github.com/RandomCodeSpace/argus/internal/vectordb"
 	"github.com/RandomCodeSpace/argus/web"
 
 	collogspb "go.opentelemetry.io/proto/otlp/collector/logs/v1"
@@ -156,6 +158,10 @@ func main() {
 	go svcGraph.Start(ctxGraph)
 	slog.Info("🕸️  In-memory service graph started (5m window, 30s refresh)")
 
+	// 4f. Initialize vector index for semantic log search
+	vectorIdx := vectordb.New(cfg.VectorIndexMaxEntries)
+	slog.Info("🔍 Vector index initialized", "max_entries", cfg.VectorIndexMaxEntries)
+
 	// 5. Initialize AI Service
 	aiService := ai.NewService(repo)
 	defer aiService.Stop()
@@ -163,6 +169,10 @@ func main() {
 	// 6. Initialize API Server
 	apiServer := api.NewServer(repo, hub, eventHub, metrics)
 	apiServer.SetGraph(svcGraph)
+
+	// 6b. Initialize MCP Server (HTTP Streamable, JSON-RPC 2.0 + SSE)
+	mcpServer := mcp.New(repo, metrics, svcGraph, vectorIdx)
+	slog.Info("🤖 MCP server initialized", "path", cfg.MCPPath, "enabled", cfg.MCPEnabled)
 
 	// 7. Initialize OTLP Ingestion (gRPC)
 	traceServer := ingest.NewTraceServer(repo, metrics, cfg)
@@ -184,6 +194,7 @@ func main() {
 			Timestamp:      l.Timestamp,
 		})
 		aiService.EnqueueLog(l)
+		vectorIdx.Add(l.ID, l.ServiceName, l.Severity, string(l.Body))
 		eventHub.NotifyRefresh()
 		if time.Since(start) > 100*time.Millisecond {
 			slog.Warn("Slow broadcast/enqueue", "duration", time.Since(start))
@@ -242,6 +253,17 @@ func main() {
 	// 8. Start HTTP Server
 	mux := http.NewServeMux()
 	apiServer.RegisterRoutes(mux)
+
+	// MCP Server routes (conditionally enabled via MCP_ENABLED)
+	if cfg.MCPEnabled {
+		mcpPath := cfg.MCPPath
+		if mcpPath == "" {
+			mcpPath = "/mcp"
+		}
+		mux.Handle(mcpPath, http.StripPrefix(mcpPath, mcpServer.Handler()))
+		mux.Handle(mcpPath+"/", http.StripPrefix(mcpPath, mcpServer.Handler()))
+		slog.Info("🤖 MCP endpoint registered", "path", mcpPath)
+	}
 
 	// SPA Handler
 	distFS, err := web.DistFS()
