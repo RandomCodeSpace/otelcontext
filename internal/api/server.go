@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/RandomCodeSpace/argus/internal/cache"
+	"github.com/RandomCodeSpace/argus/internal/graph"
 	"github.com/RandomCodeSpace/argus/internal/realtime"
 	"github.com/RandomCodeSpace/argus/internal/storage"
 	"github.com/RandomCodeSpace/argus/internal/telemetry"
@@ -17,6 +18,7 @@ type Server struct {
 	eventHub *realtime.EventHub
 	metrics  *telemetry.Metrics
 	cache    *cache.TTLCache
+	graph    *graph.Graph // in-memory service dependency graph (may be nil before first build)
 }
 
 // NewServer creates a new API server.
@@ -28,6 +30,12 @@ func NewServer(repo *storage.Repository, hub *realtime.Hub, eventHub *realtime.E
 		metrics:  metrics,
 		cache:    cache.New(),
 	}
+}
+
+// SetGraph wires the in-memory service graph into the API server.
+// Called from main after the graph is created so startup order is flexible.
+func (s *Server) SetGraph(g *graph.Graph) {
+	s.graph = g
 }
 
 // RegisterRoutes registers API endpoints on the provided mux.

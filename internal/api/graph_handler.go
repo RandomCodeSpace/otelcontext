@@ -59,9 +59,10 @@ type SystemGraphResponse struct {
 
 var argusStartTime = time.Now()
 
-// handleGetSystemGraph handles GET /api/system/graph
-// Returns a structured graph of service topology, health scores, and metrics.
-// Results are cached for 10 seconds to avoid hammering the DB.
+// handleGetSystemGraph handles GET /api/system/graph.
+// When the in-memory graph has been populated it returns instantly from memory.
+// Falls back to a DB query only when the graph has never been built yet.
+// Results are additionally cached for 10s to smooth out burst traffic.
 func (s *Server) handleGetSystemGraph(w http.ResponseWriter, r *http.Request) {
 	const cacheKey = "system_graph"
 	const cacheTTL = 10 * time.Second
@@ -73,45 +74,110 @@ func (s *Server) handleGetSystemGraph(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	resp := s.buildGraphFromMemory()
+	if resp == nil {
+		// Graph not yet hydrated — fall back to DB path.
+		resp = s.buildGraphFromDB()
+		if resp == nil {
+			http.Error(w, "failed to build system graph", http.StatusInternalServerError)
+			return
+		}
+	}
+
+	s.cache.Set(cacheKey, resp, cacheTTL)
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Cache", "MISS")
+	json.NewEncoder(w).Encode(resp)
+}
+
+// buildGraphFromMemory converts the in-memory graph snapshot to the API response.
+// Returns nil if the graph has not been built yet.
+func (s *Server) buildGraphFromMemory() *SystemGraphResponse {
+	if s.graph == nil {
+		return nil
+	}
+	snap := s.graph.Snapshot()
+	if snap.UpdatedAt.IsZero() || len(snap.Nodes) == 0 {
+		return nil
+	}
+
+	nodes := make([]GraphNode, 0, len(snap.Nodes))
+	var totalErrorRate, totalLatency float64
+
+	for _, n := range snap.Nodes {
+		alerts := n.Alerts
+		if alerts == nil {
+			alerts = []string{}
+		}
+		nodes = append(nodes, GraphNode{
+			ID:          n.Name,
+			Type:        "service",
+			HealthScore: math.Round(n.HealthScore*100) / 100,
+			Status:      n.Status,
+			Metrics: NodeMetrics{
+				RequestRateRPS: math.Round(n.RequestRateRPS*100) / 100,
+				ErrorRate:      math.Round(n.ErrorRate*10000) / 10000,
+				AvgLatencyMs:   math.Round(n.AvgLatencyMs*100) / 100,
+				P99LatencyMs:   math.Round(n.P99LatencyMs*100) / 100,
+				SpanCount1H:    n.SpanCount,
+			},
+			Alerts: alerts,
+		})
+		totalErrorRate += n.ErrorRate
+		totalLatency += n.AvgLatencyMs
+	}
+
+	edges := make([]GraphEdge, 0, len(snap.Edges))
+	for _, e := range snap.Edges {
+		edges = append(edges, GraphEdge{
+			Source:       e.Source,
+			Target:       e.Target,
+			CallCount:    e.CallCount,
+			AvgLatencyMs: math.Round(e.AvgLatencyMs*100) / 100,
+			ErrorRate:    math.Round(e.ErrorRate*10000) / 10000,
+			Status:       e.Status,
+		})
+	}
+
+	return buildSummaryResponse(nodes, edges, totalErrorRate, totalLatency)
+}
+
+// buildGraphFromDB is the fallback path used before the in-memory graph is ready.
+func (s *Server) buildGraphFromDB() *SystemGraphResponse {
 	end := time.Now()
 	start := end.Add(-1 * time.Hour)
 
 	svcMap, err := s.repo.GetServiceMapMetrics(start, end)
 	if err != nil {
 		slog.Error("Failed to get service map for system graph", "error", err)
-		http.Error(w, "failed to build system graph", http.StatusInternalServerError)
-		return
+		return nil
 	}
 
 	nodes := make([]GraphNode, 0, len(svcMap.Nodes))
-	var totalErrorRate float64
-	var totalLatency float64
+	var totalErrorRate, totalLatency float64
 
 	for _, n := range svcMap.Nodes {
 		errorRate := 0.0
 		if n.TotalTraces > 0 {
 			errorRate = float64(n.ErrorCount) / float64(n.TotalTraces)
 		}
-
 		healthScore := computeHealthScore(errorRate, n.AvgLatencyMs)
-		status := healthStatus(healthScore)
 		alerts := generateAlerts(n.Name, errorRate, n.AvgLatencyMs)
 
 		nodes = append(nodes, GraphNode{
 			ID:          n.Name,
 			Type:        "service",
 			HealthScore: healthScore,
-			Status:      status,
+			Status:      healthStatus(healthScore),
 			Metrics: NodeMetrics{
 				RequestRateRPS: math.Round(float64(n.TotalTraces)/3600*100) / 100,
 				ErrorRate:      math.Round(errorRate*10000) / 10000,
 				AvgLatencyMs:   n.AvgLatencyMs,
-				P99LatencyMs:   n.AvgLatencyMs * 2.5, // approximation until TSDB ring is in place
+				P99LatencyMs:   n.AvgLatencyMs * 2.5,
 				SpanCount1H:    n.TotalTraces,
 			},
 			Alerts: alerts,
 		})
-
 		totalErrorRate += errorRate
 		totalLatency += n.AvgLatencyMs
 	}
@@ -132,6 +198,11 @@ func (s *Server) handleGetSystemGraph(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
+	return buildSummaryResponse(nodes, edges, totalErrorRate, totalLatency)
+}
+
+// buildSummaryResponse computes system-level aggregates and returns the final response.
+func buildSummaryResponse(nodes []GraphNode, edges []GraphEdge, totalErrorRate, totalLatency float64) *SystemGraphResponse {
 	healthy, degraded, critical := 0, 0, 0
 	for _, n := range nodes {
 		switch n.Status {
@@ -145,15 +216,16 @@ func (s *Server) handleGetSystemGraph(w http.ResponseWriter, r *http.Request) {
 	}
 
 	overallHealth := 1.0
+	avgLatency := 0.0
 	if len(nodes) > 0 {
 		overallHealth = math.Round((1.0-totalErrorRate/float64(len(nodes)))*100) / 100
 		if overallHealth < 0 {
 			overallHealth = 0
 		}
-		totalLatency = math.Round(totalLatency/float64(len(nodes))*100) / 100
+		avgLatency = math.Round(totalLatency/float64(len(nodes))*100) / 100
 	}
 
-	resp := SystemGraphResponse{
+	resp := &SystemGraphResponse{
 		Timestamp: time.Now().UTC(),
 		System: SystemSummary{
 			TotalServices:      len(nodes),
@@ -162,18 +234,13 @@ func (s *Server) handleGetSystemGraph(w http.ResponseWriter, r *http.Request) {
 			Critical:           critical,
 			OverallHealthScore: overallHealth,
 			TotalErrorRate:     math.Round(totalErrorRate/float64(max(len(nodes), 1))*10000) / 10000,
-			AvgLatencyMs:       totalLatency,
+			AvgLatencyMs:       avgLatency,
 			UptimeSeconds:      time.Since(argusStartTime).Seconds(),
 		},
 		Nodes: nodes,
 		Edges: edges,
 	}
-
-	s.cache.Set(cacheKey, resp, cacheTTL)
-
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("X-Cache", "MISS")
-	json.NewEncoder(w).Encode(resp)
+	return resp
 }
 
 // computeHealthScore returns a 0.0–1.0 score where 1.0 is fully healthy.

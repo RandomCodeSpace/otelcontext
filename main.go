@@ -18,6 +18,7 @@ import (
 	"github.com/RandomCodeSpace/argus/internal/api"
 	"github.com/RandomCodeSpace/argus/internal/archive"
 	"github.com/RandomCodeSpace/argus/internal/config"
+	"github.com/RandomCodeSpace/argus/internal/graph"
 	"github.com/RandomCodeSpace/argus/internal/ingest"
 	"github.com/RandomCodeSpace/argus/internal/queue"
 	"github.com/RandomCodeSpace/argus/internal/realtime"
@@ -130,12 +131,38 @@ func main() {
 		"cold_path", cfg.ColdStoragePath,
 	)
 
+	// 4e. Initialize In-Memory Service Graph (rebuilds from spans every 30s)
+	svcGraph := graph.New(func(since time.Time) ([]graph.SpanRow, error) {
+		rows, err := repo.GetSpansForGraph(since)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]graph.SpanRow, len(rows))
+		for i, r := range rows {
+			out[i] = graph.SpanRow{
+				SpanID:        r.SpanID,
+				ParentSpanID:  r.ParentSpanID,
+				ServiceName:   r.ServiceName,
+				OperationName: r.OperationName,
+				DurationMs:    r.DurationMs,
+				IsError:       r.IsError,
+				Timestamp:     r.Timestamp,
+			}
+		}
+		return out, nil
+	}, 5*time.Minute, 30*time.Second)
+	ctxGraph, cancelGraph := context.WithCancel(context.Background())
+	defer cancelGraph()
+	go svcGraph.Start(ctxGraph)
+	slog.Info("🕸️  In-memory service graph started (5m window, 30s refresh)")
+
 	// 5. Initialize AI Service
 	aiService := ai.NewService(repo)
 	defer aiService.Stop()
 
 	// 6. Initialize API Server
 	apiServer := api.NewServer(repo, hub, eventHub, metrics)
+	apiServer.SetGraph(svcGraph)
 
 	// 7. Initialize OTLP Ingestion (gRPC)
 	traceServer := ingest.NewTraceServer(repo, metrics, cfg)

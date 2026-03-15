@@ -67,6 +67,14 @@ Specialized in-memory/embedded databases are used as **processing accelerators**
 
 ---
 
+## Phase 2: Hot/Cold Storage ✅ DONE (commit 711220c)
+
+**Changes delivered:**
+- `internal/archive/archiver.go` *(new)* — daily worker; zstd-compressed JSONL per day; SHA-256 manifest; FIFO size enforcement
+- `internal/archive/maintenance.go` *(new)* — post-archival DB optimize (SQLite/PostgreSQL/MySQL)
+- `internal/storage/archive_repo.go` *(new)* — archive query/delete methods + `HotDBSizeBytes()`
+- `main.go` — archive worker wired with context-cancelled goroutine
+
 ## Phase 2: Hot/Cold Storage & Data Compression
 
 ### 2.1 Hot/Cold storage architecture
@@ -118,6 +126,13 @@ data/cold/
 - Track and expose `argus_archive_last_run`, `argus_archive_records_moved`, `argus_hot_db_size_bytes`
 
 ---
+
+## Phase 3: Self-Monitoring Metrics ✅ DONE (commit c78058e)
+
+**Changes delivered:**
+- `internal/telemetry/metrics.go` — 19 new Prometheus metrics (gRPC, HTTP, TSDB, WebSocket, DLQ, Archive, Runtime); `StartRuntimeMetrics()` goroutine; enriched `HealthStats` with goroutines/heap/uptime
+- `internal/api/middleware.go` *(new)* — `MetricsMiddleware` wraps all HTTP routes with latency + count recording; path cardinality guard collapses UUIDs/IDs to `{id}`
+- `main.go` — `metricsUnaryInterceptor` on gRPC server; `MetricsMiddleware` wraps HTTP mux; `StartRuntimeMetrics()` called at startup
 
 ## Phase 3: Self-Monitoring Metrics
 
