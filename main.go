@@ -359,7 +359,7 @@ func main() {
 
 	var httpHandler http.Handler = api.MetricsMiddleware(metrics, mux)
 	if cfg.APIRateLimitRPS > 0 {
-		rl := api.NewRateLimiter(cfg.APIRateLimitRPS)
+		rl := api.NewRateLimiter(float64(cfg.APIRateLimitRPS))
 		httpHandler = rl.Middleware(httpHandler)
 		slog.Info("🛡️  API rate limiter enabled", "rps_per_ip", cfg.APIRateLimitRPS)
 	}
