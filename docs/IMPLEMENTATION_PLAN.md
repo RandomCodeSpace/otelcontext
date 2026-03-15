@@ -314,6 +314,14 @@ All internal DBs are **embedded** (compiled into the single binary, no external 
 
 ---
 
+## Phase 6: HTTP Streamable MCP Server ✅ DONE (commit d0372ef)
+
+**Changes delivered:**
+- `internal/mcp/types.go` *(new)* — JSON-RPC 2.0 + MCP protocol types
+- `internal/mcp/tools.go` *(new)* — 11 tools (get_system_graph, get_service_health, search_logs, get_trace, search_traces, get_metrics, get_dashboard_stats, get_storage_status, find_similar_logs, get_alerts, search_cold_archive)
+- `internal/mcp/server.go` *(new)* — HTTP Streamable MCP: POST (JSON-RPC), GET (SSE with 5s graph snapshots); enabled via `MCP_ENABLED=true`
+- `main.go` — vectordb.Index feeds live log indexing; MCP server registered at `MCPPath`
+
 ## Phase 6: HTTP Streamable MCP Server
 
 Expose Argus as an MCP (Model Context Protocol) server over HTTP with SSE streaming, so any AI agent (Claude, GPT, Cursor, etc.) can discover and call Argus tools natively — no custom API integration needed.
@@ -385,6 +393,13 @@ Each tool returns structured content that AI agents can reason over:
 - AI agents can subscribe to resources for real-time updates via SSE
 
 ---
+
+## Phase 7: Smart Observability ✅ DONE (commit fd52ebc)
+
+**Changes delivered:**
+- `internal/ingest/sampler.go` *(new)* — per-service token bucket sampler; always keeps errors, slow traces, new services; configurable via `SAMPLING_RATE`, `SAMPLING_ALWAYS_ON_ERRORS`, `SAMPLING_LATENCY_THRESHOLD_MS`
+- `internal/tsdb/aggregator.go` — `SetCardinalityLimit(max, onOverflow)` routes excess metric series to overflow bucket; increments `argus_tsdb_cardinality_overflow_total`; wired via `METRIC_MAX_CARDINALITY`
+- `internal/api/ratelimit.go` *(new)* — per-IP token bucket rate limiter; X-Forwarded-For aware; configurable via `API_RATE_LIMIT_RPS`; wraps HTTP handler in `main.go`
 
 ## Phase 7: Smart Observability
 
