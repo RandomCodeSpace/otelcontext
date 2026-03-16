@@ -7,10 +7,12 @@ on:
         description: 'Base beta version to release (e.g., v0.0.5-beta)'
         required: true
 
+permissions:
+  contents: write
+
 jobs:
   release:
     uses: RandomCodeSpace/central-ops/.github/workflows/reusable-release.yml@main
-    permissions:
-      contents: write
+    secrets: inherit
     with:
       version: ${{ inputs.version }}
