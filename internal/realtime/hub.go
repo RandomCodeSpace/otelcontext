@@ -58,8 +58,9 @@ type Hub struct {
 	maxBufferSize int
 	flushInterval time.Duration
 
-	stopCh chan struct{}
-	wg     sync.WaitGroup
+	stopCh  chan struct{}
+	wg      sync.WaitGroup
+	devMode bool
 
 	// onConnectionChange is called when the number of active connections changes.
 	onConnectionChange func(count int)
@@ -224,6 +225,12 @@ func (h *Hub) broadcastBatch(batch HubBatch) {
 	}
 }
 
+// SetDevMode controls whether cross-origin WebSocket connections are accepted.
+// Should be true only in development environments.
+func (h *Hub) SetDevMode(devMode bool) {
+	h.devMode = devMode
+}
+
 // SetWSMetrics wires WebSocket metric callbacks.
 func (h *Hub) SetWSMetrics(onMessageSent func(string), onSlowClientDrop func()) {
 	h.onMessageSent = onMessageSent
@@ -258,7 +265,7 @@ func (h *Hub) Stop() {
 // HandleWebSocket is the HTTP handler that upgrades connections to WebSocket.
 func (h *Hub) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		InsecureSkipVerify: true, // Allow cross-origin for dev mode
+		InsecureSkipVerify: h.devMode, // Allow cross-origin in dev mode only
 	})
 	if err != nil {
 		slog.Error("WebSocket upgrade failed", "error", err)
@@ -290,9 +297,10 @@ func (h *Hub) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	// Reader goroutine — keeps connection alive, handles close
+	// Reader goroutine — keeps connection alive, handles close.
+	// Use request context so the read unblocks when the connection drops.
 	for {
-		_, _, err := conn.Read(context.Background())
+		_, _, err := conn.Read(r.Context())
 		if err != nil {
 			break
 		}

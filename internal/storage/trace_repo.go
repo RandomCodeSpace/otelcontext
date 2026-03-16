@@ -178,6 +178,8 @@ func (r *Repository) GetTracesFiltered(start, end time.Time, serviceNames []stri
 	}, nil
 }
 
+const serviceMapSpanLimit = 500_000
+
 // GetServiceMapMetrics computes topology metrics from spans.
 func (r *Repository) GetServiceMapMetrics(start, end time.Time) (*ServiceMapMetrics, error) {
 	var spans []Span
@@ -187,8 +189,11 @@ func (r *Repository) GetServiceMapMetrics(start, end time.Time) (*ServiceMapMetr
 		query = query.Where("start_time BETWEEN ? AND ?", start, end)
 	}
 
-	if err := query.Find(&spans).Error; err != nil {
+	if err := query.Limit(serviceMapSpanLimit).Find(&spans).Error; err != nil {
 		return nil, fmt.Errorf("failed to fetch spans: %w", err)
+	}
+	if len(spans) == serviceMapSpanLimit {
+		slog.Warn("GetServiceMapMetrics: span query hit row limit, topology may be incomplete", "limit", serviceMapSpanLimit)
 	}
 
 	spanMap := make(map[string]Span)

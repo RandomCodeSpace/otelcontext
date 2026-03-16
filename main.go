@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strings"
 	"syscall"
 	"time"
@@ -39,8 +40,16 @@ import (
 )
 
 
-// Version is injected by GoReleaser at build time
-var Version = "dev"
+// Version defaults to "local" for development builds.
+// When installed via `go install module@vX.Y.Z`, the module version is read
+// automatically from build info — no ldflags required.
+var Version = func() string {
+	if info, ok := debug.ReadBuildInfo(); ok &&
+		info.Main.Version != "" && info.Main.Version != "(devel)" {
+		return info.Main.Version
+	}
+	return "local"
+}()
 
 func main() {
 	versionFlag := flag.Bool("version", false, "print version and exit")
@@ -60,6 +69,10 @@ func main() {
 	cfg, err := config.Load("")
 	if err != nil {
 		slog.Error("failed to load configuration", "error", err)
+		os.Exit(1)
+	}
+	if err := cfg.Validate(); err != nil {
+		slog.Error("invalid configuration", "error", err)
 		os.Exit(1)
 	}
 
@@ -124,6 +137,7 @@ func main() {
 	hub := realtime.NewHub(func(count int) {
 		metrics.SetActiveConnections(count)
 	})
+	hub.SetDevMode(cfg.DevMode)
 	hub.SetWSMetrics(
 		func(msgType string) { metrics.WSMessagesSent.WithLabelValues(msgType).Inc() },
 		func() { metrics.WSSlowClientsRemoved.Inc() },
@@ -408,15 +422,13 @@ func metricsUnaryInterceptor(m *telemetry.Metrics) grpc.UnaryServerInterceptor {
 
 func printBanner() {
 	banner := `
-     _    ____   ____ _   _ ____   __     _____ _____ ____  
-    / \  |  _ \ / ___| | | / ___|  \ \   / / ___|___ /|  _ \ 
-   / _ \ | |_) | |  _| | | \___ \   \ \ / /|___ \ |_ \| | | |
-  / ___ \|  _ <| |_| | |_| |___) |   \ V /  ___) |__) | |_| |
- /_/   \_\_| \_\\____|\\___/|____/     \_/  |____/____/|____/ 
+     _    ____   ____  _   _ ____
+    / \  |  _ \ / ___|| | | / ___|
+   / _ \ | |_) || |  _|| | | \___ \
+  / ___ \|  _ < | |_| || |_| |___) |
+ /_/   \_\_| \_\ \____| \___/ |____/
 
-  ARGUS — High Performance Edition
-  The Eye That Never Sleeps 👁️
-  Version: %s
+  version: %s
 `
 	fmt.Printf(banner, Version)
 }

@@ -5,6 +5,7 @@ package tsdb
 
 import (
 	"math"
+	"sort"
 	"sync"
 	"time"
 )
@@ -212,16 +213,7 @@ func ringPercentile(data []float64, p float64) float64 {
 	}
 	sorted := make([]float64, len(data))
 	copy(sorted, data)
-	// Insertion sort is fast for ≤256 items.
-	for i := 1; i < len(sorted); i++ {
-		key := sorted[i]
-		j := i - 1
-		for j >= 0 && sorted[j] > key {
-			sorted[j+1] = sorted[j]
-			j--
-		}
-		sorted[j+1] = key
-	}
+	sort.Float64s(sorted)
 	idx := int(math.Ceil(p/100*float64(len(sorted)))) - 1
 	if idx < 0 {
 		idx = 0

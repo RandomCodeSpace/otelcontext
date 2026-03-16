@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"runtime"
 	"sync"
 
 	"github.com/RandomCodeSpace/argus/internal/config"
@@ -173,7 +174,7 @@ func (s *MetricsServer) Export(ctx context.Context, req *colmetricspb.ExportMetr
 
 // Export handles incoming OTLP trace data.
 func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceServiceRequest) (*coltracepb.ExportTraceServiceResponse, error) {
-	slog.Info("📥 [TRACES] Received Request", "resource_spans", len(req.ResourceSpans))
+	slog.Debug("📥 [TRACES] Received Request", "resource_spans", len(req.ResourceSpans))
 
 	var (
 		spansMu         sync.Mutex
@@ -183,6 +184,7 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 	)
 
 	g, _ := errgroup.WithContext(ctx)
+	g.SetLimit(runtime.GOMAXPROCS(0) * 4)
 
 	for _, resourceSpans := range req.ResourceSpans {
 		resourceSpans := resourceSpans // Capture
@@ -204,6 +206,19 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 					endTime := time.Unix(0, int64(span.EndTimeUnixNano))
 					duration := endTime.Sub(startTime).Microseconds()
 
+					// Adaptive sampling: evaluate before any allocations.
+					statusStr := "STATUS_CODE_UNSET"
+					if span.Status != nil {
+						statusStr = span.Status.Code.String()
+					}
+					if s.sampler != nil {
+						isError := statusStr == "STATUS_CODE_ERROR"
+						durationMs := float64(duration) / 1000.0
+						if !s.sampler.ShouldSample(serviceName, isError, durationMs) {
+							continue
+						}
+					}
+
 					attrs, _ := json.Marshal(span.Attributes)
 
 					// Create Span Model
@@ -219,22 +234,6 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 						AttributesJSON: storage.CompressedText(attrs),
 					}
 					localSpans = append(localSpans, sModel)
-
-					// Create/Update Trace Model for indexing
-					statusStr := "STATUS_CODE_UNSET"
-					if span.Status != nil {
-						statusStr = span.Status.Code.String()
-					}
-
-					// Adaptive sampling: drop healthy traces at configured rate.
-					if s.sampler != nil {
-						isError := statusStr == "STATUS_CODE_ERROR"
-						durationMs := float64(duration) / 1000.0
-						if !s.sampler.ShouldSample(serviceName, isError, durationMs) {
-							localSpans = localSpans[:len(localSpans)-1]
-							continue
-						}
-					}
 
 					tModel := storage.Trace{
 						TraceID:     fmt.Sprintf("%x", span.TraceId),

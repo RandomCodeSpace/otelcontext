@@ -1,9 +1,11 @@
 package config
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/joho/godotenv"
 )
@@ -64,6 +66,10 @@ type Config struct {
 
 	// Vector Index
 	VectorIndexMaxEntries int
+
+	// DevMode disables origin checks for WebSocket and enables dev-friendly defaults.
+	// Derived from APP_ENV == "development".
+	DevMode bool
 }
 
 func Load(customPath string) (*Config, error) {
@@ -82,8 +88,10 @@ func Load(customPath string) (*Config, error) {
 		log.Println("⚠️  No .env file found, using system environment variables or defaults")
 	}
 
+	env := getEnv("APP_ENV", "development")
 	return &Config{
-		Env:               getEnv("APP_ENV", "development"),
+		Env:               env,
+		DevMode:           env == "development",
 		LogLevel:          getEnv("LOG_LEVEL", "INFO"),
 		HTTPPort:          getEnv("HTTP_PORT", "8080"),
 		GRPCPort:          getEnv("GRPC_PORT", "4317"),
@@ -172,4 +180,59 @@ func getEnvBool(key string, fallback bool) bool {
 		}
 	}
 	return fallback
+}
+
+// Validate checks that all configuration values are within valid ranges.
+// Call this once after Load() during startup to catch misconfiguration early.
+func (c *Config) Validate() error {
+	// Port validation
+	httpPort, err := strconv.Atoi(c.HTTPPort)
+	if err != nil || httpPort < 1 || httpPort > 65535 {
+		return fmt.Errorf("invalid HTTP_PORT %q: must be 1-65535", c.HTTPPort)
+	}
+	grpcPort, err := strconv.Atoi(c.GRPCPort)
+	if err != nil || grpcPort < 1 || grpcPort > 65535 {
+		return fmt.Errorf("invalid GRPC_PORT %q: must be 1-65535", c.GRPCPort)
+	}
+
+	// DB driver
+	validDrivers := map[string]bool{
+		"sqlite": true, "postgres": true, "postgresql": true,
+		"mysql": true, "mssql": true, "sqlserver": true,
+	}
+	if !validDrivers[strings.ToLower(c.DBDriver)] {
+		return fmt.Errorf("invalid DB_DRIVER %q: must be one of sqlite, postgres, mysql, mssql", c.DBDriver)
+	}
+
+	// Numeric ranges
+	if c.HotRetentionDays < 1 {
+		return fmt.Errorf("HOT_RETENTION_DAYS must be >= 1, got %d", c.HotRetentionDays)
+	}
+	if c.ArchiveScheduleHour < 0 || c.ArchiveScheduleHour > 23 {
+		return fmt.Errorf("ARCHIVE_SCHEDULE_HOUR must be 0-23, got %d", c.ArchiveScheduleHour)
+	}
+	if c.MetricMaxCardinality < 0 {
+		return fmt.Errorf("METRIC_MAX_CARDINALITY must be >= 0, got %d", c.MetricMaxCardinality)
+	}
+	if c.SamplingRate < 0 || c.SamplingRate > 1.0 {
+		return fmt.Errorf("SAMPLING_RATE must be between 0 and 1, got %f", c.SamplingRate)
+	}
+	if c.APIRateLimitRPS < 0 {
+		return fmt.Errorf("API_RATE_LIMIT_RPS must be >= 0, got %d", c.APIRateLimitRPS)
+	}
+	if c.DBMaxOpenConns < 1 {
+		return fmt.Errorf("DB_MAX_OPEN_CONNS must be >= 1, got %d", c.DBMaxOpenConns)
+	}
+	if c.DBMaxIdleConns < 0 {
+		return fmt.Errorf("DB_MAX_IDLE_CONNS must be >= 0, got %d", c.DBMaxIdleConns)
+	}
+
+	// Compression level
+	switch strings.ToLower(c.CompressionLevel) {
+	case "default", "fast", "best":
+	default:
+		return fmt.Errorf("invalid COMPRESSION_LEVEL %q: must be one of default, fast, best", c.CompressionLevel)
+	}
+
+	return nil
 }
