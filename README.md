@@ -64,5 +64,3 @@ service:
       exporters: [otlp/otelcontext]
 ```
 See `docs/otel-collector-example.yaml` for a full configuration example.
-
-
