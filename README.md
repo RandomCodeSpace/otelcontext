@@ -2,7 +2,7 @@
 
 [![Security Scan](https://github.com/RandomCodeSpace/otelcontext/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/RandomCodeSpace/otelcontext/actions/workflows/ci.yml)
 [![OpenSSF Scan](https://github.com/RandomCodeSpace/otelcontext/actions/workflows/ci.yml/badge.svg?branch=main&label=OpenSSF%20scan)](https://github.com/RandomCodeSpace/otelcontext/actions/workflows/ci.yml)
-[![OpenSSF Score](https://api.securityscorecards.dev/projects/github.com/RandomCodeSpace/otelcontext/badge)](https://securityscorecards.dev/viewer/?uri=github.com/RandomCodeSpace/otelcontext)
+[![OpenSSF Score](https://api.scorecard.dev/projects/github.com/RandomCodeSpace/otelcontext/badge)](https://scorecard.dev/viewer/?uri=github.com/RandomCodeSpace/otelcontext)
 [![Release](https://img.shields.io/github/v/release/RandomCodeSpace/otelcontext)](https://github.com/RandomCodeSpace/otelcontext/releases)
 [![Beta](https://img.shields.io/github/v/release/RandomCodeSpace/otelcontext?include_prereleases&label=beta)](https://github.com/RandomCodeSpace/otelcontext/releases)
 ![Go Version](https://img.shields.io/github/go-mod/go-version/RandomCodeSpace/otelcontext)
