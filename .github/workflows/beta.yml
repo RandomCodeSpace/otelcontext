@@ -8,6 +8,10 @@ permissions:
   contents: write
 
 jobs:
+  security-scan:
+    uses: RandomCodeSpace/central-ops/.github/workflows/security.yml@main
+    secrets: inherit
   auto-beta:
+    needs: security-scan
     uses: RandomCodeSpace/central-ops/.github/workflows/reusable-auto-beta.yml@main
     secrets: inherit
