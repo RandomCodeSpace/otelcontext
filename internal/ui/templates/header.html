@@ -6,7 +6,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{{.Title}}</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <script>(function(){var t=localStorage.getItem('argus-theme')||'dark';document.documentElement.setAttribute('data-theme',t);})()</script>
+    <script>(function(){var t=localStorage.getItem('OtelContext-theme')||'dark';document.documentElement.setAttribute('data-theme',t);})()</script>
     <style>
         :root, [data-theme="dark"] {
             --bg-base:    #000;
@@ -86,22 +86,22 @@
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/>
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/>
             </svg>
-            <span style="font-weight:700;letter-spacing:.18em;font-size:.8rem;color:var(--text-primary)">ARGUS</span>
+            <span style="font-weight:700;letter-spacing:.18em;font-size:.8rem;color:var(--text-primary)">OtelContext</span>
         </a>
 
         <!-- Nav Links -->
         <a href="/" style="display:flex;align-items:center;gap:.4rem;padding:.35rem .75rem;border-radius:6px;font-size:.8rem;font-weight:500;text-decoration:none;transition:all .15s;
-            {{if eq .Title "Dashboard - Argus"}}background:var(--nav-active-bg);color:var(--nav-active-text);border:1px solid var(--nav-active-border){{else}}color:var(--nav-inactive-text);border:1px solid transparent{{end}}">
+            {{if eq .Title "Dashboard - OtelContext"}}background:var(--nav-active-bg);color:var(--nav-active-text);border:1px solid var(--nav-active-border){{else}}color:var(--nav-inactive-text);border:1px solid transparent{{end}}">
             <svg style="width:14px;height:14px" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6"/></svg>
             Dashboard
         </a>
         <a href="/services" style="display:flex;align-items:center;gap:.4rem;padding:.35rem .75rem;border-radius:6px;font-size:.8rem;font-weight:500;text-decoration:none;transition:all .15s;
-            {{if eq .Title "Services - Argus"}}background:var(--nav-active-bg);color:var(--nav-active-text);border:1px solid var(--nav-active-border){{else}}color:var(--nav-inactive-text);border:1px solid transparent{{end}}">
+            {{if eq .Title "Services - OtelContext"}}background:var(--nav-active-bg);color:var(--nav-active-text);border:1px solid var(--nav-active-border){{else}}color:var(--nav-inactive-text);border:1px solid transparent{{end}}">
             <svg style="width:14px;height:14px" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"/></svg>
             Services
         </a>
         <a href="/mcp-console" style="display:flex;align-items:center;gap:.4rem;padding:.35rem .75rem;border-radius:6px;font-size:.8rem;font-weight:500;text-decoration:none;transition:all .15s;
-            {{if eq .Title "MCP Console - Argus"}}background:var(--nav-active-bg);color:var(--nav-active-text);border:1px solid var(--nav-active-border){{else}}color:var(--nav-inactive-text);border:1px solid transparent{{end}}">
+            {{if eq .Title "MCP Console - OtelContext"}}background:var(--nav-active-bg);color:var(--nav-active-text);border:1px solid var(--nav-active-border){{else}}color:var(--nav-inactive-text);border:1px solid transparent{{end}}">
             <svg style="width:14px;height:14px" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"/></svg>
             MCP Console
         </a>
@@ -134,7 +134,8 @@ function toggleTheme() {
     var html = document.documentElement;
     var next = html.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
     html.setAttribute('data-theme', next);
-    localStorage.setItem('argus-theme', next);
+    localStorage.setItem('OtelContext-theme', next);
 }
 </script>
 {{end}}
+

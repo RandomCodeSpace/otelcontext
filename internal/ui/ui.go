@@ -7,10 +7,10 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/RandomCodeSpace/argus/internal/graph"
-	"github.com/RandomCodeSpace/argus/internal/storage"
-	"github.com/RandomCodeSpace/argus/internal/telemetry"
-	"github.com/RandomCodeSpace/argus/internal/vectordb"
+	"github.com/RandomCodeSpace/otelcontext/internal/graph"
+	"github.com/RandomCodeSpace/otelcontext/internal/storage"
+	"github.com/RandomCodeSpace/otelcontext/internal/telemetry"
+	"github.com/RandomCodeSpace/otelcontext/internal/vectordb"
 )
 
 //go:embed templates/*.html static/*
@@ -56,7 +56,7 @@ func fmtNum(v any) string {
 }
 
 func NewServer(repo *storage.Repository, metrics *telemetry.Metrics, topo *graph.Graph, vidx *vectordb.Index) *Server {
-	tmpl := template.New("argus").Funcs(template.FuncMap{
+	tmpl := template.New("OtelContext").Funcs(template.FuncMap{
 		"text_uppercase": strings.ToUpper,
 		"text_lowercase": strings.ToLower,
 		"fmt_num":        fmtNum,
@@ -114,7 +114,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	health := s.metrics.GetHealthStats()
 
 	err := s.tmpl.ExecuteTemplate(w, "dashboard.html", map[string]any{
-		"Title":       "Dashboard - Argus",
+		"Title":       "Dashboard - OtelContext",
 		"Traces":      traces,
 		"Stats":       stats,
 		"HealthStats": health,
@@ -145,7 +145,7 @@ func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	err = s.tmpl.ExecuteTemplate(w, "logs.html", map[string]any{
-		"Title": "Logs - Argus",
+		"Title": "Logs - OtelContext",
 		"Logs":  logs,
 		"Query": query,
 	})
@@ -162,7 +162,7 @@ func (s *Server) handleTraces(w http.ResponseWriter, r *http.Request) {
 	}
 
 	err = s.tmpl.ExecuteTemplate(w, "traces.html", map[string]any{
-		"Title":  "Traces - Argus",
+		"Title":  "Traces - OtelContext",
 		"Traces": traces,
 	})
 	if err != nil {
@@ -184,7 +184,7 @@ func (s *Server) handleTraceDetail(w http.ResponseWriter, r *http.Request) {
 	}
 
 	err = s.tmpl.ExecuteTemplate(w, "trace_detail.html", map[string]any{
-		"Title": "Trace: " + traceID + " - Argus",
+		"Title": "Trace: " + traceID + " - OtelContext",
 		"Trace": trace,
 	})
 	if err != nil {
@@ -197,7 +197,7 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request) {
 	nodes := s.topo.GetNodes()
 
 	err := s.tmpl.ExecuteTemplate(w, "services.html", map[string]any{
-		"Title": "Services - Argus",
+		"Title": "Services - OtelContext",
 		"Nodes": nodes,
 	})
 	if err != nil {
@@ -207,7 +207,7 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleMCPConsole(w http.ResponseWriter, r *http.Request) {
 	err := s.tmpl.ExecuteTemplate(w, "mcp_console.html", map[string]any{
-		"Title":      "MCP Console - Argus",
+		"Title":      "MCP Console - OtelContext",
 		"MCPPath":    s.mcpPath,
 		"MCPEnabled": s.mcpEnabled,
 	})
@@ -215,3 +215,5 @@ func (s *Server) handleMCPConsole(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
+
+

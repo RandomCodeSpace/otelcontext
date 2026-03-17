@@ -1,6 +1,6 @@
 // Package mcp implements the HTTP Streamable MCP (Model Context Protocol)
 // server over JSON-RPC 2.0 with SSE streaming, allowing any AI agent
-// (Claude, GPT, Cursor, etc.) to discover and call Argus tools natively.
+// (Claude, GPT, Cursor, etc.) to discover and call OtelContext tools natively.
 package mcp
 
 // JSON-RPC 2.0 base types.
@@ -105,3 +105,4 @@ type SSEEvent struct {
 	Event string
 	Data  string
 }
+

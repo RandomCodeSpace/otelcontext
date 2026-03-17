@@ -1,15 +1,15 @@
-# Argus Observability & Performance Improvement Plan
+# OtelContext Observability & Performance Improvement Plan
 
 ## Context
 
-Argus is a self-hosted OTLP observability platform (Go backend + React frontend) that ingests traces, logs, and metrics via gRPC, stores them in a relational DB (SQLite/MySQL/PostgreSQL/MSSQL), and serves dashboards via HTTP/WebSocket. When connected to active services pushing continuous telemetry, the DB will grow unbounded and performance will degrade. The goal is to:
+OtelContext is a self-hosted OTLP observability platform (Go backend + React frontend) that ingests traces, logs, and metrics via gRPC, stores them in a relational DB (SQLite/MySQL/PostgreSQL/MSSQL), and serves dashboards via HTTP/WebSocket. When connected to active services pushing continuous telemetry, the DB will grow unbounded and performance will degrade. The goal is to:
 
 1. **Capture all metrics, traces, and logs** — comprehensively but smartly
 2. **Create an AI-consumable system graph API** — structured JSON that any AI agent can query
 3. **Maximize performance** — fix identified bottlenecks, use specialized in-memory DBs as accelerators
 4. **Hot/cold storage tiering** — keep 7 days hot, archive older data to compressed cold storage
 5. **Data compression** — prevent DB blowup from continuous ingestion
-6. **HTTP Streamable MCP Server** — universal AI agent access to Argus tools
+6. **HTTP Streamable MCP Server** — universal AI agent access to OtelContext tools
 
 ### Storage Architecture Principle
 
@@ -54,7 +54,7 @@ Specialized in-memory/embedded databases are used as **processing accelerators**
 
 ### 1.4 TSDB flush channel — visibility + throughput
 - **File:** `internal/tsdb/aggregator.go` — `flush()` (line 114)
-- **Fix:** Increase channel cap to 500, add `argus_tsdb_batches_dropped` counter, spawn multiple persistence workers (default 3)
+- **Fix:** Increase channel cap to 500, add `OtelContext_tsdb_batches_dropped` counter, spawn multiple persistence workers (default 3)
 
 ### 1.5 In-memory TTL cache for dashboard queries
 - **New file:** `internal/cache/ttl.go` — simple `sync.Map` with expiry
@@ -123,7 +123,7 @@ data/cold/
   - SQLite: `VACUUM`, `PRAGMA optimize`
   - PostgreSQL: `VACUUM ANALYZE`
   - MySQL: `OPTIMIZE TABLE`
-- Track and expose `argus_archive_last_run`, `argus_archive_records_moved`, `argus_hot_db_size_bytes`
+- Track and expose `OtelContext_archive_last_run`, `OtelContext_archive_records_moved`, `OtelContext_hot_db_size_bytes`
 
 ---
 
@@ -141,25 +141,25 @@ data/cold/
 
 | Metric | Type | Labels | Purpose |
 |--------|------|--------|---------|
-| `argus_grpc_requests_total` | CounterVec | method, status | gRPC call counts |
-| `argus_grpc_request_duration_seconds` | HistogramVec | method | gRPC latency |
-| `argus_grpc_batch_size` | Histogram | — | Spans/logs per Export call |
-| `argus_http_requests_total` | CounterVec | method, path, status | API call counts |
-| `argus_http_request_duration_seconds` | HistogramVec | method, path | API latency |
-| `argus_tsdb_ingest_total` | Counter | — | Raw metric points ingested |
-| `argus_tsdb_flush_duration_seconds` | Histogram | — | Flush window time |
-| `argus_tsdb_batches_dropped_total` | Counter | — | Dropped batches |
-| `argus_ws_messages_sent_total` | CounterVec | type | WS broadcast count |
-| `argus_ws_slow_clients_removed_total` | Counter | — | Dropped slow clients |
-| `argus_dlq_enqueued_total` | Counter | — | DLQ writes |
-| `argus_dlq_replay_success_total` | Counter | — | Successful replays |
-| `argus_dlq_replay_failure_total` | Counter | — | Failed replays |
-| `argus_dlq_disk_bytes` | Gauge | — | DLQ disk usage |
-| `argus_archive_records_moved` | Counter | type | Records archived |
-| `argus_hot_db_size_bytes` | Gauge | — | Hot DB file size |
-| `argus_cold_storage_bytes` | Gauge | — | Cold archive size |
-| `argus_go_goroutines` | Gauge | — | Active goroutines |
-| `argus_go_heap_alloc_bytes` | Gauge | — | Heap memory |
+| `OtelContext_grpc_requests_total` | CounterVec | method, status | gRPC call counts |
+| `OtelContext_grpc_request_duration_seconds` | HistogramVec | method | gRPC latency |
+| `OtelContext_grpc_batch_size` | Histogram | — | Spans/logs per Export call |
+| `OtelContext_http_requests_total` | CounterVec | method, path, status | API call counts |
+| `OtelContext_http_request_duration_seconds` | HistogramVec | method, path | API latency |
+| `OtelContext_tsdb_ingest_total` | Counter | — | Raw metric points ingested |
+| `OtelContext_tsdb_flush_duration_seconds` | Histogram | — | Flush window time |
+| `OtelContext_tsdb_batches_dropped_total` | Counter | — | Dropped batches |
+| `OtelContext_ws_messages_sent_total` | CounterVec | type | WS broadcast count |
+| `OtelContext_ws_slow_clients_removed_total` | Counter | — | Dropped slow clients |
+| `OtelContext_dlq_enqueued_total` | Counter | — | DLQ writes |
+| `OtelContext_dlq_replay_success_total` | Counter | — | Successful replays |
+| `OtelContext_dlq_replay_failure_total` | Counter | — | Failed replays |
+| `OtelContext_dlq_disk_bytes` | Gauge | — | DLQ disk usage |
+| `OtelContext_archive_records_moved` | Counter | type | Records archived |
+| `OtelContext_hot_db_size_bytes` | Gauge | — | Hot DB file size |
+| `OtelContext_cold_storage_bytes` | Gauge | — | Cold archive size |
+| `OtelContext_go_goroutines` | Gauge | — | Active goroutines |
+| `OtelContext_go_heap_alloc_bytes` | Gauge | — | Heap memory |
 
 ### 3.2 HTTP metrics middleware
 - **New file:** `internal/api/middleware.go`
@@ -168,7 +168,7 @@ data/cold/
 
 ### 3.3 gRPC interceptor
 - **File:** `main.go` — add `grpc.UnaryInterceptor()` to gRPC server
-- Records `argus_grpc_*` metrics per RPC
+- Records `OtelContext_grpc_*` metrics per RPC
 
 ### 3.4 Runtime metrics goroutine
 - **File:** `main.go` — background goroutine sampling `runtime.MemStats` every 15s
@@ -324,7 +324,7 @@ All internal DBs are **embedded** (compiled into the single binary, no external 
 
 ## Phase 6: HTTP Streamable MCP Server
 
-Expose Argus as an MCP (Model Context Protocol) server over HTTP with SSE streaming, so any AI agent (Claude, GPT, Cursor, etc.) can discover and call Argus tools natively — no custom API integration needed.
+Expose OtelContext as an MCP (Model Context Protocol) server over HTTP with SSE streaming, so any AI agent (Claude, GPT, Cursor, etc.) can discover and call OtelContext tools natively — no custom API integration needed.
 
 ### 6.1 MCP server package
 - **New package:** `internal/mcp/`
@@ -371,7 +371,7 @@ Each tool returns structured content that AI agents can reason over:
     {
       "type": "resource",
       "resource": {
-        "uri": "argus://system/graph",
+        "uri": "OtelContext://system/graph",
         "mimeType": "application/json",
         "text": "{...system graph JSON...}"
       }
@@ -387,9 +387,9 @@ Each tool returns structured content that AI agents can reason over:
 - **Cache:** MCP tools use the same TTL cache from Phase 1.5
 
 ### 6.6 MCP Resources (read-only data subscriptions)
-- `argus://system/graph` — live system graph (subscribable)
-- `argus://services/{name}/health` — per-service health
-- `argus://metrics/prometheus` — current Prometheus metrics dump
+- `OtelContext://system/graph` — live system graph (subscribable)
+- `OtelContext://services/{name}/health` — per-service health
+- `OtelContext://metrics/prometheus` — current Prometheus metrics dump
 - AI agents can subscribe to resources for real-time updates via SSE
 
 ---
@@ -398,7 +398,7 @@ Each tool returns structured content that AI agents can reason over:
 
 **Changes delivered:**
 - `internal/ingest/sampler.go` *(new)* — per-service token bucket sampler; always keeps errors, slow traces, new services; configurable via `SAMPLING_RATE`, `SAMPLING_ALWAYS_ON_ERRORS`, `SAMPLING_LATENCY_THRESHOLD_MS`
-- `internal/tsdb/aggregator.go` — `SetCardinalityLimit(max, onOverflow)` routes excess metric series to overflow bucket; increments `argus_tsdb_cardinality_overflow_total`; wired via `METRIC_MAX_CARDINALITY`
+- `internal/tsdb/aggregator.go` — `SetCardinalityLimit(max, onOverflow)` routes excess metric series to overflow bucket; increments `OtelContext_tsdb_cardinality_overflow_total`; wired via `METRIC_MAX_CARDINALITY`
 - `internal/api/ratelimit.go` *(new)* — per-IP token bucket rate limiter; X-Forwarded-For aware; configurable via `API_RATE_LIMIT_RPS`; wraps HTTP handler in `main.go`
 
 ## Phase 7: Smart Observability
@@ -413,7 +413,7 @@ Each tool returns structured content that AI agents can reason over:
 - **File:** `internal/tsdb/aggregator.go`
 - Attribute allowlist: `METRIC_ATTRIBUTE_KEYS=service,method,status_code`
 - Max cardinality guard: if `len(buckets)` > 10,000, route to overflow bucket
-- Metric: `argus_tsdb_cardinality_overflow_total`
+- Metric: `OtelContext_tsdb_cardinality_overflow_total`
 
 ### 7.3 DLQ bounded disk + backoff
 - **File:** `internal/queue/dlq.go`
@@ -454,5 +454,6 @@ Each tool returns structured content that AI agents can reason over:
 2. **Metrics:** Verify all new Prometheus metrics appear at `GET /metrics`
 3. **Graph API:** Hit `GET /api/system/graph` during simulation, validate JSON schema
 4. **Archival:** Set `HOT_RETENTION_DAYS=0`, trigger archival, verify cold files created and hot DB shrunk
-5. **Sampling:** Enable sampling, verify reduced ingestion rate via `argus_ingestion_rate` while errors still captured
+5. **Sampling:** Enable sampling, verify reduced ingestion rate via `OtelContext_ingestion_rate` while errors still captured
 6. **MCP Server:** `POST /mcp` with `{"jsonrpc":"2.0","method":"initialize",...}` returns tool list; call `tools/call` with `get_system_graph` returns valid graph; connect from Claude Desktop or any MCP client
+

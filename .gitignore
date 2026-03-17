@@ -111,9 +111,9 @@ go.work.sum
 
 .dev-pids
 
-*argus*.db*
-/argus
-/argus.exe
+*OtelContext*.db*
+/OtelContext
+/OtelContext.exe
 
 .agent/
 

@@ -9,16 +9,16 @@ import (
 	"strings"
 	"time"
 
-	"github.com/RandomCodeSpace/argus/internal/graph"
-	"github.com/RandomCodeSpace/argus/internal/storage"
-	"github.com/RandomCodeSpace/argus/internal/telemetry"
-	"github.com/RandomCodeSpace/argus/internal/vectordb"
+	"github.com/RandomCodeSpace/otelcontext/internal/graph"
+	"github.com/RandomCodeSpace/otelcontext/internal/storage"
+	"github.com/RandomCodeSpace/otelcontext/internal/telemetry"
+	"github.com/RandomCodeSpace/otelcontext/internal/vectordb"
 	"github.com/RandomCodeSpace/central-ops/pkg/httputil"
 )
 
 const (
 	mcpProtocolVersion = "2024-11-05"
-	serverName         = "argus-mcp"
+	serverName         = "OtelContext-mcp"
 	serverVersion      = "1.0.0"
 )
 
@@ -125,8 +125,8 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request) {
 	case "resources/list":
 		result = map[string]any{
 			"resources": []map[string]any{
-				{"uri": "argus://system/graph", "name": "System Graph", "mimeType": "application/json"},
-				{"uri": "argus://metrics/prometheus", "name": "Prometheus Metrics", "mimeType": "text/plain"},
+				{"uri": "OtelContext://system/graph", "name": "System Graph", "mimeType": "application/json"},
+				{"uri": "OtelContext://metrics/prometheus", "name": "Prometheus Metrics", "mimeType": "text/plain"},
 			},
 		}
 
@@ -178,7 +178,7 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 				"jsonrpc": "2.0",
 				"method":  "notifications/resources/updated",
 				"params": map[string]any{
-					"uri":  "argus://system/graph",
+					"uri":  "OtelContext://system/graph",
 					"data": string(data),
 				},
 			}
@@ -221,3 +221,4 @@ func parseToolCallParams(raw any) (ToolCallParams, bool) {
 	}
 	return p, true
 }
+

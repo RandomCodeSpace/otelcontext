@@ -1,4 +1,4 @@
-# Project Argus - AI Project Specification
+# Project OtelContext - AI Project Specification
 
 **Version:** 5.0  
 **Last Updated:** 2025  
@@ -8,9 +8,9 @@
 
 ## 🎯 Project Overview
 
-### What is Project Argus?
+### What is Project OtelContext?
 
-Project Argus is an integrated observability and AI analysis platform designed for self-hosted deployment in private network environments. It combines distributed tracing, log aggregation, real-time streaming, and AI-powered log analysis into a single, unified binary.
+Project OtelContext is an integrated observability and AI analysis platform designed for self-hosted deployment in private network environments. It combines distributed tracing, log aggregation, real-time streaming, and AI-powered log analysis into a single, unified binary.
 
 **Core Purpose:**
 - Ingest OpenTelemetry Protocol (OTLP) traces and logs from distributed systems
@@ -78,7 +78,7 @@ These are absolute rules that must be followed by any AI tool working on this co
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                        ARGUS V5.0                               │
+│                        OtelContext V5.0                               │
 │                    (Single Binary)                              │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                 │
@@ -281,7 +281,7 @@ User Action → React Component → TanStack Query
 
 
 ```
-argus/
+OtelContext/
 ├── main.go                      # Application entry point
 ├── go.mod                       # Go module dependencies
 ├── go.sum                       # Dependency checksums
@@ -460,19 +460,19 @@ type Log struct {
 ```bash
 # SQLite (default)
 DB_DRIVER=sqlite
-DB_DSN=argus.db
+DB_DSN=OtelContext.db
 
 # MySQL
 DB_DRIVER=mysql
-DB_DSN=user:password@tcp(host:3306)/argus?charset=utf8mb4&parseTime=True&loc=Local
+DB_DSN=user:password@tcp(host:3306)/OtelContext?charset=utf8mb4&parseTime=True&loc=Local
 
 # PostgreSQL
 DB_DRIVER=postgres
-DB_DSN=host=localhost user=argus password=secret dbname=argus port=5432 sslmode=disable
+DB_DSN=host=localhost user=OtelContext password=secret dbname=OtelContext port=5432 sslmode=disable
 
 # SQL Server
 DB_DRIVER=sqlserver
-DB_DSN=sqlserver://user:password@host:1433?database=argus
+DB_DSN=sqlserver://user:password@host:1433?database=OtelContext
 ```
 
 ---
@@ -810,7 +810,7 @@ GRPC_PORT=4317                   # gRPC OTLP receiver port
 #### Database
 ```bash
 DB_DRIVER=sqlite                 # Database driver: sqlite, mysql, postgres, sqlserver
-DB_DSN=argus.db                  # Database connection string (driver-specific)
+DB_DSN=OtelContext.db                  # Database connection string (driver-specific)
 ```
 
 #### Dead Letter Queue
@@ -894,11 +894,11 @@ npm run build  # Outputs to web/dist/
 
 **Build Binary:**
 ```bash
-go build -o argus main.go
+go build -o OtelContext main.go
 ```
 
 **Result:**
-- Single binary: `argus` (or `argus.exe` on Windows)
+- Single binary: `OtelContext` (or `OtelContext.exe` on Windows)
 - Frontend embedded via `go:embed` in `web/embed.go`
 - No external dependencies except database
 
@@ -907,17 +907,17 @@ go build -o argus main.go
 **Single Binary Deployment:**
 ```bash
 # Copy binary to server
-scp argus user@server:/opt/argus/
+scp OtelContext user@server:/opt/OtelContext/
 
 # Create .env file
-cat > /opt/argus/.env << EOF
+cat > /opt/OtelContext/.env << EOF
 DB_DRIVER=mysql
-DB_DSN=user:password@tcp(localhost:3306)/argus
+DB_DSN=user:password@tcp(localhost:3306)/OtelContext
 EOF
 
 # Run
-cd /opt/argus
-./argus
+cd /opt/OtelContext
+./OtelContext
 ```
 
 **Docker Deployment (Future):**
@@ -926,12 +926,12 @@ FROM golang:1.24-alpine AS builder
 WORKDIR /app
 COPY . .
 RUN cd web && npm install && npm run build
-RUN go build -o argus main.go
+RUN go build -o OtelContext main.go
 
 FROM alpine:latest
-COPY --from=builder /app/argus /argus
+COPY --from=builder /app/OtelContext /OtelContext
 EXPOSE 8080 4317
-CMD ["/argus"]
+CMD ["/OtelContext"]
 ```
 
 ### Database Migration
@@ -953,23 +953,23 @@ CMD ["/argus"]
 
 ### Internal Telemetry
 
-Argus monitors itself using Prometheus metrics.
+OtelContext monitors itself using Prometheus metrics.
 
 **Metrics Exposed:**
 
-1. **argus_ingestion_rate** (Counter)
+1. **OtelContext_ingestion_rate** (Counter)
    - Total spans and logs ingested
    - Incremented on successful batch insert
 
-2. **argus_active_connections** (Gauge)
+2. **OtelContext_active_connections** (Gauge)
    - Number of active WebSocket clients
    - Updated on connect/disconnect
 
-3. **argus_db_latency** (Histogram)
+3. **OtelContext_db_latency** (Histogram)
    - Database operation latency in seconds
    - Measured via GORM callbacks
 
-4. **argus_dlq_size** (Gauge)
+4. **OtelContext_dlq_size** (Gauge)
    - Number of files in Dead Letter Queue
    - Updated every 30 seconds
 
@@ -1008,7 +1008,7 @@ LOG_LEVEL=DEBUG  # Set via environment variable
 
 **Log Format:**
 ```
-time=2025-01-15T10:30:45.123Z level=INFO msg="🚀 Starting Argus V5.0" env=development log_level=INFO
+time=2025-01-15T10:30:45.123Z level=INFO msg="🚀 Starting OtelContext V5.0" env=development log_level=INFO
 ```
 
 **Key Log Events:**
@@ -1078,7 +1078,7 @@ time=2025-01-15T10:30:45.123Z level=INFO msg="🚀 Starting Argus V5.0" env=deve
 ### Sensitive Data Handling
 
 **PII in Logs:**
-- Argus stores log bodies and attributes as-is
+- OtelContext stores log bodies and attributes as-is
 - No automatic PII redaction
 - Recommendation: Configure OTLP exporters to redact PII before sending
 
@@ -1135,8 +1135,8 @@ The `test/` directory contains microservice simulators for generating test data:
 
 **OTLP Integration Test:**
 ```bash
-# Start Argus
-./argus
+# Start OtelContext
+./OtelContext
 
 # Send test trace via grpcurl
 grpcurl -plaintext -d @ localhost:4317 \
@@ -1334,7 +1334,7 @@ Solution:
 - Supports traces, logs, and metrics
 - Uses gRPC or HTTP transport
 
-### Argus-Specific Terms
+### OtelContext-Specific Terms
 
 **Live Mode:**
 - Real-time data streaming mode
@@ -1707,11 +1707,11 @@ cd web && npm run dev             # Run frontend dev server
 
 # Build
 cd web && npm run build           # Build frontend
-go build -o argus main.go         # Build binary
+go build -o OtelContext main.go         # Build binary
 
 # Database
-sqlite3 argus.db                  # Open SQLite database
-mysql -u root -p argus            # Connect to MySQL
+sqlite3 OtelContext.db                  # Open SQLite database
+mysql -u root -p OtelContext            # Connect to MySQL
 
 # Testing
 grpcurl -plaintext localhost:4317 list  # List gRPC services
@@ -1731,7 +1731,7 @@ curl http://localhost:8080/metrics      # Prometheus metrics
 
 ## 🎯 Summary for AI Tools
 
-**When working on Project Argus, remember:**
+**When working on Project OtelContext, remember:**
 
 1. ✅ **DO:**
    - Use Go net/http for HTTP
@@ -1772,4 +1772,5 @@ curl http://localhost:8080/metrics      # Prometheus metrics
 
 **End of AI_PROJECT_SPEC.md**
 
-*This document serves as the comprehensive reference for all AI tools and developers working on Project Argus. Keep it updated as the project evolves.*
+*This document serves as the comprehensive reference for all AI tools and developers working on Project OtelContext. Keep it updated as the project evolves.*
+

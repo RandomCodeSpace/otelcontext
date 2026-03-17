@@ -1,4 +1,4 @@
-/* Argus UI Base Styles */
+/* OtelContext UI Base Styles */
 body {
     font-family: system-ui, -apple-system, sans-serif;
     color: #cbd5e1;
@@ -11,3 +11,4 @@ body {
     margin: 0 auto;
     padding: 20px;
 }
+

@@ -4,12 +4,12 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/RandomCodeSpace/argus/internal/cache"
-	"github.com/RandomCodeSpace/argus/internal/graph"
-	"github.com/RandomCodeSpace/argus/internal/realtime"
-	"github.com/RandomCodeSpace/argus/internal/storage"
-	"github.com/RandomCodeSpace/argus/internal/telemetry"
-	"github.com/RandomCodeSpace/argus/internal/vectordb"
+	"github.com/RandomCodeSpace/otelcontext/internal/cache"
+	"github.com/RandomCodeSpace/otelcontext/internal/graph"
+	"github.com/RandomCodeSpace/otelcontext/internal/realtime"
+	"github.com/RandomCodeSpace/otelcontext/internal/storage"
+	"github.com/RandomCodeSpace/otelcontext/internal/telemetry"
+	"github.com/RandomCodeSpace/otelcontext/internal/vectordb"
 )
 
 // Server handles HTTP API requests.

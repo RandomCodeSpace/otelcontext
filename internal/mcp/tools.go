@@ -5,10 +5,10 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/RandomCodeSpace/argus/internal/storage"
+	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 )
 
-// toolDefs is the canonical list of all tools exposed by the Argus MCP server.
+// toolDefs is the canonical list of all tools exposed by the OtelContext MCP server.
 var toolDefs = []Tool{
 	{
 		Name:        "get_system_graph",
@@ -279,7 +279,7 @@ func (s *Server) toolSearchLogs(args map[string]any) ToolCallResult {
 		"entries": toLogSummaries(logs),
 	}
 	data, _ := json.MarshalIndent(result, "", "  ")
-	return resourceResult("argus://logs/search", "application/json", string(data))
+	return resourceResult("OtelContext://logs/search", "application/json", string(data))
 }
 
 func (s *Server) toolTailLogs(args map[string]any) ToolCallResult {
@@ -304,7 +304,7 @@ func (s *Server) toolTailLogs(args map[string]any) ToolCallResult {
 		return errorResult(fmt.Sprintf("tail_logs failed: %v", err))
 	}
 	data, _ := json.MarshalIndent(toLogSummaries(logs), "", "  ")
-	return resourceResult("argus://logs/tail", "application/json", string(data))
+	return resourceResult("OtelContext://logs/tail", "application/json", string(data))
 }
 
 func (s *Server) toolGetTrace(args map[string]any) ToolCallResult {
@@ -317,7 +317,7 @@ func (s *Server) toolGetTrace(args map[string]any) ToolCallResult {
 		return errorResult(fmt.Sprintf("get_trace failed: %v", err))
 	}
 	data, _ := json.MarshalIndent(trace, "", "  ")
-	return resourceResult("argus://traces/"+traceID, "application/json", string(data))
+	return resourceResult("OtelContext://traces/"+traceID, "application/json", string(data))
 }
 
 func (s *Server) toolSearchTraces(args map[string]any) ToolCallResult {
@@ -345,7 +345,7 @@ func (s *Server) toolSearchTraces(args map[string]any) ToolCallResult {
 		return errorResult(fmt.Sprintf("search_traces failed: %v", err))
 	}
 	data, _ := json.MarshalIndent(resp, "", "  ")
-	return resourceResult("argus://traces/search", "application/json", string(data))
+	return resourceResult("OtelContext://traces/search", "application/json", string(data))
 }
 
 func (s *Server) toolGetMetrics(args map[string]any) ToolCallResult {
@@ -362,7 +362,7 @@ func (s *Server) toolGetMetrics(args map[string]any) ToolCallResult {
 		return errorResult(fmt.Sprintf("get_metrics failed: %v", err))
 	}
 	data, _ := json.MarshalIndent(buckets, "", "  ")
-	return resourceResult("argus://metrics/query", "application/json", string(data))
+	return resourceResult("OtelContext://metrics/query", "application/json", string(data))
 }
 
 func (s *Server) toolGetDashboardStats(args map[string]any) ToolCallResult {
@@ -493,3 +493,5 @@ func argInt(args map[string]any, key string, def int) int {
 	}
 	return def
 }
+
+

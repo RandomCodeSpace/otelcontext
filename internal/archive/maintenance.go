@@ -5,14 +5,14 @@ import (
 	"log/slog"
 	"strings"
 
-	"github.com/RandomCodeSpace/argus/internal/config"
-	"github.com/RandomCodeSpace/argus/internal/storage"
+	"github.com/RandomCodeSpace/otelcontext/internal/config"
+	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 )
 
 // Maintain runs driver-specific DB optimization commands after archival.
 // SQLite: VACUUM + PRAGMA optimize
 // PostgreSQL: VACUUM ANALYZE
-// MySQL: OPTIMIZE TABLE for each Argus table
+// MySQL: OPTIMIZE TABLE for each OtelContext table
 func Maintain(repo *storage.Repository, cfg *config.Config) error {
 	db := repo.DB()
 	driver := strings.ToLower(cfg.DBDriver)
@@ -47,3 +47,4 @@ func Maintain(repo *storage.Repository, cfg *config.Config) error {
 	slog.Info("✅ DB maintenance complete")
 	return nil
 }
+

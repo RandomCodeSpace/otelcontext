@@ -2,8 +2,8 @@ root = "."
 tmp_dir = "tmp"
 
 [build]
-cmd = "go build -o ./tmp/argus.exe ."
-bin = "./tmp/argus.exe"
+cmd = "go build -o ./tmp/OtelContext.exe ."
+bin = "./tmp/OtelContext.exe"
 include_ext = ["go", "tpl", "tmpl", "html"]
 exclude_dir = ["assets", "tmp", "vendor", "testdata", "web", "test"]
 include_dir = []
@@ -23,3 +23,4 @@ runner = "green"
 
 [misc]
 clean_on_exit = true
+

@@ -6,7 +6,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/RandomCodeSpace/argus/internal/telemetry"
+	"github.com/RandomCodeSpace/otelcontext/internal/telemetry"
 	"gorm.io/gorm"
 )
 
@@ -167,3 +167,4 @@ func (r *Repository) SearchLogs(query string, limit int) ([]Log, error) {
 	}
 	return logs, nil
 }
+

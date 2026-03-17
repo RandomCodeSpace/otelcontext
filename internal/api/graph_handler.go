@@ -57,7 +57,7 @@ type SystemGraphResponse struct {
 	Edges     []GraphEdge   `json:"edges"`
 }
 
-var argusStartTime = time.Now()
+var OtelContextStartTime = time.Now()
 
 // handleGetSystemGraph handles GET /api/system/graph.
 // When the in-memory graph has been populated it returns instantly from memory.
@@ -235,7 +235,7 @@ func buildSummaryResponse(nodes []GraphNode, edges []GraphEdge, totalErrorRate, 
 			OverallHealthScore: overallHealth,
 			TotalErrorRate:     math.Round(totalErrorRate/float64(max(len(nodes), 1))*10000) / 10000,
 			AvgLatencyMs:       avgLatency,
-			UptimeSeconds:      time.Since(argusStartTime).Seconds(),
+			UptimeSeconds:      time.Since(OtelContextStartTime).Seconds(),
 		},
 		Nodes: nodes,
 		Edges: edges,
@@ -291,3 +291,4 @@ func max(a, b int) int {
 	}
 	return b
 }
+

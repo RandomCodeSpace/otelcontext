@@ -1,25 +1,25 @@
-# Project Argus
+# OtelContext
 
-[![Latest Release](https://img.shields.io/github/v/release/RandomCodeSpace/argus)](https://github.com/RandomCodeSpace/argus/releases)
-[![CodeQL](https://github.com/RandomCodeSpace/argus/actions/workflows/github-code-scanning/codeql/badge.svg)](https://github.com/RandomCodeSpace/argus/actions/workflows/github-code-scanning/codeql)
-![Go Version](https://img.shields.io/github/go-mod/go-version/RandomCodeSpace/argus)
+[![Latest Release](https://img.shields.io/github/v/release/RandomCodeSpace/otelcontext)](https://github.com/RandomCodeSpace/otelcontext/releases)
+[![CodeQL](https://github.com/RandomCodeSpace/otelcontext/actions/workflows/github-code-scanning/codeql/badge.svg)](https://github.com/RandomCodeSpace/otelcontext/actions/workflows/github-code-scanning/codeql)
+![Go Version](https://img.shields.io/github/go-mod/go-version/RandomCodeSpace/otelcontext)
 ![React](https://img.shields.io/badge/frontend-React%20v18-61dafb?logo=react)
 
-Project Argus is an integrated observability and AI analysis platform.
+OtelContext is an integrated observability and AI analysis platform.
 
 ## Getting Started
 
 ### Installation
 ```bash
-go install github.com/RandomCodeSpace/argus@latest
+go install github.com/RandomCodeSpace/otelcontext@latest
 ```
 
 ### Running
 Simply run the binary:
 ```bash
-argus
+otelcontext
 ```
-By default, Argus will use an embedded SQLite database (`argus.db`) in the current directory. No configuration is required.
+By default, OtelContext will use an embedded SQLite database (`otelcontext.db`) in the current directory. No configuration is required.
 
 ### Configuration (Optional)
 You can configure the database using environment variables or a `.env` file:
@@ -27,12 +27,12 @@ You can configure the database using environment variables or a `.env` file:
 - **MySQL**:
   ```bash
   DB_DRIVER=mysql
-  DB_DSN=root:password@tcp(localhost:3306)/argus?charset=utf8mb4&parseTime=True&loc=Local
+  DB_DSN=root:password@tcp(localhost:3306)/otelcontext?charset=utf8mb4&parseTime=True&loc=Local
   ```
 - **SQLite** (Default):
   ```bash
   DB_DRIVER=sqlite
-  DB_DSN=argus.db
+  DB_DSN=otelcontext.db
   ```
 
 ## Features
@@ -41,14 +41,14 @@ You can configure the database using environment variables or a `.env` file:
 - **Dashboard**: Real-time metrics and traffic analysis.
 
 ## OTLP Integration
-Argus acts as an OTLP Receiver (gRPC) on port `4317` by default.
+OtelContext acts as an OTLP Receiver (gRPC) on port `4317` by default.
 
 ### As an OTel Collector Target
-You can configure any OpenTelemetry Collector to export data to Argus.
+You can configure any OpenTelemetry Collector to export data to OtelContext.
 
 ```yaml
 exporters:
-  otlp/argus:
+  otlp/otelcontext:
     endpoint: "localhost:4317"
     tls:
       insecure: true
@@ -56,8 +56,10 @@ exporters:
 service:
   pipelines:
     traces:
-      exporters: [otlp/argus]
+      exporters: [otlp/otelcontext]
     logs:
-      exporters: [otlp/argus]
+      exporters: [otlp/otelcontext]
 ```
 See `docs/otel-collector-example.yaml` for a full configuration example.
+
+

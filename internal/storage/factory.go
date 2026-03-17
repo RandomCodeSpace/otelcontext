@@ -39,17 +39,17 @@ func NewDatabase(driver, dsn string) (*gorm.DB, error) {
 
 	case "mysql":
 		if dsn == "" {
-			dsn = "root:admin@tcp(127.0.0.1:3306)/argus?charset=utf8mb4&parseTime=True&loc=Local"
+			dsn = "root:admin@tcp(127.0.0.1:3306)/OtelContext?charset=utf8mb4&parseTime=True&loc=Local"
 		}
 		dialector = mysql.Open(dsn)
 
 	case "sqlite", "":
 		if dsn == "" {
-			dsn = "argus.db"
+			dsn = "OtelContext.db"
 		}
 		if driver == "" {
 			driver = "sqlite"
-			log.Println("DB_DRIVER not set, defaulting to sqlite (argus.db)")
+			log.Println("DB_DRIVER not set, defaulting to sqlite (OtelContext.db)")
 		}
 		dialector = sqlite.Open(dsn)
 
@@ -112,7 +112,7 @@ func getEnvPoolDuration(key string, fallback time.Duration) time.Duration {
 	return fallback
 }
 
-// AutoMigrateModels runs GORM auto-migration for all Argus models.
+// AutoMigrateModels runs GORM auto-migration for all OtelContext models.
 func AutoMigrateModels(db *gorm.DB, driver string) error {
 	// Disable FK checks during migration for MySQL
 	if strings.ToLower(driver) == "mysql" {
@@ -134,3 +134,4 @@ func AutoMigrateModels(db *gorm.DB, driver string) error {
 
 	return nil
 }
+

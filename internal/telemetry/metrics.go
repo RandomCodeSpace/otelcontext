@@ -12,7 +12,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-// Metrics holds all internal Prometheus metrics for Argus self-monitoring.
+// Metrics holds all internal Prometheus metrics for OtelContext self-monitoring.
 type Metrics struct {
 	// --- Existing ---
 	IngestionRate     prometheus.Counter
@@ -62,125 +62,125 @@ type Metrics struct {
 	startTime       time.Time
 }
 
-// New creates and registers all Argus internal metrics.
+// New creates and registers all OtelContext internal metrics.
 func New() *Metrics {
 	m := &Metrics{
 		startTime: time.Now(),
 
 		// Existing
 		IngestionRate: promauto.NewCounter(prometheus.CounterOpts{
-			Name: "argus_ingestion_rate",
+			Name: "OtelContext_ingestion_rate",
 			Help: "Total number of spans and logs ingested.",
 		}),
 		ActiveConnections: promauto.NewGauge(prometheus.GaugeOpts{
-			Name: "argus_active_connections",
+			Name: "OtelContext_active_connections",
 			Help: "Number of active WebSocket client connections.",
 		}),
 		DBLatency: promauto.NewHistogram(prometheus.HistogramOpts{
-			Name:    "argus_db_latency",
+			Name:    "OtelContext_db_latency",
 			Help:    "Database operation latency in seconds.",
 			Buckets: prometheus.DefBuckets,
 		}),
 		DLQSize: promauto.NewGauge(prometheus.GaugeOpts{
-			Name: "argus_dlq_size",
+			Name: "OtelContext_dlq_size",
 			Help: "Number of files currently in the Dead Letter Queue.",
 		}),
 
 		// gRPC
 		GRPCRequestsTotal: promauto.NewCounterVec(prometheus.CounterOpts{
-			Name: "argus_grpc_requests_total",
+			Name: "OtelContext_grpc_requests_total",
 			Help: "Total gRPC requests by method and status.",
 		}, []string{"method", "status"}),
 		GRPCRequestDuration: promauto.NewHistogramVec(prometheus.HistogramOpts{
-			Name:    "argus_grpc_request_duration_seconds",
+			Name:    "OtelContext_grpc_request_duration_seconds",
 			Help:    "gRPC request latency in seconds.",
 			Buckets: []float64{.001, .005, .01, .025, .05, .1, .25, .5, 1, 2.5},
 		}, []string{"method"}),
 		GRPCBatchSize: promauto.NewHistogram(prometheus.HistogramOpts{
-			Name:    "argus_grpc_batch_size",
+			Name:    "OtelContext_grpc_batch_size",
 			Help:    "Number of spans/logs per OTLP Export call.",
 			Buckets: []float64{1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500},
 		}),
 
 		// HTTP
 		HTTPRequestsTotal: promauto.NewCounterVec(prometheus.CounterOpts{
-			Name: "argus_http_requests_total",
+			Name: "OtelContext_http_requests_total",
 			Help: "Total HTTP requests by method, path, and status.",
 		}, []string{"method", "path", "status"}),
 		HTTPRequestDuration: promauto.NewHistogramVec(prometheus.HistogramOpts{
-			Name:    "argus_http_request_duration_seconds",
+			Name:    "OtelContext_http_request_duration_seconds",
 			Help:    "HTTP request latency in seconds.",
 			Buckets: []float64{.001, .005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5},
 		}, []string{"method", "path"}),
 
 		// TSDB
 		TSDBIngestTotal: promauto.NewCounter(prometheus.CounterOpts{
-			Name: "argus_tsdb_ingest_total",
+			Name: "OtelContext_tsdb_ingest_total",
 			Help: "Total raw metric data points ingested into TSDB.",
 		}),
 		TSDBFlushDuration: promauto.NewHistogram(prometheus.HistogramOpts{
-			Name:    "argus_tsdb_flush_duration_seconds",
+			Name:    "OtelContext_tsdb_flush_duration_seconds",
 			Help:    "Time taken to flush a TSDB window to disk.",
 			Buckets: prometheus.DefBuckets,
 		}),
 		TSDBBatchesDropped: promauto.NewCounter(prometheus.CounterOpts{
-			Name: "argus_tsdb_batches_dropped_total",
+			Name: "OtelContext_tsdb_batches_dropped_total",
 			Help: "TSDB batches dropped due to full flush channel.",
 		}),
 		TSDBCardinalityOverflow: promauto.NewCounter(prometheus.CounterOpts{
-			Name: "argus_tsdb_cardinality_overflow_total",
+			Name: "OtelContext_tsdb_cardinality_overflow_total",
 			Help: "Metric points routed to overflow bucket due to cardinality limit.",
 		}),
 
 		// WebSocket
 		WSMessagesSent: promauto.NewCounterVec(prometheus.CounterOpts{
-			Name: "argus_ws_messages_sent_total",
+			Name: "OtelContext_ws_messages_sent_total",
 			Help: "Total WebSocket messages broadcast by type.",
 		}, []string{"type"}),
 		WSSlowClientsRemoved: promauto.NewCounter(prometheus.CounterOpts{
-			Name: "argus_ws_slow_clients_removed_total",
+			Name: "OtelContext_ws_slow_clients_removed_total",
 			Help: "WebSocket clients dropped due to slow consumption.",
 		}),
 
 		// DLQ
 		DLQEnqueuedTotal: promauto.NewCounter(prometheus.CounterOpts{
-			Name: "argus_dlq_enqueued_total",
+			Name: "OtelContext_dlq_enqueued_total",
 			Help: "Total batches written to the Dead Letter Queue.",
 		}),
 		DLQReplaySuccess: promauto.NewCounter(prometheus.CounterOpts{
-			Name: "argus_dlq_replay_success_total",
+			Name: "OtelContext_dlq_replay_success_total",
 			Help: "Successful DLQ replay attempts.",
 		}),
 		DLQReplayFailure: promauto.NewCounter(prometheus.CounterOpts{
-			Name: "argus_dlq_replay_failure_total",
+			Name: "OtelContext_dlq_replay_failure_total",
 			Help: "Failed DLQ replay attempts.",
 		}),
 		DLQDiskBytes: promauto.NewGauge(prometheus.GaugeOpts{
-			Name: "argus_dlq_disk_bytes",
+			Name: "OtelContext_dlq_disk_bytes",
 			Help: "Total disk usage of the DLQ directory in bytes.",
 		}),
 
 		// Archive
 		ArchiveRecordsMoved: promauto.NewCounterVec(prometheus.CounterOpts{
-			Name: "argus_archive_records_moved_total",
+			Name: "OtelContext_archive_records_moved_total",
 			Help: "Records moved to cold storage by data type.",
 		}, []string{"type"}),
 		HotDBSizeBytes: promauto.NewGauge(prometheus.GaugeOpts{
-			Name: "argus_hot_db_size_bytes",
+			Name: "OtelContext_hot_db_size_bytes",
 			Help: "Approximate hot database size in bytes.",
 		}),
 		ColdStorageBytes: promauto.NewGauge(prometheus.GaugeOpts{
-			Name: "argus_cold_storage_bytes",
+			Name: "OtelContext_cold_storage_bytes",
 			Help: "Total cold archive size on disk in bytes.",
 		}),
 
 		// Runtime
 		GoGoroutines: promauto.NewGauge(prometheus.GaugeOpts{
-			Name: "argus_go_goroutines",
+			Name: "OtelContext_go_goroutines",
 			Help: "Current number of active goroutines.",
 		}),
 		GoHeapAllocBytes: promauto.NewGauge(prometheus.GaugeOpts{
-			Name: "argus_go_heap_alloc_bytes",
+			Name: "OtelContext_go_heap_alloc_bytes",
 			Help: "Current Go heap allocations in bytes.",
 		}),
 	}
@@ -274,3 +274,4 @@ func (m *Metrics) HealthHandler() http.HandlerFunc {
 func PrometheusHandler() http.Handler {
 	return promhttp.Handler()
 }
+

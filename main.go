@@ -17,20 +17,20 @@ import (
 
 	"github.com/RandomCodeSpace/central-ops/pkg/version"
 
-	"github.com/RandomCodeSpace/argus/internal/ai"
-	"github.com/RandomCodeSpace/argus/internal/api"
-	"github.com/RandomCodeSpace/argus/internal/archive"
-	"github.com/RandomCodeSpace/argus/internal/config"
-	"github.com/RandomCodeSpace/argus/internal/graph"
-	"github.com/RandomCodeSpace/argus/internal/ingest"
-	"github.com/RandomCodeSpace/argus/internal/mcp"
-	"github.com/RandomCodeSpace/argus/internal/queue"
-	"github.com/RandomCodeSpace/argus/internal/realtime"
-	"github.com/RandomCodeSpace/argus/internal/storage"
-	"github.com/RandomCodeSpace/argus/internal/telemetry"
-	"github.com/RandomCodeSpace/argus/internal/tsdb"
-	"github.com/RandomCodeSpace/argus/internal/vectordb"
-	"github.com/RandomCodeSpace/argus/internal/ui"
+	"github.com/RandomCodeSpace/otelcontext/internal/ai"
+	"github.com/RandomCodeSpace/otelcontext/internal/api"
+	"github.com/RandomCodeSpace/otelcontext/internal/archive"
+	"github.com/RandomCodeSpace/otelcontext/internal/config"
+	"github.com/RandomCodeSpace/otelcontext/internal/graph"
+	"github.com/RandomCodeSpace/otelcontext/internal/ingest"
+	"github.com/RandomCodeSpace/otelcontext/internal/mcp"
+	"github.com/RandomCodeSpace/otelcontext/internal/queue"
+	"github.com/RandomCodeSpace/otelcontext/internal/realtime"
+	"github.com/RandomCodeSpace/otelcontext/internal/storage"
+	"github.com/RandomCodeSpace/otelcontext/internal/telemetry"
+	"github.com/RandomCodeSpace/otelcontext/internal/tsdb"
+	"github.com/RandomCodeSpace/otelcontext/internal/vectordb"
+	"github.com/RandomCodeSpace/otelcontext/internal/ui"
 
 	collogspb "go.opentelemetry.io/proto/otlp/collector/logs/v1"
 	colmetricspb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
@@ -50,7 +50,7 @@ func main() {
 	flag.Parse()
 
 	if *versionFlag {
-		fmt.Printf("Argus version %s\n", Version)
+		fmt.Printf("OtelContext version %s\n", Version)
 		os.Exit(0)
 	}
 
@@ -88,7 +88,7 @@ func main() {
 	}))
 	slog.SetDefault(logger)
 
-	slog.Info("🚀 Starting Argus", "version", Version, "env", cfg.Env, "log_level", level)
+	slog.Info("🚀 Starting OtelContext", "version", Version, "env", cfg.Env, "log_level", level)
 
 	// 1. Initialize Internal Telemetry (first — everything registers metrics against this)
 	metrics := telemetry.New()
@@ -373,7 +373,7 @@ func main() {
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	<-stop
 
-	slog.Info("Shutting down ARGUS V5.4...")
+	slog.Info("Shutting down OtelContext V5.4...")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -388,10 +388,10 @@ func main() {
 	aiService.Stop()
 	tsdbAgg.Stop()
 
-	slog.Info("✅ ARGUS V5.4 shutdown complete")
+	slog.Info("✅ OtelContext V5.4 shutdown complete")
 }
 
-// metricsUnaryInterceptor records argus_grpc_requests_total and argus_grpc_request_duration_seconds
+// metricsUnaryInterceptor records OtelContext_grpc_requests_total and OtelContext_grpc_request_duration_seconds
 // for every unary gRPC call.
 func metricsUnaryInterceptor(m *telemetry.Metrics) grpc.UnaryServerInterceptor {
 	return func(
@@ -416,13 +416,15 @@ func metricsUnaryInterceptor(m *telemetry.Metrics) grpc.UnaryServerInterceptor {
 
 func printBanner() {
 	banner := `
-     _    ____   ____  _   _ ____
-    / \  |  _ \ / ___|| | | / ___|
-   / _ \ | |_) || |  _|| | | \___ \
-  / ___ \|  _ < | |_| || |_| |___) |
- /_/   \_\_| \_\ \____| \___/ |____/
+  ___ _____ _____ _     
+ / _ \_   _| ____| |    
+| | | || | |  _| | |    
+| |_| || | | |___| |___ 
+ \___/ |_| |_____|_____|
 
   version: %s
 `
 	fmt.Printf(banner, Version)
 }
+
+

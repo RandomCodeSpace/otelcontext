@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/RandomCodeSpace/argus/internal/telemetry"
+	"github.com/RandomCodeSpace/otelcontext/internal/telemetry"
 )
 
 // responseWriter wraps http.ResponseWriter to capture the status code.
@@ -30,7 +30,7 @@ func (rw *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	return rw.ResponseWriter.(http.Hijacker).Hijack()
 }
 
-// MetricsMiddleware records argus_http_requests_total and argus_http_request_duration_seconds
+// MetricsMiddleware records OtelContext_http_requests_total and OtelContext_http_request_duration_seconds
 // for every HTTP request.
 func MetricsMiddleware(metrics *telemetry.Metrics, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -92,3 +92,4 @@ func isIDSegment(s string) bool {
 	}
 	return len(s) > 0
 }
+

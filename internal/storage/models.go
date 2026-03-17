@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/RandomCodeSpace/argus/internal/compress"
+	"github.com/RandomCodeSpace/otelcontext/internal/compress"
 	"gorm.io/gorm"
 )
 
@@ -115,3 +115,4 @@ type MetricBucket struct {
 	Count          int64          `json:"count"`
 	AttributesJSON CompressedText `gorm:"type:blob" json:"attributes_json"` // Grouped attributes
 }
+

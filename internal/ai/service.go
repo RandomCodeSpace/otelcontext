@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/RandomCodeSpace/argus/internal/storage"
+	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 	"github.com/tmc/langchaingo/llms"
 	"github.com/tmc/langchaingo/llms/openai"
 )

@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/RandomCodeSpace/argus/internal/storage"
+	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 )
 
 // RawMetric represents an incoming single metric data point before aggregation.
@@ -245,3 +245,4 @@ func (a *Aggregator) persistenceWorker(ctx context.Context) {
 		}
 	}
 }
+

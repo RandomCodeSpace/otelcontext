@@ -1,8 +1,8 @@
-# Argus — AI Agent Instructions
+# OtelContext — AI Agent Instructions
 
 ## Project Overview
 
-Argus is a self-hosted OTLP observability platform. Single Go binary with embedded React frontend.
+OtelContext is a self-hosted OTLP observability platform. Single Go binary with embedded React frontend.
 - **Backend:** Go 1.24, native `net/http` (no frameworks), GORM ORM, gRPC for OTLP ingestion
 - **Frontend:** React 19 + TypeScript + Mantine UI v8 + ECharts + ReactFlow
 - **Ports:** gRPC `:4317` (OTLP), HTTP `:8080` (API + WebSocket + UI)
@@ -78,3 +78,4 @@ web/            # React frontend (Vite + Mantine)
 test/           # Microservice simulation (7 services)
 docs/           # Specifications and plans
 ```
+

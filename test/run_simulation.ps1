@@ -1,6 +1,6 @@
-# ARGUS V5.4 Chaos Simulation
+# OtelContext V5.4 Chaos Simulation
 # Runs all 7 test services in-process (no new windows), hammers all endpoints.
-# Requires Argus backend: .\start_dev.ps1
+# Requires OtelContext backend: .\start_dev.ps1
 
 param(
     [Alias("Workers")]  [int]    $Parallel     = 10,   # concurrent HTTP workers
@@ -27,7 +27,7 @@ foreach ($ep in $Endpoints) { for ($i = 0; $i -lt $ep.Weight; $i++) { $PickList 
 
 Write-Host ""
 Write-Host "======================================" -ForegroundColor Magenta
-Write-Host "  ARGUS V5.4 Chaos Simulation" -ForegroundColor Magenta
+Write-Host "  OtelContext V5.4 Chaos Simulation" -ForegroundColor Magenta
 Write-Host "======================================" -ForegroundColor Magenta
 Write-Host "  Workers : $Parallel"
 Write-Host "  Delay   : ${DelayMs}ms / worker"
@@ -216,3 +216,4 @@ finally {
 
     Stop-Simulation
 }
+

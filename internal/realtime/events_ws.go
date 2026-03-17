@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/RandomCodeSpace/argus/internal/storage"
+	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 	"github.com/coder/websocket"
 	"golang.org/x/sync/errgroup"
 )
@@ -360,3 +360,4 @@ func (h *EventHub) Stop() {
 		close(h.stopCh)
 	})
 }
+

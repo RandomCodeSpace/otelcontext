@@ -3,8 +3,9 @@
     "allow": [
       "mcp__plugin_context-mode_context-mode__ctx_batch_execute",
       "mcp__plugin_context-mode_context-mode__ctx_search",
-      "Read(///wsl.localhost/FedoraDevPod/home/dev/git/Argus/**)",
+      "Read(///wsl.localhost/FedoraDevPod/home/dev/git/OtelContext/**)",
       "Read(///wsl.localhost/FedoraDevPod/mnt/**)"
     ]
   }
 }
+

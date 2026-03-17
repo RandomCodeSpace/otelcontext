@@ -7,8 +7,8 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/RandomCodeSpace/argus/internal/realtime"
-	"github.com/RandomCodeSpace/argus/internal/storage"
+	"github.com/RandomCodeSpace/otelcontext/internal/realtime"
+	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 )
 
 // handleGetLogs handles GET /api/logs with advanced filtering

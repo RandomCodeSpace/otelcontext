@@ -1,4 +1,4 @@
-// Package archive implements hot/cold storage tiering for Argus.
+// Package archive implements hot/cold storage tiering for OtelContext.
 // Data older than HOT_RETENTION_DAYS is moved from the relational DB (hot)
 // to zstd-compressed JSONL files on local disk (cold).
 // Cold files are organized as: {cold_path}/{year}/{month}/{day}/{type}.jsonl.zst
@@ -17,10 +17,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/RandomCodeSpace/argus/internal/compress"
-	"github.com/RandomCodeSpace/argus/internal/config"
-	"github.com/RandomCodeSpace/argus/internal/storage"
-	"github.com/RandomCodeSpace/argus/internal/telemetry"
+	"github.com/RandomCodeSpace/otelcontext/internal/compress"
+	"github.com/RandomCodeSpace/otelcontext/internal/config"
+	"github.com/RandomCodeSpace/otelcontext/internal/storage"
+	"github.com/RandomCodeSpace/otelcontext/internal/telemetry"
 )
 
 // Manifest describes what was archived in a single day directory.
@@ -480,3 +480,4 @@ func dirSize(path string) int64 {
 	})
 	return size
 }
+

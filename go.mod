@@ -1,4 +1,4 @@
-module github.com/RandomCodeSpace/argus
+module github.com/RandomCodeSpace/otelcontext
 
 go 1.25.0
 
