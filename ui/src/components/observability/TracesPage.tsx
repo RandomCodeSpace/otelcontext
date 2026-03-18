@@ -11,13 +11,13 @@ interface Props {
 
 export default function TracesPage({ traces, selected, loading, error, onSelect }: Props) {
   return (
-    <div style={{ display: 'grid', gridTemplateColumns: 'minmax(320px, 420px) minmax(0, 1fr)', gap: '1rem', minHeight: 0, flex: 1 }}>
-      <div className="card" style={{ display: 'flex', flexDirection: 'column', gap: '0.8rem', minHeight: 0 }}>
-        <div>
+    <div className="traces-layout">
+      <div className="card" style={{ display: 'flex', flexDirection: 'column', gap: '0.8rem', minHeight: 0, overflow: 'hidden' }}>
+        <div style={{ flexShrink: 0 }}>
           <div style={{ fontSize: '0.74rem', textTransform: 'uppercase', letterSpacing: '0.12em', color: 'var(--text-dim)', marginBottom: '0.35rem' }}>Traces</div>
           <div style={{ fontSize: '0.95rem', fontWeight: 700 }}>Recent distributed requests</div>
         </div>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.65rem', overflow: 'auto' }}>
+        <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', gap: '0.65rem', overflowY: 'auto', overflowX: 'hidden' }}>
           {loading && <div style={{ color: 'var(--text-muted)' }}>Loading traces…</div>}
           {error && <div style={{ color: '#ef4444' }}>{error}</div>}
           {traces.map((trace) => (
@@ -35,7 +35,7 @@ export default function TracesPage({ traces, selected, loading, error, onSelect 
           ))}
         </div>
       </div>
-      <div style={{ display: 'grid', gridTemplateRows: 'auto 1fr auto', gap: '1rem', minHeight: 0 }}>
+      <div className="traces-right-col">
         <div className="card">
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '1rem' }}>
             <div>
@@ -62,7 +62,7 @@ export default function TracesPage({ traces, selected, loading, error, onSelect 
             ))}
           </div>
         </div>
-        <JsonViewer title="Selected trace JSON" value={selected ?? {}} defaultOpen />
+        <JsonViewer title="Selected trace JSON" value={selected ?? {}} />
       </div>
     </div>
   )

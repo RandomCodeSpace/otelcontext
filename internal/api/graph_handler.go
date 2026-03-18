@@ -116,7 +116,7 @@ func (s *Server) buildGraphFromMemory() *SystemGraphResponse {
 			Status:      n.Status,
 			Metrics: NodeMetrics{
 				RequestRateRPS: math.Round(n.RequestRateRPS*100) / 100,
-				ErrorRate:      math.Round(n.ErrorRate*10000) / 10000,
+				ErrorRate:      math.Round(n.ErrorRate*1000000) / 1000000,
 				AvgLatencyMs:   math.Round(n.AvgLatencyMs*100) / 100,
 				P99LatencyMs:   math.Round(n.P99LatencyMs*100) / 100,
 				SpanCount1H:    n.SpanCount,
@@ -134,7 +134,7 @@ func (s *Server) buildGraphFromMemory() *SystemGraphResponse {
 			Target:       e.Target,
 			CallCount:    e.CallCount,
 			AvgLatencyMs: math.Round(e.AvgLatencyMs*100) / 100,
-			ErrorRate:    math.Round(e.ErrorRate*10000) / 10000,
+			ErrorRate:    math.Round(e.ErrorRate*1000000) / 1000000,
 			Status:       e.Status,
 		})
 	}
@@ -171,7 +171,7 @@ func (s *Server) buildGraphFromDB() *SystemGraphResponse {
 			Status:      healthStatus(healthScore),
 			Metrics: NodeMetrics{
 				RequestRateRPS: math.Round(float64(n.TotalTraces)/3600*100) / 100,
-				ErrorRate:      math.Round(errorRate*10000) / 10000,
+				ErrorRate:      math.Round(errorRate*1000000) / 1000000,
 				AvgLatencyMs:   n.AvgLatencyMs,
 				P99LatencyMs:   n.AvgLatencyMs * 2.5,
 				SpanCount1H:    n.TotalTraces,
@@ -291,4 +291,3 @@ func max(a, b int) int {
 	}
 	return b
 }
-

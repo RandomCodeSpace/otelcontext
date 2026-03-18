@@ -239,3 +239,28 @@ code {
 @keyframes mc-ping {
   75%, 100% { transform: scale(2); opacity: 0; }
 }
+
+/* ── Traces responsive two-column layout ─────────────────────────────── */
+.traces-layout {
+  display: grid;
+  grid-template-columns: minmax(300px, 380px) minmax(0, 1fr);
+  gap: 1rem;
+  min-height: 0;
+  flex: 1;
+  overflow: hidden;
+}
+@media (max-width: 860px) {
+  .traces-layout {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto 1fr;
+    overflow: auto;
+  }
+}
+
+.traces-right-col {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  gap: 1rem;
+  min-height: 0;
+  overflow: hidden;
+}
