@@ -74,7 +74,7 @@ internal/
   telemetry/    # Prometheus metrics + health
   tsdb/         # Time series aggregator + ring buffer
   vectordb/     # Embedded vector index (new)
-web/            # React frontend (Vite + Mantine)
+ui/             # React frontend (Vite + Mantine)
 test/           # Microservice simulation (7 services)
 docs/           # Specifications and plans
 ```

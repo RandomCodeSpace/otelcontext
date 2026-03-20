@@ -1,6 +1,12 @@
-.PHONY: build test vet check setup-hooks
+.PHONY: build test vet check setup-hooks ui-install ui-build dev-ui
 
-build:
+ui-install:
+	cd ui && npm install
+
+ui-build:
+	cd ui && npm run build
+
+build: ui-build
 	CGO_ENABLED=0 go build ./...
 
 vet:
@@ -11,6 +17,9 @@ test:
 
 ## check runs the same steps as CI: build → vet → test
 check: build vet test
+
+dev-ui:
+	cd ui && npm run dev
 
 ## setup-hooks installs the pre-commit hook into .git/hooks
 setup-hooks:
