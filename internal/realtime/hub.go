@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
@@ -58,9 +59,11 @@ type Hub struct {
 	maxBufferSize int
 	flushInterval time.Duration
 
-	stopCh  chan struct{}
-	wg      sync.WaitGroup
-	devMode bool
+	stopCh   chan struct{}
+	stopped  atomic.Bool
+	wg       sync.WaitGroup
+	writerWg sync.WaitGroup // tracks writer goroutines
+	devMode  bool
 
 	// onConnectionChange is called when the number of active connections changes.
 	onConnectionChange func(count int)
@@ -75,8 +78,9 @@ type Hub struct {
 
 // client represents a single WebSocket connection.
 type client struct {
-	conn *websocket.Conn
-	send chan []byte
+	conn   *websocket.Conn
+	send   chan []byte
+	closed atomic.Bool // guards against double-close of send channel
 }
 
 // NewHub creates a new buffered WebSocket hub.
@@ -130,7 +134,9 @@ func (h *Hub) Run() {
 		case c := <-h.unregister:
 			if _, ok := h.clients[c]; ok {
 				delete(h.clients, c)
-				close(c.send)
+				if c.closed.CompareAndSwap(false, true) {
+					close(c.send)
+				}
 				slog.Info("🔌 WebSocket client disconnected", "total", len(h.clients))
 				if h.onConnectionChange != nil {
 					h.onConnectionChange(len(h.clients))
@@ -204,20 +210,26 @@ func (h *Hub) broadcastBatch(batch HubBatch) {
 	}
 
 	sent := 0
+	var slow []*client
 	for c := range h.clients {
 		select {
 		case c.send <- data:
 			sent++
 		default:
-			delete(h.clients, c)
+			slow = append(slow, c)
+		}
+	}
+	for _, c := range slow {
+		delete(h.clients, c)
+		if c.closed.CompareAndSwap(false, true) {
 			close(c.send)
-			slog.Warn("Hub: slow client removed", "total", len(h.clients))
-			if h.onConnectionChange != nil {
-				h.onConnectionChange(len(h.clients))
-			}
-			if h.onSlowClientDrop != nil {
-				h.onSlowClientDrop()
-			}
+		}
+		slog.Warn("Hub: slow client removed", "total", len(h.clients))
+		if h.onConnectionChange != nil {
+			h.onConnectionChange(len(h.clients))
+		}
+		if h.onSlowClientDrop != nil {
+			h.onSlowClientDrop()
 		}
 	}
 	if sent > 0 && h.onMessageSent != nil {
@@ -257,8 +269,10 @@ func (h *Hub) BroadcastMetric(entry MetricEntry) {
 
 // Stop gracefully shuts down the hub.
 func (h *Hub) Stop() {
+	h.stopped.Store(true)
 	close(h.stopCh)
 	h.wg.Wait()
+	h.writerWg.Wait()
 	slog.Info("🛑 WebSocket hub stopped")
 }
 
@@ -280,9 +294,18 @@ func (h *Hub) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	h.register <- c
 
 	// Writer goroutine
+	h.writerWg.Add(1)
 	go func() {
+		defer h.writerWg.Done()
 		defer func() {
-			h.unregister <- c
+			if !h.stopped.Load() {
+				h.unregister <- c
+			} else {
+				// Hub already stopped; clean up directly.
+				if c.closed.CompareAndSwap(false, true) {
+					close(c.send)
+				}
+			}
 			conn.Close(websocket.StatusNormalClosure, "closing")
 		}()
 

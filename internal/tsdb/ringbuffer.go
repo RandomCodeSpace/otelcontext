@@ -28,8 +28,8 @@ type WindowAgg struct {
 const maxSamples = 256 // per-window sample cap for percentile computation
 
 // ringSlot is a fixed-capacity circular slot in the ring buffer.
+// Access is protected by the parent MetricRing's mu.
 type ringSlot struct {
-	mu  sync.Mutex
 	agg WindowAgg
 }
 
@@ -85,16 +85,12 @@ func (r *MetricRing) Record(value float64, at time.Time) {
 			r.currentIdx = (r.currentIdx + 1) % r.size
 			r.currentStart = r.currentStart.Add(r.windowDur)
 			s := &r.slots[r.currentIdx]
-			s.mu.Lock()
 			s.agg = newEmptyAgg(r.metricName, r.serviceName)
 			s.agg.WindowStart = r.currentStart
-			s.mu.Unlock()
 		}
 	}
 
 	s := &r.slots[r.currentIdx]
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.agg.Count++
 	s.agg.Sum += value
 	if value < s.agg.Min {
@@ -109,32 +105,44 @@ func (r *MetricRing) Record(value float64, at time.Time) {
 }
 
 // Windows returns up to `n` most-recent completed window aggregates.
+// Takes a snapshot under the ring lock to avoid acquiring 120+ slot locks sequentially.
 func (r *MetricRing) Windows(n int) []WindowAgg {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
+	r.mu.Lock()
 	if n > r.size {
 		n = r.size
 	}
-	out := make([]WindowAgg, 0, n)
+	// Snapshot all needed slots under a single lock
+	type slotSnap struct {
+		agg     WindowAgg
+		samples []float64
+	}
+	snaps := make([]slotSnap, 0, n)
 	for i := 0; i < n; i++ {
 		idx := (r.currentIdx - i + r.size) % r.size
 		s := &r.slots[idx]
-		s.mu.Lock()
 		if s.agg.Count > 0 {
-			agg := s.agg
-			agg.P50 = ringPercentile(s.agg.samples, 50)
-			agg.P95 = ringPercentile(s.agg.samples, 95)
-			agg.P99 = ringPercentile(s.agg.samples, 99)
-			if agg.Min == math.MaxFloat64 {
-				agg.Min = 0
-			}
-			if agg.Max == -math.MaxFloat64 {
-				agg.Max = 0
-			}
-			out = append(out, agg)
+			samplesCopy := make([]float64, len(s.agg.samples))
+			copy(samplesCopy, s.agg.samples)
+			snaps = append(snaps, slotSnap{agg: s.agg, samples: samplesCopy})
 		}
-		s.mu.Unlock()
+	}
+	r.mu.Unlock()
+
+	// Compute percentiles outside the lock
+	out := make([]WindowAgg, 0, len(snaps))
+	for _, snap := range snaps {
+		agg := snap.agg
+		agg.P50 = ringPercentile(snap.samples, 50)
+		agg.P95 = ringPercentile(snap.samples, 95)
+		agg.P99 = ringPercentile(snap.samples, 99)
+		if agg.Min == math.MaxFloat64 {
+			agg.Min = 0
+		}
+		if agg.Max == -math.MaxFloat64 {
+			agg.Max = 0
+		}
+		agg.samples = nil // don't leak raw samples
+		out = append(out, agg)
 	}
 	return out
 }

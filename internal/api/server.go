@@ -6,6 +6,7 @@ import (
 
 	"github.com/RandomCodeSpace/otelcontext/internal/cache"
 	"github.com/RandomCodeSpace/otelcontext/internal/graph"
+	"github.com/RandomCodeSpace/otelcontext/internal/graphrag"
 	"github.com/RandomCodeSpace/otelcontext/internal/realtime"
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 	"github.com/RandomCodeSpace/otelcontext/internal/telemetry"
@@ -19,9 +20,10 @@ type Server struct {
 	eventHub  *realtime.EventHub
 	metrics   *telemetry.Metrics
 	cache     *cache.TTLCache
-	graph     *graph.Graph    // in-memory service dependency graph (may be nil before first build)
-	vectorIdx *vectordb.Index // TF-IDF semantic log search index
-	coldPath  string          // cold storage base path for archive search
+	graph     *graph.Graph       // in-memory service dependency graph (may be nil before first build)
+	graphRAG  *graphrag.GraphRAG // layered GraphRAG for advanced queries
+	vectorIdx *vectordb.Index    // TF-IDF semantic log search index
+	coldPath  string             // cold storage base path for archive search
 }
 
 // NewServer creates a new API server.
@@ -38,6 +40,11 @@ func NewServer(repo *storage.Repository, hub *realtime.Hub, eventHub *realtime.E
 // SetGraph wires the in-memory service graph into the API server.
 func (s *Server) SetGraph(g *graph.Graph) {
 	s.graph = g
+}
+
+// SetGraphRAG wires the GraphRAG instance for advanced queries.
+func (s *Server) SetGraphRAG(g *graphrag.GraphRAG) {
+	s.graphRAG = g
 }
 
 // SetVectorIndex wires the TF-IDF vector index for semantic log search.

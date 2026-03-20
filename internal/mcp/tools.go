@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/RandomCodeSpace/otelcontext/internal/graphrag"
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 )
 
@@ -132,6 +133,123 @@ var toolDefs = []Tool{
 		InputSchema: InputSchema{Type: "object"},
 	},
 	{
+		Name:        "get_service_map",
+		Description: "Returns the service topology with health scores, error rates, call counts, and dependency edges. Powered by the live GraphRAG.",
+		InputSchema: InputSchema{
+			Type: "object",
+			Properties: map[string]Property{
+				"depth":   {Type: "number", Description: "Max traversal depth (default 3)."},
+				"service": {Type: "string", Description: "Focus on a specific service and its neighbors."},
+			},
+		},
+	},
+	{
+		Name:        "get_error_chains",
+		Description: "Traces recent error spans upstream to identify root cause services. Returns span path, root cause service/operation, and correlated error logs.",
+		InputSchema: InputSchema{
+			Type:     "object",
+			Required: []string{"service"},
+			Properties: map[string]Property{
+				"service":    {Type: "string", Description: "Service experiencing errors."},
+				"time_range": {Type: "string", Description: "Lookback window, e.g. '5m', '1h'. Defaults to '15m'."},
+				"limit":      {Type: "number", Description: "Max error chains to return (default 10)."},
+			},
+		},
+	},
+	{
+		Name:        "trace_graph",
+		Description: "Returns the full span tree for a trace with service names, durations, errors, and linked logs.",
+		InputSchema: InputSchema{
+			Type:     "object",
+			Required: []string{"trace_id"},
+			Properties: map[string]Property{
+				"trace_id": {Type: "string", Description: "The trace ID to visualize."},
+			},
+		},
+	},
+	{
+		Name:        "impact_analysis",
+		Description: "BFS downstream from a service to find all affected services and impact scores.",
+		InputSchema: InputSchema{
+			Type:     "object",
+			Required: []string{"service"},
+			Properties: map[string]Property{
+				"service": {Type: "string", Description: "Service to analyze blast radius for."},
+				"depth":   {Type: "number", Description: "Max traversal depth (default 5)."},
+			},
+		},
+	},
+	{
+		Name:        "root_cause_analysis",
+		Description: "Ranked probable root causes with evidence: error chains, anomalous metrics, correlated logs.",
+		InputSchema: InputSchema{
+			Type:     "object",
+			Required: []string{"service"},
+			Properties: map[string]Property{
+				"service":    {Type: "string", Description: "Service experiencing issues."},
+				"time_range": {Type: "string", Description: "Lookback window. Defaults to '15m'."},
+			},
+		},
+	},
+	{
+		Name:        "correlated_signals",
+		Description: "All related signals for a service: error logs, metric anomalies, traces, and investigations.",
+		InputSchema: InputSchema{
+			Type:     "object",
+			Required: []string{"service"},
+			Properties: map[string]Property{
+				"service":    {Type: "string", Description: "Service to gather signals for."},
+				"time_range": {Type: "string", Description: "Lookback window. Defaults to '1h'."},
+			},
+		},
+	},
+	{
+		Name:        "get_investigations",
+		Description: "Lists persisted investigation records from automated error analysis.",
+		InputSchema: InputSchema{
+			Type: "object",
+			Properties: map[string]Property{
+				"service":  {Type: "string", Description: "Filter by service."},
+				"severity": {Type: "string", Description: "Filter: critical, warning, info."},
+				"status":   {Type: "string", Description: "Filter: detected, triaged, resolved."},
+				"limit":    {Type: "number", Description: "Max results (default 20)."},
+			},
+		},
+	},
+	{
+		Name:        "get_investigation",
+		Description: "Returns a full investigation record with causal chain, evidence, and affected services.",
+		InputSchema: InputSchema{
+			Type:     "object",
+			Required: []string{"investigation_id"},
+			Properties: map[string]Property{
+				"investigation_id": {Type: "string", Description: "The investigation ID."},
+			},
+		},
+	},
+	{
+		Name:        "get_graph_snapshot",
+		Description: "Returns the historical service topology closest to the requested time.",
+		InputSchema: InputSchema{
+			Type:     "object",
+			Required: []string{"time"},
+			Properties: map[string]Property{
+				"time": {Type: "string", Description: "RFC3339 timestamp to query the snapshot for."},
+			},
+		},
+	},
+	{
+		Name:        "get_anomaly_timeline",
+		Description: "Returns recent anomalies with temporal causal links, optionally filtered by service.",
+		InputSchema: InputSchema{
+			Type: "object",
+			Properties: map[string]Property{
+				"since":   {Type: "string", Description: "Start time RFC3339. Defaults to 1h ago."},
+				"service": {Type: "string", Description: "Filter by service."},
+			},
+		},
+	},
+	{
 		Name:        "search_cold_archive",
 		Description: "Searches archived data older than the hot retention window. Returns results with source: 'cold'.",
 		InputSchema: InputSchema{
@@ -172,6 +290,26 @@ func (s *Server) toolHandler(name string, args map[string]any) ToolCallResult {
 		return s.toolFindSimilarLogs(args)
 	case "get_alerts":
 		return s.toolGetAlerts()
+	case "get_service_map":
+		return s.toolGetServiceMap(args)
+	case "get_error_chains":
+		return s.toolGetErrorChains(args)
+	case "trace_graph":
+		return s.toolTraceGraph(args)
+	case "impact_analysis":
+		return s.toolImpactAnalysis(args)
+	case "root_cause_analysis":
+		return s.toolRootCauseAnalysis(args)
+	case "correlated_signals":
+		return s.toolCorrelatedSignals(args)
+	case "get_investigations":
+		return s.toolGetInvestigations(args)
+	case "get_investigation":
+		return s.toolGetInvestigationByID(args)
+	case "get_graph_snapshot":
+		return s.toolGetGraphSnapshot(args)
+	case "get_anomaly_timeline":
+		return s.toolGetAnomalyTimeline(args)
 	case "search_cold_archive":
 		return s.toolSearchColdArchive(args)
 	default:
@@ -186,7 +324,10 @@ func (s *Server) toolGetSystemGraph(_ map[string]any) ToolCallResult {
 		return errorResult("service graph not yet initialized")
 	}
 	snap := s.svcGraph.Snapshot()
-	data, _ := json.MarshalIndent(snap, "", "  ")
+	data, err := json.MarshalIndent(snap, "", "  ")
+	if err != nil {
+		return errorResult(fmt.Sprintf("failed to marshal system graph: %v", err))
+	}
 	return textResult(string(data))
 }
 
@@ -203,7 +344,10 @@ func (s *Server) toolGetServiceHealth(args map[string]any) ToolCallResult {
 	if !ok {
 		return textResult(fmt.Sprintf("service %q not found in the current graph window", svcName))
 	}
-	data, _ := json.MarshalIndent(node, "", "  ")
+	data, err := json.MarshalIndent(node, "", "  ")
+	if err != nil {
+		return errorResult(fmt.Sprintf("failed to marshal service health: %v", err))
+	}
 	return textResult(string(data))
 }
 
@@ -278,7 +422,10 @@ func (s *Server) toolSearchLogs(args map[string]any) ToolCallResult {
 		"count":   len(logs),
 		"entries": toLogSummaries(logs),
 	}
-	data, _ := json.MarshalIndent(result, "", "  ")
+	data, err := json.MarshalIndent(result, "", "  ")
+	if err != nil {
+		return errorResult(fmt.Sprintf("failed to marshal search results: %v", err))
+	}
 	return resourceResult("OtelContext://logs/search", "application/json", string(data))
 }
 
@@ -303,7 +450,10 @@ func (s *Server) toolTailLogs(args map[string]any) ToolCallResult {
 	if err != nil {
 		return errorResult(fmt.Sprintf("tail_logs failed: %v", err))
 	}
-	data, _ := json.MarshalIndent(toLogSummaries(logs), "", "  ")
+	data, err := json.MarshalIndent(toLogSummaries(logs), "", "  ")
+	if err != nil {
+		return errorResult(fmt.Sprintf("failed to marshal tail results: %v", err))
+	}
 	return resourceResult("OtelContext://logs/tail", "application/json", string(data))
 }
 
@@ -316,7 +466,10 @@ func (s *Server) toolGetTrace(args map[string]any) ToolCallResult {
 	if err != nil {
 		return errorResult(fmt.Sprintf("get_trace failed: %v", err))
 	}
-	data, _ := json.MarshalIndent(trace, "", "  ")
+	data, err := json.MarshalIndent(trace, "", "  ")
+	if err != nil {
+		return errorResult(fmt.Sprintf("failed to marshal trace: %v", err))
+	}
 	return resourceResult("OtelContext://traces/"+traceID, "application/json", string(data))
 }
 
@@ -344,7 +497,10 @@ func (s *Server) toolSearchTraces(args map[string]any) ToolCallResult {
 	if err != nil {
 		return errorResult(fmt.Sprintf("search_traces failed: %v", err))
 	}
-	data, _ := json.MarshalIndent(resp, "", "  ")
+	data, err := json.MarshalIndent(resp, "", "  ")
+	if err != nil {
+		return errorResult(fmt.Sprintf("failed to marshal trace search results: %v", err))
+	}
 	return resourceResult("OtelContext://traces/search", "application/json", string(data))
 }
 
@@ -361,7 +517,10 @@ func (s *Server) toolGetMetrics(args map[string]any) ToolCallResult {
 	if err != nil {
 		return errorResult(fmt.Sprintf("get_metrics failed: %v", err))
 	}
-	data, _ := json.MarshalIndent(buckets, "", "  ")
+	data, err := json.MarshalIndent(buckets, "", "  ")
+	if err != nil {
+		return errorResult(fmt.Sprintf("failed to marshal metrics: %v", err))
+	}
 	return resourceResult("OtelContext://metrics/query", "application/json", string(data))
 }
 
@@ -375,7 +534,10 @@ func (s *Server) toolGetDashboardStats(args map[string]any) ToolCallResult {
 	if err != nil {
 		return errorResult(fmt.Sprintf("get_dashboard_stats failed: %v", err))
 	}
-	data, _ := json.MarshalIndent(stats, "", "  ")
+	data, err := json.MarshalIndent(stats, "", "  ")
+	if err != nil {
+		return errorResult(fmt.Sprintf("failed to marshal dashboard stats: %v", err))
+	}
 	return textResult(string(data))
 }
 
@@ -391,7 +553,10 @@ func (s *Server) toolGetStorageStatus() ToolCallResult {
 		"ingestion_total":   health.IngestionRate,
 		"db_latency_p99_ms": health.DBLatencyP99Ms,
 	}
-	data, _ := json.MarshalIndent(result, "", "  ")
+	data, err := json.MarshalIndent(result, "", "  ")
+	if err != nil {
+		return errorResult(fmt.Sprintf("failed to marshal storage status: %v", err))
+	}
 	return textResult(string(data))
 }
 
@@ -400,12 +565,18 @@ func (s *Server) toolFindSimilarLogs(args map[string]any) ToolCallResult {
 	if query == "" {
 		return errorResult("query is required")
 	}
-	limit := argInt(args, "limit", 10)
+	limit := argInt(args, "limit", 20)
+	if limit > 100 {
+		limit = 100
+	}
 	if s.vectorIdx == nil {
 		return errorResult("vector index not yet initialized")
 	}
 	results := s.vectorIdx.Search(query, limit)
-	data, _ := json.MarshalIndent(results, "", "  ")
+	data, err := json.MarshalIndent(results, "", "  ")
+	if err != nil {
+		return errorResult(fmt.Sprintf("failed to marshal similar logs: %v", err))
+	}
 	return textResult(string(data))
 }
 
@@ -434,7 +605,10 @@ func (s *Server) toolGetAlerts() ToolCallResult {
 	if len(entries) == 0 {
 		return textResult("No active alerts. All services are healthy.")
 	}
-	data, _ := json.MarshalIndent(entries, "", "  ")
+	data, err := json.MarshalIndent(entries, "", "  ")
+	if err != nil {
+		return errorResult(fmt.Sprintf("failed to marshal alerts: %v", err))
+	}
 	return textResult(string(data))
 }
 
@@ -452,8 +626,218 @@ func (s *Server) toolSearchColdArchive(args map[string]any) ToolCallResult {
 		"end":     endStr,
 		"message": "Cold archive data is available. Query the /api/archive/search endpoint for full streaming results.",
 	}
-	data, _ := json.MarshalIndent(result, "", "  ")
+	data, err := json.MarshalIndent(result, "", "  ")
+	if err != nil {
+		return errorResult(fmt.Sprintf("failed to marshal cold archive result: %v", err))
+	}
 	return textResult(string(data))
+}
+
+// --- GraphRAG Tool implementations ---
+
+func (s *Server) toolGetServiceMap(args map[string]any) ToolCallResult {
+	if s.graphRAG == nil {
+		return errorResult("GraphRAG not initialized")
+	}
+	depth := argInt(args, "depth", 3)
+	result := s.graphRAG.ServiceMap(depth)
+	data, err := json.MarshalIndent(result, "", "  ")
+	if err != nil {
+		return errorResult(fmt.Sprintf("failed to marshal service map: %v", err))
+	}
+	return textResult(string(data))
+}
+
+func (s *Server) toolGetErrorChains(args map[string]any) ToolCallResult {
+	if s.graphRAG == nil {
+		return errorResult("GraphRAG not initialized")
+	}
+	svcName, _ := args["service"].(string)
+	if svcName == "" {
+		return errorResult("service is required")
+	}
+	since := time.Now().Add(-15 * time.Minute)
+	parseTimeRange(args, "time_range", &since)
+	limit := argInt(args, "limit", 10)
+
+	chains := s.graphRAG.ErrorChain(svcName, since, limit)
+	data, err := json.MarshalIndent(chains, "", "  ")
+	if err != nil {
+		return errorResult(fmt.Sprintf("failed to marshal error chains: %v", err))
+	}
+	return textResult(string(data))
+}
+
+func (s *Server) toolTraceGraph(args map[string]any) ToolCallResult {
+	if s.graphRAG == nil {
+		return errorResult("GraphRAG not initialized")
+	}
+	traceID, _ := args["trace_id"].(string)
+	if traceID == "" {
+		return errorResult("trace_id is required")
+	}
+	spans := s.graphRAG.DependencyChain(traceID)
+	if len(spans) == 0 {
+		// Fallback to DB
+		trace, err := s.repo.GetTrace(traceID)
+		if err != nil {
+			return errorResult(fmt.Sprintf("trace not found: %v", err))
+		}
+		data, err := json.MarshalIndent(trace, "", "  ")
+		if err != nil {
+			return errorResult(fmt.Sprintf("failed to marshal trace: %v", err))
+		}
+		return resourceResult("OtelContext://traces/"+traceID, "application/json", string(data))
+	}
+	data, err := json.MarshalIndent(spans, "", "  ")
+	if err != nil {
+		return errorResult(fmt.Sprintf("failed to marshal trace graph: %v", err))
+	}
+	return textResult(string(data))
+}
+
+func (s *Server) toolImpactAnalysis(args map[string]any) ToolCallResult {
+	if s.graphRAG == nil {
+		return errorResult("GraphRAG not initialized")
+	}
+	svcName, _ := args["service"].(string)
+	if svcName == "" {
+		return errorResult("service is required")
+	}
+	depth := argInt(args, "depth", 5)
+	result := s.graphRAG.ImpactAnalysis(svcName, depth)
+	data, err := json.MarshalIndent(result, "", "  ")
+	if err != nil {
+		return errorResult(fmt.Sprintf("failed to marshal impact analysis: %v", err))
+	}
+	return textResult(string(data))
+}
+
+func (s *Server) toolRootCauseAnalysis(args map[string]any) ToolCallResult {
+	if s.graphRAG == nil {
+		return errorResult("GraphRAG not initialized")
+	}
+	svcName, _ := args["service"].(string)
+	if svcName == "" {
+		return errorResult("service is required")
+	}
+	since := time.Now().Add(-15 * time.Minute)
+	parseTimeRange(args, "time_range", &since)
+
+	causes := s.graphRAG.RootCauseAnalysis(svcName, since)
+	data, err := json.MarshalIndent(causes, "", "  ")
+	if err != nil {
+		return errorResult(fmt.Sprintf("failed to marshal root cause analysis: %v", err))
+	}
+	return textResult(string(data))
+}
+
+func (s *Server) toolCorrelatedSignals(args map[string]any) ToolCallResult {
+	if s.graphRAG == nil {
+		return errorResult("GraphRAG not initialized")
+	}
+	svcName, _ := args["service"].(string)
+	if svcName == "" {
+		return errorResult("service is required")
+	}
+	since := time.Now().Add(-1 * time.Hour)
+	parseTimeRange(args, "time_range", &since)
+
+	result := s.graphRAG.CorrelatedSignals(svcName, since)
+	data, err := json.MarshalIndent(result, "", "  ")
+	if err != nil {
+		return errorResult(fmt.Sprintf("failed to marshal correlated signals: %v", err))
+	}
+	return textResult(string(data))
+}
+
+func (s *Server) toolGetInvestigations(args map[string]any) ToolCallResult {
+	if s.graphRAG == nil {
+		return errorResult("GraphRAG not initialized")
+	}
+	service, _ := args["service"].(string)
+	severity, _ := args["severity"].(string)
+	status, _ := args["status"].(string)
+	limit := argInt(args, "limit", 20)
+
+	investigations, err := s.graphRAG.GetInvestigations(service, severity, status, limit)
+	if err != nil {
+		return errorResult(fmt.Sprintf("failed to query investigations: %v", err))
+	}
+	data, err := json.MarshalIndent(investigations, "", "  ")
+	if err != nil {
+		return errorResult(fmt.Sprintf("failed to marshal investigations: %v", err))
+	}
+	return textResult(string(data))
+}
+
+func (s *Server) toolGetInvestigationByID(args map[string]any) ToolCallResult {
+	if s.graphRAG == nil {
+		return errorResult("GraphRAG not initialized")
+	}
+	id, _ := args["investigation_id"].(string)
+	if id == "" {
+		return errorResult("investigation_id is required")
+	}
+	inv, err := s.graphRAG.GetInvestigation(id)
+	if err != nil {
+		return errorResult(fmt.Sprintf("investigation not found: %v", err))
+	}
+	data, err := json.MarshalIndent(inv, "", "  ")
+	if err != nil {
+		return errorResult(fmt.Sprintf("failed to marshal investigation: %v", err))
+	}
+	return textResult(string(data))
+}
+
+func (s *Server) toolGetGraphSnapshot(args map[string]any) ToolCallResult {
+	if s.graphRAG == nil {
+		return errorResult("GraphRAG not initialized")
+	}
+	var at time.Time
+	parseTime(args, "time", &at)
+	if at.IsZero() {
+		at = time.Now()
+	}
+	snap, err := s.graphRAG.GetGraphSnapshot(at)
+	if err != nil {
+		return errorResult(fmt.Sprintf("no snapshot found: %v", err))
+	}
+	data, err := json.MarshalIndent(snap, "", "  ")
+	if err != nil {
+		return errorResult(fmt.Sprintf("failed to marshal snapshot: %v", err))
+	}
+	return textResult(string(data))
+}
+
+func (s *Server) toolGetAnomalyTimeline(args map[string]any) ToolCallResult {
+	if s.graphRAG == nil {
+		return errorResult("GraphRAG not initialized")
+	}
+	since := time.Now().Add(-1 * time.Hour)
+	parseTime(args, "since", &since)
+	service, _ := args["service"].(string)
+
+	var anomalies []*graphrag.AnomalyNode
+	if service != "" {
+		anomalies = s.graphRAG.AnomalyStore.AnomaliesForService(service, since)
+	} else {
+		anomalies = s.graphRAG.AnomalyTimeline(since)
+	}
+	data, err := json.MarshalIndent(anomalies, "", "  ")
+	if err != nil {
+		return errorResult(fmt.Sprintf("failed to marshal anomaly timeline: %v", err))
+	}
+	return textResult(string(data))
+}
+
+// parseTimeRange converts a duration-like string (e.g. "15m", "1h") to a since time.
+func parseTimeRange(args map[string]any, key string, since *time.Time) {
+	if v, ok := args[key].(string); ok && v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			*since = time.Now().Add(-d)
+		}
+	}
 }
 
 // --- Helpers ---

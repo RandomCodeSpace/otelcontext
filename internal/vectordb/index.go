@@ -64,9 +64,12 @@ func (idx *Index) Add(logID uint, serviceName, severity, body string) {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 
-	// FIFO eviction
+	// FIFO eviction — copy to new slice to release old backing array memory
 	if len(idx.docs) >= idx.maxSize {
-		idx.docs = idx.docs[idx.maxSize/10:] // drop oldest 10%
+		keep := idx.docs[idx.maxSize/10:]
+		newDocs := make([]LogVector, len(keep), idx.maxSize)
+		copy(newDocs, keep)
+		idx.docs = newDocs
 		idx.dirty = true
 	}
 
@@ -167,9 +170,12 @@ func (idx *Index) recomputeIDF() {
 		}
 	}
 	n := float64(len(idx.docs))
+	// Replace the entire IDF map to drop stale terms from evicted docs
+	newIDF := make(map[string]float64, len(df))
 	for term, count := range df {
-		idx.idf[term] = math.Log(n/float64(count)) + 1
+		newIDF[term] = math.Log(n/float64(count)) + 1
 	}
+	idx.idf = newIDF
 }
 
 // shouldIndex returns true for severity levels worth indexing.

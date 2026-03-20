@@ -22,6 +22,7 @@ import (
 	"github.com/RandomCodeSpace/otelcontext/internal/archive"
 	"github.com/RandomCodeSpace/otelcontext/internal/config"
 	"github.com/RandomCodeSpace/otelcontext/internal/graph"
+	"github.com/RandomCodeSpace/otelcontext/internal/graphrag"
 	"github.com/RandomCodeSpace/otelcontext/internal/ingest"
 	"github.com/RandomCodeSpace/otelcontext/internal/mcp"
 	"github.com/RandomCodeSpace/otelcontext/internal/queue"
@@ -108,12 +109,47 @@ func main() {
 	}
 
 	dlq, err := queue.NewDLQWithLimits(cfg.DLQPath, replayInterval, func(data []byte) error {
-		// Replay handler: try to deserialize and re-insert logs
-		var logs []storage.Log
-		if err := json.Unmarshal(data, &logs); err != nil {
-			return fmt.Errorf("DLQ replay unmarshal failed: %w", err)
+		// Replay handler: typed envelope supports logs, spans, traces, and metrics
+		var envelope struct {
+			Type string          `json:"type"`
+			Data json.RawMessage `json:"data"`
 		}
-		return repo.BatchCreateLogs(logs)
+		if err := json.Unmarshal(data, &envelope); err != nil {
+			// Legacy format: try to deserialize as []storage.Log
+			var logs []storage.Log
+			if err2 := json.Unmarshal(data, &logs); err2 != nil {
+				return fmt.Errorf("DLQ replay unmarshal failed: %w", err)
+			}
+			return repo.BatchCreateLogs(logs)
+		}
+		switch envelope.Type {
+		case "logs":
+			var logs []storage.Log
+			if err := json.Unmarshal(envelope.Data, &logs); err != nil {
+				return fmt.Errorf("DLQ replay logs unmarshal failed: %w", err)
+			}
+			return repo.BatchCreateLogs(logs)
+		case "spans":
+			var spans []storage.Span
+			if err := json.Unmarshal(envelope.Data, &spans); err != nil {
+				return fmt.Errorf("DLQ replay spans unmarshal failed: %w", err)
+			}
+			return repo.BatchCreateSpans(spans)
+		case "traces":
+			var traces []storage.Trace
+			if err := json.Unmarshal(envelope.Data, &traces); err != nil {
+				return fmt.Errorf("DLQ replay traces unmarshal failed: %w", err)
+			}
+			return repo.BatchCreateTraces(traces)
+		case "metrics":
+			var metrics []storage.MetricBucket
+			if err := json.Unmarshal(envelope.Data, &metrics); err != nil {
+				return fmt.Errorf("DLQ replay metrics unmarshal failed: %w", err)
+			}
+			return repo.BatchCreateMetrics(metrics)
+		default:
+			return fmt.Errorf("DLQ replay: unknown type %q", envelope.Type)
+		}
 	}, cfg.DLQMaxFiles, int64(cfg.DLQMaxDiskMB), cfg.DLQMaxRetries)
 	if err != nil {
 		log.Fatalf("Failed to initialize DLQ: %v", err)
@@ -124,7 +160,6 @@ func main() {
 		func() { metrics.DLQReplayFailure.Inc() },
 		func(b int64) { metrics.DLQDiskBytes.Set(float64(b)) },
 	)
-	defer dlq.Stop()
 	slog.Info("🔁 DLQ initialized", "path", cfg.DLQPath, "interval", replayInterval)
 
 	// 4. Initialize Real-Time WebSocket Hub
@@ -137,7 +172,6 @@ func main() {
 		func() { metrics.WSSlowClientsRemoved.Inc() },
 	)
 	go hub.Run()
-	defer hub.Stop()
 	slog.Info("🔌 WebSocket hub started")
 
 	// 4b. Initialize Event Notification Hub (for live mode — pushes data snapshots)
@@ -147,7 +181,6 @@ func main() {
 		metrics.DecrementActiveConns,
 	)
 	ctxEvents, cancelEvents := context.WithCancel(context.Background())
-	defer cancelEvents()
 	go eventHub.Start(ctxEvents, 5*time.Second, 500*time.Millisecond)
 	slog.Info("⚡ Event notification hub started (5s snapshots, 500ms batches)")
 
@@ -168,7 +201,6 @@ func main() {
 	slog.Info("📈 TSDB ring buffer attached (120 slots × 30s = 1h retention)")
 
 	ctxTSDB, cancelTSDB := context.WithCancel(context.Background())
-	defer cancelTSDB()
 	go tsdbAgg.Start(ctxTSDB)
 	slog.Info("📈 TSDB Aggregator started (30s window)")
 
@@ -176,7 +208,6 @@ func main() {
 	archiver := archive.New(repo, cfg)
 	archiver.SetMetrics(metrics)
 	ctxArchive, cancelArchive := context.WithCancel(context.Background())
-	defer cancelArchive()
 	go archiver.Start(ctxArchive)
 	slog.Info("🗄️  Archive worker started",
 		"hot_retention_days", cfg.HotRetentionDays,
@@ -204,7 +235,6 @@ func main() {
 		return out, nil
 	}, 5*time.Minute, 30*time.Second)
 	ctxGraph, cancelGraph := context.WithCancel(context.Background())
-	defer cancelGraph()
 	go svcGraph.Start(ctxGraph)
 	slog.Info("🕸️  In-memory service graph started (5m window, 30s refresh)")
 
@@ -228,18 +258,30 @@ func main() {
 		}
 	}()
 
+	// 4g. Initialize GraphRAG (replaces simple graph for advanced queries)
+	graphRAG := graphrag.New(repo, vectorIdx, tsdbAgg, ringBuf, graphrag.DefaultConfig())
+	ctxGraphRAG, cancelGraphRAG := context.WithCancel(context.Background())
+	go graphRAG.Start(ctxGraphRAG)
+	slog.Info("GraphRAG started (layered graph with anomaly detection)")
+
+	// Auto-migrate GraphRAG models (Investigation, GraphSnapshot)
+	if err := graphrag.AutoMigrateGraphRAG(repo.DB()); err != nil {
+		slog.Error("Failed to migrate GraphRAG models", "error", err)
+	}
+
 	// 5. Initialize AI Service
 	aiService := ai.NewService(repo)
-	defer aiService.Stop()
 
 	// 6. Initialize API Server
 	apiServer := api.NewServer(repo, hub, eventHub, metrics)
 	apiServer.SetGraph(svcGraph)
+	apiServer.SetGraphRAG(graphRAG)
 	apiServer.SetVectorIndex(vectorIdx)
 	apiServer.SetColdStoragePath(cfg.ColdStoragePath)
 
 	// 6b. Initialize MCP Server (HTTP Streamable, JSON-RPC 2.0 + SSE)
 	mcpServer := mcp.New(repo, metrics, svcGraph, vectorIdx)
+	mcpServer.SetGraphRAG(graphRAG)
 	slog.Info("🤖 MCP server initialized", "path", cfg.MCPPath, "enabled", cfg.MCPEnabled)
 
 	// 7. Initialize OTLP Ingestion (gRPC)
@@ -280,8 +322,19 @@ func main() {
 		}
 	}
 
-	logsServer.SetLogCallback(logHandler)
-	traceServer.SetLogCallback(logHandler)
+	logsServer.SetLogCallback(func(l storage.Log) {
+		logHandler(l)
+		graphRAG.OnLogIngested(l)
+	})
+	traceServer.SetLogCallback(func(l storage.Log) {
+		logHandler(l)
+		graphRAG.OnLogIngested(l)
+	})
+
+	// Wire span callbacks for GraphRAG
+	traceServer.SetSpanCallback(func(span storage.Span) {
+		graphRAG.OnSpanIngested(span)
+	})
 
 	metricsServer.SetMetricCallback(func(m tsdb.RawMetric) {
 		eventHub.BroadcastMetric(realtime.MetricEntry{
@@ -291,6 +344,7 @@ func main() {
 			Timestamp:   m.Timestamp,
 			Attributes:  m.Attributes,
 		})
+		graphRAG.OnMetricIngested(m)
 	})
 
 	// Update DLQ size metric periodically
@@ -327,8 +381,12 @@ func main() {
 	metrics.StartRuntimeMetrics()
 	slog.Info("📊 Runtime metrics sampling started")
 
+	// 7b. Register HTTP OTLP endpoints (before catch-all UI handler)
+	otlpHTTP := ingest.NewHTTPHandler(traceServer, logsServer, metricsServer)
+
 	// 8. Start HTTP Server
 	mux := http.NewServeMux()
+	otlpHTTP.RegisterRoutes(mux)
 	apiServer.RegisterRoutes(mux)
 
 	// MCP Server routes (conditionally enabled via MCP_ENABLED)
@@ -378,15 +436,33 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	// 1. Stop high-ingestion paths
+	// Ordered shutdown: ingestion → HTTP → hubs/events → processing → DLQ → DB
+	// 1. Stop ingestion paths first (no new data)
 	grpcServer.GracefulStop()
 	if err := srv.Shutdown(ctx); err != nil {
 		slog.Error("HTTP server forced shutdown", "error", err)
 	}
 
-	// 2. Stop processing engines (order: Hubs -> AI -> TSDB)
+	// 2. Stop real-time hubs and event processing
+	hub.Stop()
+	cancelEvents()
 	aiService.Stop()
+
+	// 3. Stop processing engines (TSDB flush, archiver, graph, GraphRAG)
 	tsdbAgg.Stop()
+	cancelTSDB()
+	cancelArchive()
+	cancelGraph()
+	graphRAG.Stop()
+	cancelGraphRAG()
+
+	// 4. Stop DLQ (may still be replaying)
+	dlq.Stop()
+
+	// 5. Close database last (everything above may still write)
+	if err := repo.Close(); err != nil {
+		slog.Error("Failed to close database", "error", err)
+	}
 
 	slog.Info("✅ OtelContext V5.4 shutdown complete")
 }

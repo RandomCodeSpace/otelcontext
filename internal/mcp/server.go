@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/RandomCodeSpace/otelcontext/internal/graph"
+	"github.com/RandomCodeSpace/otelcontext/internal/graphrag"
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 	"github.com/RandomCodeSpace/otelcontext/internal/telemetry"
 	"github.com/RandomCodeSpace/otelcontext/internal/vectordb"
@@ -31,6 +32,7 @@ type Server struct {
 	metrics   *telemetry.Metrics
 	svcGraph  *graph.Graph
 	vectorIdx *vectordb.Index
+	graphRAG  *graphrag.GraphRAG
 }
 
 // New creates a new MCP server.
@@ -46,6 +48,11 @@ func New(
 		svcGraph:  svcGraph,
 		vectorIdx: vectorIdx,
 	}
+}
+
+// SetGraphRAG wires the GraphRAG instance for advanced query tools.
+func (s *Server) SetGraphRAG(g *graphrag.GraphRAG) {
+	s.graphRAG = g
 }
 
 // Handler returns an http.Handler for the MCP server with CORS applied.

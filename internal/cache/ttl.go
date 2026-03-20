@@ -17,6 +17,7 @@ type TTLCache struct {
 	mu     sync.RWMutex
 	items  map[string]entry
 	stopCh chan struct{}
+	wg     sync.WaitGroup
 }
 
 // New creates a new TTLCache and starts the background eviction loop.
@@ -25,13 +26,15 @@ func New() *TTLCache {
 		items:  make(map[string]entry),
 		stopCh: make(chan struct{}),
 	}
+	c.wg.Add(1)
 	go c.evictLoop()
 	return c
 }
 
-// Stop shuts down the background eviction goroutine.
+// Stop shuts down the background eviction goroutine and waits for it to exit.
 func (c *TTLCache) Stop() {
 	close(c.stopCh)
+	c.wg.Wait()
 }
 
 // Set stores value under key with the given TTL.
@@ -61,6 +64,7 @@ func (c *TTLCache) Delete(key string) {
 
 // evictLoop removes expired entries every 30 seconds.
 func (c *TTLCache) evictLoop() {
+	defer c.wg.Done()
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	for {

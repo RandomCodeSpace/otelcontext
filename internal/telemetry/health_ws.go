@@ -40,11 +40,14 @@ func (m *Metrics) HealthWSHandler() http.HandlerFunc {
 		defer ticker.Stop()
 
 		// Read goroutine — detects client disconnect
+		// Use request context so goroutine exits when connection drops
+		connCtx, connCancel := context.WithCancel(r.Context())
+		defer connCancel()
 		disconnected := make(chan struct{})
 		go func() {
 			defer close(disconnected)
 			for {
-				_, _, err := conn.Read(context.Background())
+				_, _, err := conn.Read(connCtx)
 				if err != nil {
 					return
 				}

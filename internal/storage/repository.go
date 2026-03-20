@@ -132,6 +132,15 @@ func (r *Repository) VacuumDB() error {
 	return nil
 }
 
+// Close closes the underlying database connection.
+func (r *Repository) Close() error {
+	sqlDB, err := r.db.DB()
+	if err != nil {
+		return fmt.Errorf("failed to get underlying sql.DB: %w", err)
+	}
+	return sqlDB.Close()
+}
+
 // DB returns the underlying gorm.DB for advanced queries.
 func (r *Repository) DB() *gorm.DB {
 	return r.db

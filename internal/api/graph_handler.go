@@ -93,6 +93,10 @@ func (s *Server) handleGetSystemGraph(w http.ResponseWriter, r *http.Request) {
 // buildGraphFromMemory converts the in-memory graph snapshot to the API response.
 // Returns nil if the graph has not been built yet.
 func (s *Server) buildGraphFromMemory() *SystemGraphResponse {
+	// Prefer GraphRAG if available
+	if s.graphRAG != nil {
+		return s.buildGraphFromGraphRAG()
+	}
 	if s.graph == nil {
 		return nil
 	}
@@ -140,6 +144,75 @@ func (s *Server) buildGraphFromMemory() *SystemGraphResponse {
 	}
 
 	return buildSummaryResponse(nodes, edges, totalErrorRate, totalLatency)
+}
+
+// buildGraphFromGraphRAG converts the GraphRAG service store into the API response.
+func (s *Server) buildGraphFromGraphRAG() *SystemGraphResponse {
+	services := s.graphRAG.ServiceMap(0)
+	if len(services) == 0 {
+		return nil
+	}
+
+	nodes := make([]GraphNode, 0, len(services))
+	var totalErrorRate, totalLatency float64
+
+	for _, entry := range services {
+		svc := entry.Service
+		alerts := buildAlertsFromGraphRAG(svc.Name, svc.ErrorRate, svc.AvgLatency)
+		nodes = append(nodes, GraphNode{
+			ID:          svc.Name,
+			Type:        "service",
+			HealthScore: math.Round(svc.HealthScore*100) / 100,
+			Status:      healthStatus(svc.HealthScore),
+			Metrics: NodeMetrics{
+				RequestRateRPS: math.Round(float64(svc.CallCount)/300*100) / 100, // approx 5min window
+				ErrorRate:      math.Round(svc.ErrorRate*1000000) / 1000000,
+				AvgLatencyMs:   math.Round(svc.AvgLatency*100) / 100,
+				P99LatencyMs:   math.Round(svc.AvgLatency*2.5*100) / 100, // estimate
+				SpanCount1H:    svc.CallCount,
+			},
+			Alerts: alerts,
+		})
+		totalErrorRate += svc.ErrorRate
+		totalLatency += svc.AvgLatency
+	}
+
+	edges := make([]GraphEdge, 0)
+	allEdges := s.graphRAG.ServiceStore.AllEdges()
+	for _, e := range allEdges {
+		if e.Type == "CALLS" {
+			edges = append(edges, GraphEdge{
+				Source:       e.FromID,
+				Target:       e.ToID,
+				CallCount:    e.CallCount,
+				AvgLatencyMs: math.Round(e.AvgMs*100) / 100,
+				ErrorRate:    math.Round(e.ErrorRate*1000000) / 1000000,
+				Status:       healthStatus(computeHealthScore(e.ErrorRate, e.AvgMs)),
+			})
+		}
+	}
+
+	return buildSummaryResponse(nodes, edges, totalErrorRate, totalLatency)
+}
+
+func buildAlertsFromGraphRAG(service string, errorRate, avgLatencyMs float64) []string {
+	var alerts []string
+	if errorRate > 0.05 {
+		alerts = append(alerts, "error rate above 5%")
+	}
+	if errorRate > 0.10 {
+		alerts = append(alerts, "error rate above 10% — investigate immediately")
+	}
+	if avgLatencyMs > 500 {
+		alerts = append(alerts, "avg latency above 500ms")
+	}
+	if avgLatencyMs > 1000 {
+		alerts = append(alerts, "avg latency above 1s — SLA breach risk")
+	}
+	if len(alerts) == 0 {
+		alerts = []string{}
+	}
+	return alerts
 }
 
 // buildGraphFromDB is the fallback path used before the in-memory graph is ready.

@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"runtime"
-	"sync"
 
 	"github.com/RandomCodeSpace/otelcontext/internal/config"
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
@@ -28,6 +27,7 @@ type TraceServer struct {
 	repo             *storage.Repository
 	metrics          *telemetry.Metrics
 	logCallback      func(storage.Log)
+	spanCallback     func(storage.Span) // called for each span after persistence
 	minSeverity      int
 	allowedServices  map[string]bool
 	excludedServices map[string]bool
@@ -68,6 +68,11 @@ func NewTraceServer(repo *storage.Repository, metrics *telemetry.Metrics, cfg *c
 // SetLogCallback sets the function to call when a new log is synthesized from a trace.
 func (s *TraceServer) SetLogCallback(cb func(storage.Log)) {
 	s.logCallback = cb
+}
+
+// SetSpanCallback sets the function to call when spans are persisted.
+func (s *TraceServer) SetSpanCallback(cb func(storage.Span)) {
+	s.spanCallback = cb
 }
 
 // SetSampler enables adaptive trace sampling. Pass nil to disable.
@@ -176,18 +181,19 @@ func (s *MetricsServer) Export(ctx context.Context, req *colmetricspb.ExportMetr
 func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceServiceRequest) (*coltracepb.ExportTraceServiceResponse, error) {
 	slog.Debug("📥 [TRACES] Received Request", "resource_spans", len(req.ResourceSpans))
 
-	var (
-		spansMu         sync.Mutex
-		spansToInsert   []storage.Span
-		tracesToUpsert  []storage.Trace
-		synthesizedLogs []storage.Log
-	)
+	type batchResult struct {
+		spans  []storage.Span
+		traces []storage.Trace
+		logs   []storage.Log
+	}
+
+	results := make([]batchResult, len(req.ResourceSpans))
 
 	g, _ := errgroup.WithContext(ctx)
 	g.SetLimit(runtime.GOMAXPROCS(0) * 4)
 
-	for _, resourceSpans := range req.ResourceSpans {
-		resourceSpans := resourceSpans // Capture
+	for idx, resourceSpans := range req.ResourceSpans {
+		idx, resourceSpans := idx, resourceSpans // Capture
 		g.Go(func() error {
 			serviceName := getServiceName(resourceSpans.Resource.Attributes)
 
@@ -307,18 +313,24 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 				}
 			}
 
-			// Fan-In: Collect local results into shared buffers
-			spansMu.Lock()
-			spansToInsert = append(spansToInsert, localSpans...)
-			tracesToUpsert = append(tracesToUpsert, localTraces...)
-			synthesizedLogs = append(synthesizedLogs, localLogs...)
-			spansMu.Unlock()
+			// Store results in pre-allocated slot (no mutex needed)
+			results[idx] = batchResult{spans: localSpans, traces: localTraces, logs: localLogs}
 
 			return nil
 		})
 	}
 
 	g.Wait()
+
+	// Merge results after all goroutines complete (no lock contention)
+	var spansToInsert []storage.Span
+	var tracesToUpsert []storage.Trace
+	var synthesizedLogs []storage.Log
+	for _, r := range results {
+		spansToInsert = append(spansToInsert, r.spans...)
+		tracesToUpsert = append(tracesToUpsert, r.traces...)
+		synthesizedLogs = append(synthesizedLogs, r.logs...)
+	}
 
 	// Persist - CRITICAL ORDER: Traces MUST be inserted before Spans due to FK
 	if len(tracesToUpsert) > 0 {
@@ -340,6 +352,12 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 		}
 		if s.metrics != nil {
 			s.metrics.RecordIngestion(len(spansToInsert))
+		}
+		// Notify GraphRAG of persisted spans
+		if s.spanCallback != nil {
+			for _, span := range spansToInsert {
+				s.spanCallback(span)
+			}
 		}
 	}
 
@@ -363,15 +381,12 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 func (s *LogsServer) Export(ctx context.Context, req *collogspb.ExportLogsServiceRequest) (*collogspb.ExportLogsServiceResponse, error) {
 	// slog.Debug("📥 [LOGS] Received Request", "resource_logs", len(req.ResourceLogs))
 
-	var (
-		mu           sync.Mutex
-		logsToInsert []storage.Log
-	)
+	logResults := make([][]storage.Log, len(req.ResourceLogs))
 
 	g, _ := errgroup.WithContext(ctx)
 
-	for _, resourceLogs := range req.ResourceLogs {
-		resourceLogs := resourceLogs // Capture
+	for idx, resourceLogs := range req.ResourceLogs {
+		idx, resourceLogs := idx, resourceLogs // Capture
 		g.Go(func() error {
 			serviceName := getServiceName(resourceLogs.Resource.Attributes)
 
@@ -414,15 +429,19 @@ func (s *LogsServer) Export(ctx context.Context, req *collogspb.ExportLogsServic
 				}
 			}
 
-			mu.Lock()
-			logsToInsert = append(logsToInsert, localLogs...)
-			mu.Unlock()
+			logResults[idx] = localLogs
 
 			return nil
 		})
 	}
 
 	g.Wait()
+
+	// Merge results after all goroutines complete (no lock contention)
+	var logsToInsert []storage.Log
+	for _, lr := range logResults {
+		logsToInsert = append(logsToInsert, lr...)
+	}
 
 	if len(logsToInsert) > 0 {
 		if err := s.repo.BatchCreateLogs(logsToInsert); err != nil {
