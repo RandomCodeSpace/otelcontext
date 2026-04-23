@@ -118,6 +118,7 @@ type Span struct {
 	EndTime        time.Time      `json:"end_time"`
 	Duration       int64          `json:"duration"`                                                                     // Microseconds
 	ServiceName    string         `gorm:"size:255;index:idx_spans_tenant_service_start,priority:2" json:"service_name"` // Originating service
+	Status         string         `gorm:"size:50;default:'STATUS_CODE_UNSET';index" json:"status"`                      // OTLP status code (e.g. STATUS_CODE_ERROR); drives GraphRAG error signal
 	AttributesJSON CompressedText `json:"attributes_json"`                                                              // Compressed JSON string
 }
 

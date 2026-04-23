@@ -322,6 +322,7 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 						EndTime:        endTime,
 						Duration:       duration,
 						ServiceName:    serviceName,
+						Status:         statusStr,
 						AttributesJSON: storage.CompressedText(attrs),
 					}
 					localSpans = append(localSpans, sModel)

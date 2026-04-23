@@ -240,14 +240,19 @@ func (g *GraphRAG) IsRunning() bool {
 
 // OnSpanIngested is the callback wired into the trace ingestion pipeline.
 func (g *GraphRAG) OnSpanIngested(span storage.Span) {
+	status := span.Status
+	if status == "" {
+		status = "STATUS_CODE_UNSET"
+	}
 	select {
 	case g.eventCh <- event{span: &spanEvent{
 		Span:    span,
 		TraceID: span.TraceID,
-		Status:  "OK",
+		Status:  status,
 	}}:
 	default:
-		// Channel full — graph is best-effort; DB is source of truth
+		// Channel full — graph is best-effort; DB is source of truth.
+		// Task 2 will add a drop counter here.
 	}
 }
 

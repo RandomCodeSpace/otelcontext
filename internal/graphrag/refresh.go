@@ -86,7 +86,7 @@ func (g *GraphRAG) rebuildFromDB() {
 	var rows []spanRow
 	err := g.repo.DB().
 		Table("spans").
-		Select("span_id, parent_span_id, service_name, operation_name, duration, trace_id, start_time").
+		Select("span_id, parent_span_id, service_name, operation_name, duration, trace_id, status, start_time").
 		Where("start_time > ?", since).
 		Order("start_time ASC").
 		Limit(50000).
