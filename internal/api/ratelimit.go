@@ -37,6 +37,22 @@ func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 	})
 }
 
+// MiddlewareExcept returns a handler chain that applies the rate limit only
+// when skip(path) returns false. Intended to exempt OTLP ingestion paths from
+// the per-IP API limiter.
+func (rl *RateLimiter) MiddlewareExcept(skip func(path string) bool) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		wrapped := rl.Middleware(next)
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if skip != nil && skip(r.URL.Path) {
+				next.ServeHTTP(w, r)
+				return
+			}
+			wrapped.ServeHTTP(w, r)
+		})
+	}
+}
+
 func (rl *RateLimiter) allow(ip string) bool {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()

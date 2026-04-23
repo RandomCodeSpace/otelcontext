@@ -568,8 +568,13 @@ func main() {
 	httpHandler = api.MetricsMiddleware(metrics, httpHandler)
 	if cfg.APIRateLimitRPS > 0 {
 		rl := api.NewRateLimiter(float64(cfg.APIRateLimitRPS))
-		httpHandler = rl.Middleware(httpHandler)
-		slog.Info("🛡️  API rate limiter enabled", "rps_per_ip", cfg.APIRateLimitRPS)
+		httpHandler = rl.MiddlewareExcept(func(path string) bool {
+			return strings.HasPrefix(path, "/v1/")
+		})(httpHandler)
+		slog.Info("🛡️  API rate limiter enabled",
+			"rps_per_ip", cfg.APIRateLimitRPS,
+			"exempt_prefixes", []string{"/v1/"},
+		)
 	}
 
 	// DB health fast-fail gate: returns 503 for DB-dependent paths when the
