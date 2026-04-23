@@ -49,6 +49,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	_ "google.golang.org/grpc/encoding/gzip" // Register gzip decompressor
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/reflection"
 	"google.golang.org/grpc/status"
 )
@@ -467,13 +468,39 @@ func main() {
 	if err != nil {
 		fatal("Failed to listen on gRPC port", err, "port", cfg.GRPCPort)
 	}
+	recvBytes := cfg.GRPCMaxRecvMB
+	if recvBytes <= 0 {
+		recvBytes = 16
+	}
+	streams := cfg.GRPCMaxConcurrentStreams
+	if streams <= 0 {
+		streams = 1000
+	}
+
 	grpcOpts := []grpc.ServerOption{
+		grpc.MaxRecvMsgSize(recvBytes * 1024 * 1024),
+		grpc.MaxConcurrentStreams(uint32(streams)),
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			Time:                  60 * time.Second, // ping idle clients
+			Timeout:               10 * time.Second, // drop if no pong
+			MaxConnectionIdle:     10 * time.Minute, // garbage-collect dead NAT entries
+			MaxConnectionAge:      2 * time.Hour,    // force periodic reconnects
+			MaxConnectionAgeGrace: 30 * time.Second,
+		}),
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime:             5 * time.Second,
+			PermitWithoutStream: true,
+		}),
 		// Recovery FIRST so a panic inside the metrics interceptor is still caught.
 		grpc.ChainUnaryInterceptor(
 			recoveryUnaryInterceptor(metrics),
 			metricsUnaryInterceptor(metrics),
 		),
 	}
+	slog.Info("📡 gRPC server tuned",
+		"max_recv_mb", recvBytes,
+		"max_concurrent_streams", streams,
+	)
 	switch tlsMode {
 	case "cert-file":
 		creds, err := credentials.NewServerTLSFromFile(tlsCertPath, tlsKeyPath)

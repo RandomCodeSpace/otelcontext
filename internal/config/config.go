@@ -112,6 +112,10 @@ type Config struct {
 	// DevMode disables origin checks for WebSocket and enables dev-friendly defaults.
 	// Derived from APP_ENV == "development".
 	DevMode bool
+
+	// gRPC server tuning — protects against huge OTLP batches and connection abuse.
+	GRPCMaxRecvMB            int
+	GRPCMaxConcurrentStreams int
 }
 
 func Load(customPath string) (*Config, error) {
@@ -204,6 +208,10 @@ func Load(customPath string) (*Config, error) {
 		DefaultTenant:           getEnv("DEFAULT_TENANT", "default"),
 		OTLPTrustResourceTenant: parseTruthy(getEnv("OTLP_TRUST_RESOURCE_TENANT", "")),
 		APITenantKeysFile:       getEnv("API_TENANT_KEYS_FILE", ""),
+
+		// gRPC server tuning
+		GRPCMaxRecvMB:            getEnvInt("GRPC_MAX_RECV_MB", 16),
+		GRPCMaxConcurrentStreams: getEnvInt("GRPC_MAX_CONCURRENT_STREAMS", 1000),
 	}, nil
 }
 
