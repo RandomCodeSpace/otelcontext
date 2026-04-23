@@ -23,6 +23,8 @@ func baseValid() *Config {
 		CompressionLevel:     "default",
 		GRPCMaxRecvMB:            16,
 		GRPCMaxConcurrentStreams: 1000,
+		RetentionBatchSize:    50000,
+		RetentionBatchSleepMs: 1,
 	}
 }
 

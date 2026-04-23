@@ -279,7 +279,7 @@ func (r *Repository) GetLatencyHeatmap(ctx context.Context, start, end time.Time
 // Tenant scope: this is a SYSTEM-WIDE retention operation and intentionally
 // does NOT filter by tenant. Rows are deleted across every tenant. Never expose
 // this on a tenant-scoped API surface.
-func (r *Repository) PurgeMetricBucketsBatched(ctx context.Context, olderThan time.Time, batchSize int) (int64, error) {
+func (r *Repository) PurgeMetricBucketsBatched(ctx context.Context, olderThan time.Time, batchSize int, sleep time.Duration) (int64, error) {
 	if batchSize <= 0 {
 		batchSize = 10_000
 	}
@@ -308,7 +308,7 @@ func (r *Repository) PurgeMetricBucketsBatched(ctx context.Context, olderThan ti
 		select {
 		case <-ctx.Done():
 			return total, ctx.Err()
-		case <-time.After(5 * time.Millisecond):
+		case <-time.After(sleep):
 		}
 	}
 }

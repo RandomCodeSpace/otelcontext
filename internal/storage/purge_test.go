@@ -9,7 +9,7 @@ import (
 
 func TestPurgeLogsBatched_EmptyTable(t *testing.T) {
 	repo := newTestRepo(t)
-	n, err := repo.PurgeLogsBatched(context.Background(), time.Now(), 100)
+	n, err := repo.PurgeLogsBatched(context.Background(), time.Now(), 100, 5*time.Millisecond)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -23,7 +23,7 @@ func TestPurgeLogsBatched_AllOld_AllDeleted(t *testing.T) {
 	old := time.Now().UTC().Add(-10 * 24 * time.Hour)
 	seedLogs(t, repo.db, 50, old, "svc")
 
-	n, err := repo.PurgeLogsBatched(context.Background(), time.Now().UTC().Add(-time.Hour), 10)
+	n, err := repo.PurgeLogsBatched(context.Background(), time.Now().UTC().Add(-time.Hour), 10, 5*time.Millisecond)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -39,7 +39,7 @@ func TestPurgeLogsBatched_AllNew_NoneDeleted(t *testing.T) {
 	repo := newTestRepo(t)
 	seedLogs(t, repo.db, 20, time.Now().UTC(), "svc")
 
-	n, err := repo.PurgeLogsBatched(context.Background(), time.Now().UTC().Add(-time.Hour), 10)
+	n, err := repo.PurgeLogsBatched(context.Background(), time.Now().UTC().Add(-time.Hour), 10, 5*time.Millisecond)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -59,7 +59,7 @@ func TestPurgeLogsBatched_ZeroBatchSize_DefaultsTo10k(t *testing.T) {
 	// batchSize=0 must default internally and not loop forever.
 	done := make(chan struct{})
 	go func() {
-		_, _ = repo.PurgeLogsBatched(context.Background(), time.Now(), 0)
+		_, _ = repo.PurgeLogsBatched(context.Background(), time.Now(), 0, 5*time.Millisecond)
 		close(done)
 	}()
 	select {
@@ -78,7 +78,7 @@ func TestPurgeLogsBatched_ContextCancellation(t *testing.T) {
 	cancel() // pre-cancelled
 
 	// SQLite path is single-shot so ctx.Err() may not be observed; validate it doesn't panic.
-	_, _ = repo.PurgeLogsBatched(ctx, time.Now(), 10)
+	_, _ = repo.PurgeLogsBatched(ctx, time.Now(), 10, 5*time.Millisecond)
 }
 
 func TestPurgeLogsBatched_BoundaryTimestamp(t *testing.T) {
@@ -89,7 +89,7 @@ func TestPurgeLogsBatched_BoundaryTimestamp(t *testing.T) {
 	seedLogs(t, repo.db, 1, cutoff.Add(-time.Nanosecond), "just-before")
 	seedLogs(t, repo.db, 1, cutoff.Add(time.Nanosecond), "just-after")
 
-	n, err := repo.PurgeLogsBatched(context.Background(), cutoff, 100)
+	n, err := repo.PurgeLogsBatched(context.Background(), cutoff, 100, 5*time.Millisecond)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -126,7 +126,7 @@ func TestPurgeTracesBatched_OrphanSpanSweep(t *testing.T) {
 	// T3: fresh trace + fresh spans — all preserved.
 	seedTrace(t, repo.db, "t-new", nowUTC, []time.Time{nowUTC})
 
-	_, err := repo.PurgeTracesBatched(context.Background(), cutoff, 10)
+	_, err := repo.PurgeTracesBatched(context.Background(), cutoff, 10, 5*time.Millisecond)
 	if err != nil {
 		t.Fatalf("PurgeTracesBatched: %v", err)
 	}
@@ -188,7 +188,7 @@ func TestPurgeTracesBatched_DoesNotDeleteLiveSpans(t *testing.T) {
 		t.Fatalf("seed live spans: %v", err)
 	}
 
-	if _, err := repo.PurgeTracesBatched(context.Background(), cutoff, 10); err != nil {
+	if _, err := repo.PurgeTracesBatched(context.Background(), cutoff, 10, 5*time.Millisecond); err != nil {
 		t.Fatalf("purge: %v", err)
 	}
 
@@ -224,7 +224,7 @@ func TestPurgeMetricBucketsBatched(t *testing.T) {
 		t.Fatalf("create buckets: %v", err)
 	}
 
-	n, err := repo.PurgeMetricBucketsBatched(context.Background(), time.Now().UTC().Add(-time.Hour), 10)
+	n, err := repo.PurgeMetricBucketsBatched(context.Background(), time.Now().UTC().Add(-time.Hour), 10, 5*time.Millisecond)
 	if err != nil {
 		t.Fatalf("purge: %v", err)
 	}
@@ -265,7 +265,7 @@ func TestPurgeLogs_ConcurrentIngestWhilePurging(t *testing.T) {
 	}()
 	time.Sleep(20 * time.Millisecond)
 
-	_, err := repo.PurgeLogsBatched(context.Background(), time.Now().UTC().Add(-time.Hour), 50)
+	_, err := repo.PurgeLogsBatched(context.Background(), time.Now().UTC().Add(-time.Hour), 50, 5*time.Millisecond)
 	if err != nil {
 		t.Fatalf("purge: %v", err)
 	}

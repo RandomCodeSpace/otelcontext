@@ -248,7 +248,7 @@ func TestPurgeLogs_DeadlineExceeded_ReturnsPromptly(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		_, _ = repo.PurgeLogsBatched(ctx, time.Now(), 10)
+		_, _ = repo.PurgeLogsBatched(ctx, time.Now(), 10, 5*time.Millisecond)
 		close(done)
 	}()
 	select {

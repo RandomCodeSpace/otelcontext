@@ -52,6 +52,7 @@ type Metrics struct {
 	RetentionRowsPurgedTotal       *prometheus.CounterVec
 	RetentionPurgeDurationSeconds  *prometheus.HistogramVec
 	RetentionVacuumDurationSeconds *prometheus.HistogramVec
+	RetentionRowsBehindGauge       *prometheus.GaugeVec
 
 	// --- Runtime ---
 	GoGoroutines     prometheus.Gauge
@@ -196,6 +197,10 @@ func New() *Metrics {
 			Help:    "Duration of per-table retention maintenance (VACUUM/ANALYZE/OPTIMIZE), by driver and table.",
 			Buckets: prometheus.ExponentialBuckets(0.01, 2, 16),
 		}, []string{"driver", "table"}),
+		RetentionRowsBehindGauge: promauto.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "otelcontext_retention_rows_behind",
+			Help: "Rows older than retention cutoff that have not yet been purged. Climbing means purge cannot keep pace with ingest.",
+		}, []string{"table", "driver"}),
 
 		// Runtime
 		GoGoroutines: promauto.NewGauge(prometheus.GaugeOpts{

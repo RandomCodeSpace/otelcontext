@@ -182,7 +182,12 @@ func main() {
 
 	// 2a. Retention scheduler: hourly batched purge + daily VACUUM/ANALYZE.
 	ctxRetention, cancelRetention := context.WithCancel(context.Background())
-	retention := storage.NewRetentionScheduler(repo, cfg.HotRetentionDays)
+	retention := storage.NewRetentionScheduler(
+		repo,
+		cfg.HotRetentionDays,
+		cfg.RetentionBatchSize,
+		time.Duration(cfg.RetentionBatchSleepMs)*time.Millisecond,
+	)
 	retention.Start(ctxRetention)
 	slog.Info("🧹 Retention scheduler started", "retention_days", cfg.HotRetentionDays)
 

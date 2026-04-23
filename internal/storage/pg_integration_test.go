@@ -230,7 +230,7 @@ func TestPG_VacuumAnalyze_OutsideTx(t *testing.T) {
 	// Seed a few rows so VACUUM ANALYZE has something to observe.
 	seedLogs(t, repo.db, 10, time.Now().UTC(), "svc")
 
-	sched := NewRetentionScheduler(repo, 7)
+	sched := NewRetentionScheduler(repo, 7, 10_000, 5*time.Millisecond)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
@@ -283,7 +283,7 @@ func TestPG_PurgeLogsBatched_LargeVolume(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
-	n, err := repo.PurgeLogsBatched(ctx, time.Now().UTC().Add(-time.Hour), batch)
+	n, err := repo.PurgeLogsBatched(ctx, time.Now().UTC().Add(-time.Hour), batch, 5*time.Millisecond)
 	if err != nil {
 		t.Fatalf("PurgeLogsBatched: %v", err)
 	}
@@ -326,7 +326,7 @@ func TestPG_PurgeTracesBatched_OrphanSpanSweep_NOT_IN(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if _, err := repo.PurgeTracesBatched(ctx, cutoff, 10); err != nil {
+	if _, err := repo.PurgeTracesBatched(ctx, cutoff, 10, 5*time.Millisecond); err != nil {
 		t.Fatalf("PurgeTracesBatched: %v", err)
 	}
 

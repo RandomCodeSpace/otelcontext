@@ -33,6 +33,12 @@ type Config struct {
 	// Retention
 	HotRetentionDays int
 
+	// Retention tuning. Defaults (batch=50000, sleep=1ms) work for Postgres at
+	// 100k logs/sec sustained. Lower on resource-constrained hosts; raise on
+	// dedicated DB machines. 0/negative values use defaults.
+	RetentionBatchSize    int
+	RetentionBatchSleepMs int
+
 	// TSDB
 	TSDBRingBufferDuration string // e.g. "1h"
 
@@ -156,7 +162,9 @@ func Load(customPath string) (*Config, error) {
 		DBConnMaxLifetime: getEnv("DB_CONN_MAX_LIFETIME", "1h"),
 
 		// Retention
-		HotRetentionDays: getEnvInt("HOT_RETENTION_DAYS", 7),
+		HotRetentionDays:      getEnvInt("HOT_RETENTION_DAYS", 7),
+		RetentionBatchSize:    getEnvInt("RETENTION_BATCH_SIZE", 50000),
+		RetentionBatchSleepMs: getEnvInt("RETENTION_BATCH_SLEEP_MS", 1),
 
 		// TSDB
 		TSDBRingBufferDuration: getEnv("TSDB_RING_BUFFER_DURATION", "1h"),
@@ -288,6 +296,12 @@ func (c *Config) Validate() error {
 	// cutoff into the future and deletes everything). 36500 (100y) is generous.
 	if c.HotRetentionDays < 1 || c.HotRetentionDays > 36500 {
 		return fmt.Errorf("HOT_RETENTION_DAYS must be between 1 and 36500, got %d", c.HotRetentionDays)
+	}
+	if c.RetentionBatchSize < 1 || c.RetentionBatchSize > 10_000_000 {
+		return fmt.Errorf("RETENTION_BATCH_SIZE must be between 1 and 10000000, got %d", c.RetentionBatchSize)
+	}
+	if c.RetentionBatchSleepMs < 0 || c.RetentionBatchSleepMs > 60_000 {
+		return fmt.Errorf("RETENTION_BATCH_SLEEP_MS must be between 0 and 60000, got %d", c.RetentionBatchSleepMs)
 	}
 	if c.MetricMaxCardinality < 0 {
 		return fmt.Errorf("METRIC_MAX_CARDINALITY must be >= 0, got %d", c.MetricMaxCardinality)

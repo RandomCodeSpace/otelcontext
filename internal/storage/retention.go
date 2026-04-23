@@ -14,11 +14,12 @@ import (
 // On startup and hourly thereafter it deletes rows older than retentionDays.
 // Daily it runs driver-appropriate maintenance (VACUUM ANALYZE / OPTIMIZE / VACUUM).
 type RetentionScheduler struct {
-	repo           *Repository
-	retentionDays  int
-	purgeInterval  time.Duration
-	vacuumInterval time.Duration
-	purgeBatchSize int
+	repo            *Repository
+	retentionDays   int
+	purgeInterval   time.Duration
+	vacuumInterval  time.Duration
+	purgeBatchSize  int
+	purgeBatchSleep time.Duration
 
 	// started is an atomic so a fast-path Stop() before Start() is lock-free.
 	// mu serializes the Start/Stop transition itself (protects cancel + done).
@@ -38,14 +39,22 @@ type RetentionScheduler struct {
 }
 
 // NewRetentionScheduler constructs a scheduler but does not start it.
-func NewRetentionScheduler(repo *Repository, retentionDays int) *RetentionScheduler {
+// batchSize <= 0 defaults to 10_000; batchSleep < 0 defaults to 5ms.
+func NewRetentionScheduler(repo *Repository, retentionDays, batchSize int, batchSleep time.Duration) *RetentionScheduler {
+	if batchSize <= 0 {
+		batchSize = 10_000
+	}
+	if batchSleep < 0 {
+		batchSleep = 5 * time.Millisecond
+	}
 	return &RetentionScheduler{
-		repo:           repo,
-		retentionDays:  retentionDays,
-		purgeInterval:  1 * time.Hour,
-		vacuumInterval: 24 * time.Hour,
-		purgeBatchSize: 10_000,
-		done:           make(chan struct{}),
+		repo:            repo,
+		retentionDays:   retentionDays,
+		purgeInterval:   1 * time.Hour,
+		vacuumInterval:  24 * time.Hour,
+		purgeBatchSize:  batchSize,
+		purgeBatchSleep: batchSleep,
+		done:            make(chan struct{}),
 	}
 }
 
@@ -122,16 +131,83 @@ func (r *RetentionScheduler) runPurge(ctx context.Context) {
 	if driver == "" {
 		driver = "sqlite"
 	}
-	metrics := r.repo.metrics
-
-	start := time.Now()
 	cutoff := time.Now().UTC().Add(-time.Duration(r.retentionDays) * 24 * time.Hour)
 
-	// Fix 6: track failure across all three purges so we can expose
-	// retention_consecutive_failures{job="purge"} accurately.
+	// SQLite: single-writer, parallel purges would just contend on the DB lock.
+	if driver == "sqlite" {
+		r.runPurgeSerial(ctx, cutoff, driver)
+		return
+	}
+
+	metrics := r.repo.metrics
+	start := time.Now()
+
+	// Observe rows-behind before we start — good for dashboards, costs a COUNT.
+	// Only on Postgres/MySQL where the extra scan is cheap relative to the purge.
+	r.observeRowsBehind(ctx, driver, cutoff)
+
+	type result struct {
+		kind string
+		n    int64
+		err  error
+	}
+	results := make(chan result, 3)
+
+	go func() {
+		n, err := r.repo.PurgeLogsBatched(ctx, cutoff, r.purgeBatchSize, r.purgeBatchSleep)
+		results <- result{"logs", n, err}
+	}()
+	go func() {
+		n, err := r.repo.PurgeTracesBatched(ctx, cutoff, r.purgeBatchSize, r.purgeBatchSleep)
+		results <- result{"traces", n, err}
+	}()
+	go func() {
+		n, err := r.repo.PurgeMetricBucketsBatched(ctx, cutoff, r.purgeBatchSize, r.purgeBatchSleep)
+		results <- result{"metric_buckets", n, err}
+	}()
+
+	purgeFailed := false
+	totals := map[string]int64{}
+	for i := 0; i < 3; i++ {
+		res := <-results
+		if res.err != nil {
+			slog.Error("retention: purge failed", "kind", res.kind, "error", res.err)
+			purgeFailed = true
+		}
+		totals[res.kind] += res.n
+		if metrics != nil && res.n > 0 {
+			metrics.RetentionRowsPurgedTotal.WithLabelValues(res.kind, driver).Add(float64(res.n))
+		}
+	}
+
+	if metrics != nil {
+		metrics.RetentionPurgeDurationSeconds.WithLabelValues(driver).Observe(time.Since(start).Seconds())
+		if purgeFailed {
+			metrics.RetentionConsecutiveFailures.WithLabelValues("purge").Inc()
+		} else {
+			metrics.RetentionConsecutiveFailures.WithLabelValues("purge").Set(0)
+			metrics.RetentionLastSuccessTimestamp.WithLabelValues("purge").Set(float64(time.Now().Unix()))
+		}
+	}
+
+	slog.Info("retention purge complete",
+		"driver", driver,
+		"duration", time.Since(start),
+		"logs_deleted", totals["logs"],
+		"traces_deleted", totals["traces"],
+		"metrics_deleted", totals["metric_buckets"],
+	)
+}
+
+// runPurgeSerial is the SQLite path: running the three purges concurrently buys
+// nothing because the driver holds a single writer lock, so we serialize them
+// to keep the "running" gauge accurate and avoid goroutine launch cost.
+func (r *RetentionScheduler) runPurgeSerial(ctx context.Context, cutoff time.Time, driver string) {
+	metrics := r.repo.metrics
+	start := time.Now()
 	purgeFailed := false
 
-	logs, err := r.repo.PurgeLogsBatched(ctx, cutoff, r.purgeBatchSize)
+	logs, err := r.repo.PurgeLogsBatched(ctx, cutoff, r.purgeBatchSize, r.purgeBatchSleep)
 	if err != nil {
 		slog.Error("retention: purge logs failed", "error", err)
 		purgeFailed = true
@@ -140,19 +216,16 @@ func (r *RetentionScheduler) runPurge(ctx context.Context) {
 		metrics.RetentionRowsPurgedTotal.WithLabelValues("logs", driver).Add(float64(logs))
 	}
 
-	traces, err := r.repo.PurgeTracesBatched(ctx, cutoff, r.purgeBatchSize)
+	traces, err := r.repo.PurgeTracesBatched(ctx, cutoff, r.purgeBatchSize, r.purgeBatchSleep)
 	if err != nil {
 		slog.Error("retention: purge traces failed", "error", err)
 		purgeFailed = true
 	}
 	if metrics != nil && traces > 0 {
-		// PurgeTracesBatched deletes traces and sweeps orphan spans. The returned
-		// count reflects traces; report under the "traces" label. Spans are swept
-		// as a side effect — no separate authoritative count is returned.
 		metrics.RetentionRowsPurgedTotal.WithLabelValues("traces", driver).Add(float64(traces))
 	}
 
-	metricsPurged, err := r.repo.PurgeMetricBucketsBatched(ctx, cutoff, r.purgeBatchSize)
+	metricsPurged, err := r.repo.PurgeMetricBucketsBatched(ctx, cutoff, r.purgeBatchSize, r.purgeBatchSleep)
 	if err != nil {
 		slog.Error("retention: purge metrics failed", "error", err)
 		purgeFailed = true
@@ -172,12 +245,39 @@ func (r *RetentionScheduler) runPurge(ctx context.Context) {
 	}
 
 	slog.Info("retention purge complete",
+		"driver", driver,
 		"cutoff", cutoff.Format(time.RFC3339),
 		"logs_deleted", logs,
 		"traces_deleted", traces,
 		"metrics_deleted", metricsPurged,
 		"duration", time.Since(start),
 	)
+}
+
+// observeRowsBehind populates RetentionRowsBehindGauge so operators can see
+// when ingest is outrunning purge. Best-effort — a failed COUNT is logged and
+// skipped rather than failing the purge.
+func (r *RetentionScheduler) observeRowsBehind(ctx context.Context, driver string, cutoff time.Time) {
+	metrics := r.repo.metrics
+	if metrics == nil || metrics.RetentionRowsBehindGauge == nil {
+		return
+	}
+	probes := []struct {
+		table    string
+		model    any
+		tsColumn string
+	}{
+		{"logs", &Log{}, "timestamp"},
+		{"traces", &Trace{}, "timestamp"},
+		{"metric_buckets", &MetricBucket{}, "time_bucket"},
+	}
+	for _, p := range probes {
+		var n int64
+		if err := r.repo.db.WithContext(ctx).Model(p.model).Where(p.tsColumn+" < ?", cutoff).Count(&n).Error; err != nil {
+			continue // count failure is non-fatal; skip this label
+		}
+		metrics.RetentionRowsBehindGauge.WithLabelValues(p.table, driver).Set(float64(n))
+	}
 }
 
 func (r *RetentionScheduler) runMaintenance(ctx context.Context) {

@@ -9,7 +9,7 @@ import (
 
 func TestRetentionScheduler_StopBeforeStart_NoDeadlock(t *testing.T) {
 	repo := newTestRepo(t)
-	r := NewRetentionScheduler(repo, 7)
+	r := NewRetentionScheduler(repo, 7, 10_000, 5*time.Millisecond)
 	done := make(chan struct{})
 	go func() {
 		r.Stop()
@@ -24,7 +24,7 @@ func TestRetentionScheduler_StopBeforeStart_NoDeadlock(t *testing.T) {
 
 func TestRetentionScheduler_DoubleStop(t *testing.T) {
 	repo := newTestRepo(t)
-	r := NewRetentionScheduler(repo, 7)
+	r := NewRetentionScheduler(repo, 7, 10_000, 5*time.Millisecond)
 	r.Start(context.Background())
 	r.Stop()
 	done := make(chan struct{})
@@ -41,7 +41,7 @@ func TestRetentionScheduler_DoubleStop(t *testing.T) {
 
 func TestRetentionScheduler_DoubleStart_Idempotent(t *testing.T) {
 	repo := newTestRepo(t)
-	r := NewRetentionScheduler(repo, 7)
+	r := NewRetentionScheduler(repo, 7, 10_000, 5*time.Millisecond)
 	r.Start(context.Background())
 	r.Start(context.Background())
 	r.Stop()
@@ -56,7 +56,7 @@ func TestRetentionScheduler_InitialPurgeRunsImmediately(t *testing.T) {
 	old := time.Now().UTC().Add(-30 * 24 * time.Hour)
 	seedLogs(t, repo.db, 100, old, "old-service")
 
-	r := NewRetentionScheduler(repo, 7)
+	r := NewRetentionScheduler(repo, 7, 10_000, 5*time.Millisecond)
 	r.purgeInterval = time.Hour
 	r.vacuumInterval = time.Hour
 	r.Start(context.Background())
@@ -74,7 +74,7 @@ func TestRetentionScheduler_InitialPurgeRunsImmediately(t *testing.T) {
 
 func TestRetentionScheduler_ContextCancellationStopsLoop(t *testing.T) {
 	repo := newTestRepo(t)
-	r := NewRetentionScheduler(repo, 7)
+	r := NewRetentionScheduler(repo, 7, 10_000, 5*time.Millisecond)
 	ctx, cancel := context.WithCancel(context.Background())
 	r.Start(ctx)
 	cancel()
@@ -91,7 +91,7 @@ func TestRetentionScheduler_MaintenanceVacuumsSQLite(t *testing.T) {
 	repo := newTestRepo(t)
 	seedLogs(t, repo.db, 1000, time.Now().UTC(), "svc")
 
-	r := NewRetentionScheduler(repo, 7)
+	r := NewRetentionScheduler(repo, 7, 10_000, 5*time.Millisecond)
 	r.runMaintenance(context.Background())
 	// If runMaintenance crashes on "cannot run inside a transaction", this test fails.
 	if mustCount(t, repo.db, &Log{}) != 1000 {
@@ -101,7 +101,7 @@ func TestRetentionScheduler_MaintenanceVacuumsSQLite(t *testing.T) {
 
 func TestRetentionScheduler_NoDataNoError(t *testing.T) {
 	repo := newTestRepo(t)
-	r := NewRetentionScheduler(repo, 7)
+	r := NewRetentionScheduler(repo, 7, 10_000, 5*time.Millisecond)
 	// Must not panic/error against empty tables.
 	r.runPurge(context.Background())
 	r.runMaintenance(context.Background())
@@ -109,7 +109,7 @@ func TestRetentionScheduler_NoDataNoError(t *testing.T) {
 
 func TestRetentionScheduler_ConcurrentStartStop(t *testing.T) {
 	repo := newTestRepo(t)
-	r := NewRetentionScheduler(repo, 7)
+	r := NewRetentionScheduler(repo, 7, 10_000, 5*time.Millisecond)
 
 	// Race detector target: 20 goroutines hammering Start/Stop simultaneously.
 	// atomic.Bool CAS means at most one goroutine transitions the flag, and
@@ -152,7 +152,7 @@ func TestRetentionScheduler_OverlapGuard(t *testing.T) {
 	old := time.Now().UTC().Add(-30 * 24 * time.Hour)
 	seedLogs(t, repo.db, 500, old, "svc")
 
-	r := NewRetentionScheduler(repo, 7)
+	r := NewRetentionScheduler(repo, 7, 10_000, 5*time.Millisecond)
 
 	// Pin the "running" flag as if a purge were already executing. Because
 	// CompareAndSwap(false, true) fails, the concurrent call must skip.
@@ -191,7 +191,7 @@ func TestRetentionScheduler_OverlapGuard(t *testing.T) {
 // purge tick.
 func TestRetentionScheduler_MaintenanceRespectsOverlapGuard(t *testing.T) {
 	repo := newTestRepo(t)
-	r := NewRetentionScheduler(repo, 7)
+	r := NewRetentionScheduler(repo, 7, 10_000, 5*time.Millisecond)
 
 	r.running.Store(true) // pretend purge is in flight
 	before := r.SkippedRuns()
@@ -204,7 +204,7 @@ func TestRetentionScheduler_MaintenanceRespectsOverlapGuard(t *testing.T) {
 
 func TestRetentionScheduler_ConcurrentStopCallers(t *testing.T) {
 	repo := newTestRepo(t)
-	r := NewRetentionScheduler(repo, 7)
+	r := NewRetentionScheduler(repo, 7, 10_000, 5*time.Millisecond)
 	r.Start(context.Background())
 
 	var wg sync.WaitGroup

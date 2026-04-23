@@ -160,7 +160,7 @@ func (r *Repository) PurgeLogs(olderThan time.Time) (int64, error) {
 // Tenant scope: this is a SYSTEM-WIDE retention operation and intentionally
 // does NOT filter by tenant. All rows older than olderThan are purged across
 // every tenant. Never expose this on a tenant-scoped API surface.
-func (r *Repository) PurgeLogsBatched(ctx context.Context, olderThan time.Time, batchSize int) (int64, error) {
+func (r *Repository) PurgeLogsBatched(ctx context.Context, olderThan time.Time, batchSize int, sleep time.Duration) (int64, error) {
 	if batchSize <= 0 {
 		batchSize = 10_000
 	}
@@ -189,7 +189,7 @@ func (r *Repository) PurgeLogsBatched(ctx context.Context, olderThan time.Time, 
 		select {
 		case <-ctx.Done():
 			return total, ctx.Err()
-		case <-time.After(5 * time.Millisecond):
+		case <-time.After(sleep):
 		}
 	}
 }
