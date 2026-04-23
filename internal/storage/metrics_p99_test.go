@@ -2,7 +2,6 @@ package storage
 
 import (
 	"context"
-	"math"
 	"testing"
 	"time"
 
@@ -220,18 +219,6 @@ func p99Itoa(n int) string {
 		buf[pos] = '-'
 	}
 	return string(buf[pos:])
-}
-
-// verifyP99Index is the reference formula used in assertions.
-func verifyP99Index(n int) int {
-	idx := int(math.Ceil(float64(n)*0.99)) - 1
-	if idx < 0 {
-		idx = 0
-	}
-	if idx >= n {
-		idx = n - 1
-	}
-	return idx
 }
 
 // ---------------------------------------------------------------------------

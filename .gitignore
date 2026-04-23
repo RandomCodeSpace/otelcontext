@@ -127,3 +127,7 @@ go.work.sum
 *scheduled_tasks*
 tmp/
 data/
+
+/bin/
+/loadsim
+/otelcontext

@@ -27,8 +27,12 @@ func (g *GraphRAG) refreshLoop(ctx context.Context) {
 				slog.Debug("GraphRAG pruned expired traces/spans", "count", pruned)
 			}
 			g.pruneOldAnomalies()
-			// Bound the investigation cooldown map. 2× window keeps
-			// entries through the active suppression plus a grace period.
+			// Bound the investigation cooldown map. The 10m cutoff is 2×
+			// the cooldown window (5m) — it retains entries through the
+			// active suppression plus a grace period. This assumes the
+			// refresh tick runs at least every 10 minutes; if RefreshEvery
+			// grows larger, raise the cutoff in lockstep, otherwise a stuck
+			// service could bypass the cooldown between prunes.
 			if g.invCooldown != nil {
 				g.invCooldown.prune(time.Now().Add(-10 * time.Minute))
 			}

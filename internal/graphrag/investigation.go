@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -37,6 +38,16 @@ func (c *investigationCooldown) allow(key string, now time.Time) bool {
 	}
 	c.lastSeen[key] = now
 	return true
+}
+
+// cooldownKey builds a case- and whitespace-insensitive key from the tuple
+// (trigger_service, root_service, root_operation). Service names emitted
+// from different instrumentations occasionally differ in casing or have
+// trailing whitespace; canonicalizing here prevents those variants from
+// bypassing the cooldown guard.
+func cooldownKey(triggerService, rootService, rootOperation string) string {
+	norm := func(s string) string { return strings.ToLower(strings.TrimSpace(s)) }
+	return norm(triggerService) + "|" + norm(rootService) + "|" + norm(rootOperation)
 }
 
 // prune drops entries older than cutoff to bound map size. Called from
@@ -91,19 +102,21 @@ func (g *GraphRAG) PersistInvestigation(triggerService string, chains []ErrorCha
 		return
 	}
 
+	now := time.Now()
+
 	// Cooldown: suppress repeat investigations for the same
 	// (trigger_service, root_service, root_operation) inside a sliding window.
-	// Without this guard, a stuck service produces one insert every anomaly
-	// tick (default 10s) indefinitely.
-	key := triggerService + "|" + firstChain.RootCause.Service + "|" + firstChain.RootCause.Operation
-	if g.invCooldown != nil && !g.invCooldown.allow(key, time.Now()) {
+	// Keys are canonicalized (lower + trim) so "Orders" and "orders " share a
+	// bucket — otherwise trivial casing differences would bypass the guard.
+	key := cooldownKey(triggerService, firstChain.RootCause.Service, firstChain.RootCause.Operation)
+	if g.invCooldown != nil && !g.invCooldown.allow(key, now) {
 		return
 	}
 	// Increment BEFORE db.Create so the counter reflects "cooldown allowed;
 	// persist attempted". See InvestigationInsertCount's doc comment.
 	g.invInserts.Add(1)
 
-	id := fmt.Sprintf("inv_%d", time.Now().UnixNano())
+	id := fmt.Sprintf("inv_%d", now.UnixNano())
 
 	severity := "warning"
 	if len(anomalies) > 0 {
@@ -160,7 +173,7 @@ func (g *GraphRAG) PersistInvestigation(triggerService string, chains []ErrorCha
 
 	inv := Investigation{
 		ID:               id,
-		CreatedAt:        time.Now(),
+		CreatedAt:        now,
 		Status:           "detected",
 		Severity:         severity,
 		TriggerService:   triggerService,

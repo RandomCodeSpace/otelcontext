@@ -44,3 +44,20 @@ func TestPersistInvestigation_Cooldown(t *testing.T) {
 		t.Fatalf("distinct service should bypass cooldown; got %d, want > %d", third, second)
 	}
 }
+
+// TestCooldownKey_Canonical verifies the key normalizes case and trims
+// whitespace so "Orders" / "orders " / "ORDERS" land in the same bucket.
+func TestCooldownKey_Canonical(t *testing.T) {
+	cases := [][3]string{
+		{"orders", "orders", "op"},
+		{"Orders", "ORDERS", "op"},
+		{" orders ", "orders", " op "},
+		{"ORDERS", "Orders ", "OP"},
+	}
+	want := cooldownKey(cases[0][0], cases[0][1], cases[0][2])
+	for _, c := range cases[1:] {
+		if got := cooldownKey(c[0], c[1], c[2]); got != want {
+			t.Errorf("cooldownKey%v = %q, want %q", c, got, want)
+		}
+	}
+}
