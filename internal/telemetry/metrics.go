@@ -82,6 +82,9 @@ type Metrics struct {
 	DLQEvictedTotal      prometheus.Counter
 	DLQEvictedBytesTotal prometheus.Counter
 
+	// --- Dashboard p99 (Task 10) ---
+	DashboardP99RowCapHitsTotal prometheus.Counter
+
 	// Atomic counters for JSON health endpoint (avoids scraping Prometheus)
 	totalIngested  atomic.Int64
 	activeConns    atomic.Int64
@@ -288,6 +291,10 @@ func New() *Metrics {
 	m.DLQEvictedBytesTotal = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "otelcontext_dlq_evicted_bytes_total",
 		Help: "Total bytes evicted from DLQ. Rate indicates data-loss volume during backlog.",
+	})
+	m.DashboardP99RowCapHitsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "otelcontext_dashboard_p99_row_cap_hits_total",
+		Help: "Number of dashboard p99 computations that hit the SQLite row cap (200k). Indicates the dataset is too large for in-memory p99 — use Postgres for prod.",
 	})
 	return m
 }

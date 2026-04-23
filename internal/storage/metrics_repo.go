@@ -2,7 +2,6 @@ package storage
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"log/slog"
 	"math"
@@ -103,22 +102,32 @@ func (r *Repository) GetMetricNames(ctx context.Context, serviceName string) ([]
 //   - default (sqlite + unknown): in-memory sort capped at sqliteP99RowCap rows.
 //
 // The caller must pass a fresh Session so nothing leaks across subsequent calls.
-func (r *Repository) p99DurationForQuery(session *gorm.DB) (int64, error) {
+// ctx is threaded into every sub-session so client cancellation (disconnect/timeout)
+// is honoured at the driver level.
+func (r *Repository) p99DurationForQuery(ctx context.Context, session *gorm.DB) (int64, error) {
 	switch strings.ToLower(r.driver) {
 	case "postgres", "postgresql":
-		row := session.Select("COALESCE(percentile_disc(0.99) WITHIN GROUP (ORDER BY duration), 0)::bigint").Row()
+		// Use Rows() (not Row()) so we can explicitly Close the underlying
+		// *sql.Rows — otherwise the connection leaks on sustained traffic.
+		rows, err := session.Session(&gorm.Session{Context: ctx}).Select("COALESCE(percentile_disc(0.99) WITHIN GROUP (ORDER BY duration), 0)::bigint").Rows()
+		if err != nil {
+			return 0, err
+		}
+		defer rows.Close()
 		var p int64
-		if err := row.Scan(&p); err != nil {
-			if err == sql.ErrNoRows {
-				return 0, nil
+		if rows.Next() {
+			if err := rows.Scan(&p); err != nil {
+				return 0, err
 			}
+		}
+		if err := rows.Err(); err != nil {
 			return 0, err
 		}
 		return p, nil
 
 	case "mysql":
 		var n int64
-		if err := session.Session(&gorm.Session{}).Model(&Trace{}).Count(&n).Error; err != nil {
+		if err := session.Session(&gorm.Session{Context: ctx}).Model(&Trace{}).Count(&n).Error; err != nil {
 			return 0, err
 		}
 		if n == 0 {
@@ -131,14 +140,14 @@ func (r *Repository) p99DurationForQuery(session *gorm.DB) (int64, error) {
 			offset = n - 1
 		}
 		var p int64
-		if err := session.Session(&gorm.Session{}).Select("duration").Order("duration ASC").Offset(int(offset)).Limit(1).Scan(&p).Error; err != nil {
+		if err := session.Session(&gorm.Session{Context: ctx}).Select("duration").Order("duration ASC").Offset(int(offset)).Limit(1).Scan(&p).Error; err != nil {
 			return 0, err
 		}
 		return p, nil
 
 	default: // sqlite and any unknown driver
 		var durations []int64
-		q := session.Session(&gorm.Session{}).Select("duration").Order("duration ASC").Limit(sqliteP99RowCap + 1)
+		q := session.Session(&gorm.Session{Context: ctx}).Select("duration").Order("duration ASC").Limit(sqliteP99RowCap + 1)
 		if err := q.Find(&durations).Error; err != nil {
 			return 0, err
 		}
@@ -146,8 +155,13 @@ func (r *Repository) p99DurationForQuery(session *gorm.DB) (int64, error) {
 			return 0, nil
 		}
 		if len(durations) > sqliteP99RowCap {
-			// Truncate to cap and warn — accuracy degrades gracefully.
-			slog.Warn("p99 SQLite fallback capped rows", "cap", sqliteP99RowCap)
+			// Truncate to cap — accuracy degrades gracefully. Operators alert on
+			// the counter (dataset is too large for in-memory p99 — migrate to
+			// Postgres). Keep a low-volume debug log for dev observability.
+			if r.metrics != nil {
+				r.metrics.DashboardP99RowCapHitsTotal.Inc()
+			}
+			slog.Debug("p99 SQLite fallback capped rows", "cap", sqliteP99RowCap)
 			durations = durations[:sqliteP99RowCap]
 		}
 		idx := int(math.Ceil(float64(len(durations))*0.99)) - 1
@@ -218,7 +232,7 @@ func (r *Repository) GetDashboardStats(ctx context.Context, start, end time.Time
 	}
 
 	// 6. P99 Latency
-	p99, err := r.p99DurationForQuery(baseQuery.Session(&gorm.Session{}))
+	p99, err := r.p99DurationForQuery(ctx, baseQuery.Session(&gorm.Session{}))
 	if err != nil {
 		return nil, fmt.Errorf("failed to compute p99 latency: %w", err)
 	}

@@ -30,7 +30,7 @@ func TestP99_SQLite_DispatchLimit(t *testing.T) {
 	//
 	// The real cap-and-limit behaviour is covered by the large-data test below.
 	// Here we verify the helper is callable and returns (0, nil) for an empty DB.
-	p99, err := repo.p99DurationForQuery(session)
+	p99, err := repo.p99DurationForQuery(context.Background(), session)
 	if err != nil {
 		t.Fatalf("p99DurationForQuery (sqlite, empty): %v", err)
 	}
@@ -56,7 +56,7 @@ func TestP99_MySQL_Dispatch(t *testing.T) {
 	baseQuery := repo.db.Model(&Trace{}).Where("tenant_id = ? AND timestamp BETWEEN ? AND ?", "default", now.Add(-time.Hour), now.Add(time.Hour))
 	session := baseQuery.Session(&gorm.Session{})
 
-	p99, err := repo.p99DurationForQuery(session)
+	p99, err := repo.p99DurationForQuery(context.Background(), session)
 	if err != nil {
 		t.Fatalf("p99DurationForQuery (mysql path): %v", err)
 	}
@@ -75,7 +75,7 @@ func TestP99_MySQL_EmptyTable(t *testing.T) {
 	baseQuery := repo.db.Model(&Trace{}).Where("tenant_id = ? AND timestamp BETWEEN ? AND ?", "default", time.Now().Add(-time.Hour), time.Now())
 	session := baseQuery.Session(&gorm.Session{})
 
-	p99, err := repo.p99DurationForQuery(session)
+	p99, err := repo.p99DurationForQuery(context.Background(), session)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -249,4 +249,68 @@ func verifyP99Index(n int) int {
 		idx = n - 1
 	}
 	return idx
+}
+
+// ---------------------------------------------------------------------------
+// Critical 2: verify MySQL branch preserves tenant filter
+// ---------------------------------------------------------------------------
+
+// TestP99_MySQLBranch_PreservesTenantFilter inserts 10 rows for tenant "a"
+// with durations 1000..10000 µs and 10 rows for tenant "b" with durations
+// 100000..1000000 µs. It then calls GetDashboardStats scoped to tenant "a"
+// with r.driver forced to "mysql" and asserts P99Latency == 10000 (tenant "a"
+// p99), not a value contaminated by tenant "b" rows.
+//
+// If the GORM Session+Model dance loses the WHERE clause the Count or Offset
+// calculation will be wrong (n=20 instead of 10) and the p99 will land in
+// tenant "b"'s range (≥100000), causing the assertion to fail.
+func TestP99_MySQLBranch_PreservesTenantFilter(t *testing.T) {
+	repo := newTestRepo(t)
+	repo.driver = "mysql" // force MySQL path on SQLite engine
+
+	now := time.Now().UTC()
+
+	// Tenant "a": durations 1000, 2000, ..., 10000 µs
+	tracesA := make([]Trace, 10)
+	for i := 0; i < 10; i++ {
+		tracesA[i] = Trace{
+			TraceID:     "a-" + p99Itoa(i),
+			ServiceName: "svc",
+			Duration:    int64((i + 1) * 1000),
+			Status:      "OK",
+			Timestamp:   now,
+			TenantID:    "a",
+		}
+	}
+	if err := repo.db.Create(&tracesA).Error; err != nil {
+		t.Fatalf("seed tenant a: %v", err)
+	}
+
+	// Tenant "b": durations 100000, 200000, ..., 1000000 µs (10× larger)
+	tracesB := make([]Trace, 10)
+	for i := 0; i < 10; i++ {
+		tracesB[i] = Trace{
+			TraceID:     "b-" + p99Itoa(i),
+			ServiceName: "svc",
+			Duration:    int64((i + 1) * 100_000),
+			Status:      "OK",
+			Timestamp:   now,
+			TenantID:    "b",
+		}
+	}
+	if err := repo.db.Create(&tracesB).Error; err != nil {
+		t.Fatalf("seed tenant b: %v", err)
+	}
+
+	ctx := WithTenantContext(context.Background(), "a")
+	stats, err := repo.GetDashboardStats(ctx, now.Add(-time.Hour), now.Add(time.Hour), nil)
+	if err != nil {
+		t.Fatalf("GetDashboardStats: %v", err)
+	}
+
+	// ceil(10*0.99)-1 = 9 → tracesA[9].Duration = 10*1000 = 10000
+	const want = int64(10_000)
+	if stats.P99Latency != want {
+		t.Fatalf("P99Latency: want %d (tenant a p99), got %d — tenant filter may be lost in MySQL branch", want, stats.P99Latency)
+	}
 }
