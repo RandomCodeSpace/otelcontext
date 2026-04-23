@@ -7,6 +7,17 @@ import (
 	"testing"
 )
 
+// TestRateLimiter_ExemptsOTLPPaths pins the /v1/* exemption contract.
+//
+// OTLP collectors (Otel SDK, Collector, Alloy, vector, etc.) batch aggressively
+// and a single agent routinely exceeds the 100 RPS/IP default that protects
+// /api/*. Without this exemption, legitimate ingestion traffic — the exact data
+// this platform exists to capture — would get 429'd and dropped. This test
+// locks in the carve-out so a future refactor doesn't silently re-enable
+// throttling on /v1/* and regress ingestion.
+//
+// It also asserts the inverse — that /api/* on the *same* IP is still
+// throttled — so the exemption remains narrow (path-prefix, not blanket).
 func TestRateLimiter_ExemptsOTLPPaths(t *testing.T) {
 	rl := NewRateLimiter(1) // 1 RPS per IP — draconian
 	handler := rl.MiddlewareExcept(func(path string) bool {

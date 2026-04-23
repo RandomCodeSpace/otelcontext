@@ -568,6 +568,27 @@ func main() {
 	httpHandler = api.MetricsMiddleware(metrics, httpHandler)
 	if cfg.APIRateLimitRPS > 0 {
 		rl := api.NewRateLimiter(float64(cfg.APIRateLimitRPS))
+		// OTLP ingestion paths (/v1/*) are exempt from the per-IP rate limiter.
+		//
+		// Why: OTLP collectors batch aggressively and a healthy agent routinely
+		// exceeds the API_RATE_LIMIT_RPS default (100 RPS/IP). Throttling the
+		// ingestion path drops legitimate telemetry — the exact data this
+		// platform exists to capture — so /v1/* bypasses the limiter.
+		//
+		// DoS trade-off (acknowledged): the APIKeyGate runs *downstream* of the
+		// limiter in the middleware chain, which means an unauthenticated
+		// attacker can push /v1/* requests past the (bypassed) limiter all the
+		// way to the auth check before getting a 401. This is acceptable
+		// because APIKeyGate is header-only: it inspects the Authorization
+		// header and returns 401 without parsing the request body, so the
+		// per-request CPU cost is bounded and small (no protobuf decode, no
+		// JSON parse, no DB touch). Layer-4/7 protections (firewall, LB,
+		// WAF, mTLS) remain the primary defense against volumetric abuse.
+		//
+		// TODO: if this trade-off becomes a concern (e.g. abuse observed in
+		// prod, or CPU pressure from 401 storms), add a separate
+		// higher-ceiling OTLP-specific limiter scoped to /v1/* — tuned for
+		// collector-class RPS — rather than lowering the general API limit.
 		httpHandler = rl.MiddlewareExcept(func(path string) bool {
 			return strings.HasPrefix(path, "/v1/")
 		})(httpHandler)
