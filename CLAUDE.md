@@ -214,6 +214,10 @@ Key settings in `internal/config/config.go`:
 - `MCP_ENABLED` (true), `MCP_PATH` (/mcp)
 - `VECTOR_INDEX_MAX_ENTRIES` (100000)
 - `DLQ_MAX_FILES` (1000), `DLQ_MAX_DISK_MB` (500), `DLQ_MAX_RETRIES` (10)
+- `GRAPHRAG_WORKER_COUNT` (4), `GRAPHRAG_EVENT_QUEUE_SIZE` (10000) — raise both at 100+ services if `otelcontext_graphrag_events_dropped_total` climbs
+- `GRPC_MAX_RECV_MB` (16), `GRPC_MAX_CONCURRENT_STREAMS` (1000) — OTLP gRPC server caps, validated to 1..256 and 1..1_000_000
+- `RETENTION_BATCH_SIZE` (50000), `RETENTION_BATCH_SLEEP_MS` (1) — purge pacing; raise the sleep on busy production DBs
+- `APP_ENV` (`"development"`), `OTELCONTEXT_ALLOW_SQLITE_PROD` (false) — SQLite is refused when `APP_ENV=production` unless the allow flag is set
 
 ### Authentication
 

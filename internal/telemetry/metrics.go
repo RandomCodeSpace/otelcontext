@@ -13,6 +13,13 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
+// Metric naming convention: historical metrics use the PascalCase
+// `OtelContext_*` prefix; all metrics added during the backend-robustness
+// initiative (and later) use the Prometheus-idiomatic lowercase
+// `otelcontext_*` prefix. Both are kept for backward compatibility —
+// operators querying by prefix should match `(?i)^otelcontext_`. Migrate
+// the legacy names when a major version bump is acceptable.
+
 // Metrics holds all internal Prometheus metrics for OtelContext self-monitoring.
 type Metrics struct {
 	// --- Existing ---
