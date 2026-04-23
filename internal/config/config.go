@@ -298,6 +298,17 @@ func (c *Config) Validate() error {
 	if c.APIRateLimitRPS < 0 {
 		return fmt.Errorf("API_RATE_LIMIT_RPS must be >= 0, got %d", c.APIRateLimitRPS)
 	}
+	// gRPC receive cap: must be positive, and capped to prevent per-message OOM
+	// from a bad env value (the limit pre-allocates a buffer of this size on
+	// the first large message). 256 MiB is far beyond any legitimate OTLP batch
+	// and still small enough that a 200-connection flood cannot exhaust a host
+	// with typical RAM.
+	if c.GRPCMaxRecvMB < 1 || c.GRPCMaxRecvMB > 256 {
+		return fmt.Errorf("GRPC_MAX_RECV_MB must be between 1 and 256, got %d", c.GRPCMaxRecvMB)
+	}
+	if c.GRPCMaxConcurrentStreams < 1 || c.GRPCMaxConcurrentStreams > 1_000_000 {
+		return fmt.Errorf("GRPC_MAX_CONCURRENT_STREAMS must be between 1 and 1000000, got %d", c.GRPCMaxConcurrentStreams)
+	}
 	if c.DBMaxOpenConns < 1 {
 		return fmt.Errorf("DB_MAX_OPEN_CONNS must be >= 1, got %d", c.DBMaxOpenConns)
 	}

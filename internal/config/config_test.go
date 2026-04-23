@@ -21,6 +21,8 @@ func baseValid() *Config {
 		DBMaxOpenConns:       50,
 		DBMaxIdleConns:       10,
 		CompressionLevel:     "default",
+		GRPCMaxRecvMB:            16,
+		GRPCMaxConcurrentStreams: 1000,
 	}
 }
 
