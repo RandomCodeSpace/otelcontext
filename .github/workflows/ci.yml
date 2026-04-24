@@ -8,16 +8,30 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
-  security-events: write
-  id-token: write
-  actions: read
+  contents: read
 
 jobs:
-  pipeline:
-    uses: RandomCodeSpace/central-ops/.github/workflows/reusable-pipeline.yml@main
-    secrets: inherit
-    with:
-      go_version_file: go.mod
-      cgo_enabled: "1"
-      go_test_flags: "-race -timeout 120s"
+  build-and-test:
+    name: build · vet · test
+    runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go build
+        run: go build ./...
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test (race)
+        run: go test -race -timeout 180s ./...
+
+      - name: loadsim build tag compiles
+        run: go build -tags loadtest ./test/loadsim/...
