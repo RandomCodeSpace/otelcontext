@@ -4,11 +4,23 @@ import (
 	"context"
 	"fmt"
 	"time"
+
+	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 )
 
-// detectAnomalies runs anomaly detection across all services.
-func (g *GraphRAG) detectAnomalies() {
-	services := g.ServiceStore.AllServices()
+// detectAnomalies runs anomaly detection across every known tenant. For each
+// tenant slice we walk the ServiceStore and SignalStore under their own
+// locks and emit anomalies into that tenant's AnomalyStore.
+func (g *GraphRAG) detectAnomalies(ctx context.Context) {
+	tenants := g.snapshotTenants()
+	for tenant, stores := range tenants {
+		tctx := storage.WithTenantContext(ctx, tenant)
+		g.detectAnomaliesForTenant(tctx, tenant, stores)
+	}
+}
+
+func (g *GraphRAG) detectAnomaliesForTenant(ctx context.Context, tenant string, stores *tenantStores) {
+	services := stores.service.AllServices()
 	now := time.Now()
 
 	for _, svc := range services {
@@ -23,14 +35,14 @@ func (g *GraphRAG) detectAnomalies() {
 				Evidence:  fmt.Sprintf("error rate %.1f%% (baseline ~%.1f%%)", svc.ErrorRate*100, baselineErrorRate*100),
 				Timestamp: now,
 			}
-			g.AnomalyStore.AddAnomaly(anomaly)
-			g.correlateWithRecent(anomaly)
+			stores.anomalies.AddAnomaly(anomaly)
+			correlateWithRecent(stores, anomaly)
 
-			// Trigger investigation
-			chains := g.ErrorChain(svc.Name, now.Add(-5*time.Minute), 5)
+			// Trigger investigation (scoped to this tenant).
+			chains := g.ErrorChain(ctx, svc.Name, now.Add(-5*time.Minute), 5)
 			if len(chains) > 0 {
-				anomalies := g.AnomalyStore.AnomaliesForService(svc.Name, now.Add(-1*time.Minute))
-				g.PersistInvestigation(svc.Name, chains, anomalies)
+				anomalies := stores.anomalies.AnomaliesForService(svc.Name, now.Add(-1*time.Minute))
+				g.PersistInvestigation(tenant, svc.Name, chains, anomalies)
 			}
 		}
 
@@ -44,18 +56,18 @@ func (g *GraphRAG) detectAnomalies() {
 				Evidence:  fmt.Sprintf("avg latency %.0fms", svc.AvgLatency),
 				Timestamp: now,
 			}
-			g.AnomalyStore.AddAnomaly(anomaly)
-			g.correlateWithRecent(anomaly)
+			stores.anomalies.AddAnomaly(anomaly)
+			correlateWithRecent(stores, anomaly)
 		}
 	}
 
-	// Metric z-score anomalies (check metrics in SignalStore)
-	g.SignalStore.mu.RLock()
-	metrics := make([]*MetricNode, 0, len(g.SignalStore.Metrics))
-	for _, m := range g.SignalStore.Metrics {
+	// Metric z-score anomalies (check metrics in this tenant's SignalStore).
+	stores.signals.mu.RLock()
+	metrics := make([]*MetricNode, 0, len(stores.signals.Metrics))
+	for _, m := range stores.signals.Metrics {
 		metrics = append(metrics, m)
 	}
-	g.SignalStore.mu.RUnlock()
+	stores.signals.mu.RUnlock()
 
 	for _, m := range metrics {
 		if m.SampleCount < 10 {
@@ -74,23 +86,24 @@ func (g *GraphRAG) detectAnomalies() {
 					Evidence:  fmt.Sprintf("metric %s z-score %.1f (avg=%.2f, range=[%.2f, %.2f])", m.MetricName, deviation, m.RollingAvg, m.RollingMin, m.RollingMax),
 					Timestamp: now,
 				}
-				g.AnomalyStore.AddAnomaly(anomaly)
-				g.correlateWithRecent(anomaly)
+				stores.anomalies.AddAnomaly(anomaly)
+				correlateWithRecent(stores, anomaly)
 			}
 		}
 	}
 }
 
-// correlateWithRecent links an anomaly to other anomalies within ±30s.
-func (g *GraphRAG) correlateWithRecent(anomaly AnomalyNode) {
+// correlateWithRecent links an anomaly to other anomalies within ±30s in the
+// same tenant's AnomalyStore.
+func correlateWithRecent(stores *tenantStores, anomaly AnomalyNode) {
 	window := 30 * time.Second
-	recent := g.AnomalyStore.AnomaliesSince(anomaly.Timestamp.Add(-window))
+	recent := stores.anomalies.AnomaliesSince(anomaly.Timestamp.Add(-window))
 	for _, prev := range recent {
 		if prev.ID == anomaly.ID {
 			continue
 		}
 		if prev.Timestamp.After(anomaly.Timestamp.Add(-window)) && prev.Timestamp.Before(anomaly.Timestamp.Add(window)) {
-			g.AnomalyStore.AddPrecededByEdge(anomaly.ID, prev.ID, anomaly.Timestamp)
+			stores.anomalies.AddPrecededByEdge(anomaly.ID, prev.ID, anomaly.Timestamp)
 		}
 	}
 }
@@ -117,20 +130,23 @@ func classifyLatencySeverity(avgMs float64) AnomalySeverity {
 	}
 }
 
-// pruneOldAnomalies removes anomalies older than 24 hours.
+// pruneOldAnomalies removes anomalies older than 24 hours across every
+// tenant slice.
 func (g *GraphRAG) pruneOldAnomalies() {
 	cutoff := time.Now().Add(-24 * time.Hour)
-	g.AnomalyStore.mu.Lock()
-	defer g.AnomalyStore.mu.Unlock()
-	for id, a := range g.AnomalyStore.Anomalies {
-		if a.Timestamp.Before(cutoff) {
-			delete(g.AnomalyStore.Anomalies, id)
+	for _, stores := range g.snapshotTenants() {
+		stores.anomalies.mu.Lock()
+		for id, a := range stores.anomalies.Anomalies {
+			if a.Timestamp.Before(cutoff) {
+				delete(stores.anomalies.Anomalies, id)
+			}
 		}
-	}
-	for ek, e := range g.AnomalyStore.Edges {
-		if e.UpdatedAt.Before(cutoff) {
-			delete(g.AnomalyStore.Edges, ek)
+		for ek, e := range stores.anomalies.Edges {
+			if e.UpdatedAt.Before(cutoff) {
+				delete(stores.anomalies.Edges, ek)
+			}
 		}
+		stores.anomalies.mu.Unlock()
 	}
 }
 
@@ -145,7 +161,7 @@ func (g *GraphRAG) anomalyLoop(ctx context.Context) {
 		case <-g.stopCh:
 			return
 		case <-ticker.C:
-			g.detectAnomalies()
+			g.detectAnomalies(ctx)
 		}
 	}
 }

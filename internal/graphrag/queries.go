@@ -1,18 +1,23 @@
 package graphrag
 
 import (
+	"context"
 	"math"
 	"sort"
 	"time"
 )
 
 // ErrorChain traces error spans upstream to find the root cause service.
-func (g *GraphRAG) ErrorChain(service string, since time.Time, limit int) []ErrorChainResult {
+// The tenant slice is selected via ctx — callers without a tenant ctx
+// collapse to storage.DefaultTenantID at the coordinator boundary.
+func (g *GraphRAG) ErrorChain(ctx context.Context, service string, since time.Time, limit int) []ErrorChainResult {
 	if limit <= 0 {
 		limit = 10
 	}
 
-	errorSpans := g.TraceStore.ErrorSpans(service, since)
+	stores := g.storesFor(ctx)
+
+	errorSpans := stores.traces.ErrorSpans(service, since)
 	if len(errorSpans) > limit {
 		errorSpans = errorSpans[:limit]
 	}
@@ -26,7 +31,7 @@ func (g *GraphRAG) ErrorChain(service string, since time.Time, limit int) []Erro
 		}
 		seen[span.TraceID] = true
 
-		chain := g.traceErrorChainUpstream(span)
+		chain := traceErrorChainUpstream(stores, span)
 		if len(chain) == 0 {
 			continue
 		}
@@ -46,7 +51,7 @@ func (g *GraphRAG) ErrorChain(service string, since time.Time, limit int) []Erro
 		// Gather correlated logs
 		for _, s := range chain {
 			if s.IsError {
-				clusters := g.SignalStore.LogClustersForService(s.Service)
+				clusters := stores.signals.LogClustersForService(s.Service)
 				for _, lc := range clusters {
 					if lc.LastSeen.After(since) {
 						result.CorrelatedLogs = append(result.CorrelatedLogs, *lc)
@@ -61,8 +66,9 @@ func (g *GraphRAG) ErrorChain(service string, since time.Time, limit int) []Erro
 	return results
 }
 
-// traceErrorChainUpstream walks CHILD_OF edges upstream from an error span to the root.
-func (g *GraphRAG) traceErrorChainUpstream(span *SpanNode) []SpanNode {
+// traceErrorChainUpstream walks CHILD_OF edges upstream from an error span to
+// the root within a single tenant's TraceStore.
+func traceErrorChainUpstream(stores *tenantStores, span *SpanNode) []SpanNode {
 	var chain []SpanNode
 	visited := make(map[string]bool)
 	current := span
@@ -74,7 +80,7 @@ func (g *GraphRAG) traceErrorChainUpstream(span *SpanNode) []SpanNode {
 		if current.ParentSpanID == "" {
 			break
 		}
-		parent, ok := g.TraceStore.GetSpan(current.ParentSpanID)
+		parent, ok := stores.traces.GetSpan(current.ParentSpanID)
 		if !ok {
 			break
 		}
@@ -85,10 +91,12 @@ func (g *GraphRAG) traceErrorChainUpstream(span *SpanNode) []SpanNode {
 }
 
 // ImpactAnalysis performs BFS downstream from a service to find affected services.
-func (g *GraphRAG) ImpactAnalysis(service string, maxDepth int) *ImpactResult {
+func (g *GraphRAG) ImpactAnalysis(ctx context.Context, service string, maxDepth int) *ImpactResult {
 	if maxDepth <= 0 {
 		maxDepth = 5
 	}
+
+	stores := g.storesFor(ctx)
 
 	result := &ImpactResult{Service: service}
 	visited := map[string]bool{service: true}
@@ -107,14 +115,14 @@ func (g *GraphRAG) ImpactAnalysis(service string, maxDepth int) *ImpactResult {
 			continue
 		}
 
-		edges := g.ServiceStore.CallEdgesFrom(item.svc)
+		edges := stores.service.CallEdgesFrom(item.svc)
 		for _, e := range edges {
 			if visited[e.ToID] {
 				continue
 			}
 			visited[e.ToID] = true
 
-			svc, _ := g.ServiceStore.GetService(e.ToID)
+			svc, _ := stores.service.GetService(e.ToID)
 			impact := 1.0
 			if svc != nil {
 				impact = 1.0 - svc.HealthScore
@@ -136,9 +144,10 @@ func (g *GraphRAG) ImpactAnalysis(service string, maxDepth int) *ImpactResult {
 }
 
 // RootCauseAnalysis combines ErrorChain with anomaly correlation to rank probable causes.
-func (g *GraphRAG) RootCauseAnalysis(service string, since time.Time) []RankedCause {
-	errorChains := g.ErrorChain(service, since, 20)
-	anomalies := g.AnomalyStore.AnomaliesForService(service, since)
+func (g *GraphRAG) RootCauseAnalysis(ctx context.Context, service string, since time.Time) []RankedCause {
+	stores := g.storesFor(ctx)
+	errorChains := g.ErrorChain(ctx, service, since, 20)
+	anomalies := stores.anomalies.AnomaliesForService(service, since)
 
 	// Score services by how often they appear as root cause
 	causeScores := make(map[string]*RankedCause)
@@ -197,8 +206,9 @@ func (g *GraphRAG) RootCauseAnalysis(service string, since time.Time) []RankedCa
 }
 
 // DependencyChain returns the full span tree for a trace.
-func (g *GraphRAG) DependencyChain(traceID string) []SpanNode {
-	spans := g.TraceStore.SpansForTrace(traceID)
+func (g *GraphRAG) DependencyChain(ctx context.Context, traceID string) []SpanNode {
+	stores := g.storesFor(ctx)
+	spans := stores.traces.SpansForTrace(traceID)
 	out := make([]SpanNode, len(spans))
 	for i, s := range spans {
 		out[i] = *s
@@ -219,11 +229,12 @@ type CorrelatedSignalsResult struct {
 	ErrorChains []ErrorChainResult `json:"error_chains,omitempty"`
 }
 
-func (g *GraphRAG) CorrelatedSignals(service string, since time.Time) *CorrelatedSignalsResult {
+func (g *GraphRAG) CorrelatedSignals(ctx context.Context, service string, since time.Time) *CorrelatedSignalsResult {
+	stores := g.storesFor(ctx)
 	result := &CorrelatedSignalsResult{Service: service}
 
 	// Error logs
-	clusters := g.SignalStore.LogClustersForService(service)
+	clusters := stores.signals.LogClustersForService(service)
 	for _, lc := range clusters {
 		if lc.LastSeen.After(since) {
 			result.ErrorLogs = append(result.ErrorLogs, *lc)
@@ -231,29 +242,30 @@ func (g *GraphRAG) CorrelatedSignals(service string, since time.Time) *Correlate
 	}
 
 	// Metrics
-	metrics := g.SignalStore.MetricsForService(service)
+	metrics := stores.signals.MetricsForService(service)
 	for _, m := range metrics {
 		result.Metrics = append(result.Metrics, *m)
 	}
 
 	// Anomalies
-	anomalies := g.AnomalyStore.AnomaliesForService(service, since)
+	anomalies := stores.anomalies.AnomaliesForService(service, since)
 	for _, a := range anomalies {
 		result.Anomalies = append(result.Anomalies, *a)
 	}
 
 	// Recent error chains
-	result.ErrorChains = g.ErrorChain(service, since, 5)
+	result.ErrorChains = g.ErrorChain(ctx, service, since, 5)
 
 	return result
 }
 
 // ShortestPath finds the shortest path between two services using Dijkstra.
-func (g *GraphRAG) ShortestPath(from, to string) []string {
+func (g *GraphRAG) ShortestPath(ctx context.Context, from, to string) []string {
+	stores := g.storesFor(ctx)
 	// Build adjacency from CALLS edges
-	g.ServiceStore.mu.RLock()
+	stores.service.mu.RLock()
 	adj := make(map[string]map[string]float64)
-	for _, e := range g.ServiceStore.Edges {
+	for _, e := range stores.service.Edges {
 		if e.Type != EdgeCalls {
 			continue
 		}
@@ -271,7 +283,7 @@ func (g *GraphRAG) ShortestPath(from, to string) []string {
 		}
 		adj[e.ToID][e.FromID] = weight
 	}
-	g.ServiceStore.mu.RUnlock()
+	stores.service.mu.RUnlock()
 
 	// Dijkstra
 	dist := map[string]float64{from: 0}
@@ -320,12 +332,27 @@ func (g *GraphRAG) ShortestPath(from, to string) []string {
 }
 
 // AnomalyTimeline returns recent anomalies sorted by time.
-func (g *GraphRAG) AnomalyTimeline(since time.Time) []*AnomalyNode {
-	anomalies := g.AnomalyStore.AnomaliesSince(since)
+func (g *GraphRAG) AnomalyTimeline(ctx context.Context, since time.Time) []*AnomalyNode {
+	stores := g.storesFor(ctx)
+	anomalies := stores.anomalies.AnomaliesSince(since)
 	sort.Slice(anomalies, func(i, j int) bool {
 		return anomalies[i].Timestamp.After(anomalies[j].Timestamp)
 	})
 	return anomalies
+}
+
+// AnomaliesForService is a tenant-aware read-through to the per-tenant
+// AnomalyStore, exported so handlers outside this package never need to
+// reach into the store maps directly.
+func (g *GraphRAG) AnomaliesForService(ctx context.Context, service string, since time.Time) []*AnomalyNode {
+	return g.storesFor(ctx).anomalies.AnomaliesForService(service, since)
+}
+
+// AllServiceEdges returns every edge in the caller's tenant's ServiceStore.
+// Kept as a narrow helper so API handlers do not need to traverse the
+// tenantStores composite themselves.
+func (g *GraphRAG) AllServiceEdges(ctx context.Context) []*Edge {
+	return g.storesFor(ctx).service.AllEdges()
 }
 
 // ServiceMap returns the service topology with health scores for the API.
@@ -336,25 +363,26 @@ type ServiceMapEntry struct {
 	CalledBy   []*Edge          `json:"called_by,omitempty"`
 }
 
-func (g *GraphRAG) ServiceMap(depth int) []ServiceMapEntry {
-	services := g.ServiceStore.AllServices()
+func (g *GraphRAG) ServiceMap(ctx context.Context, depth int) []ServiceMapEntry {
+	stores := g.storesFor(ctx)
+	services := stores.service.AllServices()
 	result := make([]ServiceMapEntry, 0, len(services))
 
 	for _, svc := range services {
 		entry := ServiceMapEntry{
 			Service:  svc,
-			CallsTo:  g.ServiceStore.CallEdgesFrom(svc.Name),
-			CalledBy: g.ServiceStore.CallEdgesTo(svc.Name),
+			CallsTo:  stores.service.CallEdgesFrom(svc.Name),
+			CalledBy: stores.service.CallEdgesTo(svc.Name),
 		}
 
 		// Get operations for this service
-		g.ServiceStore.mu.RLock()
-		for _, op := range g.ServiceStore.Operations {
+		stores.service.mu.RLock()
+		for _, op := range stores.service.Operations {
 			if op.Service == svc.Name {
 				entry.Operations = append(entry.Operations, op)
 			}
 		}
-		g.ServiceStore.mu.RUnlock()
+		stores.service.mu.RUnlock()
 
 		result = append(result, entry)
 	}

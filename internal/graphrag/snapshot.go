@@ -1,13 +1,22 @@
 package graphrag
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"time"
+
+	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 )
 
 // GraphSnapshot is a periodic snapshot of the service topology persisted to DB.
+//
+// Tenant identity is not yet a column on this model — Subtask B (RAN-38) adds
+// `tenant_id` to the schema along with the persistence-layer filtering. For
+// now, snapshots are written one row per tenant per tick and remain queryable
+// only across the whole table; callers must not treat pre-Subtask-B rows as
+// tenant-scoped.
 type GraphSnapshot struct {
 	ID             string          `gorm:"primaryKey;size:64" json:"id"`
 	CreatedAt      time.Time       `json:"created_at"`
@@ -43,10 +52,19 @@ type snapshotEdge struct {
 	ErrorRate float64 `json:"error_rate"`
 }
 
-// takeSnapshot captures the current service topology and persists it.
-func (g *GraphRAG) takeSnapshot() {
-	services := g.ServiceStore.AllServices()
-	edges := g.ServiceStore.AllEdges()
+// takeSnapshot captures each tenant's current service topology and persists
+// one row per tenant per tick. See the note on GraphSnapshot regarding the
+// upcoming tenant_id column in Subtask B.
+func (g *GraphRAG) takeSnapshot(ctx context.Context) {
+	for tenant, stores := range g.snapshotTenants() {
+		tctx := storage.WithTenantContext(ctx, tenant)
+		g.takeSnapshotForTenant(tctx, tenant, stores)
+	}
+}
+
+func (g *GraphRAG) takeSnapshotForTenant(_ context.Context, tenant string, stores *tenantStores) {
+	services := stores.service.AllServices()
+	edges := stores.service.AllEdges()
 
 	if len(services) == 0 {
 		return
@@ -69,9 +87,9 @@ func (g *GraphRAG) takeSnapshot() {
 		totalHealth += svc.HealthScore
 	}
 
-	// Also include operations
-	g.ServiceStore.mu.RLock()
-	for _, op := range g.ServiceStore.Operations {
+	// Also include operations for this tenant.
+	stores.service.mu.RLock()
+	for _, op := range stores.service.Operations {
 		nodes = append(nodes, snapshotNode{
 			ID:          op.ID,
 			Type:        "operation",
@@ -81,7 +99,7 @@ func (g *GraphRAG) takeSnapshot() {
 			AvgLatency:  op.AvgLatency,
 		})
 	}
-	g.ServiceStore.mu.RUnlock()
+	stores.service.mu.RUnlock()
 
 	var snapEdges []snapshotEdge
 	for _, e := range edges {
@@ -99,7 +117,7 @@ func (g *GraphRAG) takeSnapshot() {
 	edgesJSON, _ := json.Marshal(snapEdges)
 
 	snap := GraphSnapshot{
-		ID:             fmt.Sprintf("snap_%d", time.Now().UnixNano()),
+		ID:             fmt.Sprintf("snap_%s_%d", tenant, time.Now().UnixNano()),
 		CreatedAt:      time.Now(),
 		Nodes:          nodesJSON,
 		Edges:          edgesJSON,
@@ -108,16 +126,26 @@ func (g *GraphRAG) takeSnapshot() {
 		AvgHealthScore: totalHealth / float64(len(services)),
 	}
 
+	if g.repo == nil || g.repo.DB() == nil {
+		return
+	}
 	if err := g.repo.DB().Create(&snap).Error; err != nil {
-		slog.Error("Failed to persist graph snapshot", "error", err)
+		slog.Error("Failed to persist graph snapshot", "tenant", tenant, "error", err)
 		return
 	}
 
-	slog.Debug("Graph snapshot persisted", "services", len(services), "edges", len(snapEdges))
+	slog.Debug("Graph snapshot persisted",
+		"tenant", tenant,
+		"services", len(services),
+		"edges", len(snapEdges),
+	)
 }
 
 // pruneOldSnapshots removes snapshots older than 7 days.
 func (g *GraphRAG) pruneOldSnapshots() {
+	if g.repo == nil || g.repo.DB() == nil {
+		return
+	}
 	cutoff := time.Now().AddDate(0, 0, -7)
 	result := g.repo.DB().Where("created_at < ?", cutoff).Delete(&GraphSnapshot{})
 	if result.Error != nil {
@@ -128,6 +156,7 @@ func (g *GraphRAG) pruneOldSnapshots() {
 }
 
 // GetGraphSnapshot retrieves the snapshot closest to the requested time.
+// TODO(RAN-38, Subtask B): scope by tenant once tenant_id lands on the table.
 func (g *GraphRAG) GetGraphSnapshot(at time.Time) (*GraphSnapshot, error) {
 	var snap GraphSnapshot
 	err := g.repo.DB().

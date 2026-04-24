@@ -52,6 +52,7 @@ func TestOnSpanIngested_PropagatesErrorStatus(t *testing.T) {
 	g := newTestGraphRAG(t)
 
 	errSpan := storage.Span{
+		TenantID:      storage.DefaultTenantID,
 		TraceID:       "trace-err",
 		SpanID:        "span-err",
 		OperationName: "/checkout",
@@ -63,9 +64,10 @@ func TestOnSpanIngested_PropagatesErrorStatus(t *testing.T) {
 	g.OnSpanIngested(errSpan)
 
 	// Event loop is async; poll briefly for the event to be processed.
+	stores := g.storesForTenant(storage.DefaultTenantID)
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if svc, ok := g.ServiceStore.GetService("orders"); ok && svc.ErrorCount > 0 {
+		if svc, ok := stores.service.GetService("orders"); ok && svc.ErrorCount > 0 {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
@@ -80,9 +82,10 @@ func TestOnSpanIngested_PropagatesErrorStatus(t *testing.T) {
 func TestRefresh_PopulatesErrorCountFromDBStatus(t *testing.T) {
 	repo := newTestRepo(t)
 
-	// Seed: one trace + one ERROR span under it.
+	// Seed: one trace + one ERROR span under it, on the default tenant.
 	now := time.Now()
 	tr := storage.Trace{
+		TenantID:    storage.DefaultTenantID,
 		TraceID:     "trace-err-refresh",
 		ServiceName: "orders",
 		Duration:    1000,
@@ -93,6 +96,7 @@ func TestRefresh_PopulatesErrorCountFromDBStatus(t *testing.T) {
 		t.Fatalf("seed trace: %v", err)
 	}
 	sp := storage.Span{
+		TenantID:      storage.DefaultTenantID,
 		TraceID:       "trace-err-refresh",
 		SpanID:        "span-err-refresh",
 		OperationName: "/checkout",
@@ -111,11 +115,12 @@ func TestRefresh_PopulatesErrorCountFromDBStatus(t *testing.T) {
 	g := New(repo, nil, nil, nil, DefaultConfig())
 	t.Cleanup(g.Stop)
 
-	g.rebuildFromDB()
+	g.rebuildAllTenantsFromDB(context.Background())
 
-	svc, ok := g.ServiceStore.GetService("orders")
+	stores := g.storesForTenant(storage.DefaultTenantID)
+	svc, ok := stores.service.GetService("orders")
 	if !ok {
-		t.Fatalf("service 'orders' missing after rebuildFromDB")
+		t.Fatalf("service 'orders' missing after rebuildAllTenantsFromDB")
 	}
 	if svc.ErrorCount < 1 {
 		t.Fatalf("ErrorCount=%d after refresh, want >=1 — status not read from DB", svc.ErrorCount)

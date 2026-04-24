@@ -7,6 +7,8 @@ import (
 	"math"
 	"net/http"
 	"time"
+
+	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 )
 
 // SystemSummary is the top-level system health summary.
@@ -63,10 +65,12 @@ var OtelContextStartTime = time.Now()
 // handleGetSystemGraph handles GET /api/system/graph.
 // When the in-memory graph has been populated it returns instantly from memory.
 // Falls back to a DB query only when the graph has never been built yet.
-// Results are additionally cached for 10s to smooth out burst traffic.
+// Results are cached for 10s per tenant — the cache key is scoped by tenant
+// so two tenants hitting this endpoint never share a response.
 func (s *Server) handleGetSystemGraph(w http.ResponseWriter, r *http.Request) {
-	const cacheKey = "system_graph"
 	const cacheTTL = 10 * time.Second
+	ctx := r.Context()
+	cacheKey := "system_graph:" + storage.TenantFromContext(ctx)
 
 	if cached, ok := s.cache.Get(cacheKey); ok {
 		w.Header().Set("Content-Type", "application/json")
@@ -75,10 +79,10 @@ func (s *Server) handleGetSystemGraph(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp := s.buildGraphFromMemory()
+	resp := s.buildGraphFromMemory(ctx)
 	if resp == nil {
 		// Graph not yet hydrated — fall back to DB path.
-		resp = s.buildGraphFromDB(r.Context())
+		resp = s.buildGraphFromDB(ctx)
 		if resp == nil {
 			http.Error(w, "failed to build system graph", http.StatusInternalServerError)
 			return
@@ -93,10 +97,10 @@ func (s *Server) handleGetSystemGraph(w http.ResponseWriter, r *http.Request) {
 
 // buildGraphFromMemory converts the in-memory graph snapshot to the API response.
 // Returns nil if the graph has not been built yet.
-func (s *Server) buildGraphFromMemory() *SystemGraphResponse {
+func (s *Server) buildGraphFromMemory(ctx context.Context) *SystemGraphResponse {
 	// Prefer GraphRAG if available
 	if s.graphRAG != nil {
-		return s.buildGraphFromGraphRAG()
+		return s.buildGraphFromGraphRAG(ctx)
 	}
 	if s.graph == nil {
 		return nil
@@ -147,9 +151,10 @@ func (s *Server) buildGraphFromMemory() *SystemGraphResponse {
 	return buildSummaryResponse(nodes, edges, totalErrorRate, totalLatency)
 }
 
-// buildGraphFromGraphRAG converts the GraphRAG service store into the API response.
-func (s *Server) buildGraphFromGraphRAG() *SystemGraphResponse {
-	services := s.graphRAG.ServiceMap(0)
+// buildGraphFromGraphRAG converts the caller's tenant slice of the GraphRAG
+// service store into the API response.
+func (s *Server) buildGraphFromGraphRAG(ctx context.Context) *SystemGraphResponse {
+	services := s.graphRAG.ServiceMap(ctx, 0)
 	if len(services) == 0 {
 		return nil
 	}
@@ -179,7 +184,7 @@ func (s *Server) buildGraphFromGraphRAG() *SystemGraphResponse {
 	}
 
 	edges := make([]GraphEdge, 0)
-	allEdges := s.graphRAG.ServiceStore.AllEdges()
+	allEdges := s.graphRAG.AllServiceEdges(ctx)
 	for _, e := range allEdges {
 		if e.Type == "CALLS" {
 			edges = append(edges, GraphEdge{

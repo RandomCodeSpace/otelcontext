@@ -6,6 +6,27 @@ import (
 	"time"
 )
 
+// tenantStores bundles one tenant's slice of the four layered in-memory
+// stores. Every mutation and query lands in exactly one composite, keyed by
+// tenant ID in the coordinator (see storesFor / storesForTenant in builder.go).
+// Storage is lazily created on first reference — empty-tenant contexts coerce
+// to storage.DefaultTenantID at the lookup boundary.
+type tenantStores struct {
+	service   *ServiceStore
+	traces    *TraceStore
+	signals   *SignalStore
+	anomalies *AnomalyStore
+}
+
+func newTenantStores(traceTTL time.Duration) *tenantStores {
+	return &tenantStores{
+		service:   newServiceStore(),
+		traces:    newTraceStore(traceTTL),
+		signals:   newSignalStore(),
+		anomalies: newAnomalyStore(),
+	}
+}
+
 // ServiceStore holds permanent service topology data.
 type ServiceStore struct {
 	mu         sync.RWMutex

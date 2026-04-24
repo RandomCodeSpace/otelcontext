@@ -304,21 +304,21 @@ func (s *Server) toolHandler(ctx context.Context, name string, args map[string]a
 	case "get_storage_status":
 		return s.toolGetStorageStatus()
 	case "find_similar_logs":
-		return s.toolFindSimilarLogs(args)
+		return s.toolFindSimilarLogs(ctx, args)
 	case "get_alerts":
 		return s.toolGetAlerts()
 	case "get_service_map":
-		return s.toolGetServiceMap(args)
+		return s.toolGetServiceMap(ctx, args)
 	case "get_error_chains":
-		return s.toolGetErrorChains(args)
+		return s.toolGetErrorChains(ctx, args)
 	case "trace_graph":
 		return s.toolTraceGraph(ctx, args)
 	case "impact_analysis":
-		return s.toolImpactAnalysis(args)
+		return s.toolImpactAnalysis(ctx, args)
 	case "root_cause_analysis":
-		return s.toolRootCauseAnalysis(args)
+		return s.toolRootCauseAnalysis(ctx, args)
 	case "correlated_signals":
-		return s.toolCorrelatedSignals(args)
+		return s.toolCorrelatedSignals(ctx, args)
 	case "get_investigations":
 		return s.toolGetInvestigations(args)
 	case "get_investigation":
@@ -326,7 +326,7 @@ func (s *Server) toolHandler(ctx context.Context, name string, args map[string]a
 	case "get_graph_snapshot":
 		return s.toolGetGraphSnapshot(args)
 	case "get_anomaly_timeline":
-		return s.toolGetAnomalyTimeline(args)
+		return s.toolGetAnomalyTimeline(ctx, args)
 	default:
 		return errorResult(fmt.Sprintf("unknown tool: %s", name))
 	}
@@ -575,7 +575,10 @@ func (s *Server) toolGetStorageStatus() ToolCallResult {
 	return textResult(string(data))
 }
 
-func (s *Server) toolFindSimilarLogs(args map[string]any) ToolCallResult {
+// toolFindSimilarLogs returns logs semantically similar to the query text
+// scoped to the tenant resolved from the MCP transport (X-Tenant-ID header or
+// the server's default tenant). Cross-tenant rows are never returned.
+func (s *Server) toolFindSimilarLogs(ctx context.Context, args map[string]any) ToolCallResult {
 	query, _ := args["query"].(string)
 	if query == "" {
 		return errorResult("query is required")
@@ -587,7 +590,8 @@ func (s *Server) toolFindSimilarLogs(args map[string]any) ToolCallResult {
 	if s.vectorIdx == nil {
 		return errorResult("vector index not yet initialized")
 	}
-	results := s.vectorIdx.Search(query, limit)
+	tenant := storage.TenantFromContext(mcpCtx(ctx))
+	results := s.vectorIdx.Search(tenant, query, limit)
 	data, err := json.MarshalIndent(results, "", "  ")
 	if err != nil {
 		return errorResult(fmt.Sprintf("failed to marshal similar logs: %v", err))
@@ -629,12 +633,12 @@ func (s *Server) toolGetAlerts() ToolCallResult {
 
 // --- GraphRAG Tool implementations ---
 
-func (s *Server) toolGetServiceMap(args map[string]any) ToolCallResult {
+func (s *Server) toolGetServiceMap(ctx context.Context, args map[string]any) ToolCallResult {
 	if s.graphRAG == nil {
 		return errorResult("GraphRAG not initialized")
 	}
 	depth := argInt(args, "depth", 3)
-	result := s.graphRAG.ServiceMap(depth)
+	result := s.graphRAG.ServiceMap(mcpCtx(ctx), depth)
 	data, err := json.MarshalIndent(result, "", "  ")
 	if err != nil {
 		return errorResult(fmt.Sprintf("failed to marshal service map: %v", err))
@@ -642,7 +646,7 @@ func (s *Server) toolGetServiceMap(args map[string]any) ToolCallResult {
 	return textResult(string(data))
 }
 
-func (s *Server) toolGetErrorChains(args map[string]any) ToolCallResult {
+func (s *Server) toolGetErrorChains(ctx context.Context, args map[string]any) ToolCallResult {
 	if s.graphRAG == nil {
 		return errorResult("GraphRAG not initialized")
 	}
@@ -654,7 +658,7 @@ func (s *Server) toolGetErrorChains(args map[string]any) ToolCallResult {
 	parseTimeRange(args, "time_range", &since)
 	limit := argInt(args, "limit", 10)
 
-	chains := s.graphRAG.ErrorChain(svcName, since, limit)
+	chains := s.graphRAG.ErrorChain(mcpCtx(ctx), svcName, since, limit)
 	data, err := json.MarshalIndent(chains, "", "  ")
 	if err != nil {
 		return errorResult(fmt.Sprintf("failed to marshal error chains: %v", err))
@@ -670,7 +674,7 @@ func (s *Server) toolTraceGraph(ctx context.Context, args map[string]any) ToolCa
 	if traceID == "" {
 		return errorResult("trace_id is required")
 	}
-	spans := s.graphRAG.DependencyChain(traceID)
+	spans := s.graphRAG.DependencyChain(mcpCtx(ctx), traceID)
 	if len(spans) == 0 {
 		// Fallback to DB
 		trace, err := s.repo.GetTrace(mcpCtx(ctx), traceID)
@@ -690,7 +694,7 @@ func (s *Server) toolTraceGraph(ctx context.Context, args map[string]any) ToolCa
 	return textResult(string(data))
 }
 
-func (s *Server) toolImpactAnalysis(args map[string]any) ToolCallResult {
+func (s *Server) toolImpactAnalysis(ctx context.Context, args map[string]any) ToolCallResult {
 	if s.graphRAG == nil {
 		return errorResult("GraphRAG not initialized")
 	}
@@ -699,7 +703,7 @@ func (s *Server) toolImpactAnalysis(args map[string]any) ToolCallResult {
 		return errorResult("service is required")
 	}
 	depth := argInt(args, "depth", 5)
-	result := s.graphRAG.ImpactAnalysis(svcName, depth)
+	result := s.graphRAG.ImpactAnalysis(mcpCtx(ctx), svcName, depth)
 	data, err := json.MarshalIndent(result, "", "  ")
 	if err != nil {
 		return errorResult(fmt.Sprintf("failed to marshal impact analysis: %v", err))
@@ -707,7 +711,7 @@ func (s *Server) toolImpactAnalysis(args map[string]any) ToolCallResult {
 	return textResult(string(data))
 }
 
-func (s *Server) toolRootCauseAnalysis(args map[string]any) ToolCallResult {
+func (s *Server) toolRootCauseAnalysis(ctx context.Context, args map[string]any) ToolCallResult {
 	if s.graphRAG == nil {
 		return errorResult("GraphRAG not initialized")
 	}
@@ -718,7 +722,7 @@ func (s *Server) toolRootCauseAnalysis(args map[string]any) ToolCallResult {
 	since := time.Now().Add(-15 * time.Minute)
 	parseTimeRange(args, "time_range", &since)
 
-	causes := s.graphRAG.RootCauseAnalysis(svcName, since)
+	causes := s.graphRAG.RootCauseAnalysis(mcpCtx(ctx), svcName, since)
 	data, err := json.MarshalIndent(causes, "", "  ")
 	if err != nil {
 		return errorResult(fmt.Sprintf("failed to marshal root cause analysis: %v", err))
@@ -726,7 +730,7 @@ func (s *Server) toolRootCauseAnalysis(args map[string]any) ToolCallResult {
 	return textResult(string(data))
 }
 
-func (s *Server) toolCorrelatedSignals(args map[string]any) ToolCallResult {
+func (s *Server) toolCorrelatedSignals(ctx context.Context, args map[string]any) ToolCallResult {
 	if s.graphRAG == nil {
 		return errorResult("GraphRAG not initialized")
 	}
@@ -737,7 +741,7 @@ func (s *Server) toolCorrelatedSignals(args map[string]any) ToolCallResult {
 	since := time.Now().Add(-1 * time.Hour)
 	parseTimeRange(args, "time_range", &since)
 
-	result := s.graphRAG.CorrelatedSignals(svcName, since)
+	result := s.graphRAG.CorrelatedSignals(mcpCtx(ctx), svcName, since)
 	data, err := json.MarshalIndent(result, "", "  ")
 	if err != nil {
 		return errorResult(fmt.Sprintf("failed to marshal correlated signals: %v", err))
@@ -804,7 +808,7 @@ func (s *Server) toolGetGraphSnapshot(args map[string]any) ToolCallResult {
 	return textResult(string(data))
 }
 
-func (s *Server) toolGetAnomalyTimeline(args map[string]any) ToolCallResult {
+func (s *Server) toolGetAnomalyTimeline(ctx context.Context, args map[string]any) ToolCallResult {
 	if s.graphRAG == nil {
 		return errorResult("GraphRAG not initialized")
 	}
@@ -814,9 +818,9 @@ func (s *Server) toolGetAnomalyTimeline(args map[string]any) ToolCallResult {
 
 	var anomalies []*graphrag.AnomalyNode
 	if service != "" {
-		anomalies = s.graphRAG.AnomalyStore.AnomaliesForService(service, since)
+		anomalies = s.graphRAG.AnomaliesForService(mcpCtx(ctx), service, since)
 	} else {
-		anomalies = s.graphRAG.AnomalyTimeline(since)
+		anomalies = s.graphRAG.AnomalyTimeline(mcpCtx(ctx), since)
 	}
 	data, err := json.MarshalIndent(anomalies, "", "  ")
 	if err != nil {

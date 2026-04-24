@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"runtime/debug"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -51,16 +52,22 @@ type spanEvent struct {
 	Span    storage.Span
 	TraceID string
 	Status  string
+	// Tenant is the tenant slice to route this event into. Populated by
+	// OnSpanIngested from storage.Span.TenantID; empty values are coerced
+	// to storage.DefaultTenantID before processing.
+	Tenant string
 }
 
 // logEvent is sent through the ingestion channel.
 type logEvent struct {
-	Log storage.Log
+	Log    storage.Log
+	Tenant string
 }
 
 // metricEvent is sent through the ingestion channel.
 type metricEvent struct {
 	Metric tsdb.RawMetric
+	Tenant string
 }
 
 // event wraps one of the above event types.
@@ -71,11 +78,17 @@ type event struct {
 }
 
 // GraphRAG is the main coordinator for the layered graph system.
+//
+// Every in-memory store is partitioned by tenant. The coordinator holds a map
+// of tenant ID → *tenantStores and a reader/writer mutex that protects only
+// the outer map; per-tenant stores keep their own RWMutexes for fine-grained
+// concurrent access. All event ingestion and queries route through
+// storesFor(ctx) / storesForTenant(tenant) — there is no "global" slice.
 type GraphRAG struct {
-	ServiceStore *ServiceStore
-	TraceStore   *TraceStore
-	SignalStore  *SignalStore
-	AnomalyStore *AnomalyStore
+	// tenants maps tenant ID → per-tenant store composite. Access via
+	// storesFor / storesForTenant / snapshotTenants, not directly.
+	tenants   map[string]*tenantStores
+	tenantsMu sync.RWMutex
 
 	repo      *storage.Repository
 	vectorIdx *vectordb.Index
@@ -201,10 +214,7 @@ func New(repo *storage.Repository, vectorIdx *vectordb.Index, tsdbAgg *tsdb.Aggr
 	}
 
 	g := &GraphRAG{
-		ServiceStore:  newServiceStore(),
-		TraceStore:    newTraceStore(cfg.TraceTTL),
-		SignalStore:   newSignalStore(),
-		AnomalyStore:  newAnomalyStore(),
+		tenants:       make(map[string]*tenantStores),
 		repo:          repo,
 		vectorIdx:     vectorIdx,
 		tsdbAgg:       tsdbAgg,
@@ -219,6 +229,11 @@ func New(repo *storage.Repository, vectorIdx *vectordb.Index, tsdbAgg *tsdb.Aggr
 		workerCount:   cfg.WorkerCount,
 		invCooldown:   newInvestigationCooldown(5 * time.Minute),
 	}
+
+	// Bootstrap the default tenant slice so refresh/snapshot loops have a
+	// baseline to iterate over before any ingest lands. Other tenants are
+	// created lazily on first event via storesForTenant.
+	g.storesForTenant(storage.DefaultTenantID)
 
 	// Restore persisted Drain templates so log clustering survives restarts.
 	// A missing table (fresh install) or transient DB error is non-fatal —
@@ -311,16 +326,24 @@ func (g *GraphRAG) IsRunning() bool {
 }
 
 // OnSpanIngested is the callback wired into the trace ingestion pipeline.
+// Tenant is taken straight from the persisted Span (already resolved upstream
+// by the OTLP Export handlers) and carried on the event — the callback
+// signature is intentionally unchanged so external wiring stays trivial.
 func (g *GraphRAG) OnSpanIngested(span storage.Span) {
 	status := span.Status
 	if status == "" {
 		status = "STATUS_CODE_UNSET"
+	}
+	tenant := span.TenantID
+	if tenant == "" {
+		tenant = storage.DefaultTenantID
 	}
 	select {
 	case g.eventCh <- event{span: &spanEvent{
 		Span:    span,
 		TraceID: span.TraceID,
 		Status:  status,
+		Tenant:  tenant,
 	}}:
 	default:
 		// Channel full — graph is best-effort; DB is source of truth.
@@ -330,8 +353,12 @@ func (g *GraphRAG) OnSpanIngested(span storage.Span) {
 
 // OnLogIngested is the callback wired into the log ingestion pipeline.
 func (g *GraphRAG) OnLogIngested(log storage.Log) {
+	tenant := log.TenantID
+	if tenant == "" {
+		tenant = storage.DefaultTenantID
+	}
 	select {
-	case g.eventCh <- event{log: &logEvent{Log: log}}:
+	case g.eventCh <- event{log: &logEvent{Log: log, Tenant: tenant}}:
 	default:
 		// Channel full — graph is best-effort; DB is source of truth.
 		g.recordEventDrop("log")
@@ -339,9 +366,16 @@ func (g *GraphRAG) OnLogIngested(log storage.Log) {
 }
 
 // OnMetricIngested is the callback wired into the metric ingestion pipeline.
+// tsdb.RawMetric already carries a resolved TenantID (set in ingest/otlp.go
+// Export), so we read it here instead of adding a second argument — keeping
+// the metric callback signature identical across TSDB and GraphRAG.
 func (g *GraphRAG) OnMetricIngested(metric tsdb.RawMetric) {
+	tenant := metric.TenantID
+	if tenant == "" {
+		tenant = storage.DefaultTenantID
+	}
 	select {
-	case g.eventCh <- event{metric: &metricEvent{Metric: metric}}:
+	case g.eventCh <- event{metric: &metricEvent{Metric: metric, Tenant: tenant}}:
 	default:
 		// Channel full — graph is best-effort; DB is source of truth.
 		g.recordEventDrop("metric")
@@ -381,17 +415,19 @@ func (g *GraphRAG) processSpan(ev *spanEvent) {
 		return
 	}
 
+	stores := g.storesForTenant(ev.Tenant)
+
 	// 1. Upsert ServiceNode
-	g.ServiceStore.UpsertService(span.ServiceName, durationMs, isError, span.StartTime)
+	stores.service.UpsertService(span.ServiceName, durationMs, isError, span.StartTime)
 
 	// 2. Upsert OperationNode + EXPOSES edge
 	if span.OperationName != "" {
-		g.ServiceStore.UpsertOperation(span.ServiceName, span.OperationName, durationMs, isError, span.StartTime)
+		stores.service.UpsertOperation(span.ServiceName, span.OperationName, durationMs, isError, span.StartTime)
 	}
 
 	// 3. Create TraceNode + SpanNode + CONTAINS + CHILD_OF edges
-	g.TraceStore.UpsertTrace(span.TraceID, span.ServiceName, ev.Status, durationMs, span.StartTime)
-	g.TraceStore.UpsertSpan(SpanNode{
+	stores.traces.UpsertTrace(span.TraceID, span.ServiceName, ev.Status, durationMs, span.StartTime)
+	stores.traces.UpsertSpan(SpanNode{
 		ID:           span.SpanID,
 		TraceID:      span.TraceID,
 		ParentSpanID: span.ParentSpanID,
@@ -405,9 +441,9 @@ func (g *GraphRAG) processSpan(ev *spanEvent) {
 
 	// 4. If parent span exists and belongs to different service, create CALLS edge
 	if span.ParentSpanID != "" {
-		if parentSpan, ok := g.TraceStore.GetSpan(span.ParentSpanID); ok {
+		if parentSpan, ok := stores.traces.GetSpan(span.ParentSpanID); ok {
 			if parentSpan.Service != span.ServiceName {
-				g.ServiceStore.UpsertCallEdge(parentSpan.Service, span.ServiceName, durationMs, isError, span.StartTime)
+				stores.service.UpsertCallEdge(parentSpan.Service, span.ServiceName, durationMs, isError, span.StartTime)
 			}
 		}
 	}
@@ -420,16 +456,21 @@ func (g *GraphRAG) processLog(ev *logEvent) {
 		return
 	}
 
-	// Drain-based clustering (replaces hash+TF-IDF clustering).
+	stores := g.storesForTenant(ev.Tenant)
+
+	// Drain-based clustering (replaces hash+TF-IDF clustering). The Drain
+	// miner is shared across tenants — its template tokens describe log shape,
+	// not content, so same-shape logs from different tenants share a template
+	// ID but land in their own tenant's SignalStore LogClusterNode entry.
 	body := log.Body
-	clusterID := g.clusterLog(log.ServiceName, body, log.Severity, log.Timestamp)
+	clusterID := g.clusterLog(stores, log.ServiceName, body, log.Severity, log.Timestamp)
 	if clusterID == "" {
 		return
 	}
 
 	// If log has trace_id + span_id, create LOGGED_DURING edge
 	if log.SpanID != "" {
-		g.SignalStore.AddLoggedDuringEdge(clusterID, log.SpanID, log.Timestamp)
+		stores.signals.AddLoggedDuringEdge(clusterID, log.SpanID, log.Timestamp)
 	}
 }
 
@@ -438,7 +479,8 @@ func (g *GraphRAG) processMetric(ev *metricEvent) {
 	if m.ServiceName == "" {
 		return
 	}
-	g.SignalStore.UpsertMetric(m.Name, m.ServiceName, m.Value, m.Timestamp)
+	stores := g.storesForTenant(ev.Tenant)
+	stores.signals.UpsertMetric(m.Name, m.ServiceName, m.Value, m.Timestamp)
 }
 
 // simpleHash produces a quick hash for log clustering.
@@ -448,4 +490,51 @@ func simpleHash(s string) uint32 {
 		h = h*31 + uint32(c) // #nosec G115 -- rune -> uint32 for hash is intentional
 	}
 	return h
+}
+
+// storesFor returns the tenantStores composite scoped to the tenant carried
+// on ctx. A missing or empty tenant collapses to storage.DefaultTenantID,
+// matching WithTenantContext semantics. Lazily creates the slice on first
+// reference so a single-tenant install never carries empty maps for phantom
+// tenants, and a new tenant does not require a restart.
+func (g *GraphRAG) storesFor(ctx context.Context) *tenantStores {
+	return g.storesForTenant(storage.TenantFromContext(ctx))
+}
+
+// storesForTenant is the tenant-string flavour of storesFor, used by event
+// handlers that have already resolved the tenant (the callback path carries
+// it on spanEvent / logEvent / metricEvent). Empty strings are coerced to
+// storage.DefaultTenantID.
+func (g *GraphRAG) storesForTenant(tenant string) *tenantStores {
+	if tenant == "" {
+		tenant = storage.DefaultTenantID
+	}
+	g.tenantsMu.RLock()
+	slice, ok := g.tenants[tenant]
+	g.tenantsMu.RUnlock()
+	if ok {
+		return slice
+	}
+	g.tenantsMu.Lock()
+	defer g.tenantsMu.Unlock()
+	if slice, ok = g.tenants[tenant]; ok {
+		return slice
+	}
+	slice = newTenantStores(g.traceTTL)
+	g.tenants[tenant] = slice
+	return slice
+}
+
+// snapshotTenants returns a stable copy of the tenant → stores map suitable
+// for iteration without holding the coordinator lock. Background loops call
+// this once per tick and then operate on each slice under its own per-store
+// lock, so a long-running refresh never blocks new-tenant ingestion.
+func (g *GraphRAG) snapshotTenants() map[string]*tenantStores {
+	g.tenantsMu.RLock()
+	defer g.tenantsMu.RUnlock()
+	out := make(map[string]*tenantStores, len(g.tenants))
+	for k, v := range g.tenants {
+		out[k] = v
+	}
+	return out
 }

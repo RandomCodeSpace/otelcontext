@@ -4,15 +4,21 @@ import (
 	"context"
 	"log/slog"
 	"time"
+
+	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 )
 
 // refreshLoop periodically rebuilds/merges from DB and prunes stale data.
+// Work is sharded per tenant: on each tick we snapshot the coordinator's
+// tenant map, then rebuild and prune each slice under its own lock. Tenants
+// are discovered from the spans table on first rebuild so historical data
+// from tenants that have not yet ingested via callbacks is still loaded.
 func (g *GraphRAG) refreshLoop(ctx context.Context) {
 	ticker := time.NewTicker(g.refreshEvery)
 	defer ticker.Stop()
 
-	// Initial rebuild on startup
-	g.rebuildFromDB()
+	// Initial rebuild on startup.
+	g.rebuildAllTenantsFromDB(ctx)
 
 	for {
 		select {
@@ -21,8 +27,11 @@ func (g *GraphRAG) refreshLoop(ctx context.Context) {
 		case <-g.stopCh:
 			return
 		case <-ticker.C:
-			g.rebuildFromDB()
-			pruned := g.TraceStore.Prune()
+			g.rebuildAllTenantsFromDB(ctx)
+			pruned := 0
+			for _, stores := range g.snapshotTenants() {
+				pruned += stores.traces.Prune()
+			}
 			if pruned > 0 {
 				slog.Debug("GraphRAG pruned expired traces/spans", "count", pruned)
 			}
@@ -51,7 +60,7 @@ func (g *GraphRAG) snapshotLoop(ctx context.Context) {
 		case <-g.stopCh:
 			return
 		case <-ticker.C:
-			g.takeSnapshot()
+			g.takeSnapshot(ctx)
 			g.pruneOldSnapshots()
 			g.persistDrainTemplates()
 		}
@@ -75,12 +84,53 @@ func (g *GraphRAG) persistDrainTemplates() {
 	slog.Debug("Drain templates persisted", "count", len(tpls))
 }
 
-// rebuildFromDB loads recent span data from the DB and merges into the graph.
-// This catches data from before callbacks started (e.g., restart recovery).
-func (g *GraphRAG) rebuildFromDB() {
+// rebuildAllTenantsFromDB rebuilds each known tenant's in-memory service
+// topology from the spans table. Tenants are the union of already-present
+// coordinator slices and the distinct tenant_id values observed in recent
+// spans — this catches historical tenants that have not yet ingested via
+// live callbacks since startup.
+func (g *GraphRAG) rebuildAllTenantsFromDB(ctx context.Context) {
+	if g.repo == nil || g.repo.DB() == nil {
+		return
+	}
+
 	since := time.Now().Add(-1 * time.Hour)
 
-	// Load recent spans
+	// Discover tenants that have recent spans. Missing tenant_id rows fall
+	// back to DefaultTenantID so pre-multi-tenant data still rebuilds.
+	var tenantIDs []string
+	if err := g.repo.DB().
+		Table("spans").
+		Where("start_time > ?", since).
+		Distinct("tenant_id").
+		Pluck("tenant_id", &tenantIDs).Error; err != nil {
+		slog.Error("GraphRAG: failed to enumerate tenants for rebuild", "error", err)
+		return
+	}
+
+	seen := make(map[string]bool, len(tenantIDs))
+	for _, t := range tenantIDs {
+		if t == "" {
+			t = storage.DefaultTenantID
+		}
+		seen[t] = true
+	}
+	// Always include tenants the coordinator already knows about so we refresh
+	// live-ingested tenants even when no DB rows yet carry their ID.
+	for t := range g.snapshotTenants() {
+		seen[t] = true
+	}
+
+	for tenant := range seen {
+		tctx := storage.WithTenantContext(ctx, tenant)
+		g.rebuildFromDBForTenant(tctx, tenant, since)
+	}
+}
+
+// rebuildFromDBForTenant loads recent span data for a single tenant and
+// merges it into that tenant's slice of the graph. Catches data from before
+// callbacks started (e.g., restart recovery).
+func (g *GraphRAG) rebuildFromDBForTenant(_ context.Context, tenant string, since time.Time) {
 	type spanRow struct {
 		SpanID        string
 		ParentSpanID  string
@@ -92,16 +142,18 @@ func (g *GraphRAG) rebuildFromDB() {
 		StartTime     time.Time
 	}
 
+	stores := g.storesForTenant(tenant)
+
 	var rows []spanRow
 	err := g.repo.DB().
 		Table("spans").
 		Select("span_id, parent_span_id, service_name, operation_name, duration, trace_id, status, start_time").
-		Where("start_time > ?", since).
+		Where("start_time > ? AND tenant_id = ?", since, tenant).
 		Order("start_time ASC").
 		Limit(50000).
 		Find(&rows).Error
 	if err != nil {
-		slog.Error("GraphRAG: failed to rebuild from DB", "error", err)
+		slog.Error("GraphRAG: failed to rebuild from DB", "tenant", tenant, "error", err)
 		return
 	}
 
@@ -109,7 +161,7 @@ func (g *GraphRAG) rebuildFromDB() {
 		return
 	}
 
-	// Build spanID → service map for edge resolution
+	// Build spanID → service map for edge resolution.
 	spanService := make(map[string]string, len(rows))
 	for _, r := range rows {
 		spanService[r.SpanID] = r.ServiceName
@@ -119,18 +171,22 @@ func (g *GraphRAG) rebuildFromDB() {
 		durationMs := float64(r.Duration) / 1000.0
 		isError := r.Status == "STATUS_CODE_ERROR"
 
-		g.ServiceStore.UpsertService(r.ServiceName, durationMs, isError, r.StartTime)
+		stores.service.UpsertService(r.ServiceName, durationMs, isError, r.StartTime)
 		if r.OperationName != "" {
-			g.ServiceStore.UpsertOperation(r.ServiceName, r.OperationName, durationMs, isError, r.StartTime)
+			stores.service.UpsertOperation(r.ServiceName, r.OperationName, durationMs, isError, r.StartTime)
 		}
 
-		// Cross-service edges
+		// Cross-service edges.
 		if r.ParentSpanID != "" {
 			if parentSvc, ok := spanService[r.ParentSpanID]; ok && parentSvc != r.ServiceName {
-				g.ServiceStore.UpsertCallEdge(parentSvc, r.ServiceName, durationMs, isError, r.StartTime)
+				stores.service.UpsertCallEdge(parentSvc, r.ServiceName, durationMs, isError, r.StartTime)
 			}
 		}
 	}
 
-	slog.Debug("GraphRAG rebuilt from DB", "spans", len(rows), "services", len(g.ServiceStore.Services))
+	slog.Debug("GraphRAG rebuilt from DB",
+		"tenant", tenant,
+		"spans", len(rows),
+		"services", len(stores.service.Services),
+	)
 }

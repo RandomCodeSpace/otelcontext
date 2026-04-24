@@ -6,22 +6,29 @@ package graphrag
 // SimilarErrors — similarity search across mined templates.
 
 import (
+	"context"
 	"fmt"
 	"time"
+
+	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 )
 
 // clusterLog runs the log body through Drain and upserts a LogClusterNode
-// into the SignalStore. Returns the service-scoped cluster ID.
+// into the supplied tenant's SignalStore. Returns the service-scoped cluster ID.
 //
 // The cluster ID is service-scoped and derived from the Drain template ID,
 // so it remains stable for any future ingestion of the same template shape.
 // Drain's internal template ID may change when tokens generalize to
 // wildcards; the LogClusterNode's TemplateID field is updated to track this.
-func (g *GraphRAG) clusterLog(service, body, severity string, ts time.Time) string {
+//
+// The Drain miner itself is shared across tenants — its templates describe
+// log shape, not content, and the per-tenant SignalStore keeps the actual
+// cluster nodes isolated.
+func (g *GraphRAG) clusterLog(stores *tenantStores, service, body, severity string, ts time.Time) string {
 	if g.drain == nil {
 		// Fallback: legacy hash-based clustering.
 		clusterID := fmt.Sprintf("lc_%s_%x", service, simpleHash(body))
-		g.SignalStore.UpsertLogCluster(clusterID, body, severity, service, ts)
+		stores.signals.UpsertLogCluster(clusterID, body, severity, service, ts)
 		return clusterID
 	}
 
@@ -34,7 +41,7 @@ func (g *GraphRAG) clusterLog(service, body, severity string, ts time.Time) stri
 	// Drain merges (tokens generalize), the ID may shift — acceptable since
 	// it occurs only on the first few ingestions of a pattern.
 	clusterID := fmt.Sprintf("lc_%s_%x", service, tpl.ID)
-	g.SignalStore.UpsertLogClusterWithTemplate(
+	stores.signals.UpsertLogClusterWithTemplate(
 		clusterID,
 		tpl.TemplateString(),
 		severity,
@@ -47,15 +54,20 @@ func (g *GraphRAG) clusterLog(service, body, severity string, ts time.Time) stri
 	return clusterID
 }
 
-// SimilarErrors finds log clusters similar to a given cluster using the vector index.
-func (g *GraphRAG) SimilarErrors(clusterID string, k int) []LogClusterNode {
+// SimilarErrors finds log clusters similar to a given cluster using the vector
+// index, scoped to the tenant carried on ctx. Cross-tenant hits are impossible
+// because the underlying vectordb partitions docs per tenant and this lookup
+// resolves the SignalStore through storesFor(ctx).
+func (g *GraphRAG) SimilarErrors(ctx context.Context, clusterID string, k int) []LogClusterNode {
 	if k <= 0 {
 		k = 10
 	}
 
-	g.SignalStore.mu.RLock()
-	cluster, ok := g.SignalStore.LogClusters[clusterID]
-	g.SignalStore.mu.RUnlock()
+	stores := g.storesFor(ctx)
+
+	stores.signals.mu.RLock()
+	cluster, ok := stores.signals.LogClusters[clusterID]
+	stores.signals.mu.RUnlock()
 	if !ok {
 		return nil
 	}
@@ -68,21 +80,25 @@ func (g *GraphRAG) SimilarErrors(clusterID string, k int) []LogClusterNode {
 	if query == "" && len(cluster.TemplateTokens) > 0 {
 		query = joinTokens(cluster.TemplateTokens)
 	}
-	results := g.vectorIdx.Search(query, k*2) // over-fetch to filter
+	// vectordb.Index.Search takes the tenant string directly; we resolve it
+	// from ctx via the same storage helper used by storesFor so both sides
+	// agree on coercion rules (empty → DefaultTenantID).
+	tenant := storage.TenantFromContext(ctx)
+	results := g.vectorIdx.Search(tenant, query, k*2) // over-fetch to filter
 
 	// Map results back to log clusters.
 	seen := map[string]bool{clusterID: true}
 	var similar []LogClusterNode
 
-	g.SignalStore.mu.RLock()
-	defer g.SignalStore.mu.RUnlock()
+	stores.signals.mu.RLock()
+	defer stores.signals.mu.RUnlock()
 
 	for _, r := range results {
-		for _, lc := range g.SignalStore.LogClusters {
+		for _, lc := range stores.signals.LogClusters {
 			if seen[lc.ID] {
 				continue
 			}
-			for _, e := range g.SignalStore.Edges {
+			for _, e := range stores.signals.Edges {
 				if e.Type == EdgeEmittedBy && e.FromID == lc.ID && e.ToID == r.ServiceName {
 					seen[lc.ID] = true
 					similar = append(similar, *lc)

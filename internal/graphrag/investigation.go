@@ -1,6 +1,7 @@
 package graphrag
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -8,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 	"gorm.io/gorm"
 )
 
@@ -91,8 +93,12 @@ func AutoMigrateGraphRAG(db *gorm.DB) error {
 	return db.AutoMigrate(&Investigation{}, &GraphSnapshot{}, &DrainTemplateRow{})
 }
 
-// PersistInvestigation saves an investigation record from an error chain analysis.
-func (g *GraphRAG) PersistInvestigation(triggerService string, chains []ErrorChainResult, anomalies []*AnomalyNode) {
+// PersistInvestigation saves an investigation record from an error chain
+// analysis. Tenant is accepted explicitly so the caller (the per-tenant
+// anomaly loop) can re-enter ImpactAnalysis on the correct tenant slice. The
+// `investigations` table itself does not yet carry a tenant_id column —
+// Subtask B (RAN-38) owns that migration.
+func (g *GraphRAG) PersistInvestigation(tenant, triggerService string, chains []ErrorChainResult, anomalies []*AnomalyNode) {
 	if len(chains) == 0 {
 		return
 	}
@@ -151,8 +157,10 @@ func (g *GraphRAG) PersistInvestigation(triggerService string, chains []ErrorCha
 		})
 	}
 
-	// Affected services from impact analysis
-	impact := g.ImpactAnalysis(triggerService, 3)
+	// Affected services from impact analysis, run against the tenant that
+	// raised this investigation.
+	impactCtx := storage.WithTenantContext(context.Background(), tenant)
+	impact := g.ImpactAnalysis(impactCtx, triggerService, 3)
 	var affected []string
 	for _, a := range impact.AffectedServices {
 		affected = append(affected, a.Service)

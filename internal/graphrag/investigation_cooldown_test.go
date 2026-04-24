@@ -22,13 +22,13 @@ func TestPersistInvestigation_Cooldown(t *testing.T) {
 		RootCause: &RootCauseInfo{Service: "orders", Operation: "op"},
 	}}
 
-	g.PersistInvestigation("orders", chains, nil)
+	g.PersistInvestigation("default", "orders", chains, nil)
 	first := g.InvestigationInsertCount()
 	if first == 0 {
 		t.Fatalf("first PersistInvestigation should insert, got count=0")
 	}
 
-	g.PersistInvestigation("orders", chains, nil)
+	g.PersistInvestigation("default", "orders", chains, nil)
 	second := g.InvestigationInsertCount()
 	if second != first {
 		t.Fatalf("second PersistInvestigation within cooldown should be suppressed; got %d new inserts", second-first)
@@ -38,7 +38,7 @@ func TestPersistInvestigation_Cooldown(t *testing.T) {
 		TraceID:   "tr2",
 		RootCause: &RootCauseInfo{Service: "payments", Operation: "op"},
 	}}
-	g.PersistInvestigation("payments", chains2, nil)
+	g.PersistInvestigation("default", "payments", chains2, nil)
 	third := g.InvestigationInsertCount()
 	if third <= second {
 		t.Fatalf("distinct service should bypass cooldown; got %d, want > %d", third, second)
