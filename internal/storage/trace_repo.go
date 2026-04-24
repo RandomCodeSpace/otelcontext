@@ -56,6 +56,9 @@ func (r *Repository) BatchCreateSpans(spans []Span) error {
 }
 
 // BatchCreateTraces inserts traces, skipping duplicates.
+// Duplicate is defined per the composite uniqueIndex idx_traces_tenant_trace_id
+// on (tenant_id, trace_id): a trace_id clash within the same tenant is ignored,
+// while the same trace_id under a different tenant inserts cleanly.
 func (r *Repository) BatchCreateTraces(traces []Trace) error {
 	if len(traces) == 0 {
 		return nil
@@ -67,6 +70,8 @@ func (r *Repository) BatchCreateTraces(traces []Trace) error {
 }
 
 // CreateTrace inserts a new trace, skipping if it already exists.
+// Uniqueness is per idx_traces_tenant_trace_id (tenant_id, trace_id), so the
+// same trace_id across tenants is allowed.
 func (r *Repository) CreateTrace(trace Trace) error {
 	if strings.ToLower(r.driver) == "mysql" {
 		return r.db.Clauses(clause.Insert{Modifier: "IGNORE"}).Create(&trace).Error
@@ -75,8 +80,9 @@ func (r *Repository) CreateTrace(trace Trace) error {
 }
 
 // GetTrace returns a trace by ID with its spans and logs, scoped to the tenant on ctx.
-// The Preloaded Spans and Logs are additionally filtered so a trace ID collision
-// across tenants cannot leak cross-tenant children.
+// Trace uniqueness is composite (tenant_id, trace_id), so the same trace_id can
+// legitimately exist in multiple tenants; the Preloaded Spans and Logs are
+// filtered by tenant_id as defense-in-depth against cross-tenant child leakage.
 func (r *Repository) GetTrace(ctx context.Context, traceID string) (*Trace, error) {
 	tenant := TenantFromContext(ctx)
 	var trace Trace

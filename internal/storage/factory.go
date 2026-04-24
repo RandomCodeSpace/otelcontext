@@ -178,6 +178,15 @@ func AutoMigrateModels(db *gorm.DB, driver string) error {
 		return fmt.Errorf("failed to migrate database: %w", err)
 	}
 
+	// RAN-21: retire the pre-composite standalone unique index on traces.trace_id.
+	// AutoMigrate never drops indexes that no longer appear on struct tags, so on
+	// pre-existing databases the old uniqueIndex would persist and still block
+	// cross-tenant trace_id reuse. This is idempotent across drivers and a no-op
+	// on fresh databases.
+	if err := dropLegacyTraceIDUniqueIndex(db, driver); err != nil {
+		log.Printf("⚠️  legacy trace_id unique index drop failed: %v", err)
+	}
+
 	// Drop foreign keys that AutoMigrate may have created (MySQL)
 	if driver == "mysql" {
 		db.Exec("ALTER TABLE spans DROP FOREIGN KEY fk_traces_spans")

@@ -84,11 +84,14 @@ const DefaultTenantID = "default"
 // Index strategy: single-column tenant_id is redundant — every tenant-scoped
 // query joins tenant_id with another filter (timestamp, service_name). The
 // leftmost column of a composite index satisfies single-column tenant lookups,
-// so we only declare composites.
+// so we only declare composites. TraceID uniqueness is scoped to (tenant_id,
+// trace_id): distinct tenants may legitimately ingest identical trace_ids
+// (RAN-21). The old standalone `uniqueIndex` on trace_id is dropped at
+// migration time by dropLegacyTraceIDUniqueIndex.
 type Trace struct {
 	ID          uint    `gorm:"primaryKey" json:"id"`
-	TenantID    string  `gorm:"size:64;default:'default';not null;index:idx_traces_tenant_ts,priority:1;index:idx_traces_tenant_service,priority:1" json:"tenant_id"`
-	TraceID     string  `gorm:"uniqueIndex;size:32;not null" json:"trace_id"`
+	TenantID    string  `gorm:"size:64;default:'default';not null;index:idx_traces_tenant_ts,priority:1;index:idx_traces_tenant_service,priority:1;uniqueIndex:idx_traces_tenant_trace_id,priority:1" json:"tenant_id"`
+	TraceID     string  `gorm:"size:32;not null;uniqueIndex:idx_traces_tenant_trace_id,priority:2" json:"trace_id"`
 	ServiceName string  `gorm:"size:255;index:idx_traces_tenant_service,priority:2" json:"service_name"`
 	Duration    int64   `gorm:"index" json:"duration"` // Microseconds
 	DurationMs  float64 `gorm:"-" json:"duration_ms"`
