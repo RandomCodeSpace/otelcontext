@@ -286,9 +286,9 @@ func (s *Server) toolHandler(ctx context.Context, name string, args map[string]a
 	}()
 	switch name {
 	case "get_system_graph":
-		return s.toolGetSystemGraph(args)
+		return s.toolGetSystemGraph(ctx, args)
 	case "get_service_health":
-		return s.toolGetServiceHealth(args)
+		return s.toolGetServiceHealth(ctx, args)
 	case "search_logs":
 		return s.toolSearchLogs(ctx, args)
 	case "tail_logs":
@@ -334,7 +334,28 @@ func (s *Server) toolHandler(ctx context.Context, name string, args map[string]a
 
 // --- Tool implementations ---
 
-func (s *Server) toolGetSystemGraph(_ map[string]any) ToolCallResult {
+// toolGetSystemGraph returns a tenant-scoped service topology snapshot.
+//
+// When GraphRAG is wired (the default in production) the response is built
+// from its per-tenant ServiceMap and AllServiceEdges, so two tenants with
+// overlapping service names cannot see each other's nodes or edges. The
+// legacy *graph.Graph remains as a fallback for boot windows when GraphRAG
+// is still warming up; that fallback is cross-tenant by construction and
+// is the documented legacy code path called out in RAN-39.
+func (s *Server) toolGetSystemGraph(ctx context.Context, _ map[string]any) ToolCallResult {
+	if s.graphRAG != nil {
+		entries := s.graphRAG.ServiceMap(mcpCtx(ctx), 0)
+		edges := s.graphRAG.AllServiceEdges(mcpCtx(ctx))
+		payload := map[string]any{
+			"services": entries,
+			"edges":    edges,
+		}
+		data, err := json.MarshalIndent(payload, "", "  ")
+		if err != nil {
+			return errorResult(fmt.Sprintf("failed to marshal system graph: %v", err))
+		}
+		return textResult(string(data))
+	}
 	if s.svcGraph == nil {
 		return errorResult("service graph not yet initialized")
 	}
@@ -346,10 +367,25 @@ func (s *Server) toolGetSystemGraph(_ map[string]any) ToolCallResult {
 	return textResult(string(data))
 }
 
-func (s *Server) toolGetServiceHealth(args map[string]any) ToolCallResult {
+// toolGetServiceHealth returns the ServiceMap entry for svcName scoped to
+// the tenant on ctx. Falls back to the legacy svcGraph snapshot when
+// GraphRAG is not yet wired.
+func (s *Server) toolGetServiceHealth(ctx context.Context, args map[string]any) ToolCallResult {
 	svcName, _ := args["service_name"].(string)
 	if svcName == "" {
 		return errorResult("service_name is required")
+	}
+	if s.graphRAG != nil {
+		for _, entry := range s.graphRAG.ServiceMap(mcpCtx(ctx), 0) {
+			if entry.Service != nil && entry.Service.Name == svcName {
+				data, err := json.MarshalIndent(entry, "", "  ")
+				if err != nil {
+					return errorResult(fmt.Sprintf("failed to marshal service health: %v", err))
+				}
+				return textResult(string(data))
+			}
+		}
+		return textResult(fmt.Sprintf("service %q not found in the current tenant window", svcName))
 	}
 	if s.svcGraph == nil {
 		return errorResult("service graph not yet initialized")

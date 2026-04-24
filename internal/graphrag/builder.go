@@ -154,6 +154,19 @@ func (g *GraphRAG) DroppedMetricsCount() int64 { return g.droppedMetrics.Load() 
 // tests to assert cooldown behavior without requiring a live repo.
 func (g *GraphRAG) InvestigationInsertCount() int64 { return g.invInserts.Load() }
 
+// RegisterAnomaly inserts an anomaly into the AnomalyStore for tenant.
+// Mirrors PersistInvestigation's "tenant accepted explicitly" shape so
+// out-of-band anomaly producers (synthetic detectors, integration tests,
+// future external anomaly feeds) can land directly on the right tenant
+// slice without going through the metric/error detection loops. Empty
+// tenant collapses to storage.DefaultTenantID.
+func (g *GraphRAG) RegisterAnomaly(tenant string, anomaly AnomalyNode) {
+	if tenant == "" {
+		tenant = storage.DefaultTenantID
+	}
+	g.storesForTenant(tenant).anomalies.AddAnomaly(anomaly)
+}
+
 // recordEventDrop increments the per-signal atomic counter and — when
 // a telemetry registry is wired — the Prometheus counter vec.
 func (g *GraphRAG) recordEventDrop(signal string) {

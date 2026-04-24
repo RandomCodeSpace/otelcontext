@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+
+	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 )
 
 // handleGetSimilarLogs handles GET /api/logs/similar?q=<text>&limit=10
@@ -30,7 +32,8 @@ func (s *Server) handleGetSimilarLogs(w http.ResponseWriter, r *http.Request) {
 		limit = 50
 	}
 
-	results := s.vectorIdx.Search(query, limit)
+	tenant := storage.TenantFromContext(r.Context())
+	results := s.vectorIdx.Search(tenant, query, limit)
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{

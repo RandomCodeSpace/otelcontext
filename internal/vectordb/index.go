@@ -11,9 +11,20 @@ import (
 	"unicode"
 )
 
+// defaultTenantID is the tenant assigned when the caller passes an empty
+// tenant string. Mirrors storage.DefaultTenantID; duplicated here to avoid
+// pulling internal/storage into vectordb's import graph.
+const defaultTenantID = "default"
+
 // LogVector represents an indexed log entry.
+//
+// Tenant scopes the document so Search can return only the caller's tenant
+// rows. The TF-IDF table is shared across tenants — global IDF still gives
+// the right rarity signal — but the per-document tenant tag is enforced at
+// query time so two tenants with overlapping log bodies stay isolated.
 type LogVector struct {
 	LogID       uint
+	Tenant      string
 	ServiceName string
 	Severity    string
 	Body        string
@@ -23,6 +34,7 @@ type LogVector struct {
 // SearchResult is a single similarity hit.
 type SearchResult struct {
 	LogID       uint
+	Tenant      string
 	ServiceName string
 	Severity    string
 	Body        string
@@ -50,8 +62,10 @@ func New(maxSize int) *Index {
 	}
 }
 
-// Add adds a log to the index. Thread-safe.
-func (idx *Index) Add(logID uint, serviceName, severity, body string) {
+// Add adds a log to the index. Thread-safe. Tenant is recorded with the
+// document so Search can filter by it; an empty tenant collapses to
+// the platform default at the boundary, matching storage.TenantFromContext.
+func (idx *Index) Add(logID uint, tenant, serviceName, severity, body string) {
 	if !shouldIndex(severity) {
 		return
 	}
@@ -60,6 +74,10 @@ func (idx *Index) Add(logID uint, serviceName, severity, body string) {
 		return
 	}
 	tf := computeTF(tokens)
+
+	if tenant == "" {
+		tenant = defaultTenantID
+	}
 
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
@@ -75,6 +93,7 @@ func (idx *Index) Add(logID uint, serviceName, severity, body string) {
 
 	idx.docs = append(idx.docs, LogVector{
 		LogID:       logID,
+		Tenant:      tenant,
 		ServiceName: serviceName,
 		Severity:    severity,
 		Body:        body,
@@ -83,10 +102,16 @@ func (idx *Index) Add(logID uint, serviceName, severity, body string) {
 	idx.dirty = true
 }
 
-// Search finds the top-k logs most similar to the query string.
-func (idx *Index) Search(query string, k int) []SearchResult {
+// Search finds the top-k logs most similar to the query string within
+// tenant. Documents from other tenants are excluded — the IDF table stays
+// global so rarity is computed against the whole corpus, but result rows
+// are filtered to the caller's tenant.
+func (idx *Index) Search(tenant, query string, k int) []SearchResult {
 	if k <= 0 {
 		k = 10
+	}
+	if tenant == "" {
+		tenant = defaultTenantID
 	}
 	tokens := tokenize(query)
 	if len(tokens) == 0 {
@@ -124,6 +149,9 @@ func (idx *Index) Search(query string, k int) []SearchResult {
 	}
 	results := make([]scored, 0, len(docs))
 	for _, doc := range docs {
+		if doc.Tenant != tenant {
+			continue
+		}
 		docVec := make(map[string]float64, len(doc.vec))
 		for term, tf := range doc.vec {
 			docVec[term] = tf * idfSnap[term]
@@ -145,6 +173,7 @@ func (idx *Index) Search(query string, k int) []SearchResult {
 	for i, r := range results {
 		out[i] = SearchResult{
 			LogID:       r.doc.LogID,
+			Tenant:      r.doc.Tenant,
 			ServiceName: r.doc.ServiceName,
 			Severity:    r.doc.Severity,
 			Body:        r.doc.Body,

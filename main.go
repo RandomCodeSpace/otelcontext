@@ -342,7 +342,7 @@ func main() {
 		})
 		if err == nil {
 			for _, l := range recentLogs {
-				vectorIdx.Add(l.ID, l.ServiceName, l.Severity, l.Body)
+				vectorIdx.Add(l.ID, l.TenantID, l.ServiceName, l.Severity, l.Body)
 			}
 			slog.Info("🔍 Vector index hydrated from recent ERROR logs", "count", len(recentLogs))
 		}
@@ -412,7 +412,7 @@ func main() {
 			Timestamp:      l.Timestamp,
 		})
 		aiService.EnqueueLog(l)
-		vectorIdx.Add(l.ID, l.ServiceName, l.Severity, l.Body)
+		vectorIdx.Add(l.ID, l.TenantID, l.ServiceName, l.Severity, l.Body)
 		eventHub.NotifyRefresh()
 		if time.Since(start) > 100*time.Millisecond {
 			slog.Warn("Slow broadcast/enqueue", "duration", time.Since(start))
