@@ -69,6 +69,25 @@ func NewDatabase(driver, dsn string) (*gorm.DB, error) {
 
 	db, err := gorm.Open(dialector, &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Error),
+		// RAN-49: never emit FK constraints during AutoMigrate.
+		//
+		// (1) Async ingestion: spans/logs can arrive before their parent trace,
+		// so a real FK on (spans|logs).trace_id → traces.trace_id would reject
+		// valid out-of-order writes — which is why the MySQL path explicitly
+		// drops fk_traces_spans / fk_traces_logs after AutoMigrate.
+		//
+		// (2) RAN-21 made trace identity tenant-scoped: traces no longer carries
+		// a single-column unique on trace_id (only the composite
+		// (tenant_id, trace_id)). On Postgres, CREATE TABLE spans (... FK
+		// trace_id REFERENCES traces(trace_id)) then fails at DDL time with
+		// SQLSTATE 42830 ("there is no unique constraint matching given keys
+		// for referenced table"), aborting boot on a fresh DB. SQLite hides
+		// this because it does not validate FK targets at CREATE TABLE time.
+		//
+		// The model-level `constraint:false` GORM tag is not honored by
+		// gorm v2's relationship parser, so the only reliable way to suppress
+		// FK creation across all drivers is this config flag.
+		DisableForeignKeyConstraintWhenMigrating: true,
 	})
 	if err != nil {
 		// Never surface the DSN in error wraps — pgx occasionally embeds connection
@@ -168,7 +187,11 @@ func getEnvPoolDuration(key string, fallback time.Duration) time.Duration {
 func AutoMigrateModels(db *gorm.DB, driver string) error {
 	driver = strings.ToLower(driver)
 
-	// Disable FK checks during migration for MySQL
+	// Disable FK checks during migration for MySQL.
+	// New databases will not get FKs created (DisableForeignKeyConstraintWhenMigrating
+	// in NewDatabase), but legacy MySQL DBs may still carry fk_traces_spans /
+	// fk_traces_logs from before RAN-49 — toggling FK_CHECKS=0 keeps the
+	// post-migrate DROP statements below safe regardless of legacy state.
 	if driver == "mysql" {
 		db.Exec("SET FOREIGN_KEY_CHECKS = 0")
 		log.Println("🔓 Disabled foreign key checks for migration")
@@ -187,12 +210,15 @@ func AutoMigrateModels(db *gorm.DB, driver string) error {
 		log.Printf("⚠️  legacy trace_id unique index drop failed: %v", err)
 	}
 
-	// Drop foreign keys that AutoMigrate may have created (MySQL)
+	// Legacy MySQL cleanup: drop FKs that pre-RAN-49 migrations created. Fresh
+	// MySQL DBs after RAN-49 won't have these (FK creation is now disabled at
+	// the gorm.Config layer), but pre-existing deployments still need this
+	// drop to keep async ingestion non-blocking.
 	if driver == "mysql" {
 		db.Exec("ALTER TABLE spans DROP FOREIGN KEY fk_traces_spans")
 		db.Exec("ALTER TABLE logs DROP FOREIGN KEY fk_traces_logs")
 		db.Exec("SET FOREIGN_KEY_CHECKS = 1")
-		log.Println("🔓 Dropped FK constraints for async ingestion compatibility")
+		log.Println("🔓 Dropped legacy FK constraints (no-op on fresh DBs)")
 	}
 
 	// Postgres: enable pg_trgm and create a GIN index on logs.body for fuzzy ILIKE search.
