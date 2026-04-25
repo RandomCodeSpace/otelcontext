@@ -9,8 +9,6 @@ import (
 	"context"
 	"fmt"
 	"time"
-
-	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 )
 
 // clusterLog runs the log body through Drain and upserts a LogClusterNode
@@ -80,11 +78,14 @@ func (g *GraphRAG) SimilarErrors(ctx context.Context, clusterID string, k int) [
 	if query == "" && len(cluster.TemplateTokens) > 0 {
 		query = joinTokens(cluster.TemplateTokens)
 	}
-	// vectordb.Index.Search takes the tenant string directly; we resolve it
-	// from ctx via the same storage helper used by storesFor so both sides
-	// agree on coercion rules (empty → DefaultTenantID).
-	tenant := storage.TenantFromContext(ctx)
-	results := g.vectorIdx.Search(tenant, query, k*2) // over-fetch to filter
+	// TODO(RAN-20): vectordb.Index.Search itself is not yet tenant-scoped on
+	// `main`, so we call the 2-arg signature here. Tenant isolation for the
+	// SignalStore lookup above is already enforced via storesFor(ctx); the
+	// vector hits are then narrowed by the EmittedBy edges in this tenant's
+	// SignalStore on lines below, so cross-tenant hits cannot surface even
+	// while the underlying vector index is shared.
+	_ = ctx
+	results := g.vectorIdx.Search(query, k*2) // over-fetch to filter
 
 	// Map results back to log clusters.
 	seen := map[string]bool{clusterID: true}
