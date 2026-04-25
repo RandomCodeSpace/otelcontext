@@ -348,6 +348,79 @@ func TestPG_PurgeTracesBatched_OrphanSpanSweep_NOT_IN(t *testing.T) {
 	}
 }
 
+// TestPG_AutoMigrate_FromEmpty_NoSpansTracesFK is the RAN-49 regression
+// guard. It boots a fresh Postgres 16 container, runs AutoMigrateModels
+// directly against the empty schema, and asserts:
+//
+//  1. The migrator completes (no SQLSTATE 42830 from the legacy
+//     spans.trace_id → traces.trace_id FK that pre-RAN-49 GORM emitted).
+//  2. No FK constraint exists on spans or logs that references traces —
+//     async ingestion can land child rows before their parent trace, and
+//     RAN-21 made trace identity composite, so a single-column FK on
+//     trace_id would either reject valid writes or fail at DDL time.
+//
+// SQLite cannot exercise this path: it does not validate FK targets at
+// CREATE TABLE time, which is exactly why RAN-21 silently regressed past
+// CI. Keep this test on the integration build tag so the regression
+// class can not sneak back in.
+func TestPG_AutoMigrate_FromEmpty_NoSpansTracesFK(t *testing.T) {
+	ctx := context.Background()
+
+	pgContainer, err := postgres.Run(ctx, "postgres:16-alpine",
+		postgres.WithDatabase("otel_test"),
+		postgres.WithUsername("otel"),
+		postgres.WithPassword("otel"),
+		postgres.BasicWaitStrategies(),
+	)
+	if err != nil {
+		t.Skipf("docker unavailable, skipping pg integration tests: %v", err)
+	}
+	defer func() { _ = pgContainer.Terminate(ctx) }()
+
+	dsn, err := pgContainer.ConnectionString(ctx, "sslmode=disable")
+	if err != nil {
+		t.Fatalf("ConnectionString: %v", err)
+	}
+
+	db, err := NewDatabase("postgres", dsn)
+	if err != nil {
+		t.Fatalf("NewDatabase(postgres): %v", err)
+	}
+	defer func() {
+		if sqlDB, dbErr := db.DB(); dbErr == nil {
+			_ = sqlDB.Close()
+		}
+	}()
+
+	if err := AutoMigrateModels(db, "postgres"); err != nil {
+		t.Fatalf("AutoMigrateModels(postgres) on empty DB failed (RAN-49 regression): %v", err)
+	}
+
+	// Assert no FK from spans/logs references traces.
+	rows, err := db.Raw(`
+		SELECT tc.table_name, tc.constraint_name, ccu.table_name AS foreign_table
+		FROM information_schema.table_constraints tc
+		JOIN information_schema.constraint_column_usage ccu
+		  ON tc.constraint_name = ccu.constraint_name
+		 AND tc.table_schema   = ccu.table_schema
+		WHERE tc.constraint_type = 'FOREIGN KEY'
+		  AND tc.table_schema    = 'public'
+		  AND tc.table_name      IN ('spans','logs')
+		  AND ccu.table_name     = 'traces'`).Rows()
+	if err != nil {
+		t.Fatalf("information_schema FK lookup: %v", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var table, name, foreignTable string
+		if scanErr := rows.Scan(&table, &name, &foreignTable); scanErr != nil {
+			t.Fatalf("FK row scan: %v", scanErr)
+		}
+		t.Errorf("unexpected FK %s on %s referencing %s — async ingestion expects no FK back to traces (RAN-49)", name, table, foreignTable)
+	}
+}
+
 // TestPG_AutoMigrate_BlobTypesBecomeBytea inspects information_schema to
 // assert that CompressedText fields are materialized as bytea columns on
 // Postgres — proves the GormDBDataType dialect mapping survives migration.
