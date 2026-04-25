@@ -626,11 +626,8 @@ func (s *Server) toolFindSimilarLogs(ctx context.Context, args map[string]any) T
 	if s.vectorIdx == nil {
 		return errorResult("vector index not yet initialized")
 	}
-	// TODO(RAN-20): vectordb.Index.Search itself is not yet tenant-scoped on
-	// `main`. The tenant filter for log similarity will move into the
-	// vector index in the RAN-20 follow-up; until then this call is shared.
-	_ = ctx
-	results := s.vectorIdx.Search(query, limit)
+	tenant := storage.TenantFromContext(mcpCtx(ctx))
+	results := s.vectorIdx.Search(tenant, query, limit)
 	data, err := json.MarshalIndent(results, "", "  ")
 	if err != nil {
 		return errorResult(fmt.Sprintf("failed to marshal similar logs: %v", err))
