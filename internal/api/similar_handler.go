@@ -9,7 +9,9 @@ import (
 )
 
 // handleGetSimilarLogs handles GET /api/logs/similar?q=<text>&limit=10
-// Returns logs semantically similar to the query string using TF-IDF cosine similarity.
+// Returns logs semantically similar to the query string using TF-IDF cosine
+// similarity, scoped to the tenant on r.Context() (set by TenantMiddleware
+// from X-Tenant-ID). Cross-tenant rows are never returned.
 func (s *Server) handleGetSimilarLogs(w http.ResponseWriter, r *http.Request) {
 	if s.vectorIdx == nil {
 		http.Error(w, "vector index not initialized", http.StatusServiceUnavailable)
