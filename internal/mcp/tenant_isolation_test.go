@@ -431,7 +431,11 @@ func TestMCP_TenantIsolation_AllGraphRAGTools(t *testing.T) {
 				"service":    ownService,
 				"time_range": "1h",
 			})
-			assertNoLeak(t, "root_cause_analysis", body, "", leakMarkers)
+			// RankedCause carries Service + Operation, so the caller's
+			// own service name MUST appear; an empty result here would
+			// silently regress the tool to a vacuous "[]" response that
+			// trivially "passes" leak checks (review feedback fix).
+			assertNoLeak(t, "root_cause_analysis", body, ownService, leakMarkers)
 		})
 
 		t.Run(caller.name+"/correlated_signals", func(t *testing.T) {
@@ -506,57 +510,118 @@ func TestMCP_TenantIsolation_AllGraphRAGTools(t *testing.T) {
 }
 
 // TestMCP_TenantIsolation_DrainClusterIDsStayPerTenant proves that two
-// tenants writing identical log bodies do not collide on the same Drain
-// cluster id surfaced by CorrelatedSignals. Drain itself is currently a
-// shared miner, but the LogClusterNodes are stored on per-tenant
-// SignalStores so the cluster id surfaces tenant-side and a tenant cannot
-// observe another tenant's cluster row.
+// tenants writing identical log bodies under an *identical* service name
+// do not share a single shared LogClusterNode. Drain itself is currently
+// a shared miner — without per-tenant SignalStore partitioning the same
+// (template, service) pair would collapse to one cluster row visible to
+// both tenants. The test inspects the actual LogClusterNodes returned by
+// CorrelatedSignals (not just the response text) and asserts each tenant
+// only ever sees rows tagged with its own marker.
 func TestMCP_TenantIsolation_DrainClusterIDsStayPerTenant(t *testing.T) {
-	ts, g, repo, vIdx := setupTenantIsolationServer(t)
+	ts, g, _, _ := setupTenantIsolationServer(t)
 	now := time.Now().Add(-time.Minute)
 
-	// Identical log body for both tenants — collision-by-design.
-	for _, tenant := range []string{"acme", "beta"} {
-		seedTenant(t, g, repo, vIdx, tenant, now)
-	}
-	waitForServiceMaps(t, g, []string{"acme", "beta"})
+	// Identical service AND identical log template across tenants — Drain
+	// is a shared miner so the (service, templateID) cluster key would
+	// collide if SignalStore weren't tenant-partitioned. The body marker
+	// is the only per-tenant differentiator.
+	const sharedService = "shared-orders"
+	const sharedTrace = "trace-shared"
+	const sharedSpan = "span-shared"
 
+	for _, tenant := range []string{"acme", "beta"} {
+		g.OnSpanIngested(storage.Span{
+			TenantID:      tenant,
+			TraceID:       sharedTrace,
+			SpanID:        sharedSpan,
+			ServiceName:   sharedService,
+			OperationName: "/checkout",
+			Status:        "STATUS_CODE_ERROR",
+			StartTime:     now,
+			EndTime:       now.Add(time.Millisecond),
+			Duration:      1000,
+		})
+		g.OnLogIngested(storage.Log{
+			TenantID:    tenant,
+			TraceID:     sharedTrace,
+			SpanID:      sharedSpan,
+			ServiceName: sharedService,
+			Severity:    "ERROR",
+			Body:        tenant + "-marker upstream connection refused",
+			Timestamp:   now.Add(time.Millisecond),
+		})
+	}
+
+	ctxA := storage.WithTenantContext(context.Background(), "acme")
+	ctxB := storage.WithTenantContext(context.Background(), "beta")
+
+	// Wait for both tenants' SignalStores to surface the cluster row.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		a := g.CorrelatedSignals(ctxA, sharedService, now.Add(-time.Hour))
+		b := g.CorrelatedSignals(ctxB, sharedService, now.Add(-time.Hour))
+		if a != nil && b != nil && len(a.ErrorLogs) >= 1 && len(b.ErrorLogs) >= 1 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	sigA := g.CorrelatedSignals(ctxA, sharedService, now.Add(-time.Hour))
+	sigB := g.CorrelatedSignals(ctxB, sharedService, now.Add(-time.Hour))
+	if sigA == nil || len(sigA.ErrorLogs) == 0 {
+		t.Fatalf("acme CorrelatedSignals returned no ErrorLogs — Drain/SignalStore did not see the seeded log")
+	}
+	if sigB == nil || len(sigB.ErrorLogs) == 0 {
+		t.Fatalf("beta CorrelatedSignals returned no ErrorLogs — Drain/SignalStore did not see the seeded log")
+	}
+
+	// Per-tenant cluster row content must carry only that tenant's marker.
+	// We probe both Template and SampleLog because Drain stores the
+	// templated form on Template and the original body on SampleLog, and
+	// both should be uncontaminated.
+	checkClusters := func(name string, clusters []graphrag.LogClusterNode, ownMarker, foreignMarker string) []string {
+		t.Helper()
+		var ids []string
+		for _, lc := range clusters {
+			ids = append(ids, lc.ID)
+			joined := lc.Template + "\n" + lc.SampleLog
+			if !strings.Contains(joined, ownMarker) {
+				t.Errorf("[%s] cluster %q missing own marker %q (template=%q sample=%q)", name, lc.ID, ownMarker, lc.Template, lc.SampleLog)
+			}
+			if strings.Contains(joined, foreignMarker) {
+				t.Errorf("[%s] cluster %q LEAKED foreign marker %q (template=%q sample=%q)", name, lc.ID, foreignMarker, lc.Template, lc.SampleLog)
+			}
+		}
+		return ids
+	}
+	idsA := checkClusters("acme", sigA.ErrorLogs, "acme-marker", "beta-marker")
+	idsB := checkClusters("beta", sigB.ErrorLogs, "beta-marker", "acme-marker")
+
+	// The cluster IDs themselves can be identical across tenants (Drain ID
+	// is service-scoped, not tenant-scoped) — that is precisely WHY the
+	// SignalStore partition matters: without it, the same key would point
+	// at one shared row. Surface this fact in the test record so a future
+	// refactor that makes IDs tenant-stamped doesn't accidentally weaken
+	// the assertion above.
+	t.Logf("drain cluster IDs: acme=%v beta=%v", idsA, idsB)
+
+	// End-to-end probe: the same isolation must hold via the MCP HTTP
+	// surface, not just the in-process API.
 	for _, scoped := range []string{"acme", "beta"} {
 		_, body := callTool(t, ts, scoped, "correlated_signals", map[string]any{
-			"service":    scoped + "-orders",
+			"service":    sharedService,
 			"time_range": "1h",
 		})
-		// Caller's marker must appear, the other tenant's must not.
 		other := "beta"
 		if scoped == "beta" {
 			other = "acme"
 		}
 		if !strings.Contains(body, scoped+"-marker") {
-			t.Errorf("%s correlated_signals missing own marker, body=%s", scoped, truncate(body))
+			t.Errorf("%s correlated_signals (HTTP) missing own marker, body=%s", scoped, truncate(body))
 		}
 		if strings.Contains(body, other+"-marker") {
-			t.Errorf("%s correlated_signals leaked %s marker, body=%s", scoped, other, truncate(body))
+			t.Errorf("%s correlated_signals (HTTP) leaked %s marker, body=%s", scoped, other, truncate(body))
 		}
-	}
-
-	// Sanity: prove the test setup actually shares state between tenants
-	// at the storage layer (so the isolation we're asserting above is
-	// non-trivial). Same trace_id should land in two distinct rows because
-	// Span.TenantID is part of the unique identity for these inserts.
-	// We don't persist spans here directly (we go through OnSpanIngested
-	// which is in-memory only), so we just assert the in-memory invariant.
-	ctxA := storage.WithTenantContext(context.Background(), "acme")
-	ctxB := storage.WithTenantContext(context.Background(), "beta")
-	mapA := g.ServiceMap(ctxA, 0)
-	mapB := g.ServiceMap(ctxB, 0)
-	if got, want := len(mapA), 1; got != want {
-		t.Fatalf("acme ServiceMap len=%d want=%d (%+v)", got, want, mapA)
-	}
-	if got, want := len(mapB), 1; got != want {
-		t.Fatalf("beta ServiceMap len=%d want=%d (%+v)", got, want, mapB)
-	}
-	if mapA[0].Service.Name == mapB[0].Service.Name {
-		t.Fatalf("ServiceMap shows same service name for both tenants — partition broken: %v vs %v", mapA[0].Service, mapB[0].Service)
 	}
 }
 

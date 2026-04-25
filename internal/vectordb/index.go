@@ -82,12 +82,35 @@ func (idx *Index) Add(logID uint, tenant, serviceName, severity, body string) {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 
-	// FIFO eviction — copy to new slice to release old backing array memory
+	// Tenant-aware FIFO eviction. When at cap, remove up to maxSize/10 of the
+	// oldest entries belonging to the inserting tenant so a noisy tenant
+	// cannot push another tenant's warm rows out of the index (availability
+	// isolation — the confidentiality invariant is enforced separately by
+	// doc.Tenant filtering in Search). The new backing slice also releases
+	// the old array memory on the next GC cycle.
 	if len(idx.docs) >= idx.maxSize {
-		keep := idx.docs[idx.maxSize/10:]
-		newDocs := make([]LogVector, len(keep), idx.maxSize)
-		copy(newDocs, keep)
-		idx.docs = newDocs
+		toDrop := idx.maxSize / 10
+		if toDrop < 1 {
+			toDrop = 1
+		}
+		kept := make([]LogVector, 0, idx.maxSize)
+		droppedSame := 0
+		for _, d := range idx.docs {
+			if droppedSame < toDrop && d.Tenant == tenant {
+				droppedSame++
+				continue
+			}
+			kept = append(kept, d)
+		}
+		// Edge case: the inserting tenant has no prior entries while the
+		// index is at cap with other tenants' rows. Drop one globally-oldest
+		// entry so the new tenant can take its first slot. This is the only
+		// path where a tenant's entry can be evicted by another tenant, and
+		// it costs at most one row per brand-new tenant.
+		if droppedSame == 0 && len(kept) > 0 {
+			kept = kept[1:]
+		}
+		idx.docs = kept
 		idx.dirty = true
 	}
 

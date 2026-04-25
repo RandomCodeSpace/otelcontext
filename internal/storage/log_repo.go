@@ -143,6 +143,33 @@ func (r *Repository) UpdateLogInsight(ctx context.Context, logID uint, insight s
 	return nil
 }
 
+// ListRecentHighSeverityLogsAllTenants returns recent logs of the given
+// severity across EVERY tenant, each row carrying its own TenantID. This is an
+// administrative read used exclusively by the vector index's startup
+// hydration path, which fans rows out to per-tenant shards. It is not exposed
+// on any tenant-scoped API surface — tenant isolation for read paths must
+// otherwise be preserved via the context-driven WHERE clause.
+func (r *Repository) ListRecentHighSeverityLogsAllTenants(ctx context.Context, severity string, since, until time.Time, limit int) ([]Log, error) {
+	if limit <= 0 {
+		limit = 5000
+	}
+	q := r.db.WithContext(ctx).Model(&Log{})
+	if severity != "" {
+		q = q.Where("severity = ?", severity)
+	}
+	if !since.IsZero() {
+		q = q.Where("timestamp >= ?", since)
+	}
+	if !until.IsZero() {
+		q = q.Where("timestamp <= ?", until)
+	}
+	var logs []Log
+	if err := q.Order("timestamp desc").Limit(limit).Find(&logs).Error; err != nil {
+		return nil, fmt.Errorf("failed to list recent logs all tenants: %w", err)
+	}
+	return logs, nil
+}
+
 // PurgeLogs deletes logs older than the given timestamp in a single statement.
 // Suitable for SQLite; for Postgres at large retention volumes prefer PurgeLogsBatched.
 func (r *Repository) PurgeLogs(olderThan time.Time) (int64, error) {
