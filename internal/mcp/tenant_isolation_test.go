@@ -94,7 +94,7 @@ func setupTenantIsolationServer(t *testing.T) (*httptest.Server, *graphrag.Graph
 	bgCtx, cancel := context.WithCancel(context.Background())
 	go g.Start(bgCtx)
 
-	srv := New(repo, nil, nil, vIdx)
+	srv := New("", repo, nil, nil, vIdx)
 	srv.SetGraphRAG(g)
 
 	httpSrv := httptest.NewServer(srv.Handler())

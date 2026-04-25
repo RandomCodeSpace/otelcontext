@@ -41,24 +41,33 @@ type Server struct {
 	defaultTenant string
 }
 
-// New creates a new MCP server.
+// New creates a new MCP server. defaultTenant is the fallback tenant applied
+// to header-less MCP requests; an empty string falls back to
+// storage.DefaultTenantID. Required at construction time so production startup
+// cannot accidentally drop cfg.DefaultTenant — a missing argument is a compile
+// error rather than a silent regression.
 func New(
+	defaultTenant string,
 	repo *storage.Repository,
 	metrics *telemetry.Metrics,
 	svcGraph *graph.Graph,
 	vectorIdx *vectordb.Index,
 ) *Server {
+	if defaultTenant == "" {
+		defaultTenant = storage.DefaultTenantID
+	}
 	return &Server{
 		repo:          repo,
 		metrics:       metrics,
 		svcGraph:      svcGraph,
 		vectorIdx:     vectorIdx,
-		defaultTenant: storage.DefaultTenantID,
+		defaultTenant: defaultTenant,
 	}
 }
 
-// SetDefaultTenant overrides the fallback tenant used when an MCP request
-// carries no X-Tenant-ID header. Call from startup wiring with cfg.DefaultTenant.
+// SetDefaultTenant overrides the fallback tenant at runtime. Empty strings are
+// ignored so callers can pass through optional config without clobbering the
+// constructor-provided value.
 func (s *Server) SetDefaultTenant(t string) {
 	if t != "" {
 		s.defaultTenant = t

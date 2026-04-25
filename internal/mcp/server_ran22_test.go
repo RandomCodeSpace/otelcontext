@@ -12,53 +12,74 @@ import (
 	"github.com/RandomCodeSpace/otelcontext/internal/vectordb"
 )
 
-// TestSetDefaultTenant_PropagatesToHTTPTransport is the RAN-22 acceptance bar:
-// after startup wiring calls SetDefaultTenant(cfg.DefaultTenant), a header-less
-// MCP tools/call must resolve to the configured tenant rather than the
-// hardcoded storage.DefaultTenantID. Also asserts the no-op semantics for
-// SetDefaultTenant("") so we don't regress the documented contract.
-func TestSetDefaultTenant_PropagatesToHTTPTransport(t *testing.T) {
+// TestNew_DefaultTenant_FromConstructor is the RAN-22 regression bar at the
+// type level: the configured default tenant is a required leading parameter
+// to New, so production startup wiring (main.go) cannot drop it without a
+// compile error. Empty input falls back to storage.DefaultTenantID; a
+// non-empty value is preserved verbatim.
+func TestNew_DefaultTenant_FromConstructor(t *testing.T) {
+	t.Run("empty falls back to storage.DefaultTenantID", func(t *testing.T) {
+		srv := New("", nil, nil, nil, vectordb.New(1))
+		if srv.defaultTenant != storage.DefaultTenantID {
+			t.Fatalf(`New("") defaultTenant = %q, want %q`, srv.defaultTenant, storage.DefaultTenantID)
+		}
+	})
+	t.Run("non-empty value is preserved", func(t *testing.T) {
+		srv := New("acme", nil, nil, nil, vectordb.New(1))
+		if srv.defaultTenant != "acme" {
+			t.Fatalf(`New("acme") defaultTenant = %q, want "acme"`, srv.defaultTenant)
+		}
+	})
+	t.Run("SetDefaultTenant runtime override still works", func(t *testing.T) {
+		srv := New("acme", nil, nil, nil, vectordb.New(1))
+		srv.SetDefaultTenant("globex")
+		if srv.defaultTenant != "globex" {
+			t.Fatalf(`SetDefaultTenant("globex") defaultTenant = %q, want "globex"`, srv.defaultTenant)
+		}
+		// Empty argument is a no-op so optional config doesn't clobber.
+		srv.SetDefaultTenant("")
+		if srv.defaultTenant != "globex" {
+			t.Fatalf(`SetDefaultTenant("") clobbered field to %q`, srv.defaultTenant)
+		}
+	})
+}
+
+// TestNew_DefaultTenant_FlowsThroughHTTPTransport proves that the constructor-
+// supplied tenant is the actual fallback used by the JSON-RPC HTTP handler
+// when no X-Tenant-ID header is present, and that an explicit header still
+// wins over the default. This locks in the end-to-end behavior the RAN-22
+// fix delivers: a deployment with DEFAULT_TENANT=acme returns acme-scoped
+// data from header-less MCP tool calls.
+func TestNew_DefaultTenant_FlowsThroughHTTPTransport(t *testing.T) {
 	idx := vectordb.New(100)
 	idx.Add(1, "acme", "checkout", "ERROR", "payment gateway timeout acme-marker-xyz")
 	idx.Add(2, "globex", "auth", "ERROR", "payment gateway 500 globex-marker-qqq")
 	idx.Add(3, "default", "svc", "ERROR", "payment gateway refused default-marker-aaa")
-
-	srv := New(nil, nil, nil, idx)
-	if srv.defaultTenant != storage.DefaultTenantID {
-		t.Fatalf("constructor default = %q, want %q", srv.defaultTenant, storage.DefaultTenantID)
-	}
-
-	// Empty argument is a no-op — preserves prior value.
-	srv.SetDefaultTenant("")
-	if srv.defaultTenant != storage.DefaultTenantID {
-		t.Fatalf(`SetDefaultTenant("") clobbered field to %q`, srv.defaultTenant)
-	}
 
 	body := mustMarshalJSONRPC(t, "find_similar_logs", map[string]any{
 		"query": "payment gateway",
 		"limit": float64(50),
 	})
 
-	// Step 1: configure non-default tenant; no header → should be acme-scoped.
-	srv.SetDefaultTenant("acme")
-	if srv.defaultTenant != "acme" {
-		t.Fatalf(`SetDefaultTenant("acme") = %q`, srv.defaultTenant)
-	}
+	srv := New("acme", nil, nil, nil, idx)
+
+	// Header-less tools/call must scope to the constructor-provided default.
 	resp1 := callNoHeader(t, srv, body)
 	mustContain(t, resp1, "acme-marker-xyz")
 	mustNotContain(t, resp1, "globex-marker-qqq", "default-marker-aaa")
 
-	// Step 2: change configured tenant; same header-less call must follow.
-	srv.SetDefaultTenant("globex")
-	resp2 := callNoHeader(t, srv, body)
+	// Explicit X-Tenant-ID header beats the configured default — precedence
+	// invariant is preserved.
+	resp2 := callWithHeader(t, srv, body, "globex")
 	mustContain(t, resp2, "globex-marker-qqq")
 	mustNotContain(t, resp2, "acme-marker-xyz", "default-marker-aaa")
 
-	// Step 3: explicit X-Tenant-ID header must still win over the configured
-	// default — proves the fix did not invert tenant precedence.
-	resp3 := callWithHeader(t, srv, body, "acme")
-	mustContain(t, resp3, "acme-marker-xyz")
-	mustNotContain(t, resp3, "globex-marker-qqq", "default-marker-aaa")
+	// SetDefaultTenant runtime override flows to the same transport path so
+	// future runtime-config-reload paths behave correctly.
+	srv.SetDefaultTenant("globex")
+	resp3 := callNoHeader(t, srv, body)
+	mustContain(t, resp3, "globex-marker-qqq")
+	mustNotContain(t, resp3, "acme-marker-xyz", "default-marker-aaa")
 }
 
 func mustMarshalJSONRPC(t *testing.T, tool string, args map[string]any) []byte {
