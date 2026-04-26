@@ -234,6 +234,47 @@ Failure-mode gauges (prefix `OtelContext_`):
 - `retention_last_success_timestamp` — Unix seconds; alert when stale relative to the hourly tick
 - `retention_rows_purged_total`, `retention_purge_duration_seconds`, `retention_vacuum_duration_seconds` — throughput and latency
 
+## Security & Supply Chain
+
+OtelContext targets the OpenSSF Best Practices `passing` badge (project [12646](https://www.bestpractices.dev/en/projects/12646)) and ships a six-job OSS-CLI security stack — no Sonar, no CodeQL, no NVD-direct tooling. Cost: $0.
+
+### OSS-CLI security stack (`.github/workflows/security.yml`)
+
+| Concern | Tool | Gate |
+|---|---|---|
+| SCA (Go modules + npm) | OSV-Scanner against `go.mod` + `ui/package-lock.json` (OSV.dev / GHSA / ecosystem feeds; **not NVD**) | Block merge on High/Critical |
+| SCA (filesystem + OS) + container scan | Trivy filesystem scan; Dependabot surfaces advisories on the Security tab | Block merge on `severity: HIGH,CRITICAL`, `exit-code: 1`, `ignore-unfixed: true` |
+| SAST | Semgrep (`p/security-audit` + `p/owasp-top-ten` + `p/golang`) | Block merge on `--severity ERROR` |
+| Secret scan | Gitleaks (full git history) | Block merge on any finding |
+| Duplication | jscpd, threshold 3%, `--min-tokens 100`, scoped to `internal/` + `ui/src/`, excludes tests, vendor, build artifacts, and the legacy `internal/graph/` package | Block merge above threshold |
+| SBOM | `anchore/sbom-action` (SPDX + CycloneDX) | Surface as 90-day artifact; do **not** gate merge |
+| Lint (Go) | `golangci-lint` (existing `.golangci.yml`) | Wired into `ci.yml`, not security.yml |
+
+All actions are SHA-pinned per Scorecard `Pinned-Dependencies`. Top-level `permissions: read-all`; jobs scope up only when needed (gitleaks needs full history; sbom uploads).
+
+**Not used (do not re-introduce without an explicit board reversal):** SonarCloud / SonarQube, CodeQL (GHAS-paid for non-public repos), OWASP Dependency-Check (or any NVD-direct tool — NVD has analysis-backlog and rate-limit reliability problems).
+
+### OpenSSF Scorecard (`.github/workflows/scorecard.yml`)
+
+- **Schedule:** push to `main` + Mondays 06:00 UTC + manual `workflow_dispatch`.
+- **Output:** SARIF → Security tab; results published to public Scorecard dashboard.
+- **Hardening:** `step-security/harden-runner` (egress: audit), `actions/checkout` with `persist-credentials: false`.
+- **Baseline:** to be measured after first push to `main`. Track via the Scorecard dashboard linked from the README badge.
+- **Stretch target:** ≥ 8.0/10. Best-effort — Scorecard does **not** gate merge per the board ruling. The `passing` Best Practices badge is the only hard supply-chain gate.
+
+### Vulnerability reporting
+
+See [`SECURITY.md`](SECURITY.md). Preferred channel: GitHub Security Advisories at `https://github.com/RandomCodeSpace/otelcontext/security/advisories/new`. Email fallback: `ak.nitrr13@gmail.com` with subject prefix `[otelcontext security]`.
+
+### Signed commits & branch protection
+
+- Repo-local config helper: [`scripts/setup-git-signed.sh`](scripts/setup-git-signed.sh) — supports ssh, openpgp, and x509 signing; honours the contributor's existing global git identity.
+- Branch protection on `main` requiring signed commits is configured at the GitHub repo level (board-admin action; not file-driven). When toggled on, every commit landing on `main` must verify.
+
+### Self-assessment evidence
+
+- [`.bestpractices.json`](.bestpractices.json) — OpenSSF Best Practices evidence map (project 12646, level `passing`, six categories self-assessed). The badge level transition from `in_progress` → `passing` requires a board admin to log into bestpractices.dev with the OSS-Random identity.
+
 ## Build & Run
 
 ```bash

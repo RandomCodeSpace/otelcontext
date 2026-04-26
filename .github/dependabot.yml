@@ -1,0 +1,123 @@
+# Dependabot configuration for otelcontext.
+# Docs: https://docs.github.com/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+#
+# Strategy:
+#   * weekly cadence — keeps the noise floor low while still catching CVEs early
+#   * grouped updates per ecosystem so PR fan-out stays manageable
+#   * security updates fire whenever needed regardless of the weekly slot
+#
+# RAN-53 AC #5 reactive channel. Also enable repo-level "Dependabot security
+# updates" via gh api (the version-updates below cover routine bumps; security
+# updates are the reactive channel).
+
+version: 2
+updates:
+  # ----- Go modules (the otelcontext binary) -----
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "08:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 10
+    labels:
+      - "type:dependencies"
+      - "area:backend"
+    commit-message:
+      prefix: "chore(deps)"
+      include: "scope"
+    groups:
+      otel:
+        patterns:
+          - "go.opentelemetry.io/*"
+      grpc-protobuf:
+        patterns:
+          - "google.golang.org/grpc"
+          - "google.golang.org/protobuf"
+          - "google.golang.org/genproto*"
+      gorm:
+        patterns:
+          - "gorm.io/*"
+      azure:
+        patterns:
+          - "github.com/Azure/*"
+          - "github.com/AzureAD/*"
+      prometheus:
+        patterns:
+          - "github.com/prometheus/*"
+      test-libs:
+        patterns:
+          - "github.com/stretchr/testify"
+          - "github.com/google/go-cmp"
+
+  # ----- GitHub Actions (CI / release / security) -----
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "08:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
+    labels:
+      - "type:dependencies"
+      - "area:ci"
+    commit-message:
+      prefix: "chore(actions)"
+      include: "scope"
+    groups:
+      actions:
+        patterns:
+          - "*"
+
+  # ----- Frontend (npm under ui/) -----
+  - package-ecosystem: "npm"
+    directory: "/ui"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "08:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
+    labels:
+      - "type:dependencies"
+      - "area:frontend"
+    commit-message:
+      prefix: "chore(frontend)"
+      include: "scope"
+    groups:
+      react:
+        patterns:
+          - "react"
+          - "react-dom"
+          - "react-window"
+          - "@types/react*"
+          - "@types/react-window"
+      mantine:
+        patterns:
+          - "@mantine/*"
+      vite:
+        patterns:
+          - "vite"
+          - "@vitejs/*"
+      vitest-testing:
+        patterns:
+          - "vitest"
+          - "@testing-library/*"
+          - "jsdom"
+      echarts:
+        patterns:
+          - "echarts"
+          - "echarts-for-react"
+      eslint:
+        patterns:
+          - "eslint"
+          - "@eslint/*"
+          - "eslint-plugin-*"
+          - "typescript-eslint"
+          - "globals"
+      typescript:
+        patterns:
+          - "typescript"
+          - "@types/*"

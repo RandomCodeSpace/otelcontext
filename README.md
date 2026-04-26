@@ -1,8 +1,9 @@
 # OtelContext
 
-[![Security Scan](https://github.com/RandomCodeSpace/otelcontext/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/RandomCodeSpace/otelcontext/actions/workflows/ci.yml)
-[![OpenSSF Scan](https://github.com/RandomCodeSpace/otelcontext/actions/workflows/ci.yml/badge.svg?branch=main&label=OpenSSF%20scan)](https://github.com/RandomCodeSpace/otelcontext/actions/workflows/ci.yml)
-[![OpenSSF Score](https://api.scorecard.dev/projects/github.com/RandomCodeSpace/otelcontext/badge)](https://scorecard.dev/viewer/?uri=github.com/RandomCodeSpace/otelcontext)
+[![CI](https://github.com/RandomCodeSpace/otelcontext/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/RandomCodeSpace/otelcontext/actions/workflows/ci.yml)
+[![Security (OSS-CLI)](https://github.com/RandomCodeSpace/otelcontext/actions/workflows/security.yml/badge.svg?branch=main)](https://github.com/RandomCodeSpace/otelcontext/actions/workflows/security.yml)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/RandomCodeSpace/otelcontext/badge)](https://scorecard.dev/viewer/?uri=github.com/RandomCodeSpace/otelcontext)
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/12646/badge)](https://www.bestpractices.dev/projects/12646)
 [![Release](https://img.shields.io/github/v/release/RandomCodeSpace/otelcontext)](https://github.com/RandomCodeSpace/otelcontext/releases)
 [![Beta](https://img.shields.io/github/v/release/RandomCodeSpace/otelcontext?include_prereleases&label=beta)](https://github.com/RandomCodeSpace/otelcontext/releases)
 ![Go Version](https://img.shields.io/github/go-mod/go-version/RandomCodeSpace/otelcontext)
@@ -112,6 +113,10 @@ See `docs/otel-collector-example.yaml` for a complete example.
 - **DLQ** — durable typed envelopes with disk-bounded replay.
 - **Self-instrumentation** — export OtelContext's own spans via `OTEL_EXPORTER_OTLP_ENDPOINT`.
 
+## Security
+
+See [`SECURITY.md`](SECURITY.md) for the vulnerability reporting process. The security posture (OSV-Scanner, Trivy, Semgrep, Gitleaks, jscpd, SBOM, Scorecard) is described in [`CLAUDE.md`](CLAUDE.md) under "Security & Supply Chain".
+
 ## License
 
-See [LICENSE](LICENSE).
+See [LICENSE.md](LICENSE.md).

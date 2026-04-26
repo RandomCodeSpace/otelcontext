@@ -1,0 +1,67 @@
+# OpenSSF Scorecard supply-chain analysis.
+# RAN-53 AC #4. Best-effort target — no hard numeric floor; Scorecard does not gate merge.
+# Stretch target: >= 8.0/10. See CLAUDE.md "Security & Supply Chain" for baseline tracking.
+# Docs: https://github.com/ossf/scorecard-action
+
+name: Scorecard supply-chain security
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    # Mondays 06:00 UTC
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+# Restrict the default GITHUB_TOKEN to read-only; the steps below request the
+# narrow scopes they actually need.
+permissions: read-all
+
+jobs:
+  analysis:
+    name: Scorecard analysis
+    runs-on: ubuntu-latest
+    permissions:
+      # Required for upload to the code-scanning Security tab.
+      security-events: write
+      # Required to read OIDC token for publish_results.
+      id-token: write
+      # Default scopes for actions/checkout.
+      contents: read
+      actions: read
+
+    steps:
+      - name: Harden runner egress
+        # step-security/harden-runner v2.19.0
+        uses: step-security/harden-runner@8d3c67de8e2fe68ef647c8db1e6a09f647780f40
+        with:
+          egress-policy: audit
+
+      - name: Checkout code
+        # actions/checkout v6.0.2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - name: Run Scorecard analysis
+        # ossf/scorecard-action v2.4.3
+        uses: ossf/scorecard-action@4eaacf0543bb3f2c246792bd56e8cdeffafb205a
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          # Publish the results so they appear on the public Scorecard dashboard.
+          publish_results: true
+
+      - name: Upload Scorecard SARIF (artifact)
+        # actions/upload-artifact v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: scorecard-sarif
+          path: results.sarif
+          retention-days: 5
+
+      - name: Upload SARIF to GitHub code-scanning
+        # github/codeql-action/upload-sarif v3.35.2
+        uses: github/codeql-action/upload-sarif@ce64ddcb0d8d890d2df4a9d1c04ff297367dea2a
+        with:
+          sarif_file: results.sarif

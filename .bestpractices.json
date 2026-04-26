@@ -1,0 +1,39 @@
+{
+  "$schema": "https://bestpractices.coreinfrastructure.org/projects.schema.json",
+  "_comment": "OpenSSF Best Practices self-assessment for RandomCodeSpace/otelcontext (RAN-53). Project page: https://www.bestpractices.dev/en/projects/12646. The badge level transition from in_progress -> passing requires a board admin to log into bestpractices.dev with the OSS-Random identity and confirm the evidence pointers against the questionnaire. The self-assessment below is the evidence map for that review.",
+  "project_id": 12646,
+  "name": "otelcontext",
+  "description": "Self-hosted OTLP observability platform in a single Go binary — OTLP gRPC + HTTP ingest, GraphRAG-powered root-cause analysis, multi-tenant storage, and a built-in MCP server for AI agents.",
+  "homepage_url": "https://github.com/RandomCodeSpace/otelcontext",
+  "repo_url": "https://github.com/RandomCodeSpace/otelcontext",
+  "license": "MIT",
+  "level": "passing",
+  "status": {
+    "basics": "self-assessed-passing",
+    "change_control": "self-assessed-passing",
+    "reporting": "self-assessed-passing",
+    "quality": "self-assessed-passing",
+    "security": "self-assessed-passing",
+    "analysis": "self-assessed-passing"
+  },
+  "evidence": {
+    "vulnerability_report_process": "SECURITY.md",
+    "engineering_standards": "CLAUDE.md",
+    "license_file": "LICENSE.md",
+    "build_reproducible": "go build -o otelcontext .",
+    "ci_workflow": ".github/workflows/ci.yml",
+    "supply_chain_scorecard": ".github/workflows/scorecard.yml",
+    "dependency_updates": ".github/dependabot.yml",
+    "signed_commits": "scripts/setup-git-signed.sh",
+    "secret_scanning": ".github/workflows/security.yml (gitleaks job, full git history) + GitHub repo setting (secret_scanning + push_protection enabled — escalated to board)",
+    "static_analysis": "golangci-lint (.golangci.yml) + Semgrep (.github/workflows/security.yml, p/security-audit + p/owasp-top-ten + p/golang)",
+    "vulnerability_scanning": "OSV-Scanner (go.mod + ui/package-lock.json) + Trivy (filesystem) + Dependabot (.github/dependabot.yml)",
+    "sbom": ".github/workflows/security.yml (anchore/sbom-action — SPDX + CycloneDX, 90-day artifact retention)",
+    "duplication": ".github/workflows/security.yml (jscpd, threshold 3%, scoped to internal/ + ui/src/)"
+  },
+  "audit": {
+    "self_assessment_date": "2026-04-26",
+    "self_assessment_author": "TechLead (RAN-53)",
+    "registration_blocker": "Badge promotion in_progress -> passing requires board admin OAuth at https://www.bestpractices.dev/. Tracked under RAN-53 acceptance item #1."
+  }
+}
