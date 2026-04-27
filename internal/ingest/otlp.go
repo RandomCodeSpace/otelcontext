@@ -3,6 +3,7 @@ package ingest
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -21,7 +22,9 @@ import (
 	metricspb "go.opentelemetry.io/proto/otlp/metrics/v1"
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 	"golang.org/x/sync/errgroup"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	grpcstatus "google.golang.org/grpc/status"
 )
 
 // tenantHeader is the canonical HTTP / gRPC metadata key used to override the
@@ -99,7 +102,9 @@ type TraceServer struct {
 	minSeverity         int
 	allowedServices     map[string]bool
 	excludedServices    map[string]bool
-	sampler             *Sampler // nil = no sampling (keep all)
+	sampler             *Sampler  // nil = no sampling (keep all)
+	pipeline            *Pipeline // nil = synchronous DB writes (legacy path)
+	latencyThresholdMs  float64   // spans slower than this are flagged HasSlow for the pipeline
 	defaultTenant       string
 	trustResourceTenant bool
 	coltracepb.UnimplementedTraceServiceServer
@@ -112,6 +117,7 @@ type LogsServer struct {
 	minSeverity         int
 	allowedServices     map[string]bool
 	excludedServices    map[string]bool
+	pipeline            *Pipeline // nil = synchronous DB writes (legacy path)
 	defaultTenant       string
 	trustResourceTenant bool
 	collogspb.UnimplementedLogsServiceServer
@@ -136,6 +142,7 @@ func NewTraceServer(repo *storage.Repository, metrics *telemetry.Metrics, cfg *c
 		minSeverity:         parseSeverity(cfg.IngestMinSeverity),
 		allowedServices:     parseServiceList(cfg.IngestAllowedServices),
 		excludedServices:    parseServiceList(cfg.IngestExcludedServices),
+		latencyThresholdMs:  float64(cfg.SamplingLatencyThresholdMs),
 		defaultTenant:       cfg.DefaultTenant,
 		trustResourceTenant: cfg.OTLPTrustResourceTenant,
 	}
@@ -154,6 +161,20 @@ func (s *TraceServer) SetSpanCallback(cb func(storage.Span)) {
 // SetSampler enables adaptive trace sampling. Pass nil to disable.
 func (s *TraceServer) SetSampler(sm *Sampler) {
 	s.sampler = sm
+}
+
+// SetPipeline enables the async ingest pipeline. When set, Export()
+// returns to the caller as soon as the parsed batch is enqueued (or
+// rejected), and persistence runs on the pipeline's worker pool. Pass
+// nil to revert to the synchronous DB-write path.
+func (s *TraceServer) SetPipeline(p *Pipeline) {
+	s.pipeline = p
+}
+
+// SetPipeline enables the async ingest pipeline for log export. Same
+// semantics as TraceServer.SetPipeline.
+func (s *LogsServer) SetPipeline(p *Pipeline) {
+	s.pipeline = p
 }
 
 func NewLogsServer(repo *storage.Repository, metrics *telemetry.Metrics, cfg *config.Config) *LogsServer {
@@ -265,9 +286,11 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 	slog.Debug("📥 [TRACES] Received Request", "resource_spans", len(req.ResourceSpans))
 
 	type batchResult struct {
-		spans  []storage.Span
-		traces []storage.Trace
-		logs   []storage.Log
+		spans   []storage.Span
+		traces  []storage.Trace
+		logs    []storage.Log
+		hasErr  bool // any span in this slice had STATUS_CODE_ERROR
+		hasSlow bool // any span exceeded latencyThresholdMs
 	}
 
 	results := make([]batchResult, len(req.ResourceSpans))
@@ -289,6 +312,7 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 			localSpans := make([]storage.Span, 0)
 			localTraces := make([]storage.Trace, 0)
 			localLogs := make([]storage.Log, 0)
+			var localHasErr, localHasSlow bool
 
 			for _, scopeSpans := range resourceSpans.ScopeSpans {
 				for _, span := range scopeSpans.Spans {
@@ -326,6 +350,16 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 						AttributesJSON: storage.CompressedText(attrs),
 					}
 					localSpans = append(localSpans, sModel)
+
+					// Flag the batch for the async pipeline's priority lane.
+					// Errors and slow spans bypass soft-backpressure drops so
+					// diagnostic data is never silently lost at >=90% queue.
+					if statusStr == "STATUS_CODE_ERROR" {
+						localHasErr = true
+					}
+					if s.latencyThresholdMs > 0 && float64(duration)/1000.0 >= s.latencyThresholdMs {
+						localHasSlow = true
+					}
 
 					tModel := storage.Trace{
 						TenantID:    tenantID,
@@ -403,7 +437,13 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 			}
 
 			// Store results in pre-allocated slot (no mutex needed)
-			results[idx] = batchResult{spans: localSpans, traces: localTraces, logs: localLogs}
+			results[idx] = batchResult{
+				spans:   localSpans,
+				traces:  localTraces,
+				logs:    localLogs,
+				hasErr:  localHasErr,
+				hasSlow: localHasSlow,
+			}
 
 			return nil
 		})
@@ -415,11 +455,54 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 	var spansToInsert []storage.Span
 	var tracesToUpsert []storage.Trace
 	var synthesizedLogs []storage.Log
+	var batchHasErr, batchHasSlow bool
 	for _, r := range results {
 		spansToInsert = append(spansToInsert, r.spans...)
 		tracesToUpsert = append(tracesToUpsert, r.traces...)
 		synthesizedLogs = append(synthesizedLogs, r.logs...)
+		if r.hasErr {
+			batchHasErr = true
+		}
+		if r.hasSlow {
+			batchHasSlow = true
+		}
 	}
+
+	// Intake metrics fire before the persist decision so operators see
+	// what was received regardless of async drops/rejections. Net
+	// persisted = ingestion_total - ingest_pipeline_dropped_total.
+	if s.metrics != nil && len(spansToInsert) > 0 {
+		s.metrics.GRPCBatchSize.Observe(float64(len(spansToInsert)))
+		s.metrics.RecordIngestion(len(spansToInsert))
+	}
+
+	// Async path: hand off to the pipeline. ErrQueueFull is the only
+	// signal we need to surface to the OTLP client — translates to
+	// gRPC RESOURCE_EXHAUSTED so the client backs off rather than
+	// retrying tighter. Soft backpressure drops are silent.
+	if s.pipeline != nil {
+		batch := &Batch{
+			Type:         SignalTraces,
+			Traces:       tracesToUpsert,
+			Spans:        spansToInsert,
+			Logs:         synthesizedLogs,
+			HasError:     batchHasErr,
+			HasSlow:      batchHasSlow,
+			SpanCallback: s.spanCallback,
+			LogCallback:  s.logCallback,
+		}
+		if err := s.pipeline.Submit(batch); err != nil {
+			if errors.Is(err, ErrQueueFull) {
+				return nil, grpcstatus.Errorf(codes.ResourceExhausted, "ingest pipeline at capacity")
+			}
+			return nil, err
+		}
+		return &coltracepb.ExportTraceServiceResponse{}, nil
+	}
+
+	// Synchronous fallback (s.pipeline == nil). Preserves the original
+	// behavior bit-for-bit — no async-related side effects when the
+	// operator opts out via INGEST_ASYNC_ENABLED=false.
 
 	// Persist - CRITICAL ORDER: Traces MUST be inserted before Spans due to FK
 	if len(tracesToUpsert) > 0 {
@@ -430,15 +513,9 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 	}
 
 	if len(spansToInsert) > 0 {
-		if s.metrics != nil {
-			s.metrics.GRPCBatchSize.Observe(float64(len(spansToInsert)))
-		}
 		if err := s.repo.BatchCreateSpans(spansToInsert); err != nil {
 			slog.Error("❌ Failed to insert spans", "error", err)
 			return nil, err
-		}
-		if s.metrics != nil {
-			s.metrics.RecordIngestion(len(spansToInsert))
 		}
 		// Notify GraphRAG of persisted spans
 		if s.spanCallback != nil {
@@ -532,20 +609,50 @@ func (s *LogsServer) Export(ctx context.Context, req *collogspb.ExportLogsServic
 		logsToInsert = append(logsToInsert, lr...)
 	}
 
-	if len(logsToInsert) > 0 {
-		if err := s.repo.BatchCreateLogs(logsToInsert); err != nil {
-			slog.Error("❌ Failed to insert logs", "error", err)
+	if len(logsToInsert) == 0 {
+		return &collogspb.ExportLogsServiceResponse{}, nil
+	}
+
+	// Intake metric fires before the persist decision (see TraceServer.Export
+	// rationale). Net persisted = ingestion_total - ingest_pipeline_dropped_total.
+	if s.metrics != nil {
+		s.metrics.RecordIngestion(len(logsToInsert))
+	}
+
+	// Detect priority logs — ERROR/FATAL must bypass soft backpressure.
+	var hasErr bool
+	for _, l := range logsToInsert {
+		if l.Severity == "ERROR" || l.Severity == "FATAL" {
+			hasErr = true
+			break
+		}
+	}
+
+	// Async path: hand off to the pipeline.
+	if s.pipeline != nil {
+		batch := &Batch{
+			Type:        SignalLogs,
+			Logs:        logsToInsert,
+			HasError:    hasErr,
+			LogCallback: s.logCallback,
+		}
+		if err := s.pipeline.Submit(batch); err != nil {
+			if errors.Is(err, ErrQueueFull) {
+				return nil, grpcstatus.Errorf(codes.ResourceExhausted, "ingest pipeline at capacity")
+			}
 			return nil, err
 		}
-		if s.metrics != nil {
-			s.metrics.RecordIngestion(len(logsToInsert))
-		}
+		return &collogspb.ExportLogsServiceResponse{}, nil
+	}
 
-		// Notify listener
-		if s.logCallback != nil {
-			for _, l := range logsToInsert {
-				s.logCallback(l)
-			}
+	// Synchronous fallback (preserves original behavior when async is disabled).
+	if err := s.repo.BatchCreateLogs(logsToInsert); err != nil {
+		slog.Error("❌ Failed to insert logs", "error", err)
+		return nil, err
+	}
+	if s.logCallback != nil {
+		for _, l := range logsToInsert {
+			s.logCallback(l)
 		}
 	}
 

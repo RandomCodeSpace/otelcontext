@@ -93,6 +93,7 @@ DB_DSN="host=my-server.postgres.database.azure.com user=my-mi@tenant.onmicrosoft
 - `VECTOR_INDEX_MAX_ENTRIES=100000`
 - `SAMPLING_*` (defaults keep 100% + always-on errors)
 - `GRAPHRAG_WORKER_COUNT=16`, `GRAPHRAG_EVENT_QUEUE_SIZE=100000` — sized for 100–200 services. Lower for tiny deployments; raise further if `graphrag_events_dropped_total` climbs.
+- `INGEST_ASYNC_ENABLED=true`, `INGEST_PIPELINE_QUEUE_SIZE=50000`, `INGEST_PIPELINE_WORKERS=8` — async ingest pipeline. Decouples OTLP `Export()` from DB writes. Backpressure is hybrid: silent drop of healthy traces at >=90% queue, gRPC `RESOURCE_EXHAUSTED` at 100%. Disable only to debug the legacy synchronous write path. Watch `otelcontext_ingest_pipeline_dropped_total{signal,reason}` and `otelcontext_ingest_pipeline_queue_depth{signal}`.
 - `GRPC_MAX_RECV_MB=16`, `GRPC_MAX_CONCURRENT_STREAMS=1000` — OTLP gRPC server caps
 - `RETENTION_BATCH_SIZE=50000`, `RETENTION_BATCH_SLEEP_MS=1` — purge pacing; raise the sleep for busy production DBs
 
@@ -197,6 +198,9 @@ Grep structured logs for `acquire entra token`. Common causes: expired managed-i
   - `rate(OtelContext_otlp_payload_rejected_total[5m]) > 0`
   - `rate(OtelContext_dlq_replay_failure_total[5m]) > rate(OtelContext_dlq_replay_success_total[5m])`
   - `rate(otelcontext_graphrag_events_dropped_total[5m]) > 0` — ingestion channel saturated; bump `GRAPHRAG_WORKER_COUNT` or `GRAPHRAG_EVENT_QUEUE_SIZE`
+  - `rate(otelcontext_ingest_pipeline_dropped_total{reason="queue_full"}[5m]) > 0` — clients are getting `RESOURCE_EXHAUSTED`; raise `INGEST_PIPELINE_QUEUE_SIZE` or `INGEST_PIPELINE_WORKERS`. Sustained drops mean the DB cannot keep up with the ingest rate.
+  - `rate(otelcontext_ingest_pipeline_dropped_total{reason="soft_backpressure"}[5m]) > 0` — pipeline is actively shedding healthy traces; check downstream DB latency or scale workers/queue.
+  - `otelcontext_ingest_pipeline_queue_depth / INGEST_PIPELINE_QUEUE_SIZE > 0.7` for >5m — queue trending toward soft drop; capacity is becoming a constraint.
   - `otelcontext_retention_rows_behind > 1_000_000` — purge is falling behind; tune `RETENTION_BATCH_SIZE` / `RETENTION_BATCH_SLEEP_MS`
   - `otelcontext_db_pool_in_use / otelcontext_db_pool_max_open > 0.9` — pool exhausted; raise `DB_MAX_OPEN_CONNS`
   - `rate(otelcontext_dlq_evicted_total[5m]) > 0` — DLQ is actively dropping entries at cap; replay target is down or slow

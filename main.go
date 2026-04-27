@@ -397,6 +397,27 @@ func main() {
 		)
 	}
 
+	// Wire async ingest pipeline. Decouples OTLP Export() from synchronous
+	// DB writes — caller returns as soon as the parsed batch is enqueued.
+	// When disabled (INGEST_ASYNC_ENABLED=false), trace/logs servers fall
+	// back to the inline-write path bit-for-bit.
+	var ingestPipeline *ingest.Pipeline
+	if cfg.IngestAsyncEnabled {
+		ingestPipeline = ingest.NewPipeline(repo, metrics, ingest.PipelineConfig{
+			Capacity: cfg.IngestPipelineQueueSize,
+			Workers:  cfg.IngestPipelineWorkers,
+		})
+		ingestPipeline.Start(context.Background())
+		traceServer.SetPipeline(ingestPipeline)
+		logsServer.SetPipeline(ingestPipeline)
+		slog.Info("🌊 Async ingest pipeline enabled",
+			"queue_size", cfg.IngestPipelineQueueSize,
+			"workers", cfg.IngestPipelineWorkers,
+		)
+	} else {
+		slog.Warn("🐌 Async ingest pipeline disabled (INGEST_ASYNC_ENABLED=false) — Export() blocks on DB writes")
+	}
+
 	// Wire up live log streaming + AI + DLQ metrics
 	logHandler := func(l storage.Log) {
 		start := time.Now()
@@ -748,6 +769,13 @@ func main() {
 	cancelGraph()
 	graphRAG.Stop()
 	cancelGraphRAG()
+
+	// 3a. Drain async ingest pipeline. gRPC GracefulStop above guarantees
+	// no new Submits land; this blocks until workers finish in-flight
+	// batches so a graceful shutdown doesn't lose buffered ingest.
+	if ingestPipeline != nil {
+		ingestPipeline.Stop()
+	}
 
 	// 4. Stop DLQ (may still be replaying)
 	dlq.Stop()

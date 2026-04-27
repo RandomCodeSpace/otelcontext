@@ -76,6 +76,18 @@ type Config struct {
 	// GraphRAG event channel buffer size. Defaults to 10000 if unset or <=0.
 	GraphRAGEventQueueSize int
 
+	// Async ingest pipeline (Phase 1 robustness work). Decouples OTLP Export
+	// from synchronous DB writes. When enabled, Export() returns as soon as
+	// the parsed batch is enqueued; persistence runs on a worker pool.
+	//
+	// Backpressure is hybrid:
+	//   <90% queue       — accept all
+	//   90%-100% queue   — drop healthy batches (silent), errors/slow always pass
+	//   100% queue       — return RESOURCE_EXHAUSTED so OTLP clients back off
+	IngestAsyncEnabled      bool // default true; opt out via INGEST_ASYNC_ENABLED=false
+	IngestPipelineQueueSize int  // default 50000 batches; per-deployment tunable
+	IngestPipelineWorkers   int  // default 8 worker goroutines
+
 	// TLS (HTTP + gRPC). When both paths are set, TLS is enabled on both servers.
 	// Empty values (default) keep plaintext behavior.
 	TLSCertFile string
@@ -204,6 +216,11 @@ func Load(customPath string) (*Config, error) {
 		// GraphRAG
 		GraphRAGWorkerCount:    getEnvInt("GRAPHRAG_WORKER_COUNT", 16),
 		GraphRAGEventQueueSize: getEnvInt("GRAPHRAG_EVENT_QUEUE_SIZE", 100000),
+
+		// Async ingest pipeline
+		IngestAsyncEnabled:      getEnvBool("INGEST_ASYNC_ENABLED", true),
+		IngestPipelineQueueSize: getEnvInt("INGEST_PIPELINE_QUEUE_SIZE", 50000),
+		IngestPipelineWorkers:   getEnvInt("INGEST_PIPELINE_WORKERS", 8),
 
 		// TLS
 		TLSCertFile:       getEnv("TLS_CERT_FILE", ""),
