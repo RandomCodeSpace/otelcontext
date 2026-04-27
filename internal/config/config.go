@@ -51,6 +51,14 @@ type Config struct {
 	MetricAttributeKeys  string // comma-separated allowlist
 	MetricMaxCardinality int
 
+	// Per-tenant cardinality cap. 0 = unlimited (only the global cap
+	// applies, preserving legacy single-tenant behavior). Setting this
+	// gives every tenant its own series budget so a noisy tenant cannot
+	// starve siblings of fresh series in the in-memory TSDB. The global
+	// cap (MetricMaxCardinality) remains a backstop and is checked
+	// after the per-tenant cap.
+	MetricMaxCardinalityPerTenant int
+
 	// DLQ Safety
 	DLQMaxFiles   int
 	DLQMaxDiskMB  int
@@ -192,8 +200,9 @@ func Load(customPath string) (*Config, error) {
 		SamplingLatencyThresholdMs: getEnvInt("SAMPLING_LATENCY_THRESHOLD_MS", 500),
 
 		// Cardinality
-		MetricAttributeKeys:  getEnv("METRIC_ATTRIBUTE_KEYS", ""),
-		MetricMaxCardinality: getEnvInt("METRIC_MAX_CARDINALITY", 10000),
+		MetricAttributeKeys:           getEnv("METRIC_ATTRIBUTE_KEYS", ""),
+		MetricMaxCardinality:          getEnvInt("METRIC_MAX_CARDINALITY", 10000),
+		MetricMaxCardinalityPerTenant: getEnvInt("METRIC_MAX_CARDINALITY_PER_TENANT", 0),
 
 		// DLQ
 		DLQMaxFiles:   getEnvInt("DLQ_MAX_FILES", 1000),
@@ -330,6 +339,9 @@ func (c *Config) Validate() error {
 	}
 	if c.MetricMaxCardinality < 0 {
 		return fmt.Errorf("METRIC_MAX_CARDINALITY must be >= 0, got %d", c.MetricMaxCardinality)
+	}
+	if c.MetricMaxCardinalityPerTenant < 0 {
+		return fmt.Errorf("METRIC_MAX_CARDINALITY_PER_TENANT must be >= 0, got %d", c.MetricMaxCardinalityPerTenant)
 	}
 	if c.SamplingRate < 0 || c.SamplingRate > 1.0 {
 		return fmt.Errorf("SAMPLING_RATE must be between 0 and 1, got %f", c.SamplingRate)

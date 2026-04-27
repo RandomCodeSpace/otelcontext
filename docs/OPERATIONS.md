@@ -87,7 +87,7 @@ DB_DSN="host=my-server.postgres.database.azure.com user=my-mi@tenant.onmicrosoft
 - `DB_AUTOMIGRATE=false` for Postgres in production.
 
 ### Trust the defaults (don't tune unless you have a reason)
-- `METRIC_MAX_CARDINALITY=10000`
+- `METRIC_MAX_CARDINALITY=10000`, `METRIC_MAX_CARDINALITY_PER_TENANT=0` (unlimited per-tenant by default). For multi-tenant deployments, set the per-tenant cap to enforce fairness — a noisy tenant gets bounded before exhausting the global pool. Watch `otelcontext_tsdb_cardinality_overflow_by_tenant_total{tenant_id}` to identify offenders.
 - `DLQ_MAX_DISK_MB=500`, `DLQ_MAX_FILES=1000`, `DLQ_MAX_RETRIES=10`
 - `API_RATE_LIMIT_RPS=100`
 - `VECTOR_INDEX_MAX_ENTRIES=100000`
@@ -201,6 +201,7 @@ Grep structured logs for `acquire entra token`. Common causes: expired managed-i
   - `rate(otelcontext_ingest_pipeline_dropped_total{reason="queue_full"}[5m]) > 0` — clients are getting `RESOURCE_EXHAUSTED`; raise `INGEST_PIPELINE_QUEUE_SIZE` or `INGEST_PIPELINE_WORKERS`. Sustained drops mean the DB cannot keep up with the ingest rate.
   - `rate(otelcontext_ingest_pipeline_dropped_total{reason="soft_backpressure"}[5m]) > 0` — pipeline is actively shedding healthy traces; check downstream DB latency or scale workers/queue.
   - `otelcontext_ingest_pipeline_queue_depth / INGEST_PIPELINE_QUEUE_SIZE > 0.7` for >5m — queue trending toward soft drop; capacity is becoming a constraint.
+  - `topk(5, sum by (tenant_id) (rate(otelcontext_tsdb_cardinality_overflow_by_tenant_total[5m]))) > 0` — identifies which tenants are exhausting their metric series budget. Combine with `METRIC_MAX_CARDINALITY_PER_TENANT` to enforce fairness.
   - `otelcontext_retention_rows_behind > 1_000_000` — purge is falling behind; tune `RETENTION_BATCH_SIZE` / `RETENTION_BATCH_SLEEP_MS`
   - `otelcontext_db_pool_in_use / otelcontext_db_pool_max_open > 0.9` — pool exhausted; raise `DB_MAX_OPEN_CONNS`
   - `rate(otelcontext_dlq_evicted_total[5m]) > 0` — DLQ is actively dropping entries at cap; replay target is down or slow

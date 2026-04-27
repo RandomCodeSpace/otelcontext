@@ -210,7 +210,7 @@ Key settings in `internal/config/config.go`:
 - `DEFAULT_TENANT` (`default`) — assigned to rows ingested without explicit tenant
 - `HOT_RETENTION_DAYS` (7) — drives `RetentionScheduler`; range 1..36500
 - `SAMPLING_RATE` (1.0), `SAMPLING_ALWAYS_ON_ERRORS` (true), `SAMPLING_LATENCY_THRESHOLD_MS` (500)
-- `METRIC_MAX_CARDINALITY` (10000), `API_RATE_LIMIT_RPS` (100)
+- `METRIC_MAX_CARDINALITY` (10000), `METRIC_MAX_CARDINALITY_PER_TENANT` (0 = unlimited), `API_RATE_LIMIT_RPS` (100). The per-tenant cap is checked first; when set, a noisy tenant cannot exhaust the global pool. Overflow is labeled by tenant via `otelcontext_tsdb_cardinality_overflow_by_tenant_total{tenant_id}` (`__global__` sentinel when the global cap was the trigger).
 - `MCP_ENABLED` (true), `MCP_PATH` (/mcp)
 - `VECTOR_INDEX_MAX_ENTRIES` (100000)
 - `DLQ_MAX_FILES` (1000), `DLQ_MAX_DISK_MB` (500), `DLQ_MAX_RETRIES` (10)

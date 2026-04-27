@@ -42,6 +42,11 @@ type Metrics struct {
 	TSDBFlushDuration       prometheus.Histogram
 	TSDBBatchesDropped      prometheus.Counter
 	TSDBCardinalityOverflow prometheus.Counter
+	// TSDBCardinalityOverflowByTenant labels overflow events with the tenant ID
+	// that triggered them, or the sentinel "__global__" when the global cap
+	// (not a per-tenant cap) was the trigger. Use this to identify noisy
+	// tenants: sum by (tenant_id) (rate(otelcontext_tsdb_cardinality_overflow_by_tenant_total[5m]))
+	TSDBCardinalityOverflowByTenant *prometheus.CounterVec
 
 	// --- WebSocket ---
 	WSMessagesSent       *prometheus.CounterVec
@@ -178,6 +183,10 @@ func New() *Metrics {
 			Name: "OtelContext_tsdb_cardinality_overflow_total",
 			Help: "Metric points routed to overflow bucket due to cardinality limit.",
 		}),
+		TSDBCardinalityOverflowByTenant: promauto.NewCounterVec(prometheus.CounterOpts{
+			Name: "otelcontext_tsdb_cardinality_overflow_by_tenant_total",
+			Help: "Metric points routed to overflow bucket, labeled by the tenant_id that exceeded its cap (or __global__ when the global cap triggered).",
+		}, []string{"tenant_id"}),
 
 		// WebSocket
 		WSMessagesSent: promauto.NewCounterVec(prometheus.CounterOpts{

@@ -34,10 +34,23 @@ type Aggregator struct {
 	pool           sync.Pool
 	droppedBatches int64
 
-	// Cardinality controls
-	maxCardinality      int    // 0 = unlimited
-	cardinalityOverflow func() // called when overflow bucket is used (for metrics)
-	overflowKey         string // constant key for the overflow bucket
+	// Cardinality controls.
+	//
+	// maxCardinality is the GLOBAL series budget across all tenants;
+	// when exceeded, new series go to a single shared overflow bucket
+	// keyed by overflowKey ("__cardinality_overflow__"). Preserves
+	// backward compatibility for single-tenant deployments.
+	//
+	// perTenantCardinality is the PER-TENANT series budget. When set
+	// (>0), it is checked first: a tenant exceeding its own cap routes
+	// to a tenant-specific overflow bucket so a noisy tenant cannot
+	// starve siblings of fresh series. seriesPerTenant counts unique
+	// (non-overflow) bucket keys per tenant and is reset by flush().
+	maxCardinality       int                    // 0 = unlimited
+	perTenantCardinality int                    // 0 = unlimited (global cap still applies)
+	cardinalityOverflow  func(tenantID string)  // labeled per overflow event for Prometheus
+	seriesPerTenant      map[string]int         //nolint:unused // touched only via mu
+	overflowKey          string                 // constant key for the global overflow bucket
 
 	// Ring buffer accelerator (optional)
 	ring *RingBuffer
@@ -49,15 +62,22 @@ type Aggregator struct {
 
 const persistenceWorkers = 3
 
+// overflowSentinelGlobal is the label value emitted on the per-tenant
+// overflow counter when the GLOBAL cap (not a per-tenant cap) is the
+// one that triggered. Distinguishes "this tenant got too noisy" from
+// "the whole instance is at series budget".
+const overflowSentinelGlobal = "__global__"
+
 // NewAggregator creates a new TSDB aggregator.
 func NewAggregator(repo *storage.Repository, windowSize time.Duration) *Aggregator {
 	a := &Aggregator{
-		repo:        repo,
-		windowSize:  windowSize,
-		buckets:     make(map[string]*storage.MetricBucket),
-		stopChan:    make(chan struct{}),
-		flushChan:   make(chan []storage.MetricBucket, 500),
-		overflowKey: "__cardinality_overflow__",
+		repo:            repo,
+		windowSize:      windowSize,
+		buckets:         make(map[string]*storage.MetricBucket),
+		seriesPerTenant: make(map[string]int),
+		stopChan:        make(chan struct{}),
+		flushChan:       make(chan []storage.MetricBucket, 500),
+		overflowKey:     "__cardinality_overflow__",
 	}
 	a.pool.New = func() any {
 		return make([]storage.MetricBucket, 0, 100)
@@ -65,12 +85,21 @@ func NewAggregator(repo *storage.Repository, windowSize time.Duration) *Aggregat
 	return a
 }
 
-// SetCardinalityLimit configures the maximum number of distinct metric series.
-// When exceeded, new series are routed to an overflow bucket and onOverflow is called.
-func (a *Aggregator) SetCardinalityLimit(max int, onOverflow func()) {
+// SetCardinalityLimit configures the global and per-tenant series caps.
+//
+//	global       — total distinct series across all tenants; 0 = unlimited.
+//	perTenant    — distinct series per tenant; 0 = unlimited (global only).
+//	onOverflow   — called once per overflow event with the tenant ID
+//	               that exceeded its cap, or overflowSentinelGlobal when
+//	               the global cap (not per-tenant) is the trigger.
+//
+// Pass nil for onOverflow to disable the callback. Either cap may be 0
+// independently.
+func (a *Aggregator) SetCardinalityLimit(global, perTenant int, onOverflow func(tenantID string)) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.maxCardinality = max
+	a.maxCardinality = global
+	a.perTenantCardinality = perTenant
 	a.cardinalityOverflow = onOverflow
 }
 
@@ -138,10 +167,42 @@ func (a *Aggregator) Ingest(m RawMetric) {
 
 	bucket, exists := a.buckets[key]
 	if !exists {
-		// Cardinality guard: if limit exceeded, route to overflow bucket.
-		if a.maxCardinality > 0 && len(a.buckets) >= a.maxCardinality {
+		// Cardinality enforcement order:
+		//   1. Per-tenant cap — checked first so a noisy tenant gets
+		//      bounded BEFORE the global pool is touched. Routes to a
+		//      tenant-specific overflow bucket so each tenant's overflow
+		//      stats stay separate.
+		//   2. Global cap — backstop. When triggered, routes to the
+		//      single shared overflow bucket and labels the metric with
+		//      the __global__ sentinel.
+		overTenantCap := a.perTenantCardinality > 0 && a.seriesPerTenant[m.TenantID] >= a.perTenantCardinality
+		overGlobalCap := a.maxCardinality > 0 && len(a.buckets) >= a.maxCardinality
+
+		switch {
+		case overTenantCap:
 			if a.cardinalityOverflow != nil {
-				a.cardinalityOverflow()
+				a.cardinalityOverflow(m.TenantID)
+			}
+			key = a.overflowKey + "|" + m.TenantID
+			bucket = a.buckets[key]
+			if bucket == nil {
+				windowStart := m.Timestamp.Truncate(a.windowSize)
+				bucket = &storage.MetricBucket{
+					TenantID:    m.TenantID,
+					Name:        "__overflow__",
+					ServiceName: m.ServiceName,
+					TimeBucket:  windowStart,
+					Min:         m.Value,
+					Max:         m.Value,
+					Sum:         m.Value,
+					Count:       1,
+				}
+				a.buckets[key] = bucket
+			}
+			// Fall through to update existing overflow bucket below.
+		case overGlobalCap:
+			if a.cardinalityOverflow != nil {
+				a.cardinalityOverflow(overflowSentinelGlobal)
 			}
 			key = a.overflowKey
 			bucket = a.buckets[key]
@@ -160,7 +221,7 @@ func (a *Aggregator) Ingest(m RawMetric) {
 				a.buckets[key] = bucket
 			}
 			// Fall through to update existing overflow bucket below.
-		} else {
+		default:
 			windowStart := m.Timestamp.Truncate(a.windowSize)
 			bucket = &storage.MetricBucket{
 				TenantID:       m.TenantID,
@@ -174,6 +235,7 @@ func (a *Aggregator) Ingest(m RawMetric) {
 				AttributesJSON: storage.CompressedText(attrJSON),
 			}
 			a.buckets[key] = bucket
+			a.seriesPerTenant[m.TenantID]++
 			return
 		}
 	}
@@ -214,6 +276,9 @@ func (a *Aggregator) flush() {
 		batch = append(batch, *b)
 	}
 	a.buckets = make(map[string]*storage.MetricBucket)
+	// Per-tenant counts track only non-overflow series in the live
+	// buckets map. Reset alongside it so the next window starts fresh.
+	a.seriesPerTenant = make(map[string]int)
 	a.mu.Unlock()
 
 	select {

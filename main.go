@@ -283,11 +283,19 @@ func main() {
 
 	// 4c. Initialize TSDB Aggregator + Ring Buffer
 	tsdbAgg := tsdb.NewAggregator(repo, 30*time.Second)
-	if cfg.MetricMaxCardinality > 0 {
-		tsdbAgg.SetCardinalityLimit(cfg.MetricMaxCardinality, func() {
+	if cfg.MetricMaxCardinality > 0 || cfg.MetricMaxCardinalityPerTenant > 0 {
+		tsdbAgg.SetCardinalityLimit(cfg.MetricMaxCardinality, cfg.MetricMaxCardinalityPerTenant, func(tenantID string) {
+			// Maintain the legacy unlabeled counter for back-compat dashboards
+			// AND emit the labeled by-tenant counter for fairness diagnostics.
 			metrics.TSDBCardinalityOverflow.Inc()
+			if metrics.TSDBCardinalityOverflowByTenant != nil {
+				metrics.TSDBCardinalityOverflowByTenant.WithLabelValues(tenantID).Inc()
+			}
 		})
-		slog.Info("📈 TSDB cardinality limit set", "max", cfg.MetricMaxCardinality)
+		slog.Info("📈 TSDB cardinality limits configured",
+			"global_max", cfg.MetricMaxCardinality,
+			"per_tenant_max", cfg.MetricMaxCardinalityPerTenant,
+		)
 	}
 	tsdbAgg.SetMetrics(
 		func() { metrics.TSDBIngestTotal.Inc() },
