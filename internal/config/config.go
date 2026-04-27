@@ -83,6 +83,19 @@ type Config struct {
 	// MCP Server
 	MCPEnabled bool
 	MCPPath    string
+	// MCPMaxConcurrent caps the in-flight tools/call invocations server-wide.
+	// Beyond this, callers receive a JSON-RPC server-overloaded error. <=0
+	// disables the cap. Default 32 — sized for tight agent polling loops
+	// without overrunning the GraphRAG in-memory store.
+	MCPMaxConcurrent int
+	// MCPCallTimeoutMs is the per-invocation deadline for tools/call. A tool
+	// that exceeds it gets cancelled and the client receives an RPC timeout
+	// error. <=0 disables the deadline. Default 30000 (30s).
+	MCPCallTimeoutMs int
+	// MCPCacheTTLMs is the lifetime of a memoized tool result for the cheap
+	// in-memory GraphRAG tools (get_service_map, impact_analysis, etc.).
+	// <=0 disables caching. Default 5000 (5s).
+	MCPCacheTTLMs int
 
 	// Compression
 	CompressionLevel string // "default", "fast", "best"
@@ -230,8 +243,11 @@ func Load(customPath string) (*Config, error) {
 		APIRateLimitRPS: getEnvInt("API_RATE_LIMIT_RPS", 100),
 
 		// MCP
-		MCPEnabled: getEnvBool("MCP_ENABLED", true),
-		MCPPath:    getEnv("MCP_PATH", "/mcp"),
+		MCPEnabled:       getEnvBool("MCP_ENABLED", true),
+		MCPPath:          getEnv("MCP_PATH", "/mcp"),
+		MCPMaxConcurrent: getEnvInt("MCP_MAX_CONCURRENT", 32),
+		MCPCallTimeoutMs: getEnvInt("MCP_CALL_TIMEOUT_MS", 30000),
+		MCPCacheTTLMs:    getEnvInt("MCP_CACHE_TTL_MS", 5000),
 
 		// Compression
 		CompressionLevel: getEnv("COMPRESSION_LEVEL", "default"),

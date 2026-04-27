@@ -414,7 +414,17 @@ func main() {
 	// 6b. Initialize MCP Server (HTTP Streamable, JSON-RPC 2.0 + SSE)
 	mcpServer := mcp.New(cfg.DefaultTenant, repo, metrics, svcGraph, vectorIdx)
 	mcpServer.SetGraphRAG(graphRAG)
-	slog.Info("🤖 MCP server initialized", "path", cfg.MCPPath, "enabled", cfg.MCPEnabled, "default_tenant", cfg.DefaultTenant)
+	mcpServer.SetCallLimit(cfg.MCPMaxConcurrent)
+	mcpServer.SetCallTimeout(time.Duration(cfg.MCPCallTimeoutMs) * time.Millisecond)
+	mcpServer.SetCacheTTL(time.Duration(cfg.MCPCacheTTLMs) * time.Millisecond)
+	slog.Info("🤖 MCP server initialized",
+		"path", cfg.MCPPath,
+		"enabled", cfg.MCPEnabled,
+		"default_tenant", cfg.DefaultTenant,
+		"max_concurrent", cfg.MCPMaxConcurrent,
+		"call_timeout_ms", cfg.MCPCallTimeoutMs,
+		"cache_ttl_ms", cfg.MCPCacheTTLMs,
+	)
 
 	// 7. Initialize OTLP Ingestion (gRPC)
 	traceServer := ingest.NewTraceServer(repo, metrics, cfg)

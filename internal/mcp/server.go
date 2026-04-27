@@ -1,12 +1,14 @@
 package mcp
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/RandomCodeSpace/central-ops/pkg/httputil"
@@ -26,6 +28,38 @@ const (
 	// invocations to a particular tenant. When absent, queries run under
 	// defaultTenant (injected at construction time).
 	mcpTenantHeader = "X-Tenant-ID"
+
+	// defaultMaxConcurrentCalls bounds the number of in-flight tools/call
+	// invocations across the whole MCP endpoint. Beyond this, tools/call
+	// returns the "server overloaded" RPC error so the client backs off
+	// rather than piling pressure on the DB / GraphRAG.
+	defaultMaxConcurrentCalls = 32
+
+	// defaultCallTimeout is the per-invocation deadline applied to every
+	// tools/call. Beyond this the handler returns an RPC error and frees
+	// its concurrency slot — the goroutine still runs to completion in
+	// the background but its result is not returned to the client.
+	defaultCallTimeout = 30 * time.Second
+
+	// defaultCacheTTL is the lifetime of a memoized tool result. Short
+	// enough that observability lag is imperceptible; long enough to
+	// absorb tight polling loops from agent clients.
+	defaultCacheTTL = 5 * time.Second
+
+	// sseHeartbeatInterval is the cadence of the SSE keep-alive comment
+	// we send so reverse proxies (nginx, Envoy, Istio) don't time out
+	// idle connections. 25s sits comfortably under the typical 30-60s
+	// idle timeout these proxies default to.
+	sseHeartbeatInterval = 25 * time.Second
+
+	// ErrServerOverloaded is the JSON-RPC error code we surface when the
+	// server-wide concurrency cap is exceeded. JSON-RPC reserves -32000
+	// to -32099 for server errors; we pick a stable code in that band so
+	// agent clients can detect-and-back-off deterministically.
+	ErrServerOverloaded = -32000
+	// ErrCallTimeout is the JSON-RPC error code returned when a tool
+	// invocation runs past defaultCallTimeout.
+	ErrCallTimeout = -32001
 )
 
 // Server is the HTTP Streamable MCP server.
@@ -39,6 +73,24 @@ type Server struct {
 	vectorIdx     *vectordb.Index
 	graphRAG      *graphrag.GraphRAG
 	defaultTenant string
+
+	// callSlots is a counting-semaphore implemented as a buffered channel:
+	// buffer size is the max concurrent tools/call invocations. A non-
+	// blocking send acquires a slot, a receive on defer releases it.
+	// nil-valued (no cap) when SetCallLimit is given a value <= 0.
+	callSlots chan struct{}
+	// callTimeout is applied as a context deadline to every tools/call.
+	callTimeout time.Duration
+	// cache memoizes results for a whitelist of cheap GraphRAG tools.
+	cache *resultCache
+
+	// inFlight is a live counter exposed via Stats() for tests / metrics.
+	inFlight atomic.Int64
+	// counters bump on each outcome — also exposed for tests/metrics.
+	cacheHits     atomic.Int64
+	overloaded    atomic.Int64
+	timedOut      atomic.Int64
+	callsServiced atomic.Int64
 }
 
 // New creates a new MCP server. defaultTenant is the fallback tenant applied
@@ -62,6 +114,60 @@ func New(
 		svcGraph:      svcGraph,
 		vectorIdx:     vectorIdx,
 		defaultTenant: defaultTenant,
+		callSlots:     make(chan struct{}, defaultMaxConcurrentCalls),
+		callTimeout:   defaultCallTimeout,
+		cache:         newResultCache(defaultCacheTTL, 4096),
+	}
+}
+
+// SetCallLimit configures the maximum number of concurrent tools/call
+// invocations. <= 0 disables the cap (legacy behavior). Subsequent calls
+// resize the underlying semaphore — be aware that an in-flight call holds
+// a slot of the previous size; the new size only governs new acquisitions.
+func (s *Server) SetCallLimit(maxConcurrent int) {
+	if maxConcurrent <= 0 {
+		s.callSlots = nil
+		return
+	}
+	s.callSlots = make(chan struct{}, maxConcurrent)
+}
+
+// SetCallTimeout overrides the per-invocation deadline. A zero or negative
+// value disables the timeout (handlers run until they return on their own).
+func (s *Server) SetCallTimeout(d time.Duration) {
+	s.callTimeout = d
+}
+
+// SetCacheTTL overrides the result-cache lifetime. <= 0 disables caching
+// for the whitelisted GraphRAG tools.
+func (s *Server) SetCacheTTL(d time.Duration) {
+	if d <= 0 {
+		s.cache = newResultCache(0, 0)
+		return
+	}
+	s.cache = newResultCache(d, 4096)
+}
+
+// Stats returns counters used by tests and observability.
+type Stats struct {
+	InFlight      int64
+	CallsServiced int64
+	CacheHits     int64
+	Overloaded    int64
+	TimedOut      int64
+	CacheSize     int
+}
+
+// Stats returns a snapshot of the server-wide counters. Safe to call
+// from any goroutine; values are best-effort point-in-time.
+func (s *Server) Stats() Stats {
+	return Stats{
+		InFlight:      s.inFlight.Load(),
+		CallsServiced: s.callsServiced.Load(),
+		CacheHits:     s.cacheHits.Load(),
+		Overloaded:    s.overloaded.Load(),
+		TimedOut:      s.timedOut.Load(),
+		CacheSize:     s.cache.Stats(),
 	}
 }
 
@@ -154,8 +260,50 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request) {
 		if tenant == "" {
 			tenant = s.defaultTenant
 		}
-		callCtx := storage.WithTenantContext(r.Context(), tenant)
-		result = s.toolHandler(callCtx, params.Name, params.Arguments)
+
+		// Cache fast-path: cheap, idempotent GraphRAG tools are memoized
+		// for a few seconds so polling agent clients don't cripple the
+		// in-memory store under load.
+		if cached, hit := s.cache.Get(tenant, params.Name, params.Arguments); hit {
+			s.cacheHits.Add(1)
+			result = cached
+			break
+		}
+
+		// Concurrency gate: non-blocking acquire. Beyond the cap we surface
+		// a JSON-RPC server-overloaded error; clients are expected to retry
+		// with backoff.
+		if s.callSlots != nil {
+			select {
+			case s.callSlots <- struct{}{}:
+				// acquired
+			default:
+				s.overloaded.Add(1)
+				rpcErr = &RPCError{Code: ErrServerOverloaded, Message: "MCP server at capacity, retry shortly"}
+				break
+			}
+		}
+		// rpcErr was set inside the select-default; if so, skip the call.
+		if rpcErr != nil {
+			break
+		}
+
+		s.inFlight.Add(1)
+		callCtx, cancel := s.deriveCallCtx(r.Context())
+		callCtx = storage.WithTenantContext(callCtx, tenant)
+		toolResult, timedOut := s.runWithTimeout(callCtx, cancel, params.Name, params.Arguments)
+		if s.callSlots != nil {
+			<-s.callSlots
+		}
+		s.inFlight.Add(-1)
+		if timedOut {
+			s.timedOut.Add(1)
+			rpcErr = &RPCError{Code: ErrCallTimeout, Message: fmt.Sprintf("tool %q exceeded %s deadline", params.Name, s.callTimeout)}
+			break
+		}
+		s.callsServiced.Add(1)
+		s.cache.Set(tenant, params.Name, params.Arguments, toolResult)
+		result = toolResult
 
 	case "ping":
 		result = map[string]string{"status": "ok", "ts": time.Now().UTC().Format(time.RFC3339)}
@@ -198,11 +346,24 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
+	// Heartbeat keeps the SSE connection alive across reverse-proxy idle
+	// timeouts (typical 30-60s on nginx / Envoy / Istio). Without a
+	// periodic byte on the wire, the proxy closes the stream and clients
+	// see "connection reset" mid-session — the textbook MCP HTTP
+	// streamable failure mode under low-update-rate workloads.
+	heartbeat := time.NewTicker(sseHeartbeatInterval)
+	defer heartbeat.Stop()
 
 	for {
 		select {
 		case <-r.Context().Done():
 			return
+		case <-heartbeat.C:
+			// SSE comments (lines starting with `:`) are valid heartbeats —
+			// the spec defines them as ignored content, but they reset
+			// proxy idle timers.
+			_, _ = fmt.Fprintf(w, ": keep-alive\n\n")
+			flusher.Flush()
 		case <-ticker.C:
 			if s.svcGraph == nil {
 				continue
@@ -242,6 +403,37 @@ func writeError(w http.ResponseWriter, id any, code int, msg string) {
 		Error:   &RPCError{Code: code, Message: msg},
 	}
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// deriveCallCtx builds a per-call context, attaching a deadline when
+// callTimeout > 0. The returned cancel must always be invoked once the
+// call returns to release timer resources, even on the no-timeout path.
+func (s *Server) deriveCallCtx(parent context.Context) (context.Context, context.CancelFunc) {
+	if s.callTimeout <= 0 {
+		return context.WithCancel(parent)
+	}
+	return context.WithTimeout(parent, s.callTimeout)
+}
+
+// runWithTimeout invokes toolHandler with the derived context and returns
+// the result along with a timed-out flag. We always run the tool on a
+// goroutine so that a slow handler can be aborted (its goroutine still
+// runs to completion in the background — toolHandler itself respects the
+// ctx through GORM and time.AfterFunc, so the work eventually winds
+// down). cancel is the CancelFunc returned by deriveCallCtx.
+func (s *Server) runWithTimeout(ctx context.Context, cancel context.CancelFunc, name string, args map[string]any) (ToolCallResult, bool) {
+	defer cancel()
+	type out struct{ res ToolCallResult }
+	done := make(chan out, 1)
+	go func() {
+		done <- out{res: s.toolHandler(ctx, name, args)}
+	}()
+	select {
+	case o := <-done:
+		return o.res, false
+	case <-ctx.Done():
+		return ToolCallResult{}, true
+	}
 }
 
 // parseToolCallParams flexibly parses the params field of a tools/call request.

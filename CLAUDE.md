@@ -212,6 +212,7 @@ Key settings in `internal/config/config.go`:
 - `SAMPLING_RATE` (1.0), `SAMPLING_ALWAYS_ON_ERRORS` (true), `SAMPLING_LATENCY_THRESHOLD_MS` (500)
 - `METRIC_MAX_CARDINALITY` (10000), `METRIC_MAX_CARDINALITY_PER_TENANT` (0 = unlimited), `API_RATE_LIMIT_RPS` (100). The per-tenant cap is checked first; when set, a noisy tenant cannot exhaust the global pool. Overflow is labeled by tenant via `otelcontext_tsdb_cardinality_overflow_by_tenant_total{tenant_id}` (`__global__` sentinel when the global cap was the trigger).
 - `MCP_ENABLED` (true), `MCP_PATH` (/mcp)
+- `MCP_MAX_CONCURRENT` (32), `MCP_CALL_TIMEOUT_MS` (30000), `MCP_CACHE_TTL_MS` (5000) — MCP HTTP streamable robustness. Counting semaphore gates concurrent `tools/call` (JSON-RPC `-32000` past the cap), per-call deadlines abort runaway handlers (JSON-RPC `-32001`), and a 5s TTL cache memoizes the cheap in-memory GraphRAG tools (`get_service_map`, `impact_analysis`, `root_cause_analysis`, `get_anomaly_timeline`, `get_service_health`). SSE GET sends a `: keep-alive\n\n` comment every 25s to keep the stream alive across reverse-proxy idle timeouts. Set any to 0 to disable.
 - `VECTOR_INDEX_MAX_ENTRIES` (100000)
 - `DLQ_MAX_FILES` (1000), `DLQ_MAX_DISK_MB` (500), `DLQ_MAX_RETRIES` (10)
 - `GRAPHRAG_WORKER_COUNT` (16), `GRAPHRAG_EVENT_QUEUE_SIZE` (100000) — sized for 100–200 services; raise further if `otelcontext_graphrag_events_dropped_total` climbs
