@@ -92,7 +92,7 @@ DB_DSN="host=my-server.postgres.database.azure.com user=my-mi@tenant.onmicrosoft
 - `API_RATE_LIMIT_RPS=100`
 - `VECTOR_INDEX_MAX_ENTRIES=100000`
 - `SAMPLING_*` (defaults keep 100% + always-on errors)
-- `GRAPHRAG_WORKER_COUNT=4`, `GRAPHRAG_EVENT_QUEUE_SIZE=10000` — raise worker count at 100+ services if you see `graphrag_events_dropped_total` climbing
+- `GRAPHRAG_WORKER_COUNT=16`, `GRAPHRAG_EVENT_QUEUE_SIZE=100000` — sized for 100–200 services. Lower for tiny deployments; raise further if `graphrag_events_dropped_total` climbs.
 - `GRPC_MAX_RECV_MB=16`, `GRPC_MAX_CONCURRENT_STREAMS=1000` — OTLP gRPC server caps
 - `RETENTION_BATCH_SIZE=50000`, `RETENTION_BATCH_SLEEP_MS=1` — purge pacing; raise the sleep for busy production DBs
 
@@ -246,6 +246,101 @@ If any of those trip, use the corresponding metric alert from the Observability 
 - Before cutting a release that touches the ingestion path or GraphRAG.
 - After tuning any of: `GRAPHRAG_WORKER_COUNT`, `GRPC_MAX_CONCURRENT_STREAMS`, `RETENTION_BATCH_SIZE`, `DB_MAX_OPEN_CONNS`.
 - When scaling the deployment past the current-tested envelope (e.g., 500+ services) — expand the simulator's `--services` flag to match.
+
+---
+
+## Edge Pre-processing (OTel Collector)
+
+OtelContext is an OTLP **destination**, not a collector. Beyond ~150 services emitting unsampled telemetry, put a Collector in front to absorb cardinality, batch efficiently, and drop low-value traces before they hit the DB. SDKs → Collector → OtelContext.
+
+### When to deploy a Collector in front
+
+- Aggregate ingest rate exceeds ~30k spans/s — DB writes become the bottleneck before the wire does.
+- You need processors OtelContext doesn't run: `tail_sampling`, `batch`, `memory_limiter`, `transform`, `filter`, `attributes`.
+- You ingest from non-OTLP sources (Jaeger, Zipkin, Prometheus scrape, Fluent, syslog, Kafka) — OtelContext only speaks OTLP.
+- Multi-region: edge Collectors batch + compress before crossing the WAN.
+
+### Recommended pipeline
+
+The two highest-impact processors are `tail_sampling` (10–20× volume reduction with full diagnostic value retained) and `batch` (cuts gRPC overhead per span). `memory_limiter` is mandatory in front of any Collector exposed to bursty traffic.
+
+```yaml
+# otelcol-edge.yaml
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 1024
+    spike_limit_mib: 256
+
+  tail_sampling:
+    decision_wait: 10s
+    num_traces: 50000
+    expected_new_traces_per_sec: 5000
+    policies:
+      - name: errors-always
+        type: status_code
+        status_code: { status_codes: [ERROR] }
+      - name: slow-always
+        type: latency
+        latency: { threshold_ms: 500 }
+      - name: probabilistic-healthy
+        type: probabilistic
+        probabilistic: { sampling_percentage: 5 }
+
+  batch:
+    send_batch_size: 8192
+    send_batch_max_size: 10000
+    timeout: 2s
+
+exporters:
+  otlp/otelcontext:
+    endpoint: otelcontext.internal:4317
+    tls:
+      insecure: false
+    headers:
+      authorization: "Bearer ${env:OTELCONTEXT_API_KEY}"
+      x-tenant-id: "${env:TENANT_ID}"
+    sending_queue:
+      enabled: true
+      queue_size: 10000
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 30s
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, tail_sampling, batch]
+      exporters: [otlp/otelcontext]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp/otelcontext]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp/otelcontext]
+```
+
+### Sampling policy notes
+
+- **Errors and slow traces are always sampled.** OtelContext's internal sampler does the same; keep parity at the edge so error/diagnostic data is never dropped.
+- **5% probabilistic on healthy traces** is the right default for 150–200 services. Adjust based on the volume you can store within `HOT_RETENTION_DAYS`.
+- The `tail_sampling` processor needs ~10s of buffer per trace to make the decision after spans have arrived — the `decision_wait` setting. Memory cost: `decision_wait × spans_per_sec × avg_span_size`. Plan for 256 MiB+ on the Collector at 30k spans/s.
+
+### Don't double-sample
+
+If the edge Collector applies tail-sampling, set `SAMPLING_RATE=1.0` on OtelContext. The SDK → Collector → OtelContext chain should sample exactly once. Default OtelContext config already keeps 100%, so no change is needed unless you previously tuned it.
 
 ---
 
