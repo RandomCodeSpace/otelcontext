@@ -202,8 +202,8 @@ func Load(customPath string) (*Config, error) {
 		VectorIndexMaxEntries: getEnvInt("VECTOR_INDEX_MAX_ENTRIES", 100000),
 
 		// GraphRAG
-		GraphRAGWorkerCount:    getEnvInt("GRAPHRAG_WORKER_COUNT", 4),
-		GraphRAGEventQueueSize: getEnvInt("GRAPHRAG_EVENT_QUEUE_SIZE", 10000),
+		GraphRAGWorkerCount:    getEnvInt("GRAPHRAG_WORKER_COUNT", 16),
+		GraphRAGEventQueueSize: getEnvInt("GRAPHRAG_EVENT_QUEUE_SIZE", 100000),
 
 		// TLS
 		TLSCertFile:       getEnv("TLS_CERT_FILE", ""),

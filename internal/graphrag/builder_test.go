@@ -137,8 +137,9 @@ func TestOnSpanIngested_DropsIncrementMetric(t *testing.T) {
 	g := New(nil, nil, nil, nil, DefaultConfig())
 	t.Cleanup(g.Stop)
 
-	// Fill the buffer well beyond capacity (default 10k).
-	for i := 0; i < 11000; i++ {
+	// Fill the buffer beyond capacity. Use the package constant so the test
+	// stays correct if defaultChannelSize is retuned.
+	for range defaultChannelSize + 1000 {
 		g.OnSpanIngested(storage.Span{
 			TraceID:     "t",
 			SpanID:      "s",

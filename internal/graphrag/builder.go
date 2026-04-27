@@ -39,8 +39,8 @@ func guardWorker(name string) {
 }
 
 const (
-	defaultWorkerCount   = 4
-	defaultChannelSize   = 10000
+	defaultWorkerCount   = 16
+	defaultChannelSize   = 100000
 	defaultTraceTTL      = 1 * time.Hour
 	defaultRefreshEvery  = 60 * time.Second
 	defaultSnapshotEvery = 15 * time.Minute
