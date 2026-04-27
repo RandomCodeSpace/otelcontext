@@ -115,6 +115,30 @@ SQLite is rejected at startup when `APP_ENV=production` unless you explicitly op
 
 **Multi-tenancy.** Every row carries a `tenant_id` column. The write path reads `X-Tenant-ID` (HTTP) or `x-tenant-id` (gRPC metadata) and populates the column. The read path attaches the tenant from the request context to every repository query (`Where("tenant_id = ?", ...)`).
 
+### Log search index
+
+| Driver | Index | Ranking |
+|---|---|---|
+| SQLite | FTS5 virtual table `logs_fts` over `(body, service_name)`, kept in sync via AFTER INSERT/DELETE/UPDATE triggers on `logs` | `bm25(logs_fts)` ascending (lower = more relevant) |
+| Postgres | `pg_trgm` GIN indexes on `logs.body` and `logs.service_name` | Recency (`timestamp desc`) — substring ILIKE |
+| MySQL / SQL Server | None — sequential `LIKE` scan | Recency |
+
+The FTS5 path uses `tokenize='porter unicode61 remove_diacritics 2'` — case-insensitive, accent-insensitive, English-stemmed (so `panic` matches `panicked`). User input is escaped and prefix-suffixed (`*`) so partial words like `conn` still match `connection`. If FTS5 errors at query time, the repository transparently falls back to LIKE so a misbehaving index does not surface as a 500 to the API.
+
+The FTS5 table is provisioned automatically by `AutoMigrateModels` on every SQLite boot; setup is idempotent. To rebuild after corruption or a manual schema change:
+
+```sql
+INSERT INTO logs_fts(logs_fts) VALUES('rebuild');
+```
+
+The Postgres `pg_trgm` path requires the extension; if missing, AutoMigrate logs a warning and ILIKE falls back to a sequential scan. To install:
+
+```sql
+CREATE EXTENSION pg_trgm;
+```
+
+Phase 3b will add Postgres declarative partitioning as an opt-in adapter; at that point the GIN indexes will be created per-partition. There is no migration required to use FTS5 — existing SQLite databases are backfilled the first time the upgraded binary boots.
+
 ---
 
 ## Backup & Restore

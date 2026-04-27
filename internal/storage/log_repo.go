@@ -62,13 +62,88 @@ func (r *Repository) GetRecentLogs(ctx context.Context, limit int) ([]Log, error
 
 // GetLogsV2 performs advanced filtering and search on logs scoped to the
 // tenant on ctx. COUNT and SELECT run in parallel via errgroup for reduced latency.
+//
+// When `filter.Search` is set and the driver is SQLite, the query routes
+// through the FTS5 virtual table (`logs_fts`) and results are ordered by BM25
+// relevance. Other drivers continue to use LIKE/ILIKE against logs.body and
+// logs.trace_id.
 func (r *Repository) GetLogsV2(ctx context.Context, filter LogFilter) ([]Log, int64, error) {
 	tenant := TenantFromContext(ctx)
 	var logs []Log
 	var total int64
 
-	base := r.db.WithContext(ctx).Model(&Log{}).Where("tenant_id = ?", tenant)
+	useFTS5 := filter.Search != "" && fts5Available(r.driver)
+	matchExpr := ""
+	if useFTS5 {
+		matchExpr = fts5MatchExpr(filter.Search)
+		if matchExpr == "" {
+			useFTS5 = false
+		}
+	}
 
+	base := r.db.WithContext(ctx).Model(&Log{}).Where("tenant_id = ?", tenant)
+	if useFTS5 {
+		base = base.Joins("JOIN "+fts5LogsTable+" ON logs.id = "+fts5LogsTable+".rowid").
+			Where(fts5LogsTable+" MATCH ?", matchExpr)
+	}
+
+	if filter.ServiceName != "" {
+		base = base.Where("service_name = ?", filter.ServiceName)
+	}
+	if filter.Severity != "" {
+		base = base.Where("severity = ?", filter.Severity)
+	}
+	if filter.TraceID != "" {
+		base = base.Where("trace_id = ?", filter.TraceID)
+	}
+	if !filter.StartTime.IsZero() {
+		base = base.Where("timestamp >= ?", filter.StartTime)
+	}
+	if !filter.EndTime.IsZero() {
+		base = base.Where("timestamp <= ?", filter.EndTime)
+	}
+	if filter.Search != "" && !useFTS5 {
+		search := "%" + filter.Search + "%"
+		op := r.likeOp()
+		base = base.Where(fmt.Sprintf("body %s ? OR trace_id %s ?", op, op), search, search)
+	}
+
+	orderBy := "timestamp desc"
+	if useFTS5 {
+		orderBy = "bm25(" + fts5LogsTable + ") ASC"
+	}
+
+	// Run COUNT and SELECT in parallel using independent sessions.
+	var g errgroup.Group
+	g.Go(func() error {
+		return base.Session(&gorm.Session{}).Count(&total).Error
+	})
+	g.Go(func() error {
+		return base.Session(&gorm.Session{}).
+			Order(orderBy).
+			Limit(filter.Limit).
+			Offset(filter.Offset).
+			Find(&logs).Error
+	})
+	if err := g.Wait(); err != nil {
+		if useFTS5 {
+			// Single retry via the LIKE fallback so a transient FTS5 issue does
+			// not turn into a 500 for users.
+			return r.getLogsV2LikeFallback(ctx, filter, tenant)
+		}
+		return nil, 0, fmt.Errorf("failed to fetch logs: %w", err)
+	}
+
+	return logs, total, nil
+}
+
+// getLogsV2LikeFallback re-runs the query using LIKE against body/trace_id —
+// used when the FTS5 path errors out so the API never serves a 500 because of
+// an index-layer hiccup.
+func (r *Repository) getLogsV2LikeFallback(ctx context.Context, filter LogFilter, tenant string) ([]Log, int64, error) {
+	var logs []Log
+	var total int64
+	base := r.db.WithContext(ctx).Model(&Log{}).Where("tenant_id = ?", tenant)
 	if filter.ServiceName != "" {
 		base = base.Where("service_name = ?", filter.ServiceName)
 	}
@@ -89,23 +164,15 @@ func (r *Repository) GetLogsV2(ctx context.Context, filter LogFilter) ([]Log, in
 		op := r.likeOp()
 		base = base.Where(fmt.Sprintf("body %s ? OR trace_id %s ?", op, op), search, search)
 	}
-
-	// Run COUNT and SELECT in parallel using independent sessions.
 	var g errgroup.Group
-	g.Go(func() error {
-		return base.Session(&gorm.Session{}).Count(&total).Error
-	})
+	g.Go(func() error { return base.Session(&gorm.Session{}).Count(&total).Error })
 	g.Go(func() error {
 		return base.Session(&gorm.Session{}).
-			Order("timestamp desc").
-			Limit(filter.Limit).
-			Offset(filter.Offset).
-			Find(&logs).Error
+			Order("timestamp desc").Limit(filter.Limit).Offset(filter.Offset).Find(&logs).Error
 	})
 	if err := g.Wait(); err != nil {
-		return nil, 0, fmt.Errorf("failed to fetch logs: %w", err)
+		return nil, 0, fmt.Errorf("failed to fetch logs (fallback): %w", err)
 	}
-
 	return logs, total, nil
 }
 

@@ -218,8 +218,16 @@ func (r *Repository) RecentLogs(ctx context.Context, limit int) ([]Log, error) {
 }
 
 // SearchLogs searches for logs based on query, scoped to the tenant carried on ctx.
+//
+// On SQLite the search routes through the FTS5 virtual table (`logs_fts`) and
+// orders by BM25 score for relevance. On Postgres / MySQL / others it falls
+// back to LIKE/ILIKE against logs.body and logs.service_name (Postgres uses
+// the pg_trgm GIN indexes built in AutoMigrateModels).
 func (r *Repository) SearchLogs(ctx context.Context, query string, limit int) ([]Log, error) {
 	tenant := TenantFromContext(ctx)
+	if query != "" && fts5Available(r.driver) {
+		return r.searchLogsFTS5(ctx, tenant, query, limit)
+	}
 	var logs []Log
 	db := r.db.WithContext(ctx).Where("tenant_id = ?", tenant).Order("timestamp desc").Limit(limit)
 	if query != "" {
@@ -230,4 +238,44 @@ func (r *Repository) SearchLogs(ctx context.Context, query string, limit int) ([
 		return nil, err
 	}
 	return logs, nil
+}
+
+// searchLogsFTS5 runs the FTS5 + BM25 path. The MATCH expression is built via
+// fts5MatchExpr to keep user input safe from FTS5 query syntax. Results are
+// returned ordered by BM25 score (lower = more relevant in SQLite's
+// implementation, which returns negative scores).
+func (r *Repository) searchLogsFTS5(ctx context.Context, tenant, query string, limit int) ([]Log, error) {
+	matchExpr := fts5MatchExpr(query)
+	if matchExpr == "" {
+		var logs []Log
+		err := r.db.WithContext(ctx).Where("tenant_id = ?", tenant).Order("timestamp desc").Limit(limit).Find(&logs).Error
+		return logs, err
+	}
+	var logs []Log
+	err := r.db.WithContext(ctx).
+		Table("logs").
+		Joins("JOIN "+fts5LogsTable+" ON logs.id = "+fts5LogsTable+".rowid").
+		Where("logs.tenant_id = ? AND "+fts5LogsTable+" MATCH ?", tenant, matchExpr).
+		Order("bm25(" + fts5LogsTable + ") ASC").
+		Limit(limit).
+		Find(&logs).Error
+	if err != nil {
+		// On any FTS5 query error (malformed expression, missing table on a
+		// half-migrated DB), fall back to LIKE so we never serve a 500 just
+		// because the index path is unhappy.
+		return r.searchLogsLikeFallback(ctx, tenant, query, limit)
+	}
+	return logs, nil
+}
+
+func (r *Repository) searchLogsLikeFallback(ctx context.Context, tenant, query string, limit int) ([]Log, error) {
+	var logs []Log
+	op := r.likeOp()
+	err := r.db.WithContext(ctx).
+		Where("tenant_id = ?", tenant).
+		Where(fmt.Sprintf("body %s ? OR service_name %s ?", op, op), "%"+query+"%", "%"+query+"%").
+		Order("timestamp desc").
+		Limit(limit).
+		Find(&logs).Error
+	return logs, err
 }

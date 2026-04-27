@@ -221,6 +221,15 @@ func AutoMigrateModels(db *gorm.DB, driver string) error {
 		log.Println("🔓 Dropped legacy FK constraints (no-op on fresh DBs)")
 	}
 
+	// SQLite: provision FTS5 virtual table + triggers on logs.body / logs.service_name.
+	// Search routes through bm25() ranking on this driver; LIKE remains the fallback
+	// if FTS5 is unavailable (older SQLite builds without FTS5 compiled in).
+	if driver == "sqlite" || driver == "" {
+		if err := setupSQLiteFTS5(db); err != nil {
+			log.Printf("⚠️  SQLite FTS5 setup failed (%v) — log search will fall back to LIKE", err)
+		}
+	}
+
 	// Postgres: enable pg_trgm and create a GIN index on logs.body for fuzzy ILIKE search.
 	// Azure Database for PostgreSQL allows pg_trgm by default. If the role lacks
 	// CREATE EXTENSION privilege, an operator can pre-create the extension and this

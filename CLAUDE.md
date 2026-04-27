@@ -60,7 +60,7 @@ When none are present, `DEFAULT_TENANT` (default `"default"`) is assigned. Every
 | Time Series (in-memory) | `internal/tsdb/` | Ring buffer, sliding windows, pre-computed percentiles |
 | Graph (in-memory, legacy) | `internal/graph/` | Simple service topology — **being replaced by GraphRAG** |
 | Vector (embedded) | `internal/vectordb/` | TF-IDF index for semantic log search (pure Go, no CGO). Retained as a fallback similarity index for SQLite mode and for `SimilarErrors` ranking within a Drain template cluster. |
-| Relational (persistent) | `internal/storage/` | GORM-based, multi-DB, single source of truth. Driven by `RetentionScheduler` (hourly batched purge + daily VACUUM/ANALYZE). `logs.body` is plain TEXT (Postgres: `pg_trgm` GIN indexed for substring search); `AttributesJSON` and `AIInsight` remain `CompressedText`. |
+| Relational (persistent) | `internal/storage/` | GORM-based, multi-DB, single source of truth. Driven by `RetentionScheduler` (hourly batched purge + daily VACUUM/ANALYZE). `logs.body` is plain TEXT. **Log search**: SQLite uses FTS5 virtual table `logs_fts` (porter+unicode61 tokenizer) ordered by `bm25()`, kept in sync via AFTER INSERT/DELETE/UPDATE triggers; Postgres uses `pg_trgm` GIN on `logs.body` and `logs.service_name`. `AttributesJSON` and `AIInsight` remain `CompressedText`. |
 
 ## GraphRAG Architecture
 
