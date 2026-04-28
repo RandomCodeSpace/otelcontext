@@ -78,6 +78,17 @@ type PipelineConfig struct {
 	SoftThreshold float64 // fullness fraction above which healthy batches are dropped (0.0–1.0)
 }
 
+// Defensive upper bounds on operator-supplied capacity/workers. Env-var
+// inputs go directly into a make(chan ...) and into goroutine launches;
+// without a sanity cap a typo like INGEST_PIPELINE_QUEUE_SIZE=10_000_000_000
+// would OOM the process. These caps are well above any reasonable
+// production deployment (50k is the default queue, 8 the default workers)
+// while still keeping the allocation finite.
+const (
+	maxPipelineCapacity = 1_000_000
+	maxPipelineWorkers  = 256
+)
+
 // DefaultPipelineConfig returns production-sized defaults.
 func DefaultPipelineConfig() PipelineConfig {
 	return PipelineConfig{
@@ -156,6 +167,25 @@ func NewPipeline(writer pipelineWriter, metrics *telemetry.Metrics, cfg Pipeline
 	}
 	if cfg.Workers <= 0 {
 		cfg.Workers = d.Workers
+	}
+	// Defensive sanity caps on operator-supplied values — keep them out of
+	// make()/goroutine-launch as raw env-var pass-through. CodeQL flagged
+	// the channel allocation as uncontrolled-allocation-size; clamping at
+	// the constructor satisfies the taint-tracking and prevents an OOM
+	// from a misconfigured env var.
+	if cfg.Capacity > maxPipelineCapacity {
+		slog.Warn("ingest pipeline: capacity clamped to defensive ceiling",
+			"requested", cfg.Capacity,
+			"max", maxPipelineCapacity,
+		)
+		cfg.Capacity = maxPipelineCapacity
+	}
+	if cfg.Workers > maxPipelineWorkers {
+		slog.Warn("ingest pipeline: workers clamped to defensive ceiling",
+			"requested", cfg.Workers,
+			"max", maxPipelineWorkers,
+		)
+		cfg.Workers = maxPipelineWorkers
 	}
 	// Zero-value config falls back to defaults — the field is internal
 	// (no env-var surface) and TestPipeline_DefaultsApplied enforces this.
