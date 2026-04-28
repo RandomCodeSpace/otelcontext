@@ -23,6 +23,13 @@ type Server struct {
 	graph     *graph.Graph       // in-memory service dependency graph (may be nil before first build)
 	graphRAG  *graphrag.GraphRAG // layered GraphRAG for advanced queries
 	vectorIdx *vectordb.Index    // TF-IDF semantic log search index
+
+	// Saturation probes consulted by /ready. Each returns a fullness
+	// fraction in [0.0, 1.0]; nil disables the corresponding check.
+	// Decoupling via callbacks keeps the api package free of queue/ingest
+	// imports and lets tests inject deterministic values.
+	dlqSaturation      func() float64
+	pipelineSaturation func() float64
 }
 
 // NewServer creates a new API server.
@@ -49,6 +56,21 @@ func (s *Server) SetGraphRAG(g *graphrag.GraphRAG) {
 // SetVectorIndex wires the TF-IDF vector index for semantic log search.
 func (s *Server) SetVectorIndex(idx *vectordb.Index) {
 	s.vectorIdx = idx
+}
+
+// SetDLQSaturationProbe registers a callback returning DLQ disk fullness as
+// a fraction in [0.0, 1.0]. Used by /ready to flip to 503 when DLQ is at
+// risk of FIFO-evicting unflushed batches. Pass nil to disable the check.
+func (s *Server) SetDLQSaturationProbe(fn func() float64) {
+	s.dlqSaturation = fn
+}
+
+// SetPipelineSaturationProbe registers a callback returning ingest pipeline
+// queue fullness as a fraction in [0.0, 1.0]. Used by /ready to flip to 503
+// when the pipeline is at hard capacity (already returning 429/RESOURCE_EXHAUSTED
+// to clients). Pass nil to disable the check.
+func (s *Server) SetPipelineSaturationProbe(fn func() float64) {
+	s.pipelineSaturation = fn
 }
 
 // RegisterRoutes registers API endpoints on the provided mux.

@@ -213,13 +213,64 @@ func (r *RetentionScheduler) runPurge(ctx context.Context) {
 		}
 	}
 
+	r.adaptPurgeSleep(time.Since(start))
+
 	slog.Info("retention purge complete",
 		"driver", driver,
 		"duration", time.Since(start),
 		"logs_deleted", totals["logs"],
 		"traces_deleted", totals["traces"],
 		"metrics_deleted", totals["metric_buckets"],
+		"next_batch_sleep", r.purgeBatchSleep,
 	)
+}
+
+// adaptPurgeSleepCap and friends bracket the inter-batch sleep window. The
+// adaptive controller doubles the current sleep when a pass takes more than
+// `adaptSlowFraction` of the configured purgeInterval (signal: DB is hot or
+// volume spiked); halves it when a pass finishes in under `adaptFastFraction`
+// (signal: there's headroom; tighten the loop so retention doesn't fall
+// behind ingest). Bounds keep the controller from oscillating to extreme
+// values where it would either stall (too much sleep) or starve readers
+// (too little).
+const (
+	adaptPurgeSleepCap   = 100 * time.Millisecond
+	adaptPurgeSleepFloor = 1 * time.Millisecond
+	adaptSlowFraction    = 0.50
+	adaptFastFraction    = 0.10
+)
+
+// adaptPurgeSleep tunes purgeBatchSleep based on the previous pass's wall
+// time relative to purgeInterval. Single-writer (the retention loop), so no
+// synchronization is needed; the purge methods read the value once at the
+// call boundary.
+func (r *RetentionScheduler) adaptPurgeSleep(elapsed time.Duration) {
+	if r.purgeInterval <= 0 {
+		return
+	}
+	pct := float64(elapsed) / float64(r.purgeInterval)
+	switch {
+	case pct > adaptSlowFraction && r.purgeBatchSleep < adaptPurgeSleepCap:
+		newSleep := r.purgeBatchSleep * 2
+		if newSleep < adaptPurgeSleepFloor {
+			newSleep = adaptPurgeSleepFloor
+		}
+		if newSleep > adaptPurgeSleepCap {
+			newSleep = adaptPurgeSleepCap
+		}
+		slog.Info("retention: pass slow, increasing inter-batch sleep",
+			"elapsed", elapsed,
+			"old_sleep", r.purgeBatchSleep,
+			"new_sleep", newSleep,
+		)
+		r.purgeBatchSleep = newSleep
+	case pct < adaptFastFraction && r.purgeBatchSleep > adaptPurgeSleepFloor:
+		newSleep := r.purgeBatchSleep / 2
+		if newSleep < adaptPurgeSleepFloor {
+			newSleep = adaptPurgeSleepFloor
+		}
+		r.purgeBatchSleep = newSleep
+	}
 }
 
 // runPurgeSerial is the SQLite path: running the three purges concurrently buys
@@ -267,6 +318,8 @@ func (r *RetentionScheduler) runPurgeSerial(ctx context.Context, cutoff time.Tim
 		}
 	}
 
+	r.adaptPurgeSleep(time.Since(start))
+
 	slog.Info("retention purge complete",
 		"driver", driver,
 		"cutoff", cutoff.Format(time.RFC3339),
@@ -274,6 +327,7 @@ func (r *RetentionScheduler) runPurgeSerial(ctx context.Context, cutoff time.Tim
 		"traces_deleted", traces,
 		"metrics_deleted", metricsPurged,
 		"duration", time.Since(start),
+		"next_batch_sleep", r.purgeBatchSleep,
 	)
 }
 

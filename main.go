@@ -452,15 +452,37 @@ func main() {
 			Capacity: cfg.IngestPipelineQueueSize,
 			Workers:  cfg.IngestPipelineWorkers,
 		})
+		ingestPipeline.SetPerTenantCap(cfg.IngestPipelinePerTenantCap)
 		ingestPipeline.Start(context.Background())
 		traceServer.SetPipeline(ingestPipeline)
 		logsServer.SetPipeline(ingestPipeline)
 		slog.Info("🌊 Async ingest pipeline enabled",
 			"queue_size", cfg.IngestPipelineQueueSize,
 			"workers", cfg.IngestPipelineWorkers,
+			"per_tenant_cap", cfg.IngestPipelinePerTenantCap,
 		)
 	} else {
 		slog.Warn("🐌 Async ingest pipeline disabled (INGEST_ASYNC_ENABLED=false) — Export() blocks on DB writes")
+	}
+
+	// Wire /ready saturation probes. Both probes are nil-tolerant on the
+	// api server side; we additionally guard against unconfigured caps
+	// (DLQ unbounded, async pipeline disabled) by returning 0 — i.e.
+	// "skipped" semantics — rather than dividing by zero.
+	if dlq != nil && cfg.DLQMaxDiskMB > 0 {
+		maxBytes := float64(cfg.DLQMaxDiskMB) * 1024 * 1024
+		apiServer.SetDLQSaturationProbe(func() float64 {
+			return float64(dlq.DiskBytes()) / maxBytes
+		})
+	}
+	if ingestPipeline != nil {
+		apiServer.SetPipelineSaturationProbe(func() float64 {
+			st := ingestPipeline.Stats()
+			if st.Capacity == 0 {
+				return 0
+			}
+			return float64(st.QueueDepth) / float64(st.Capacity)
+		})
 	}
 
 	// Wire up live log streaming + AI + DLQ metrics

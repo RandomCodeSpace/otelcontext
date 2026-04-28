@@ -407,6 +407,108 @@ func TestPipeline_DefaultsApplied(t *testing.T) {
 	}
 }
 
+func TestPipeline_PerTenantCap_DropsExcessHealthy(t *testing.T) {
+	// With Workers=0 and Capacity=10, queue absorbs everything; the per-
+	// tenant cap kicks in independently of soft-backpressure. Tenant A is
+	// capped at 3; the 4th healthy submission for A must be dropped while
+	// tenant B's submissions land normally.
+	p := NewPipeline(&fakeWriter{}, nil, PipelineConfig{Capacity: 10, Workers: 0, SoftThreshold: 0.9})
+	p.SetPerTenantCap(3)
+
+	mkBatch := func(tenant string) *Batch {
+		b := healthyBatch()
+		b.Tenant = tenant
+		return b
+	}
+
+	for range 3 {
+		if err := p.Submit(mkBatch("a")); err != nil {
+			t.Fatalf("submit under cap: %v", err)
+		}
+	}
+	if err := p.Submit(mkBatch("a")); err != nil {
+		t.Fatalf("4th submit returned err %v, want nil (silent drop)", err)
+	}
+	if err := p.Submit(mkBatch("b")); err != nil {
+		t.Fatalf("tenant b under its cap should not be affected: %v", err)
+	}
+
+	stats := p.Stats()
+	if stats.Enqueued != 4 { // 3 from a + 1 from b
+		t.Fatalf("Enqueued=%d, want 4", stats.Enqueued)
+	}
+	if got := p.TenantDropped(); got != 1 {
+		t.Fatalf("TenantDropped=%d, want 1", got)
+	}
+	if stats.DroppedHealthy != 0 {
+		t.Fatalf("DroppedHealthy=%d, want 0 (tenant cap is a separate counter)", stats.DroppedHealthy)
+	}
+}
+
+func TestPipeline_PerTenantCap_PriorityBypasses(t *testing.T) {
+	// Errors and slow traces must always land — they bypass the per-tenant
+	// cap the same way they bypass soft-backpressure.
+	p := NewPipeline(&fakeWriter{}, nil, PipelineConfig{Capacity: 10, Workers: 0, SoftThreshold: 0.9})
+	p.SetPerTenantCap(2)
+
+	mkErr := func(tenant string) *Batch {
+		b := errorBatch()
+		b.Tenant = tenant
+		return b
+	}
+
+	for range 5 {
+		if err := p.Submit(mkErr("noisy")); err != nil {
+			t.Fatalf("priority submit blocked by tenant cap: %v", err)
+		}
+	}
+	if got := p.TenantDropped(); got != 0 {
+		t.Fatalf("TenantDropped=%d, want 0 (priority bypasses cap)", got)
+	}
+	if got := p.Stats().Enqueued; got != 5 {
+		t.Fatalf("Enqueued=%d, want 5", got)
+	}
+}
+
+func TestPipeline_PerTenantCap_ReleasedAfterProcess(t *testing.T) {
+	// Once a worker drains and processes a batch, the tenant slot is
+	// released so subsequent submissions from the same tenant are
+	// accepted. Without release, the cap would be a one-shot per-tenant
+	// quota for the lifetime of the process.
+	w := &fakeWriter{}
+	p := NewPipeline(w, nil, PipelineConfig{Capacity: 10, Workers: 1, SoftThreshold: 0.9})
+	p.SetPerTenantCap(1)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	p.Start(ctx)
+	t.Cleanup(p.Stop)
+
+	mk := func() *Batch {
+		b := healthyBatch()
+		b.Tenant = "single"
+		return b
+	}
+
+	// First batch fills the cap.
+	if err := p.Submit(mk()); err != nil {
+		t.Fatalf("submit 1: %v", err)
+	}
+	// Wait for the worker to drain it (and release the slot).
+	if !waitFor(t, 2*time.Second, func() bool { return p.Stats().Processed == 1 }) {
+		t.Fatalf("worker did not process first batch")
+	}
+	// Second batch must succeed because the slot was released.
+	if err := p.Submit(mk()); err != nil {
+		t.Fatalf("submit 2 after release: %v", err)
+	}
+	if !waitFor(t, 2*time.Second, func() bool { return p.Stats().Processed == 2 }) {
+		t.Fatalf("worker did not process second batch")
+	}
+	if got := p.TenantDropped(); got != 0 {
+		t.Fatalf("TenantDropped=%d, want 0 (no drops when slot is released between submits)", got)
+	}
+}
+
 func TestPipeline_HardCapacityEvenForPriority(t *testing.T) {
 	// Above hard capacity, priority batches are still rejected. The
 	// caller is responsible for translating into RESOURCE_EXHAUSTED so

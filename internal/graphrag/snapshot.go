@@ -142,7 +142,16 @@ func (g *GraphRAG) takeSnapshotForTenant(_ context.Context, tenant string, store
 	)
 }
 
-// pruneOldSnapshots removes snapshots older than 7 days.
+// maxSnapshotRows is a row-count backstop on `graph_snapshots` to prevent
+// unbounded disk growth when the write rate outruns the 7-day age prune.
+// Steady state at 15-min cadence × 100 tenants is ~67k rows/week, so 100k
+// gives ~50% headroom — high enough to never trigger under normal operation,
+// low enough to bound disk if a misconfig or tenant explosion runs the
+// snapshotter hot.
+const maxSnapshotRows = 100_000
+
+// pruneOldSnapshots removes snapshots older than 7 days, then enforces a
+// row-count backstop in case the by-age prune isn't keeping up.
 func (g *GraphRAG) pruneOldSnapshots() {
 	if g.repo == nil || g.repo.DB() == nil {
 		return
@@ -154,6 +163,27 @@ func (g *GraphRAG) pruneOldSnapshots() {
 	} else if result.RowsAffected > 0 {
 		slog.Info("Pruned old graph snapshots", "count", result.RowsAffected)
 	}
+
+	var count int64
+	if err := g.repo.DB().Model(&GraphSnapshot{}).Count(&count).Error; err != nil {
+		slog.Error("Failed to count snapshots for row-cap prune", "error", err)
+		return
+	}
+	if count <= maxSnapshotRows {
+		return
+	}
+	excess := count - maxSnapshotRows
+	// Subquery selects the N oldest IDs, then deletes that set. Portable
+	// across SQLite and Postgres; avoids a multi-statement transaction.
+	sub := g.repo.DB().Model(&GraphSnapshot{}).Select("id").Order("created_at ASC").Limit(int(excess))
+	if err := g.repo.DB().Where("id IN (?)", sub).Delete(&GraphSnapshot{}).Error; err != nil {
+		slog.Error("Failed to row-cap prune snapshots", "error", err)
+		return
+	}
+	slog.Warn("graphrag: row-cap pruned snapshots (write rate exceeded by-age prune)",
+		"deleted", excess,
+		"cap", maxSnapshotRows,
+	)
 }
 
 // GetGraphSnapshot retrieves the snapshot closest to the requested time,

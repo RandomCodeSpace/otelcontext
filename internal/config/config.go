@@ -121,6 +121,14 @@ type Config struct {
 	IngestAsyncEnabled      bool // default true; opt out via INGEST_ASYNC_ENABLED=false
 	IngestPipelineQueueSize int  // default 50000 batches; per-deployment tunable
 	IngestPipelineWorkers   int  // default 8 worker goroutines
+	// IngestPipelinePerTenantCap caps in-flight batches per tenant so a noisy
+	// tenant cannot starve siblings of fresh queue slots when fullness is
+	// below the soft-backpressure threshold. 0 (default) disables — single-
+	// tenant deployments need no cap. Operators on multi-tenant deployments
+	// should set INGEST_PIPELINE_PER_TENANT_CAP to roughly Capacity/N where
+	// N is the expected number of concurrently-active tenants, with some
+	// headroom (e.g. 2× the fair-share value) for short bursts.
+	IngestPipelinePerTenantCap int
 
 	// TLS (HTTP + gRPC). When both paths are set, TLS is enabled on both servers.
 	// Empty values (default) keep plaintext behavior.
@@ -260,9 +268,10 @@ func Load(customPath string) (*Config, error) {
 		GraphRAGEventQueueSize: getEnvInt("GRAPHRAG_EVENT_QUEUE_SIZE", 100000),
 
 		// Async ingest pipeline
-		IngestAsyncEnabled:      getEnvBool("INGEST_ASYNC_ENABLED", true),
-		IngestPipelineQueueSize: getEnvInt("INGEST_PIPELINE_QUEUE_SIZE", 50000),
-		IngestPipelineWorkers:   getEnvInt("INGEST_PIPELINE_WORKERS", 8),
+		IngestAsyncEnabled:         getEnvBool("INGEST_ASYNC_ENABLED", true),
+		IngestPipelineQueueSize:    getEnvInt("INGEST_PIPELINE_QUEUE_SIZE", 50000),
+		IngestPipelineWorkers:      getEnvInt("INGEST_PIPELINE_WORKERS", 8),
+		IngestPipelinePerTenantCap: getEnvInt("INGEST_PIPELINE_PER_TENANT_CAP", 0),
 
 		// TLS
 		TLSCertFile:       getEnv("TLS_CERT_FILE", ""),

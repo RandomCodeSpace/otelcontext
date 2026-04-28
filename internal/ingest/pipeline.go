@@ -130,6 +130,16 @@ type Pipeline struct {
 	droppedHealthy  atomic.Int64
 	rejectedFull    atomic.Int64
 	processFailures atomic.Int64
+	tenantDropped   atomic.Int64
+
+	// Per-tenant in-flight cap — bounds the queue slots a single tenant
+	// can consume so a noisy tenant cannot starve siblings of fresh
+	// healthy submissions when fullness is below the soft threshold.
+	// Priority batches (errors/slow) bypass the cap because diagnostic
+	// data must always land. perTenantCap == 0 disables the check.
+	perTenantCap   int
+	tenantMu       sync.Mutex
+	tenantInFlight map[string]int
 
 	stopCh chan struct{}
 	once   sync.Once
@@ -155,13 +165,36 @@ func NewPipeline(writer pipelineWriter, metrics *telemetry.Metrics, cfg Pipeline
 		cfg.SoftThreshold = d.SoftThreshold
 	}
 	return &Pipeline{
-		writer:  writer,
-		metrics: metrics,
-		cfg:     cfg,
-		queue:   make(chan *Batch, cfg.Capacity),
-		stopCh:  make(chan struct{}),
+		writer:         writer,
+		metrics:        metrics,
+		cfg:            cfg,
+		queue:          make(chan *Batch, cfg.Capacity),
+		tenantInFlight: make(map[string]int),
+		stopCh:         make(chan struct{}),
 	}
 }
+
+// SetPerTenantCap configures the maximum in-flight batches one tenant may
+// hold in the queue (and currently being processed). 0 disables the cap.
+// Once a tenant hits the cap, further healthy submissions from that tenant
+// are dropped at Submit() time with reason "tenant_backpressure". Priority
+// batches (errors/slow traces) bypass the cap.
+//
+// Sized as a fraction of Capacity, e.g. Capacity/4 keeps any single tenant
+// to 25% of queue capacity. Operators tune via INGEST_PIPELINE_PER_TENANT_CAP.
+// Startup-only — call before Start().
+func (p *Pipeline) SetPerTenantCap(n int) {
+	if n < 0 {
+		n = 0
+	}
+	p.perTenantCap = n
+}
+
+// TenantDropped reports the cumulative number of healthy submissions
+// rejected because the submitting tenant was at the per-tenant cap.
+// Distinct from RejectedFull (queue at hard capacity) and
+// DroppedHealthy (soft-backpressure across the whole queue).
+func (p *Pipeline) TenantDropped() int64 { return p.tenantDropped.Load() }
 
 // Start spawns the worker pool. Safe to call once. Subsequent calls are
 // no-ops; tests rely on this for reset semantics.
@@ -215,16 +248,55 @@ func (p *Pipeline) Submit(b *Batch) error {
 		return nil
 	}
 
+	// Per-tenant cap — only enforced for healthy batches (priority bypasses,
+	// same as soft-backpressure). Reserve the slot under the lock so the
+	// counter and the channel send are coherent: if the channel is full,
+	// undo the reservation in the default branch below.
+	tenantReserved := false
+	if p.perTenantCap > 0 && b.Tenant != "" && !b.Priority() {
+		p.tenantMu.Lock()
+		if p.tenantInFlight[b.Tenant] >= p.perTenantCap {
+			p.tenantMu.Unlock()
+			p.tenantDropped.Add(1)
+			p.observeDrop(b.Type, "tenant_backpressure")
+			return nil
+		}
+		p.tenantInFlight[b.Tenant]++
+		tenantReserved = true
+		p.tenantMu.Unlock()
+	}
+
 	select {
 	case p.queue <- b:
 		p.enqueuedTotal.Add(1)
 		p.observeQueueDepth(b.Type)
 		return nil
 	default:
+		if tenantReserved {
+			p.releaseTenantSlot(b.Tenant)
+		}
 		p.rejectedFull.Add(1)
 		p.observeDrop(b.Type, "queue_full")
 		return ErrQueueFull
 	}
+}
+
+// releaseTenantSlot decrements the in-flight count for a tenant, removing
+// the map entry when it hits zero so the map doesn't grow unboundedly with
+// short-lived tenant IDs. Safe to call with an empty tenant or when the
+// cap is disabled — both no-op.
+func (p *Pipeline) releaseTenantSlot(tenant string) {
+	if p.perTenantCap <= 0 || tenant == "" {
+		return
+	}
+	p.tenantMu.Lock()
+	n := p.tenantInFlight[tenant] - 1
+	if n <= 0 {
+		delete(p.tenantInFlight, tenant)
+	} else {
+		p.tenantInFlight[tenant] = n
+	}
+	p.tenantMu.Unlock()
 }
 
 // Stop signals workers to exit and blocks until in-flight batches have
@@ -301,6 +373,13 @@ func (p *Pipeline) worker(ctx context.Context) {
 func (p *Pipeline) process(b *Batch) {
 	if b == nil {
 		return
+	}
+	// Release the per-tenant slot reserved at Submit time. Registered as
+	// a defer so it runs even if the batch panics. Priority batches don't
+	// reserve at submit, so they don't release here either — the conditions
+	// must mirror exactly to keep the in-flight count balanced.
+	if !b.Priority() {
+		defer p.releaseTenantSlot(b.Tenant)
 	}
 	defer func() {
 		if r := recover(); r != nil {

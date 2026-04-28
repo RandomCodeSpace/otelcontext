@@ -3,9 +3,16 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"time"
 )
+
+// readySaturationThreshold is the fullness fraction at which a saturation
+// probe (DLQ disk, ingest pipeline) flips /ready to 503. Set high enough
+// that brief spikes don't cause restart loops, low enough that orchestrators
+// stop sending traffic before the system fails outright.
+const readySaturationThreshold = 0.95
 
 // handleLive is a Kubernetes-style liveness probe.
 // Returns 200 OK as long as the process is up. Does not check dependencies.
@@ -53,6 +60,31 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 	case !s.graphRAG.IsRunning():
 		checks["graphrag"] = "not running"
 		ready = false
+	}
+
+	// Saturation probes — flip to 503 when downstream buffers are full so
+	// orchestrators (k8s, load balancers) stop routing fresh traffic before
+	// the pipeline starts hard-rejecting (gRPC RESOURCE_EXHAUSTED / HTTP 429)
+	// or DLQ starts FIFO-evicting unflushed batches.
+	if s.dlqSaturation != nil {
+		if sat := s.dlqSaturation(); sat >= readySaturationThreshold {
+			checks["dlq_disk"] = fmt.Sprintf("saturated %.0f%%", sat*100)
+			ready = false
+		} else {
+			checks["dlq_disk"] = "ok"
+		}
+	} else {
+		checks["dlq_disk"] = "skipped"
+	}
+	if s.pipelineSaturation != nil {
+		if sat := s.pipelineSaturation(); sat >= readySaturationThreshold {
+			checks["pipeline"] = fmt.Sprintf("saturated %.0f%%", sat*100)
+			ready = false
+		} else {
+			checks["pipeline"] = "ok"
+		}
+	} else {
+		checks["pipeline"] = "skipped"
 	}
 
 	status := http.StatusOK
