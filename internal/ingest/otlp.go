@@ -213,6 +213,8 @@ func (s *MetricsServer) SetMetricCallback(cb func(tsdb.RawMetric)) {
 
 // Export handles incoming OTLP metrics data.
 func (s *MetricsServer) Export(ctx context.Context, req *colmetricspb.ExportMetricsServiceRequest) (*colmetricspb.ExportMetricsServiceResponse, error) {
+	start := time.Now()
+	defer func() { s.metrics.ObserveIngestDuration("metrics", time.Since(start)) }()
 	for _, resourceMetrics := range req.ResourceMetrics {
 		serviceName := getServiceName(resourceMetrics.Resource.Attributes)
 
@@ -283,6 +285,8 @@ func (s *MetricsServer) Export(ctx context.Context, req *colmetricspb.ExportMetr
 
 // Export handles incoming OTLP trace data.
 func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceServiceRequest) (*coltracepb.ExportTraceServiceResponse, error) {
+	start := time.Now()
+	defer func() { s.metrics.ObserveIngestDuration("traces", time.Since(start)) }()
 	slog.Debug("📥 [TRACES] Received Request", "resource_spans", len(req.ResourceSpans))
 
 	type batchResult struct {
@@ -543,6 +547,8 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 
 // Export handles incoming OTLP log data.
 func (s *LogsServer) Export(ctx context.Context, req *collogspb.ExportLogsServiceRequest) (*collogspb.ExportLogsServiceResponse, error) {
+	start := time.Now()
+	defer func() { s.metrics.ObserveIngestDuration("logs", time.Since(start)) }()
 	// slog.Debug("📥 [LOGS] Received Request", "resource_logs", len(req.ResourceLogs))
 
 	logResults := make([][]storage.Log, len(req.ResourceLogs))

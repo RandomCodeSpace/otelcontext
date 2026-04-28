@@ -28,6 +28,12 @@ type Metrics struct {
 	DBLatency         prometheus.Histogram
 	DLQSize           prometheus.Gauge
 
+	// IngestDurationSeconds is the per-Export E2E latency observed inside
+	// the OTLP servers (gRPC + HTTP), labeled by signal {traces,logs,metrics}.
+	// Drives ingest SLOs: alert on p99 / error budget burn rather than on the
+	// blunt OtelContext_grpc_request_duration_seconds aggregate.
+	IngestDurationSeconds *prometheus.HistogramVec
+
 	// --- gRPC ---
 	GRPCRequestsTotal   *prometheus.CounterVec
 	GRPCRequestDuration *prometheus.HistogramVec
@@ -152,6 +158,12 @@ func New() *Metrics {
 			Name: "OtelContext_dlq_size",
 			Help: "Number of files currently in the Dead Letter Queue.",
 		}),
+
+		IngestDurationSeconds: promauto.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "otelcontext_ingest_duration_seconds",
+			Help:    "End-to-end OTLP Export latency observed in the ingest server, by signal.",
+			Buckets: []float64{.001, .005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10},
+		}, []string{"signal"}),
 
 		// gRPC
 		GRPCRequestsTotal: promauto.NewCounterVec(prometheus.CounterOpts{
@@ -399,6 +411,17 @@ func (m *Metrics) SampleDBPoolStats(sqlDB *sql.DB) {
 func (m *Metrics) RecordIngestion(count int) {
 	m.IngestionRate.Add(float64(count))
 	m.totalIngested.Add(int64(count))
+}
+
+// ObserveIngestDuration records an end-to-end OTLP Export latency for the
+// given signal. Callers should pass time.Since(start) measured from the very
+// start of the Export handler. Nil-safe so the OTLP servers can be wired
+// without a Metrics instance during tests.
+func (m *Metrics) ObserveIngestDuration(signal string, d time.Duration) {
+	if m == nil || m.IngestDurationSeconds == nil {
+		return
+	}
+	m.IngestDurationSeconds.WithLabelValues(signal).Observe(d.Seconds())
 }
 
 func (m *Metrics) SetActiveConnections(n int) {
