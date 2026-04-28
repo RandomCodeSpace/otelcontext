@@ -49,8 +49,13 @@ func tenantFromContext(ctx context.Context) string {
 		return storage.TenantFromContext(ctx)
 	}
 	if md, ok := metadata.FromIncomingContext(ctx); ok {
-		if vals := md.Get(tenantHeader); len(vals) > 0 && vals[0] != "" {
-			return vals[0]
+		if vals := md.Get(tenantHeader); len(vals) > 0 {
+			// Reject empty, over-length, or control-char values via shared
+			// sanitizer so HTTP and gRPC paths apply identical input-safety
+			// rules. Empty return falls through to the configured default.
+			if t := storage.SanitizeTenantID(vals[0]); t != "" {
+				return t
+			}
 		}
 	}
 	return ""
@@ -84,11 +89,13 @@ func resolveTenant(ctx context.Context, resourceAttrs []*commonpb.KeyValue, fall
 
 // tenantFromResource looks for an OTLP resource attribute "tenant.id".
 // Only consulted when cfg.TrustResourceTenant=true (off by default) —
-// see resolveTenant.
+// see resolveTenant. The value is run through SanitizeTenantID so a
+// compromised SDK cannot smuggle control characters or oversized strings
+// even on the trusted-resource path.
 func tenantFromResource(attrs []*commonpb.KeyValue) string {
 	for _, kv := range attrs {
 		if kv.Key == "tenant.id" {
-			return kv.Value.GetStringValue()
+			return storage.SanitizeTenantID(kv.Value.GetStringValue())
 		}
 	}
 	return ""

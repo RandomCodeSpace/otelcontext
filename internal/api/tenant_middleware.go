@@ -8,6 +8,7 @@ import (
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 )
 
+
 // TenantHeader is the canonical HTTP header carrying the tenant ID on
 // read-side (query) requests. Ingest paths resolve tenant separately via gRPC
 // metadata / OTLP resource attributes and do not go through this middleware.
@@ -34,7 +35,11 @@ func TenantMiddleware(cfg *config.Config) func(http.Handler) http.Handler {
 				next.ServeHTTP(w, r)
 				return
 			}
-			tenant := strings.TrimSpace(r.Header.Get(TenantHeader))
+			// SanitizeTenantID returns "" for empty / over-length / control-char
+			// values so they fall through to the configured default — see
+			// storage.SanitizeTenantID. Hostile or misconfigured clients cannot
+			// inject newlines into structured logs or overflow VARCHAR(64).
+			tenant := storage.SanitizeTenantID(r.Header.Get(TenantHeader))
 			if tenant == "" {
 				tenant = defaultTenant
 			}

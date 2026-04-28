@@ -135,6 +135,9 @@ func main() {
 	if err := cfg.Validate(); err != nil {
 		fatal("invalid configuration", err)
 	}
+	// Auto-exclude own service when self-instrumentation points to a loopback
+	// address (otherwise every span emitted re-enters Export and amplifies).
+	cfg.GuardSelfInstrumentation()
 	if err := cfg.ValidateDBForEnv(); err != nil {
 		fatal("DB/Env validation", err)
 	}
@@ -961,7 +964,7 @@ func initTracerProvider(endpoint string) (*sdktrace.TracerProvider, error) {
 
 	res, err := sdkresource.New(ctx,
 		sdkresource.WithAttributes(
-			semconv.ServiceName("otelcontext"),
+			semconv.ServiceName(config.SelfServiceName),
 			semconv.ServiceVersion(Version),
 		),
 	)

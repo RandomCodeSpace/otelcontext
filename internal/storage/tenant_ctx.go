@@ -1,6 +1,46 @@
 package storage
 
-import "context"
+import (
+	"context"
+	"strings"
+	"unicode"
+)
+
+// MaxTenantIDLength caps the length of an accepted tenant ID. Tenant IDs are
+// stored in a VARCHAR(64) column on every domain row plus propagate into
+// structured logs and Prometheus labels. The cap is a defense in depth against
+// silent VARCHAR truncation at insert time and unbounded label cardinality
+// from a hostile or misconfigured client.
+const MaxTenantIDLength = 128
+
+// SanitizeTenantID validates and normalizes a tenant ID supplied by an HTTP
+// header, gRPC metadata key, or OTLP resource attribute. It returns the empty
+// string for any value the caller should reject (and substitute with their
+// configured default), so the rejection contract is uniform across transports.
+//
+// Rejection criteria:
+//   - empty after TrimSpace
+//   - length exceeds MaxTenantIDLength after trim
+//   - contains a Unicode control character (\n, \r, \t, NUL, escape codes)
+//
+// On the happy path it returns the trimmed value verbatim — no case folding,
+// no allowlist, since legitimate tenant IDs may be UUIDs, slugs, or
+// organisation names in non-ASCII scripts.
+func SanitizeTenantID(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	if len(s) > MaxTenantIDLength {
+		return ""
+	}
+	for _, r := range s {
+		if unicode.IsControl(r) {
+			return ""
+		}
+	}
+	return s
+}
 
 // tenantCtxKey is the private context key used to carry the resolved tenant ID
 // through an HTTP (or gRPC) request down into the repository layer.
