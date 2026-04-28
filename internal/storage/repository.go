@@ -7,6 +7,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/RandomCodeSpace/otelcontext/internal/telemetry"
@@ -69,17 +70,23 @@ type Repository struct {
 	// active and the `logs` parent has been provisioned as a partitioned
 	// table. RetentionScheduler reads this to skip the logs DELETE — the
 	// PartitionScheduler does retention via DROP PARTITION instead.
-	logsPartitioned bool
+	//
+	// Stored as atomic.Bool: written once during NewRepository (before any
+	// goroutine reads it) and read by retention.go from a different
+	// goroutine. atomic.Bool removes the memory-model fragility of a plain
+	// bool that "works because the writer ran first" — no test catches a
+	// torn read on amd64, but the contract is brittle.
+	logsPartitioned atomic.Bool
 }
 
 // LogsPartitioned reports whether the `logs` table is provisioned as a
 // declarative partitioned parent. Used by RetentionScheduler to bypass the
 // row-level DELETE path when partition-level DROP is in charge of retention.
-func (r *Repository) LogsPartitioned() bool { return r.logsPartitioned }
+func (r *Repository) LogsPartitioned() bool { return r.logsPartitioned.Load() }
 
 // MarkLogsPartitioned flips the partitioned flag. Called by the partitioning
 // setup path (factory.go) once the partitioned schema is in place.
-func (r *Repository) MarkLogsPartitioned() { r.logsPartitioned = true }
+func (r *Repository) MarkLogsPartitioned() { r.logsPartitioned.Store(true) }
 
 // NewRepository initializes the database connection using environment variables and migrates the schema.
 func NewRepository(metrics *telemetry.Metrics) (*Repository, error) {
@@ -140,7 +147,7 @@ func NewRepository(metrics *telemetry.Metrics) (*Repository, error) {
 	// half-applied migration.
 	if driver == "postgres" || driver == "postgresql" {
 		if rk, err := pgLogsRelkind(db); err == nil && rk == "p" {
-			repo.logsPartitioned = true
+			repo.logsPartitioned.Store(true)
 			slog.Info("📦 Postgres: logs is partitioned — retention will use DROP PARTITION (via PartitionScheduler)")
 		}
 	}

@@ -168,8 +168,14 @@ func (a *Aggregator) Ingest(m RawMetric) {
 		a.onIngest()
 	}
 
+	// Capture overflow tenant under the lock; fire the callback AFTER
+	// unlock so a slow callback can't serialize Ingest. Currently the
+	// callback is a Prometheus increment (atomic, fast) but holding the
+	// lock across an external function call is a footgun for future
+	// changes.
+	var overflowTenant string
+
 	a.mu.Lock()
-	defer a.mu.Unlock()
 
 	bucket, exists := a.buckets[key]
 	if !exists {
@@ -186,9 +192,7 @@ func (a *Aggregator) Ingest(m RawMetric) {
 
 		switch {
 		case overTenantCap:
-			if a.cardinalityOverflow != nil {
-				a.cardinalityOverflow(m.TenantID)
-			}
+			overflowTenant = m.TenantID
 			key = a.overflowKey + "|" + m.TenantID
 			bucket = a.buckets[key]
 			if bucket == nil {
@@ -207,9 +211,7 @@ func (a *Aggregator) Ingest(m RawMetric) {
 			}
 			// Fall through to update existing overflow bucket below.
 		case overGlobalCap:
-			if a.cardinalityOverflow != nil {
-				a.cardinalityOverflow(overflowSentinelGlobal)
-			}
+			overflowTenant = overflowSentinelGlobal
 			key = a.overflowKey
 			bucket = a.buckets[key]
 			if bucket == nil {
@@ -242,6 +244,7 @@ func (a *Aggregator) Ingest(m RawMetric) {
 			}
 			a.buckets[key] = bucket
 			a.seriesPerTenant[m.TenantID]++
+			a.mu.Unlock()
 			return
 		}
 	}
@@ -254,6 +257,11 @@ func (a *Aggregator) Ingest(m RawMetric) {
 	}
 	bucket.Sum += m.Value
 	bucket.Count++
+	a.mu.Unlock()
+
+	if overflowTenant != "" && a.cardinalityOverflow != nil {
+		a.cardinalityOverflow(overflowTenant)
+	}
 }
 
 // BucketCount returns the current number of in-memory buckets (for metrics/health).

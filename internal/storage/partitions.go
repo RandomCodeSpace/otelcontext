@@ -2,6 +2,8 @@ package storage
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -245,8 +247,9 @@ func pgLogsRelkind(db *gorm.DB) (string, error) {
 	var relkind string
 	row := db.Raw(`SELECT relkind::text FROM pg_class WHERE relname = 'logs' AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = current_schema())`).Row()
 	if err := row.Scan(&relkind); err != nil {
-		// sql.ErrNoRows path — the table doesn't exist yet.
-		if strings.Contains(err.Error(), "no rows") {
+		// "table doesn't exist yet" path — sql.ErrNoRows is the standard
+		// signal here, not a string match against the message.
+		if errors.Is(err, sql.ErrNoRows) {
 			return "", nil
 		}
 		return "", err

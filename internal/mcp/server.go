@@ -121,9 +121,13 @@ func New(
 }
 
 // SetCallLimit configures the maximum number of concurrent tools/call
-// invocations. <= 0 disables the cap (legacy behavior). Subsequent calls
-// resize the underlying semaphore — be aware that an in-flight call holds
-// a slot of the previous size; the new size only governs new acquisitions.
+// invocations. <= 0 disables the cap (legacy behavior).
+//
+// Startup-only: this swaps the underlying channel reference without
+// quiescing in-flight callers. An already-running call will release into
+// the OLD channel when it completes, leaving the NEW semaphore one slot
+// short until process restart. Call exactly once during construction
+// (main.go does); never from a request-handling goroutine.
 func (s *Server) SetCallLimit(maxConcurrent int) {
 	if maxConcurrent <= 0 {
 		s.callSlots = nil

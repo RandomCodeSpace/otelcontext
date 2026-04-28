@@ -378,6 +378,19 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("DB_PARTITION_LOOKAHEAD_DAYS must be between 0 and 365, got %d", c.DBPartitionLookaheadDays)
 	}
 
+	// MCP robustness knobs. 0 is the documented sentinel for "disable" on
+	// each axis; negative values are nonsensical (clamping to 0 silently
+	// would mask typos like MCP_MAX_CONCURRENT=-1). Reject explicitly.
+	if c.MCPMaxConcurrent < 0 {
+		return fmt.Errorf("MCP_MAX_CONCURRENT must be >= 0 (0 disables the cap), got %d", c.MCPMaxConcurrent)
+	}
+	if c.MCPCallTimeoutMs < 0 {
+		return fmt.Errorf("MCP_CALL_TIMEOUT_MS must be >= 0 (0 disables the deadline), got %d", c.MCPCallTimeoutMs)
+	}
+	if c.MCPCacheTTLMs < 0 {
+		return fmt.Errorf("MCP_CACHE_TTL_MS must be >= 0 (0 disables the cache), got %d", c.MCPCacheTTLMs)
+	}
+
 	// Numeric ranges.
 	// Upper bound on HOT_RETENTION_DAYS guards against int64 nanosecond overflow in
 	// time.Duration(days) * 24 * time.Hour (overflow above ~106751 days flips the
