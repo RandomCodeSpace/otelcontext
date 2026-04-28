@@ -30,7 +30,7 @@ require (
 	go.opentelemetry.io/proto/otlp v1.9.0
 	golang.org/x/sync v0.20.0
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260128011058-8636f8732409
-	google.golang.org/grpc v1.79.3
+	google.golang.org/grpc v1.80.0
 	google.golang.org/protobuf v1.36.11
 	gorm.io/driver/mysql v1.6.0
 	gorm.io/driver/postgres v1.6.0
