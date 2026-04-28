@@ -239,7 +239,7 @@ Failure-mode gauges (prefix `OtelContext_`):
 
 ## Security & Supply Chain
 
-OtelContext targets the OpenSSF Best Practices `passing` badge (project [12646](https://www.bestpractices.dev/en/projects/12646)) and ships a six-job OSS-CLI security stack — no Sonar, no CodeQL, no NVD-direct tooling. Cost: $0.
+OtelContext targets the OpenSSF Best Practices `passing` badge (project [12646](https://www.bestpractices.dev/en/projects/12646)) and ships a six-job OSS-CLI security stack, supplemented by **SonarCloud SAST as a required gate** (board reversal 2026-04-28). No CodeQL, no NVD-direct tooling. Cost: $0 for the OSS-CLI tier; SonarCloud is free for public repos.
 
 ### OSS-CLI security stack (`.github/workflows/security.yml`)
 
@@ -255,7 +255,9 @@ OtelContext targets the OpenSSF Best Practices `passing` badge (project [12646](
 
 All actions are SHA-pinned per Scorecard `Pinned-Dependencies`. Top-level `permissions: read-all`; jobs scope up only when needed (gitleaks needs full history; sbom uploads).
 
-**Not used (do not re-introduce without an explicit board reversal):** SonarCloud / SonarQube, CodeQL (GHAS-paid for non-public repos), OWASP Dependency-Check (or any NVD-direct tool — NVD has analysis-backlog and rate-limit reliability problems).
+**Required external gate:** SonarCloud Code Analysis. Runs as the SonarCloud GitHub App (no in-repo workflow); listed in `main` branch protection's `required_status_checks` since 2026-04-28. Reinstated by board reversal — earlier docs that said "do not re-introduce" are superseded.
+
+**Not used (do not re-introduce without an explicit board reversal):** CodeQL (GHAS-paid for non-public repos), OWASP Dependency-Check (or any NVD-direct tool — NVD has analysis-backlog and rate-limit reliability problems).
 
 ### OpenSSF Scorecard (`.github/workflows/scorecard.yml`)
 

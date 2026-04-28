@@ -1,6 +1,9 @@
 name: Security (OSS-CLI)
 # OSS-CLI security stack per RAN-53 AC #5 (mirrors codeiq RAN-46 path B).
-# Replaces Sonar + CodeQL + OWASP Dependency-Check.
+# Replaces CodeQL + OWASP Dependency-Check. SonarCloud was originally
+# replaced too but was reinstated as a required external gate on
+# 2026-04-28 (board reversal); it runs via the SonarCloud GitHub App,
+# not as a job in this workflow.
 #
 # Six independent jobs — fail-fast off so all signals surface on a single run.
 # All actions SHA-pinned per Scorecard `Pinned-Dependencies`. Top-level
