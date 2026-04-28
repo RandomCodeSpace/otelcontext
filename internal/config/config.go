@@ -76,6 +76,12 @@ type Config struct {
 	DLQMaxFiles   int
 	DLQMaxDiskMB  int
 	DLQMaxRetries int
+	// DLQMaxReplayPerTick caps how many DLQ files the replay worker attempts
+	// in a single tick. Without it, an outage that filled the DLQ with 10k
+	// files would replay all of them in the first post-restart tick,
+	// hammering the (just-restarted) DB and exhausting connections.
+	// 0 = unlimited (legacy default).
+	DLQMaxReplayPerTick int
 
 	// API Protection
 	APIRateLimitRPS int
@@ -243,9 +249,10 @@ func Load(customPath string) (*Config, error) {
 		MetricMaxCardinalityPerTenant: getEnvInt("METRIC_MAX_CARDINALITY_PER_TENANT", 0),
 
 		// DLQ
-		DLQMaxFiles:   getEnvInt("DLQ_MAX_FILES", 1000),
-		DLQMaxDiskMB:  getEnvInt("DLQ_MAX_DISK_MB", 500),
-		DLQMaxRetries: getEnvInt("DLQ_MAX_RETRIES", 10),
+		DLQMaxFiles:         getEnvInt("DLQ_MAX_FILES", 1000),
+		DLQMaxDiskMB:        getEnvInt("DLQ_MAX_DISK_MB", 500),
+		DLQMaxRetries:       getEnvInt("DLQ_MAX_RETRIES", 10),
+		DLQMaxReplayPerTick: getEnvInt("DLQ_MAX_REPLAY_PER_TICK", 100),
 
 		// API
 		APIRateLimitRPS: getEnvInt("API_RATE_LIMIT_RPS", 100),

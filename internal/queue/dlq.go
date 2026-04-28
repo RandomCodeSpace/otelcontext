@@ -31,6 +31,13 @@ type DeadLetterQueue struct {
 	maxDiskMB  int64 // 0 = unlimited
 	maxRetries int   // 0 = unlimited
 
+	// maxReplayPerTick caps the number of files replayed per tick. Without
+	// this, an outage that filled the DLQ with 10k files would replay all
+	// of them in the first post-restart tick, hammering the (just-restarted)
+	// DB. 0 = unlimited (legacy default), set via SetMaxReplayPerTick or
+	// the DLQ_MAX_REPLAY_PER_TICK env var.
+	maxReplayPerTick int
+
 	// Per-file retry tracking (in-memory; resets on restart)
 	retries map[string]int
 
@@ -92,6 +99,18 @@ func (d *DeadLetterQueue) SetMetrics(onEnqueue, onSuccess, onFailure func(), onD
 // in telemetry. Safe to call with a nil *telemetry.Metrics (disables the hook).
 func (d *DeadLetterQueue) SetTelemetryMetrics(m *telemetry.Metrics) {
 	d.metricsTel = m
+}
+
+// SetMaxReplayPerTick caps how many files the replay worker will attempt in
+// one tick. n <= 0 disables the cap (unlimited). Safe to call after
+// construction; the next tick observes the new value.
+func (d *DeadLetterQueue) SetMaxReplayPerTick(n int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if n < 0 {
+		n = 0
+	}
+	d.maxReplayPerTick = n
 }
 
 // EvictedCount reports the cumulative number of DLQ files dropped due to
@@ -309,10 +328,22 @@ func (d *DeadLetterQueue) processFiles() {
 		return
 	}
 
+	d.mu.Lock()
+	replayCap := d.maxReplayPerTick
+	d.mu.Unlock()
+
 	replayed := 0
+	attempts := 0
 	for _, entry := range entries {
 		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
 			continue
+		}
+		// Cap actual replayFn calls per tick so a 10k-file backlog after an
+		// outage doesn't hammer the just-restarted DB. Backoff-skipped files
+		// don't count — they cost nothing.
+		if replayCap > 0 && attempts >= replayCap {
+			slog.Debug("DLQ: max replay-per-tick cap reached", "cap", replayCap)
+			break
 		}
 
 		name := entry.Name()
@@ -353,6 +384,7 @@ func (d *DeadLetterQueue) processFiles() {
 			continue
 		}
 
+		attempts++
 		if err := d.replayFn(data); err != nil {
 			d.mu.Lock()
 			d.retries[name]++

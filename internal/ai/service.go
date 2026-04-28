@@ -22,6 +22,14 @@ type Service struct {
 	workQueue  chan storage.Log
 	workerPool int
 	wg         sync.WaitGroup
+
+	// parentCtx is the application-level context. Workers derive their
+	// per-call timeout from this so an in-flight LLM call is cancelled
+	// when the application is shutting down — rather than blocking
+	// shutdown for up to 30s on each worker. Defaults to context.Background
+	// when SetParentContext isn't called (preserves legacy behaviour for
+	// embedded callers).
+	parentCtx context.Context
 }
 
 func NewService(repo *storage.Repository) *Service {
@@ -78,13 +86,25 @@ func NewService(repo *storage.Repository) *Service {
 	return s
 }
 
+// SetParentContext wires the application-level context so worker LLM calls
+// inherit cancellation on shutdown. Call once during boot before
+// EnqueueLog starts taking traffic — the parentCtx is read on every
+// dequeued log without locking.
+func (s *Service) SetParentContext(ctx context.Context) {
+	s.parentCtx = ctx
+}
+
 func (s *Service) startWorkers() {
 	for i := 0; i < s.workerPool; i++ {
 		s.wg.Add(1)
 		go func(workerID int) {
 			defer s.wg.Done()
 			for logEntry := range s.workQueue {
-				s.analyzeLog(context.Background(), logEntry)
+				ctx := s.parentCtx
+				if ctx == nil {
+					ctx = context.Background()
+				}
+				s.analyzeLog(ctx, logEntry)
 			}
 		}(i)
 	}

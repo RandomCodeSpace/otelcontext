@@ -287,7 +287,9 @@ func main() {
 		func(b int64) { metrics.DLQDiskBytes.Set(float64(b)) },
 	)
 	dlq.SetTelemetryMetrics(metrics)
-	slog.Info("🔁 DLQ initialized", "path", cfg.DLQPath, "interval", replayInterval)
+	dlq.SetMaxReplayPerTick(cfg.DLQMaxReplayPerTick)
+	slog.Info("🔁 DLQ initialized", "path", cfg.DLQPath, "interval", replayInterval,
+		"max_replay_per_tick", cfg.DLQMaxReplayPerTick)
 
 	// 4. Initialize Real-Time WebSocket Hub
 	hub := realtime.NewHub(func(count int) {
@@ -405,8 +407,14 @@ func main() {
 		slog.Error("Failed to migrate GraphRAG models", "error", err)
 	}
 
-	// 5. Initialize AI Service
+	// 5. Initialize AI Service.
+	// Workers inherit aiCtx so an in-flight LLM call (30s timeout) is
+	// cancelled the moment shutdown begins — without this, aiService.Stop()
+	// blocks for up to 30s per in-flight worker waiting on the upstream
+	// HTTP call to finish.
+	aiCtx, aiCancel := context.WithCancel(appCtx)
 	aiService := ai.NewService(repo)
+	aiService.SetParentContext(aiCtx)
 
 	// 6. Initialize API Server
 	apiServer := api.NewServer(repo, hub, eventHub, metrics)
@@ -535,13 +543,22 @@ func main() {
 		graphRAG.OnMetricIngested(m)
 	})
 
-	// Update DLQ size metric periodically
+	// Update DLQ size metric periodically. Tied to appCtx so the goroutine
+	// exits before dlq.Stop() — otherwise it keeps polling Size()/DiskBytes()
+	// on a stopped DLQ and races with the file-handle close in repo.Close().
+	bootWG.Add(1)
 	go func() {
+		defer bootWG.Done()
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
-		for range ticker.C {
-			metrics.SetDLQSize(dlq.Size())
-			metrics.DLQDiskBytes.Set(float64(dlq.DiskBytes()))
+		for {
+			select {
+			case <-appCtx.Done():
+				return
+			case <-ticker.C:
+				metrics.SetDLQSize(dlq.Size())
+				metrics.DLQDiskBytes.Set(float64(dlq.DiskBytes()))
+			}
 		}
 	}()
 
@@ -836,6 +853,9 @@ func main() {
 	// 2. Stop real-time hubs and event processing
 	hub.Stop()
 	cancelEvents()
+	// Cancel in-flight LLM calls BEFORE Stop so workers don't burn the
+	// 30s LLM deadline waiting on a half-dead upstream during shutdown.
+	aiCancel()
 	aiService.Stop()
 
 	// 3. Stop processing engines (TSDB flush, graph, GraphRAG)
