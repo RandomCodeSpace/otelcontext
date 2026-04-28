@@ -3,6 +3,7 @@ package telemetry
 import (
 	"database/sql"
 	"testing"
+	"time"
 
 	_ "github.com/glebarez/go-sqlite" // registers "sqlite" driver used by glebarez/sqlite GORM dialect
 	"github.com/prometheus/client_golang/prometheus"
@@ -65,4 +66,39 @@ func TestSampleDBPoolStats(t *testing.T) {
 		var m2 *Metrics
 		m2.SampleDBPoolStats(nil)
 	})
+
+	t.Run("ObserveIngestDuration_RecordsByLabel", func(t *testing.T) {
+		// Observe a duration for each signal and assert the histogram count
+		// increases for the matching label only — verifies the per-signal
+		// label split is wired correctly.
+		for _, signal := range []string{"traces", "logs", "metrics"} {
+			before := histCountForTest(t, m.IngestDurationSeconds, signal)
+			m.ObserveIngestDuration(signal, 25*time.Millisecond)
+			after := histCountForTest(t, m.IngestDurationSeconds, signal)
+			if after != before+1 {
+				t.Fatalf("signal=%s: count did not advance: before=%d after=%d", signal, before, after)
+			}
+		}
+	})
+
+	t.Run("ObserveIngestDuration_NilSafe", func(t *testing.T) {
+		// nil receiver must not panic — protects ingest tests that pass nil
+		// telemetry.Metrics through to the OTLP servers.
+		var m2 *Metrics
+		m2.ObserveIngestDuration("traces", time.Millisecond)
+	})
+}
+
+// histCountForTest scrapes the cumulative count of a labeled histogram.
+func histCountForTest(t *testing.T, h *prometheus.HistogramVec, label string) uint64 {
+	t.Helper()
+	hist, err := h.GetMetricWithLabelValues(label)
+	if err != nil {
+		t.Fatalf("GetMetricWithLabelValues(%q): %v", label, err)
+	}
+	var dm dto.Metric
+	if err := hist.(prometheus.Metric).Write(&dm); err != nil {
+		t.Fatalf("histogram write: %v", err)
+	}
+	return dm.GetHistogram().GetSampleCount()
 }
