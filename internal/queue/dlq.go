@@ -159,6 +159,16 @@ func (d *DeadLetterQueue) Enqueue(batch any) error {
 		_ = os.Remove(path)
 		return fmt.Errorf("DLQ: failed to write %s: %w", path, err)
 	}
+	// fsync before close so a host crash between Write and Close cannot leave
+	// a torn file on disk that permanently consumes a retry slot. Without
+	// this, the partial JSON would unmarshal-fail every replay until
+	// DLQ_MAX_RETRIES evicts it — wasting the slot and emitting a steady
+	// stream of replay-error logs.
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(path)
+		return fmt.Errorf("DLQ: failed to fsync %s: %w", path, err)
+	}
 	if err := f.Close(); err != nil {
 		_ = os.Remove(path)
 		return fmt.Errorf("DLQ: failed to close %s: %w", path, err)
