@@ -876,7 +876,27 @@ func parseTimeRange(args map[string]any, key string, since *time.Time) {
 
 // --- Helpers ---
 
+// MaxToolResponseBytes caps the rendered length of any tool response. Without
+// this, get_trace / get_graph_snapshot / correlated_signals can produce
+// 100MB+ JSON on adversarial input, OOM the process, and stall every
+// concurrent MCP call until MCP_CALL_TIMEOUT_MS fires.
+//
+// The cap is intentionally set well above any legitimate row-capped tool
+// response (search_logs at 200 rows is typically <1 MB) so it triggers only
+// on pathological cases. Operators hitting it should narrow their query
+// time range or use pagination.
+const MaxToolResponseBytes = 4 * 1024 * 1024
+
+// textResult wraps a successful tool response. Inputs over MaxToolResponseBytes
+// are converted to a structured error so callers see a clear failure mode
+// instead of a hung connection.
 func textResult(text string) ToolCallResult {
+	if len(text) > MaxToolResponseBytes {
+		return errorResult(fmt.Sprintf(
+			"response too large: %d bytes exceeds %d-byte cap; narrow time range or use pagination",
+			len(text), MaxToolResponseBytes,
+		))
+	}
 	return ToolCallResult{
 		Content: []ContentItem{{Type: "text", Text: text}},
 	}
