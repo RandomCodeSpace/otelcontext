@@ -44,15 +44,30 @@ type ServiceMapMetrics struct {
 	Edges []ServiceMapEdge `json:"edges"`
 }
 
-// BatchCreateSpans inserts multiple spans in batches.
+// BatchCreateSpans inserts multiple spans, skipping duplicates.
+// Duplicate is defined per the composite uniqueIndex idx_spans_tenant_trace_span
+// on (tenant_id, trace_id, span_id): a (tenant, trace, span) clash is silently
+// absorbed so DLQ replays (or any duplicate ingest) collapse to a no-op rather
+// than double-inserting.
 func (r *Repository) BatchCreateSpans(spans []Span) error {
 	if len(spans) == 0 {
 		return nil
 	}
-	if err := r.db.CreateInBatches(spans, 500).Error; err != nil {
+	if err := createSpansIdempotent(r.db, r.driver, spans); err != nil {
 		return fmt.Errorf("failed to batch create spans: %w", err)
 	}
 	return nil
+}
+
+// createSpansIdempotent runs the conflict-tolerant span insert against an
+// arbitrary *gorm.DB so the same logic is reused inside a transaction by
+// BatchCreateAll. MySQL takes INSERT IGNORE; SQLite/Postgres/SQL Server take
+// ON CONFLICT DO NOTHING via the gorm clause helper.
+func createSpansIdempotent(db *gorm.DB, driver string, spans []Span) error {
+	if strings.ToLower(driver) == "mysql" {
+		return db.Clauses(clause.Insert{Modifier: "IGNORE"}).CreateInBatches(spans, 500).Error
+	}
+	return db.Clauses(clause.OnConflict{DoNothing: true}).CreateInBatches(spans, 500).Error
 }
 
 // BatchCreateTraces inserts traces, skipping duplicates.
@@ -82,12 +97,14 @@ func createTracesIdempotent(db *gorm.DB, driver string, traces []Trace) error {
 // rolls back any partial commit, preventing orphan FK rows from a worker that
 // crashed between BatchCreateTraces and BatchCreateSpans.
 //
-// Trace inserts inherit BatchCreateTraces' idempotency: a trace_id clash
-// within the same tenant is silently skipped. Spans and logs have no unique
-// constraint, so a replay can still produce duplicate rows — that is a
-// separate idempotency concern (requires schema migration to fix) and is
-// out of scope for this method, whose contract is solely atomicity of the
-// batch.
+// Idempotency: traces and spans both collapse duplicates silently —
+//   - traces via idx_traces_tenant_trace_id on (tenant_id, trace_id)
+//   - spans  via idx_spans_tenant_trace_span on (tenant_id, trace_id, span_id)
+//
+// so a DLQ replay of an already-persisted batch is a safe no-op for those
+// signals. Logs do not yet have a unique key (OTLP logs lack a stable
+// identifier) and a replay can still produce duplicate log rows; that is a
+// separate idempotency concern out of scope for this method.
 func (r *Repository) BatchCreateAll(traces []Trace, spans []Span, logs []Log) error {
 	if len(traces) == 0 && len(spans) == 0 && len(logs) == 0 {
 		return nil
@@ -99,7 +116,7 @@ func (r *Repository) BatchCreateAll(traces []Trace, spans []Span, logs []Log) er
 			}
 		}
 		if len(spans) > 0 {
-			if err := tx.CreateInBatches(spans, 500).Error; err != nil {
+			if err := createSpansIdempotent(tx, r.driver, spans); err != nil {
 				return fmt.Errorf("BatchCreateAll: spans: %w", err)
 			}
 		}

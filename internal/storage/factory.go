@@ -238,6 +238,15 @@ func AutoMigrateModelsWithOptions(db *gorm.DB, driver string, opts MigrateOption
 		logsPartitioned = true
 	}
 
+	// Dedupe spans BEFORE AutoMigrate adds the composite uniqueIndex
+	// idx_spans_tenant_trace_span on (tenant_id, trace_id, span_id).
+	// Pre-RAN-65 deployments may have duplicates from DLQ replays; the
+	// unique index would fail to create against violating rows. No-op on
+	// fresh databases or when the unique index already exists.
+	if err := dedupeSpansForUniqueIndex(db, driver); err != nil {
+		log.Printf("⚠️  span dedupe before unique index failed: %v", err)
+	}
+
 	migrateModels := []any{&Trace{}, &Span{}, &MetricBucket{}}
 	if !logsPartitioned {
 		migrateModels = append(migrateModels, &Log{})

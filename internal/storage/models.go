@@ -110,11 +110,19 @@ type Trace struct {
 }
 
 // Span represents a single operation within a trace.
+//
+// Idempotency: the composite uniqueIndex idx_spans_tenant_trace_span on
+// (tenant_id, trace_id, span_id) ensures a span is written at most once
+// per tenant. DLQ replay (or any duplicate ingest) collapses cleanly via
+// OnConflict.DoNothing in BatchCreateAll/BatchCreateSpans rather than
+// double-counting in downstream metrics or GraphRAG. The composite covers
+// the legacy idx_spans_tenant_trace as a left-prefix; the legacy index
+// is retained for query-plan stability across upgrades.
 type Span struct {
 	ID             uint           `gorm:"primaryKey" json:"id"`
-	TenantID       string         `gorm:"size:64;default:'default';not null;index:idx_spans_tenant_trace,priority:1;index:idx_spans_tenant_service_start,priority:1" json:"tenant_id"`
-	TraceID        string         `gorm:"size:32;not null;index:idx_spans_tenant_trace,priority:2" json:"trace_id"`
-	SpanID         string         `gorm:"size:16;not null" json:"span_id"`
+	TenantID       string         `gorm:"size:64;default:'default';not null;index:idx_spans_tenant_trace,priority:1;index:idx_spans_tenant_service_start,priority:1;uniqueIndex:idx_spans_tenant_trace_span,priority:1" json:"tenant_id"`
+	TraceID        string         `gorm:"size:32;not null;index:idx_spans_tenant_trace,priority:2;uniqueIndex:idx_spans_tenant_trace_span,priority:2" json:"trace_id"`
+	SpanID         string         `gorm:"size:16;not null;uniqueIndex:idx_spans_tenant_trace_span,priority:3" json:"span_id"`
 	ParentSpanID   string         `gorm:"size:16" json:"parent_span_id"`
 	OperationName  string         `gorm:"size:255;index" json:"operation_name"`
 	StartTime      time.Time      `gorm:"index:idx_spans_tenant_service_start,priority:3" json:"start_time"`

@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -27,7 +28,7 @@ func newTestRepo(t *testing.T) *Repository {
 func seedLogs(t *testing.T, db *gorm.DB, n int, ts time.Time, service string) {
 	t.Helper()
 	logs := make([]Log, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		logs[i] = Log{
 			TraceID:     "trace-xxxx",
 			SpanID:      "span-yyyy",
@@ -59,8 +60,11 @@ func seedTrace(t *testing.T, db *gorm.DB, traceID string, traceTS time.Time, spa
 	spans := make([]Span, len(spanStartTimes))
 	for i, st := range spanStartTimes {
 		spans[i] = Span{
-			TraceID:       traceID,
-			SpanID:        traceID + "-span",
+			TraceID: traceID,
+			// Each span needs a distinct SpanID — the composite uniqueIndex
+			// idx_spans_tenant_trace_span on (tenant_id, trace_id, span_id)
+			// would otherwise collapse all spans for this trace into one row.
+			SpanID:        fmt.Sprintf("%s-span-%d", traceID, i),
 			OperationName: "op",
 			StartTime:     st,
 			EndTime:       st.Add(time.Millisecond),
