@@ -30,6 +30,39 @@ func partitionLookaheadFromEnv() int {
 	return n
 }
 
+// migrateTimeoutFromEnv reads DB_MIGRATE_TIMEOUT_SECS, defaulting to 60s
+// when unset, malformed, or non-positive. The migration timeout bounds
+// db.AutoMigrate so a Postgres relation-lock wait cannot hang startup
+// indefinitely. Set to 0 explicitly to opt out (legacy unbounded behaviour).
+//
+// Cap at 1 hour — anyone needing a longer migration window should run
+// schema changes out-of-band with versioned migrations and DB_AUTOMIGRATE=false.
+func migrateTimeoutFromEnv() time.Duration {
+	const (
+		defaultTimeout = 60 * time.Second
+		maxTimeout     = time.Hour
+	)
+	v := strings.TrimSpace(os.Getenv("DB_MIGRATE_TIMEOUT_SECS"))
+	if v == "" {
+		return defaultTimeout
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return defaultTimeout
+	}
+	if n == 0 {
+		return 0 // explicit opt-out — preserves legacy behaviour
+	}
+	if n < 0 {
+		return defaultTimeout
+	}
+	d := time.Duration(n) * time.Second
+	if d > maxTimeout {
+		return maxTimeout
+	}
+	return d
+}
+
 // likeOpFor returns the case-insensitive LIKE operator for the given driver.
 // Postgres LIKE is case-sensitive; SQLite/MySQL LIKE is case-insensitive by default.
 // Callers should embed the returned token directly into SQL fragments.
@@ -109,6 +142,7 @@ func NewRepository(metrics *telemetry.Metrics) (*Repository, error) {
 		opts := MigrateOptions{
 			PostgresPartitioning:   strings.ToLower(strings.TrimSpace(os.Getenv("DB_POSTGRES_PARTITIONING"))),
 			PartitionLookaheadDays: partitionLookaheadFromEnv(),
+			Timeout:                migrateTimeoutFromEnv(),
 		}
 		if err := AutoMigrateModelsWithOptions(db, driver, opts); err != nil {
 			return nil, err

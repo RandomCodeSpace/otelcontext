@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -204,6 +205,13 @@ type MigrateOptions struct {
 	// PartitionLookaheadDays is the number of future daily partitions to
 	// pre-create at boot. Defaults to 3 when zero.
 	PartitionLookaheadDays int
+	// Timeout, when > 0, bounds the AutoMigrate call. Without it,
+	// db.AutoMigrate inherits no deadline and an ALTER TABLE waiting on a
+	// Postgres relation lock can hang startup indefinitely. The timeout is
+	// applied via db.WithContext to the AutoMigrate call only — pre/post
+	// hooks (FTS5 triggers, legacy index drops) are not bounded since they
+	// don't take long-held locks. Zero preserves legacy unbounded behaviour.
+	Timeout time.Duration
 }
 
 // AutoMigrateModelsWithOptions is the option-driven variant of
@@ -251,7 +259,17 @@ func AutoMigrateModelsWithOptions(db *gorm.DB, driver string, opts MigrateOption
 	if !logsPartitioned {
 		migrateModels = append(migrateModels, &Log{})
 	}
-	if err := db.AutoMigrate(migrateModels...); err != nil {
+	// Apply a deadline to the AutoMigrate call when configured so a Postgres
+	// relation-lock wait cannot hang startup indefinitely. WithContext returns
+	// a session-scoped *gorm.DB; the parent db is unaffected for the post-
+	// migration helpers below.
+	migrator := db
+	if opts.Timeout > 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), opts.Timeout)
+		defer cancel()
+		migrator = db.WithContext(ctx)
+	}
+	if err := migrator.AutoMigrate(migrateModels...); err != nil {
 		return fmt.Errorf("failed to migrate database: %w", err)
 	}
 
