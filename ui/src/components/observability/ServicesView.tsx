@@ -3,19 +3,19 @@ import {
   Alert,
   Card,
   Drawer,
-  Grid,
   Input,
   PageHeader,
   Space,
   Spin,
-  Stat,
 } from '@ossrandom/design-system'
 import { ServiceMap as DSServiceMap } from '@ossrandom/design-system/charts'
 import type { ServiceNode as DSNode, ServiceEdge as DSEdge } from '@ossrandom/design-system/charts'
 import { Search } from 'lucide-react'
 import ServiceSidePanel from './ServiceSidePanel'
+import StatRow from './StatRow'
 import type { DashboardStats, RepoStats, SystemGraphResponse, SystemNode } from '../../types/api'
 import { fmt } from '../../lib/utils'
+import { useMediaQuery } from '../../hooks/useMediaQuery'
 
 interface ServicesViewProps {
   graph: SystemGraphResponse | null
@@ -48,6 +48,7 @@ const ServicesView: React.FC<ServicesViewProps> = ({
 }) => {
   const [selectedNode, setSelectedNode] = useState<SystemNode | null>(null)
   const [search, setSearch] = useState('')
+  const isCompact = useMediaQuery('(max-width: 760px)')
 
   const nodes = graph?.nodes ?? []
   const edges = graph?.edges ?? []
@@ -72,6 +73,8 @@ const ServicesView: React.FC<ServicesViewProps> = ({
   const errorRate = dashboard?.error_rate ?? 0
   const totalTraces = dashboard?.total_traces ?? 0
   const totalLogs = dashboard?.total_logs ?? 0
+  const dbMbRaw = (stats as Record<string, unknown> | null)?.DBSizeMB ?? stats?.db_size_mb
+  const dbMb = typeof dbMbRaw === 'string' ? Number(dbMbRaw) : (dbMbRaw as number | undefined)
 
   const handleNodeClick = (node: DSNode) => {
     const match = nodes.find((n) => n.id === node.id)
@@ -86,44 +89,33 @@ const ServicesView: React.FC<ServicesViewProps> = ({
   return (
     <Space direction="vertical" size="md">
       <PageHeader
-        size="md"
+        size="sm"
         title="Service Topology"
         subtitle="Live dependency map · click a node for details"
+        inlineSubtitle
       />
 
-      <Grid columns={12} gap="md">
-        <Grid.Col span={3}>
-          <Card bordered padding="md" radius="md">
-            <Stat label="Active services" value={totalServices} />
-          </Card>
-        </Grid.Col>
-        <Grid.Col span={3}>
-          <Card bordered padding="md" radius="md">
-            <Stat
-              label="Error rate"
-              value={errorRate.toFixed(1)}
-              unit="%"
-              delta={errorRate > 0 ? { value: errorRate, direction: 'up', tone: errorRate > 5 ? 'bad' : 'neutral' } : undefined}
-            />
-          </Card>
-        </Grid.Col>
-        <Grid.Col span={3}>
-          <Card bordered padding="md" radius="md">
-            <Stat label="Traces" value={fmt(totalTraces)} />
-          </Card>
-        </Grid.Col>
-        <Grid.Col span={3}>
-          <Card bordered padding="md" radius="md">
-            <Stat label="Logs" value={fmt(totalLogs)} unit={stats?.db_size_mb != null ? `· ${stats.db_size_mb} MB` : undefined} />
-          </Card>
-        </Grid.Col>
-      </Grid>
+      <StatRow
+        items={[
+          { label: 'Services', value: totalServices },
+          {
+            label: 'Error rate',
+            value: errorRate.toFixed(1),
+            unit: '%',
+            delta: errorRate > 0
+              ? { value: errorRate, direction: 'up', tone: errorRate > 5 ? 'bad' : 'neutral' }
+              : undefined,
+          },
+          { label: 'Traces', value: fmt(totalTraces) },
+          { label: 'Logs', value: fmt(totalLogs) },
+          ...(dbMb != null && Number.isFinite(dbMb) ? [{ label: 'DB', value: dbMb.toFixed(0), unit: 'MB' }] : []),
+        ]}
+      />
 
       <Card
         bordered
-        padding="md"
+        padding="sm"
         radius="md"
-        title="Service Map"
         extra={
           <Input
             value={search}
@@ -151,7 +143,7 @@ const ServicesView: React.FC<ServicesViewProps> = ({
             nodes={dsNodes}
             edges={dsEdges}
             layout="cose-bilkent"
-            height={620}
+            height={isCompact ? 460 : 660}
             onNodeClick={handleNodeClick}
           />
         )}
@@ -161,7 +153,7 @@ const ServicesView: React.FC<ServicesViewProps> = ({
         open={selectedNode !== null}
         onClose={() => setSelectedNode(null)}
         placement="right"
-        width={420}
+        width={isCompact ? '92vw' : 420}
         title={selectedNode ? <code>{selectedNode.id}</code> : undefined}
         description="Service detail · upstream, downstream, alerts"
       >

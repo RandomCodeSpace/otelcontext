@@ -5,18 +5,18 @@ import {
   Button,
   Card,
   Drawer,
-  Grid,
   IconButton,
   Input,
   PageHeader,
   Space,
-  Stat,
   Table,
   type TableColumn,
 } from '@ossrandom/design-system'
 import { Search, Sparkles, X } from 'lucide-react'
 import type { DashboardStats, LogEntry } from '@/types/api'
 import { fmt } from '../../lib/utils'
+import StatRow from './StatRow'
+import { useMediaQuery } from '../../hooks/useMediaQuery'
 
 interface Props {
   logs: LogEntry[]
@@ -45,7 +45,7 @@ const SEVERITIES: { value: string; label: string }[] = [
 const LogsView: React.FC<Props> = ({
   logs,
   similar,
-  loading,
+  loading: _loading,
   error,
   onSimilar,
   serviceFilter,
@@ -55,6 +55,7 @@ const LogsView: React.FC<Props> = ({
   const [query, setQuery] = useState('')
   const [severity, setSeverity] = useState('')
   const [drawerOpen, setDrawerOpen] = useState(false)
+  const isCompact = useMediaQuery('(max-width: 760px)')
 
   const filtered = useMemo(() => {
     let result = logs
@@ -66,13 +67,13 @@ const LogsView: React.FC<Props> = ({
   const counts = useMemo(() => {
     let info = 0
     let warn = 0
-    let error = 0
+    let err = 0
     for (const log of filtered) {
-      if (log.severity === 'ERROR') error++
+      if (log.severity === 'ERROR') err++
       else if (log.severity === 'WARN') warn++
       else info++
     }
-    return { info, warn, error }
+    return { info, warn, err }
   }, [filtered])
 
   const runSimilar = () => {
@@ -85,20 +86,20 @@ const LogsView: React.FC<Props> = ({
     {
       key: 'severity',
       title: 'Level',
-      width: 90,
+      width: 84,
       render: (_v, row) => <Badge tone={severityTone(row.severity)} size="sm">{row.severity}</Badge>,
     },
     {
       key: 'timestamp',
       title: 'Time',
-      width: 110,
+      width: 100,
       render: (_v, row) => <code>{new Date(row.timestamp).toLocaleTimeString()}</code>,
     },
     {
       key: 'service_name',
       title: 'Service',
       dataKey: 'service_name',
-      width: 180,
+      width: 160,
       sortable: true,
     },
     {
@@ -111,9 +112,10 @@ const LogsView: React.FC<Props> = ({
   return (
     <Space direction="vertical" size="md">
       <PageHeader
-        size="md"
+        size="sm"
         title="Logs"
         subtitle="Live tail · filter by severity · find similar incidents"
+        inlineSubtitle
         actions={
           serviceFilter ? (
             <Space size="xs" align="center">
@@ -130,44 +132,26 @@ const LogsView: React.FC<Props> = ({
         }
       />
 
-      <Grid columns={12} gap="md">
-        <Grid.Col span={3}>
-          <Card bordered padding="md" radius="md">
-            <Stat label="In view" value={fmt(filtered.length)} />
-          </Card>
-        </Grid.Col>
-        <Grid.Col span={3}>
-          <Card bordered padding="md" radius="md">
-            <Stat
-              label="Errors"
-              value={counts.error}
-              delta={counts.error > 0 ? { value: counts.error, direction: 'up', tone: 'bad' } : undefined}
-            />
-          </Card>
-        </Grid.Col>
-        <Grid.Col span={3}>
-          <Card bordered padding="md" radius="md">
-            <Stat
-              label="Warnings"
-              value={counts.warn}
-              delta={counts.warn > 0 ? { value: counts.warn, direction: 'up', tone: 'neutral' } : undefined}
-            />
-          </Card>
-        </Grid.Col>
-        <Grid.Col span={3}>
-          <Card bordered padding="md" radius="md">
-            <Stat label="Info" value={counts.info} />
-          </Card>
-        </Grid.Col>
-      </Grid>
+      <StatRow
+        items={[
+          { label: 'In view', value: fmt(filtered.length) },
+          {
+            label: 'Errors',
+            value: counts.err,
+            delta: counts.err > 0 ? { value: counts.err, direction: 'up', tone: 'bad' } : undefined,
+          },
+          {
+            label: 'Warnings',
+            value: counts.warn,
+            delta: counts.warn > 0 ? { value: counts.warn, direction: 'up', tone: 'neutral' } : undefined,
+          },
+          { label: 'Info', value: counts.info },
+        ]}
+      />
 
-      <Card
-        bordered
-        padding="md"
-        radius="md"
-        title="Stream"
-        extra={
-          <Space size="sm" align="center">
+      <Card bordered padding="sm" radius="md">
+        <Space direction="vertical" size="sm">
+          <Space size="sm" align="center" wrap>
             <Space size="xs" wrap>
               {SEVERITIES.map((item) => (
                 <Button
@@ -200,27 +184,27 @@ const LogsView: React.FC<Props> = ({
               Find similar
             </Button>
           </Space>
-        }
-      >
-        {error && <Alert severity="danger">{error}</Alert>}
-        {!loading && filtered.length === 0 && <Alert severity="info">No logs in view.</Alert>}
-        {filtered.length > 0 && (
-          <Table<LogEntry>
-            columns={columns}
-            data={filtered}
-            rowKey="id"
-            density="compact"
-            stickyHeader
-            striped
-          />
-        )}
+
+          {error && <Alert severity="danger">{error}</Alert>}
+          {filtered.length === 0 && <Alert severity="info">No logs in view.</Alert>}
+          {filtered.length > 0 && (
+            <Table<LogEntry>
+              columns={columns}
+              data={filtered}
+              rowKey="id"
+              density="compact"
+              stickyHeader
+              striped
+            />
+          )}
+        </Space>
       </Card>
 
       <Drawer
         open={drawerOpen}
         onClose={() => setDrawerOpen(false)}
         placement="right"
-        width={460}
+        width={isCompact ? '92vw' : 460}
         title="Similar logs"
         description={query.trim() ? `Matches for "${query.trim()}"` : undefined}
       >

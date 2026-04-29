@@ -4,19 +4,19 @@ import {
   Badge,
   Card,
   Drawer,
-  Grid,
   IconButton,
   PageHeader,
   Progress,
   Space,
   Spin,
-  Stat,
   Table,
   type TableColumn,
 } from '@ossrandom/design-system'
 import { X } from 'lucide-react'
 import type { DashboardStats, Trace } from '@/types/api'
 import { fmt } from '../../lib/utils'
+import StatRow from './StatRow'
+import { useMediaQuery } from '../../hooks/useMediaQuery'
 
 interface Props {
   traces: Trace[]
@@ -43,6 +43,8 @@ const TracesView: React.FC<Props> = ({
   onClearFilter,
   dashboard,
 }) => {
+  const isCompact = useMediaQuery('(max-width: 760px)')
+
   const filtered = useMemo(
     () => (serviceFilter ? traces.filter((t) => t.service_name === serviceFilter) : traces),
     [traces, serviceFilter],
@@ -105,9 +107,10 @@ const TracesView: React.FC<Props> = ({
   return (
     <Space direction="vertical" size="md">
       <PageHeader
-        size="md"
+        size="sm"
         title="Distributed Traces"
         subtitle={`${filtered.length} recent · click a row for span waterfall`}
+        inlineSubtitle
         actions={
           serviceFilter ? (
             <Space size="xs" align="center">
@@ -124,47 +127,32 @@ const TracesView: React.FC<Props> = ({
         }
       />
 
-      <Grid columns={12} gap="md">
-        <Grid.Col span={3}>
-          <Card bordered padding="md" radius="md">
-            <Stat label="Recent traces" value={fmt(filtered.length)} />
-          </Card>
-        </Grid.Col>
-        <Grid.Col span={3}>
-          <Card bordered padding="md" radius="md">
-            <Stat
-              label="Error traces"
-              value={errorCount}
-              delta={errorCount > 0 ? { value: errorCount, direction: 'up', tone: 'bad' } : undefined}
-            />
-          </Card>
-        </Grid.Col>
-        <Grid.Col span={3}>
-          <Card bordered padding="md" radius="md">
-            <Stat label="Avg duration" value={avgDuration.toFixed(1)} unit="ms" />
-          </Card>
-        </Grid.Col>
-        <Grid.Col span={3}>
-          <Card bordered padding="md" radius="md">
-            <Stat
-              label="p95 duration"
-              value={p95Duration.toFixed(1)}
-              unit="ms"
-              delta={
-                dashboard?.avg_latency_ms
-                  ? {
-                      value: ((p95Duration - dashboard.avg_latency_ms) / Math.max(dashboard.avg_latency_ms, 1)) * 100,
-                      direction: p95Duration > dashboard.avg_latency_ms ? 'up' : 'down',
-                      tone: p95Duration > dashboard.avg_latency_ms * 2 ? 'bad' : 'neutral',
-                    }
-                  : undefined
-              }
-            />
-          </Card>
-        </Grid.Col>
-      </Grid>
+      <StatRow
+        items={[
+          { label: 'In view', value: fmt(filtered.length) },
+          {
+            label: 'Errors',
+            value: errorCount,
+            delta: errorCount > 0 ? { value: errorCount, direction: 'up', tone: 'bad' } : undefined,
+          },
+          { label: 'Avg', value: avgDuration.toFixed(1), unit: 'ms' },
+          {
+            label: 'p95',
+            value: p95Duration.toFixed(1),
+            unit: 'ms',
+            delta:
+              dashboard?.avg_latency_ms && dashboard.avg_latency_ms > 0
+                ? {
+                    value: ((p95Duration - dashboard.avg_latency_ms) / dashboard.avg_latency_ms) * 100,
+                    direction: p95Duration > dashboard.avg_latency_ms ? 'up' : 'down',
+                    tone: p95Duration > dashboard.avg_latency_ms * 2 ? 'bad' : 'neutral',
+                  }
+                : undefined,
+          },
+        ]}
+      />
 
-      <Card bordered padding="md" radius="md" title="Recent traces">
+      <Card bordered padding="sm" radius="md">
         {error && <Alert severity="danger">{error}</Alert>}
         {loading && filtered.length === 0 && <Spin label="Loading traces" />}
         {!loading && filtered.length === 0 && <Alert severity="info">No traces yet.</Alert>}
@@ -185,13 +173,13 @@ const TracesView: React.FC<Props> = ({
         open={selected !== null}
         onClose={() => onSelect('')}
         placement="right"
-        width={520}
+        width={isCompact ? '92vw' : 540}
         title={selected ? <code>{selected.trace_id}</code> : undefined}
         description={selected?.service_name}
       >
         {selected && (
           <Space direction="vertical" size="md">
-            <Space size="sm" align="center">
+            <Space size="sm" align="center" wrap>
               <Badge tone={statusTone(selected.status)} size="sm">{selected.status}</Badge>
               <Badge tone="subtle" size="sm">{selected.span_count} spans</Badge>
               <Badge tone="subtle" size="sm">{selected.duration_ms?.toFixed(1)} ms</Badge>
