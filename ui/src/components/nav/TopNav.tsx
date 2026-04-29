@@ -1,77 +1,116 @@
-import { Moon, Network, Radar, Search, Sun, Terminal } from 'lucide-react'
-import type { DashboardStats, RepoStats } from '../../types/api'
-import { fmt } from '../../lib/utils'
+import { useState } from 'react'
+import {
+  Badge,
+  Drawer,
+  IconButton,
+  Menu,
+  Space,
+  Tabs,
+} from '@ossrandom/design-system'
+import { Menu as MenuIcon, Moon, Network, Radar, Search, Sun, Terminal } from 'lucide-react'
 import { useTheme } from '../../hooks/useTheme'
+import { useMediaQuery } from '../../hooks/useMediaQuery'
 
 export type OtelView = 'services' | 'traces' | 'logs' | 'mcp'
 
 interface TopNavProps {
   view: OtelView
   onNavigate: (view: OtelView) => void
-  dashboard: DashboardStats | null
-  stats: RepoStats | null
   wsConnected: boolean
 }
 
-const navItems: { key: OtelView; label: string; icon: typeof Network }[] = [
-  { key: 'services', label: 'Service Map', icon: Network },
-  { key: 'traces', label: 'Traces', icon: Search },
-  { key: 'logs', label: 'Logs', icon: Radar },
-  { key: 'mcp', label: 'MCP', icon: Terminal },
+const tabs: { key: OtelView; label: string }[] = [
+  { key: 'services', label: 'Service Map' },
+  { key: 'traces', label: 'Traces' },
+  { key: 'logs', label: 'Logs' },
+  { key: 'mcp', label: 'MCP' },
 ]
 
-export default function TopNav({ view, onNavigate, dashboard, stats, wsConnected }: TopNavProps) {
+const menuItems = [
+  { key: 'services' as const, label: 'Service Map', icon: <Network size={14} /> },
+  { key: 'traces' as const, label: 'Traces', icon: <Search size={14} /> },
+  { key: 'logs' as const, label: 'Logs', icon: <Radar size={14} /> },
+  { key: 'mcp' as const, label: 'MCP Endpoint', icon: <Terminal size={14} /> },
+]
+
+export default function TopNav({ view, onNavigate, wsConnected }: TopNavProps) {
   const { theme, toggle } = useTheme()
+  const isCompact = useMediaQuery('(max-width: 760px)')
+  const [drawerOpen, setDrawerOpen] = useState(false)
+
+  const themeBtn = (
+    <IconButton
+      icon={theme === 'dark' ? <Sun size={15} /> : <Moon size={15} />}
+      aria-label="Toggle theme"
+      variant="ghost"
+      size="sm"
+      shape="circle"
+      onClick={toggle}
+    />
+  )
+
+  const liveBadge = (
+    <Badge tone={wsConnected ? 'info' : 'danger'} size="sm">
+      {wsConnected ? 'live' : 'offline'}
+    </Badge>
+  )
+
+  if (isCompact) {
+    return (
+      <>
+        <Space justify="between" align="center" style={{ padding: '0.5rem 0.75rem' }}>
+          <Space size="sm" align="center">
+            <IconButton
+              icon={<MenuIcon size={16} />}
+              aria-label="Open navigation"
+              variant="ghost"
+              size="sm"
+              onClick={() => setDrawerOpen(true)}
+            />
+            <strong>OtelContext</strong>
+          </Space>
+          <Space size="xs" align="center">
+            {liveBadge}
+            {themeBtn}
+          </Space>
+        </Space>
+
+        <Drawer
+          open={drawerOpen}
+          onClose={() => setDrawerOpen(false)}
+          placement="left"
+          width="min(280px, 86vw)"
+          title="OtelContext"
+        >
+          <Menu<OtelView>
+            mode="vertical"
+            items={menuItems}
+            selectedKeys={[view]}
+            onSelect={(key) => {
+              onNavigate(key)
+              setDrawerOpen(false)
+            }}
+          />
+        </Drawer>
+      </>
+    )
+  }
 
   return (
-    <nav className="top-nav">
-      <a className="logo" href="/">
-        <span style={{ color: 'var(--color-accent)', fontSize: '1rem', flexShrink: 0 }}>&#9670;</span>
-        <span className="logo-mark">OtelContext</span>
-      </a>
-
-      {navItems.map(({ key, label, icon: Icon }) => (
-        <button
-          key={key}
-          className={`nav-link${view === key ? ' active' : ''}`}
-          onClick={() => onNavigate(key)}
-        >
-          <Icon size={13} /> {label}
-        </button>
-      ))}
-
-      <div className="stats-bar" style={{ marginLeft: 'auto' }}>
-        <span>
-          Services{' '}
-          <b className="stat-healthy">{dashboard?.active_services ?? '--'}</b>
-        </span>
-        <span>
-          Traces{' '}
-          <b>{fmt(dashboard?.total_traces ?? 0)}</b>
-        </span>
-        <span>
-          Logs{' '}
-          <b>{fmt(dashboard?.total_logs ?? 0)}</b>
-        </span>
-        <span>
-          Error Rate{' '}
-          <b className={(dashboard?.error_rate ?? 0) > 5 ? 'stat-error' : ''}>
-            {dashboard?.error_rate != null ? `${dashboard.error_rate.toFixed(1)}%` : '--%'}
-          </b>
-        </span>
-        <span>
-          DB{' '}
-          <b>{stats?.db_size_mb != null ? `${stats.db_size_mb}MB` : '--'}</b>
-        </span>
-        <span
-          className={`ws-dot ${wsConnected ? 'connected' : 'disconnected'}`}
-          title={wsConnected ? 'WebSocket connected' : 'WebSocket disconnected'}
+    <Space justify="between" align="center" style={{ padding: '0.4rem 1rem' }}>
+      <Space size="md" align="center">
+        <strong>OtelContext</strong>
+        <Tabs<OtelView>
+          items={tabs}
+          value={view}
+          variant="line"
+          onChange={(key) => onNavigate(key)}
         />
-      </div>
-
-      <button className="theme-btn" onClick={toggle} title="Toggle theme">
-        {theme === 'dark' ? <Sun size={15} /> : <Moon size={15} />}
-      </button>
-    </nav>
+      </Space>
+      <Space size="sm" align="center">
+        {liveBadge}
+        {themeBtn}
+      </Space>
+    </Space>
   )
 }

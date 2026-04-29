@@ -4,13 +4,13 @@
 
 OtelContext is a self-hosted OTLP observability platform. Single Go binary with embedded React frontend.
 - **Backend:** Go 1.25, native `net/http` (no frameworks), GORM ORM, gRPC + HTTP for OTLP ingestion
-- **Frontend:** React 19 + TypeScript + Mantine UI v8 + ECharts + ReactFlow
+- **Frontend:** React 19 + TypeScript + `@ossrandom/design-system` + ECharts + ReactFlow
 - **Ports:** gRPC `:4317` (OTLP), HTTP `:8080` (API + HTTP OTLP + WebSocket + UI)
 
 ## Strict Rules
 
 - NO Express.js/Gin/Echo — use native Go `net/http`
-- NO Tailwind CSS — use Mantine UI v8 exclusively
+- NO Tailwind CSS, NO Mantine — use `@ossrandom/design-system` exclusively for UI components and tokens. Raw CSS only for layout escape hatches (root height, scrollbar overrides, virtualised list containers); no auxiliary visual styling.
 - Single-service architecture (no microservices split)
 - All internal DBs must be **embedded** (no external processes)
 - Relational DB (SQLite/MySQL/PostgreSQL/MSSQL) is the **single source of truth**

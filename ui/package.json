@@ -12,14 +12,13 @@
     "test:watch": "vitest"
   },
   "dependencies": {
-    "@mantine/core": "^9.1.0",
-    "@mantine/hooks": "^9.1.0",
+    "@ossrandom/design-system": "^0.3.0",
     "clsx": "^2.1.1",
-    "echarts": "^6.0.0",
+    "cytoscape": "^3.33.2",
+    "cytoscape-cose-bilkent": "^4.1.0",
     "lucide-react": "^0.469.0",
     "react": "^19.2.5",
-    "react-dom": "^19.2.5",
-    "react-window": "^2.2.7"
+    "react-dom": "^19.2.5"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
@@ -29,7 +28,6 @@
     "@types/node": "^22.19.15",
     "@types/react": "^19.0.10",
     "@types/react-dom": "^19.0.4",
-    "@types/react-window": "^2.0.0",
     "@vitejs/plugin-react": "^6.0.1",
     "eslint": "^10.2.1",
     "eslint-plugin-react-hooks": "^7.1.1",
