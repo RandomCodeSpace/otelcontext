@@ -1,4 +1,5 @@
 import { useCallback, useRef, useState } from 'react'
+import { AppShell } from '@ossrandom/design-system'
 import TopNav, { type OtelView } from './components/nav/TopNav'
 import ServiceMap from './components/observability/ServiceMap'
 import TracesPage from './components/observability/TracesPage'
@@ -44,58 +45,50 @@ export default function App() {
   }, [])
 
   return (
-    <>
-      <TopNav
-        view={view}
-        onNavigate={setView}
-        dashboard={dash.dashboard}
-        stats={dash.stats}
-        wsConnected={wsConnected}
-      />
-      <main
-        style={{
-          flex: 1,
-          minHeight: 0,
-          display: 'flex',
-          flexDirection: 'column',
-          background: 'var(--bg-0)',
-          overflow: 'hidden',
-        }}
-      >
-        {view === 'services' && (
-          <ServiceMap
-            graph={graph.graph}
-            cache={graph.cache}
-            loading={graph.loading}
-            error={graph.error}
-            onNavigateToTraces={navigateToTraces}
-            onNavigateToLogs={navigateToLogs}
-          />
-        )}
-        {view === 'traces' && (
-          <TracesPage
-            traces={traces.traces}
-            selected={traces.selected}
-            loading={traces.loading}
-            error={traces.error}
-            onSelect={(traceId) => void traces.selectTrace(traceId)}
-            serviceFilter={serviceFilter}
-            onClearFilter={clearFilter}
-          />
-        )}
-        {view === 'logs' && (
-          <LogsPage
-            logs={logs.logs}
-            similar={logs.similar}
-            loading={logs.loading}
-            error={logs.error}
-            onSimilar={(query) => void logs.runSimilar(query)}
-            serviceFilter={serviceFilter}
-            onClearFilter={clearFilter}
-          />
-        )}
-        {view === 'mcp' && <MCPConsole />}
-      </main>
-    </>
+    <AppShell
+      header={
+        <TopNav
+          view={view}
+          onNavigate={setView}
+          dashboard={dash.dashboard}
+          stats={dash.stats}
+          wsConnected={wsConnected}
+        />
+      }
+    >
+      {view === 'services' && (
+        <ServiceMap
+          graph={graph.graph}
+          cache={graph.cache}
+          loading={graph.loading}
+          error={graph.error}
+          onNavigateToTraces={navigateToTraces}
+          onNavigateToLogs={navigateToLogs}
+        />
+      )}
+      {view === 'traces' && (
+        <TracesPage
+          traces={traces.traces}
+          selected={traces.selected}
+          loading={traces.loading}
+          error={traces.error}
+          onSelect={(traceId) => void traces.selectTrace(traceId)}
+          serviceFilter={serviceFilter}
+          onClearFilter={clearFilter}
+        />
+      )}
+      {view === 'logs' && (
+        <LogsPage
+          logs={logs.logs}
+          similar={logs.similar}
+          loading={logs.loading}
+          error={logs.error}
+          onSimilar={(query) => void logs.runSimilar(query)}
+          serviceFilter={serviceFilter}
+          onClearFilter={clearFilter}
+        />
+      )}
+      {view === 'mcp' && <MCPConsole />}
+    </AppShell>
   )
 }

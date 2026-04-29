@@ -1,5 +1,5 @@
 import React, { useMemo, useState } from 'react'
-import { Alert, Input, Spin } from '@ossrandom/design-system'
+import { Alert, Badge, Card, Grid, Input, Space, Spin } from '@ossrandom/design-system'
 import { ServiceMap as DSServiceMap } from '@ossrandom/design-system/charts'
 import type { ServiceNode as DSNode, ServiceEdge as DSEdge } from '@ossrandom/design-system/charts'
 import { Search } from 'lucide-react'
@@ -24,22 +24,6 @@ function toNodeStatus(status: string | undefined): DSNode['status'] {
 function toEdgeStatus(status: string | undefined): DSEdge['status'] {
   return status === 'critical' || status === 'failing' ? 'failing' : 'healthy'
 }
-
-const emptyState = (message: string, tone: 'muted' | 'danger' = 'muted') => (
-  <div
-    style={{
-      flex: 1,
-      display: 'flex',
-      alignItems: 'center',
-      justifyContent: 'center',
-      color: tone === 'danger' ? 'var(--brand-red-500)' : 'var(--fg-3)',
-      fontSize: '0.78rem',
-      padding: '2rem',
-    }}
-  >
-    {message}
-  </div>
-)
 
 const ServiceMap: React.FC<ServiceMapProps> = ({
   graph,
@@ -91,103 +75,78 @@ const ServiceMap: React.FC<ServiceMapProps> = ({
 
   if (loading) {
     return (
-      <div style={containerStyle}>
-        <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-          <Spin label="Loading service map" />
-        </div>
-      </div>
+      <Card bordered padding="lg" radius="md">
+        <Spin label="Loading service map" />
+      </Card>
     )
   }
 
   if (error) {
     return (
-      <div style={containerStyle}>
-        <div style={{ padding: '1rem' }}>
-          <Alert severity="danger" title="Service map failed to load">
-            {error}
-          </Alert>
-        </div>
-      </div>
+      <Card bordered padding="md" radius="md">
+        <Alert severity="danger" title="Service map failed to load">
+          {error}
+        </Alert>
+      </Card>
     )
   }
 
   if (!graph || nodes.length === 0) {
-    return <div style={containerStyle}>{emptyState('No services discovered yet.')}</div>
+    return (
+      <Card bordered padding="md" radius="md">
+        <Alert severity="info">No services discovered yet.</Alert>
+      </Card>
+    )
   }
 
-  return (
-    <div style={containerStyle}>
-      <div
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          gap: '0.6rem',
-          padding: '0.6rem 1rem',
-          borderBottom: '1px solid var(--border-1)',
-          background: 'var(--bg-1)',
-        }}
-      >
-        <div style={{ width: 240 }}>
-          <Input
-            value={search}
-            onChange={(value) => setSearch(value)}
-            placeholder="Filter services"
-            size="sm"
-            prefix={<Search size={12} />}
-          />
-        </div>
-        <span style={{ marginLeft: 'auto', fontSize: '0.7rem', color: 'var(--fg-3)' }}>
-          {dsNodes.length} of {nodes.length} services · {dsEdges.length} calls
-        </span>
-      </div>
+  const toolbar = (
+    <Space justify="between" align="center">
+      <Input
+        value={search}
+        onChange={(value) => setSearch(value)}
+        placeholder="Filter services"
+        size="sm"
+        prefix={<Search size={12} />}
+      />
+      <Space size="xs">
+        <Badge tone="subtle" size="sm">{dsNodes.length} of {nodes.length} services</Badge>
+        <Badge tone="subtle" size="sm">{dsEdges.length} calls</Badge>
+      </Space>
+    </Space>
+  )
 
-      <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
-        <div style={{ flex: 1, position: 'relative', minWidth: 0 }}>
+  return (
+    <Grid columns={12} gap="md">
+      <Grid.Col span={selectedNode ? 8 : 12}>
+        <Card bordered padding="md" radius="md" title="Service Map" extra={toolbar}>
           {dsNodes.length === 0 ? (
-            emptyState('No services match the filter.')
+            <Alert severity="info">No services match the filter.</Alert>
           ) : (
             <DSServiceMap
               nodes={dsNodes}
               edges={dsEdges}
               layout="cose-bilkent"
-              height={undefined}
+              height={560}
               onNodeClick={handleNodeClick}
-              style={{ width: '100%', height: '100%' }}
             />
           )}
-        </div>
+        </Card>
+      </Grid.Col>
 
-        {selectedNode && (
-          <div
-            style={{
-              width: 360,
-              flexShrink: 0,
-              borderLeft: '1px solid var(--border-1)',
-              background: 'var(--bg-1)',
-              overflow: 'auto',
-            }}
-          >
-            <ServiceSidePanel
-              node={selectedNode}
-              edges={edges}
-              onClose={() => setSelectedNode(null)}
-              onSelectService={handleSelectService}
-              onViewTraces={onNavigateToTraces}
-              onViewLogs={onNavigateToLogs}
-            />
-          </div>
-        )}
-      </div>
-    </div>
+      {selectedNode && (
+        <Grid.Col span={4}>
+          <ServiceSidePanel
+            node={selectedNode}
+            edges={edges}
+            onClose={() => setSelectedNode(null)}
+            onSelectService={handleSelectService}
+            onViewTraces={onNavigateToTraces}
+            onViewLogs={onNavigateToLogs}
+          />
+        </Grid.Col>
+      )}
+    </Grid>
   )
-}
-
-const containerStyle: React.CSSProperties = {
-  display: 'flex',
-  flexDirection: 'column',
-  height: '100%',
-  minHeight: 0,
-  background: 'var(--bg-0)',
 }
 
 export default React.memo(ServiceMap)

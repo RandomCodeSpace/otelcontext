@@ -1,8 +1,7 @@
 import { useState } from 'react'
-import { Alert, Badge, Button, Modal, Textarea } from '@ossrandom/design-system'
+import { Alert, Badge, Button, CodeBlock, Grid, Modal, Space, Textarea } from '@ossrandom/design-system'
 import { Play } from 'lucide-react'
 import type { MCPTool } from '@/types/api'
-import { colorJSON } from '@/lib/utils'
 
 interface Props {
   tool: MCPTool
@@ -20,17 +19,9 @@ function buildDefaultArgs(tool: MCPTool): Record<string, unknown> {
   return args
 }
 
-const labelStyle: React.CSSProperties = {
-  fontSize: '0.62rem',
-  textTransform: 'uppercase',
-  letterSpacing: '0.12em',
-  color: 'var(--fg-4)',
-  fontWeight: 700,
-}
-
 export default function ToolCallModal({ tool, onClose, onCall }: Props) {
   const [argsText, setArgsText] = useState(() => JSON.stringify(buildDefaultArgs(tool), null, 2))
-  const [resultHTML, setResultHTML] = useState('')
+  const [resultText, setResultText] = useState('')
   const [calling, setCalling] = useState(false)
   const [timing, setTiming] = useState('')
   const [error, setError] = useState('')
@@ -48,10 +39,10 @@ export default function ToolCallModal({ tool, onClose, onCall }: Props) {
     const t0 = performance.now()
     try {
       const result = await onCall(tool.name, args)
-      setResultHTML(colorJSON(result))
+      setResultText(JSON.stringify(result, null, 2))
       setTiming(`${Math.round(performance.now() - t0)}ms`)
     } catch (e) {
-      setResultHTML('')
+      setResultText('')
       setError(String(e))
     } finally {
       setCalling(false)
@@ -59,60 +50,39 @@ export default function ToolCallModal({ tool, onClose, onCall }: Props) {
   }
 
   const title = (
-    <span style={{ display: 'flex', alignItems: 'center', gap: '0.45rem' }}>
-      <Play size={12} style={{ color: 'var(--accent-fg)' }} />
+    <Space size="xs" align="center">
+      <Play size={12} />
       <span>Call</span>
-      <code style={{ background: 'transparent', padding: 0, color: 'var(--accent-fg)' }}>{tool.name}</code>
-    </span>
+      <code>{tool.name}</code>
+    </Space>
   )
 
   return (
     <Modal open onClose={onClose} title={title} description={tool.description} size="lg">
-      {error && <Alert severity="danger">{error}</Alert>}
-
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem', minHeight: 0, marginTop: error ? '0.75rem' : 0 }}>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.55rem' }}>
-          <label style={labelStyle}>Arguments</label>
-          <Textarea
-            value={argsText}
-            onChange={(value) => setArgsText(value)}
-            rows={14}
-          />
-          <Button variant="primary" block loading={calling} disabled={calling} onClick={handleCall}>
-            {calling ? 'Executing' : 'Execute Tool'}
-          </Button>
-        </div>
-
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.55rem', minHeight: 0 }}>
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-            <label style={labelStyle}>Result</label>
-            {timing && (
-              <Badge tone="subtle" size="sm">
-                {timing}
-              </Badge>
-            )}
-          </div>
-          <pre
-            style={{
-              flex: 1,
-              minHeight: '16rem',
-              overflow: 'auto',
-              padding: '0.9rem',
-              margin: 0,
-              borderRadius: 'var(--radius-md)',
-              background: 'var(--bg-3)',
-              border: '1px solid var(--border-1)',
-              color: 'var(--fg-2)',
-              fontFamily: 'var(--font-mono, ui-monospace, monospace)',
-              fontSize: '0.72rem',
-              lineHeight: 1.55,
-            }}
-            dangerouslySetInnerHTML={{
-              __html: resultHTML || '<span style="color:var(--fg-4)">—</span>',
-            }}
-          />
-        </div>
-      </div>
+      <Space direction="vertical" size="md">
+        {error && <Alert severity="danger">{error}</Alert>}
+        <Grid columns={2} gap="md">
+          <Grid.Col span={1}>
+            <Space direction="vertical" size="sm">
+              <Textarea
+                value={argsText}
+                onChange={(value) => setArgsText(value)}
+                rows={14}
+                aria-label="Arguments"
+              />
+              <Button variant="primary" block loading={calling} disabled={calling} onClick={handleCall}>
+                {calling ? 'Executing' : 'Execute Tool'}
+              </Button>
+            </Space>
+          </Grid.Col>
+          <Grid.Col span={1}>
+            <Space direction="vertical" size="sm">
+              {timing && <Badge tone="subtle" size="sm">{timing}</Badge>}
+              <CodeBlock language="json" code={resultText || '—'} wrap copyable />
+            </Space>
+          </Grid.Col>
+        </Grid>
+      </Space>
     </Modal>
   )
 }
