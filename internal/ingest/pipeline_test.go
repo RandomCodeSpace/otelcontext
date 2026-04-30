@@ -281,12 +281,13 @@ func TestPipeline_CallbacksFireAfterPersistence(t *testing.T) {
 	}
 }
 
-func TestPipeline_FailedSpansSkipsLogs(t *testing.T) {
-	// When BatchCreateSpans fails, BatchCreateLogs must NOT run for that
-	// batch — preserves the invariant that orphan logs aren't persisted
-	// without their span. Mirrors the synchronous path's behavior of
-	// returning the span error before log insert.
-	w := &fakeWriter{spanErr: errors.New("span db down")}
+// runFailureSkipsCheck wires up a 1-worker pipeline with the configured
+// fakeWriter, submits a healthy batch, waits for the failure to surface,
+// then asserts that none of the forbidden BatchCreate* calls fired.
+// Shared by the trace-fails and span-fails skip tests so the boilerplate
+// (pipeline lifecycle + waitFor) lives in one place.
+func runFailureSkipsCheck(t *testing.T, w *fakeWriter, forbidden ...string) {
+	t.Helper()
 	p := NewPipeline(w, nil, PipelineConfig{Capacity: 2, Workers: 1})
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -301,10 +302,20 @@ func TestPipeline_FailedSpansSkipsLogs(t *testing.T) {
 	}
 	calls := w.snapshotOrder()
 	for _, c := range calls {
-		if c == "logs" {
-			t.Fatalf("BatchCreateLogs ran after spans failed — order=%v", calls)
+		for _, f := range forbidden {
+			if c == f {
+				t.Fatalf("%s ran after upstream failure — order=%v", f, calls)
+			}
 		}
 	}
+}
+
+func TestPipeline_FailedSpansSkipsLogs(t *testing.T) {
+	// When BatchCreateSpans fails, BatchCreateLogs must NOT run for that
+	// batch — preserves the invariant that orphan logs aren't persisted
+	// without their span. Mirrors the synchronous path's behavior of
+	// returning the span error before log insert.
+	runFailureSkipsCheck(t, &fakeWriter{spanErr: errors.New("span db down")}, "logs")
 }
 
 func TestPipeline_FailedTracesAbortsBatch(t *testing.T) {
@@ -312,25 +323,7 @@ func TestPipeline_FailedTracesAbortsBatch(t *testing.T) {
 	// fix for orphan FK rows when a worker crashes between BatchCreate*
 	// calls. Spans and logs must NOT be persisted when the trace insert
 	// fails. Counterpart of TestPipeline_FailedSpansSkipsLogs.
-	w := &fakeWriter{traceErr: errors.New("transient")}
-	p := NewPipeline(w, nil, PipelineConfig{Capacity: 2, Workers: 1})
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	p.Start(ctx)
-	t.Cleanup(p.Stop)
-
-	if err := p.Submit(healthyBatch()); err != nil {
-		t.Fatalf("submit: %v", err)
-	}
-	if !waitFor(t, 5*time.Second, func() bool { return p.Stats().ProcessFailures > 0 }) {
-		t.Fatalf("expected ProcessFailures > 0, got %d", p.Stats().ProcessFailures)
-	}
-	calls := w.snapshotOrder()
-	for _, c := range calls {
-		if c == "spans" || c == "logs" {
-			t.Fatalf("spans/logs ran after trace failure — order=%v", calls)
-		}
-	}
+	runFailureSkipsCheck(t, &fakeWriter{traceErr: errors.New("transient")}, "spans", "logs")
 }
 
 func TestPipeline_DrainsOnStop(t *testing.T) {
