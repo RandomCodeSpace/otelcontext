@@ -98,14 +98,7 @@ const ServicesView: React.FC<ServicesViewProps> = ({
       <StatRow
         items={[
           { label: 'Services', value: totalServices },
-          {
-            label: 'Error rate',
-            value: errorRate.toFixed(2),
-            unit: '%',
-            delta: errorRate > 0
-              ? { value: errorRate, direction: 'up', tone: errorRate > 5 ? 'bad' : 'neutral' }
-              : undefined,
-          },
+          { label: 'Error rate', value: errorRate.toFixed(2), unit: '%' },
           { label: 'Traces', value: fmt(totalTraces) },
           { label: 'Logs', value: fmt(totalLogs) },
           ...(dbMb != null && Number.isFinite(dbMb) ? [{ label: 'DB', value: dbMb.toFixed(0), unit: 'MB' }] : []),

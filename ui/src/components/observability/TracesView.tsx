@@ -130,25 +130,25 @@ const TracesView: React.FC<Props> = ({
       <StatRow
         items={[
           { label: 'In view', value: fmt(filtered.length) },
-          {
-            label: 'Errors',
-            value: errorCount,
-            delta: errorCount > 0 ? { value: errorCount, direction: 'up', tone: 'bad' } : undefined,
-          },
+          { label: 'Errors', value: errorCount },
           { label: 'Avg', value: avgDuration.toFixed(1), unit: 'ms' },
-          {
-            label: 'p95',
-            value: p95Duration.toFixed(1),
-            unit: 'ms',
-            delta:
-              dashboard?.avg_latency_ms && dashboard.avg_latency_ms > 0
+          (() => {
+            const base = dashboard?.avg_latency_ms
+            const showDelta = base && base > 0
+            const pct = showDelta ? ((p95Duration - base) / base) * 100 : 0
+            return {
+              label: 'p95',
+              value: p95Duration.toFixed(1),
+              unit: 'ms',
+              delta: showDelta
                 ? {
-                    value: ((p95Duration - dashboard.avg_latency_ms) / dashboard.avg_latency_ms) * 100,
-                    direction: p95Duration > dashboard.avg_latency_ms ? 'up' : 'down',
-                    tone: p95Duration > dashboard.avg_latency_ms * 2 ? 'bad' : 'neutral',
+                    value: Number(pct.toFixed(1)),
+                    direction: pct >= 0 ? 'up' : 'down',
+                    tone: base && p95Duration > base * 2 ? 'bad' : 'neutral',
                   }
                 : undefined,
-          },
+            }
+          })(),
         ]}
       />
 

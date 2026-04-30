@@ -135,16 +135,8 @@ const LogsView: React.FC<Props> = ({
       <StatRow
         items={[
           { label: 'In view', value: fmt(filtered.length) },
-          {
-            label: 'Errors',
-            value: counts.err,
-            delta: counts.err > 0 ? { value: counts.err, direction: 'up', tone: 'bad' } : undefined,
-          },
-          {
-            label: 'Warnings',
-            value: counts.warn,
-            delta: counts.warn > 0 ? { value: counts.warn, direction: 'up', tone: 'neutral' } : undefined,
-          },
+          { label: 'Errors', value: counts.err },
+          { label: 'Warnings', value: counts.warn },
           { label: 'Info', value: counts.info },
         ]}
       />

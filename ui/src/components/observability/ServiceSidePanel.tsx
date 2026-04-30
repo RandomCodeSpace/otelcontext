@@ -30,7 +30,6 @@ const ServiceSidePanel: React.FC<ServiceSidePanelProps> = ({
   const upstream = edges.filter((e) => e.target === node.id)
   const downstream = edges.filter((e) => e.source === node.id)
   const errorRatePercent = node.metrics.error_rate * 100
-  const isHighError = node.metrics.error_rate > 0.05
 
   return (
     <Space direction="vertical" size="md">
@@ -57,7 +56,6 @@ const ServiceSidePanel: React.FC<ServiceSidePanelProps> = ({
               label="Error Rate"
               value={errorRatePercent.toFixed(2)}
               unit="%"
-              delta={isHighError ? { value: errorRatePercent, direction: 'up', tone: 'bad' } : undefined}
             />
           </Grid.Col>
           <Grid.Col span={1}>
