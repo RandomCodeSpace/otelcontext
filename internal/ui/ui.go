@@ -3,7 +3,6 @@ package ui
 import (
 	"embed"
 	"fmt"
-	"html/template"
 	"io/fs"
 	"net/http"
 	"strings"
@@ -14,7 +13,7 @@ import (
 	"github.com/RandomCodeSpace/otelcontext/internal/vectordb"
 )
 
-//go:embed templates/*.html static/* dist
+//go:embed static/* dist
 var content embed.FS
 
 type Server struct {
@@ -22,54 +21,16 @@ type Server struct {
 	metrics    *telemetry.Metrics
 	topo       *graph.Graph
 	vidx       *vectordb.Index
-	tmpl       *template.Template
 	mcpEnabled bool
 	mcpPath    string
 }
 
-// fmtNum formats an integer-like value with K / M / B suffix.
-func fmtNum(v any) string {
-	var n float64
-	switch val := v.(type) {
-	case int:
-		n = float64(val)
-	case int32:
-		n = float64(val)
-	case int64:
-		n = float64(val)
-	case float64:
-		n = val
-	case float32:
-		n = float64(val)
-	default:
-		return fmt.Sprintf("%v", v)
-	}
-	switch {
-	case n >= 1_000_000_000:
-		return fmt.Sprintf("%.2fB", n/1_000_000_000)
-	case n >= 1_000_000:
-		return fmt.Sprintf("%.2fM", n/1_000_000)
-	case n >= 1_000:
-		return fmt.Sprintf("%.1fK", n/1_000)
-	default:
-		return fmt.Sprintf("%.0f", n)
-	}
-}
-
 func NewServer(repo *storage.Repository, metrics *telemetry.Metrics, topo *graph.Graph, vidx *vectordb.Index) *Server {
-	tmpl := template.New("OtelContext").Funcs(template.FuncMap{
-		"text_uppercase": strings.ToUpper,
-		"text_lowercase": strings.ToLower,
-		"fmt_num":        fmtNum,
-	})
-	tmpl = template.Must(tmpl.ParseFS(content, "templates/*.html"))
-
 	return &Server{
 		repo:    repo,
 		metrics: metrics,
 		topo:    topo,
 		vidx:    vidx,
-		tmpl:    tmpl,
 		mcpPath: "/mcp",
 	}
 }

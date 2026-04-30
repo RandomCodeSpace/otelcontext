@@ -400,26 +400,44 @@ func (r *RetentionScheduler) runMaintenance(ctx context.Context) {
 		}
 	}
 
+	// Maintenance commands use literal SQL per table — no fmt.Sprintf — so static
+	// analyzers don't have to taint-track that the table names are hardcoded.
+	type maintCmd struct {
+		table string
+		sql   string
+	}
 	switch driver {
 	case "postgres", "postgresql":
-		for _, t := range []string{"logs", "spans", "traces", "metric_buckets"} {
+		cmds := []maintCmd{
+			{"logs", "VACUUM ANALYZE logs"},
+			{"spans", "VACUUM ANALYZE spans"},
+			{"traces", "VACUUM ANALYZE traces"},
+			{"metric_buckets", "VACUUM ANALYZE metric_buckets"},
+		}
+		for _, c := range cmds {
 			start := time.Now()
-			if _, err := sqlDB.ExecContext(ctx, fmt.Sprintf("VACUUM ANALYZE %s", t)); err != nil {
-				slog.Error("retention: VACUUM ANALYZE failed", "table", t, "error", err)
+			if _, err := sqlDB.ExecContext(ctx, c.sql); err != nil {
+				slog.Error("retention: VACUUM ANALYZE failed", "table", c.table, "error", err)
 				maintFailed = true
 			}
-			observe(t, time.Since(start))
+			observe(c.table, time.Since(start))
 		}
 	case "mysql":
 		// OPTIMIZE TABLE can run through the gorm handle (no tx restriction).
 		db := r.repo.db.WithContext(ctx)
-		for _, t := range []string{"logs", "spans", "traces", "metric_buckets"} {
+		cmds := []maintCmd{
+			{"logs", "OPTIMIZE TABLE logs"},
+			{"spans", "OPTIMIZE TABLE spans"},
+			{"traces", "OPTIMIZE TABLE traces"},
+			{"metric_buckets", "OPTIMIZE TABLE metric_buckets"},
+		}
+		for _, c := range cmds {
 			start := time.Now()
-			if err := db.Exec(fmt.Sprintf("OPTIMIZE TABLE %s", t)).Error; err != nil {
-				slog.Error("retention: OPTIMIZE TABLE failed", "table", t, "error", err)
+			if err := db.Exec(c.sql).Error; err != nil {
+				slog.Error("retention: OPTIMIZE TABLE failed", "table", c.table, "error", err)
 				maintFailed = true
 			}
-			observe(t, time.Since(start))
+			observe(c.table, time.Since(start))
 		}
 	case "sqlite":
 		start := time.Now()
