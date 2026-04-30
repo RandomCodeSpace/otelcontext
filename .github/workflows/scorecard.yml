@@ -13,9 +13,11 @@ on:
     - cron: "0 6 * * 1"
   workflow_dispatch:
 
-# Restrict the default GITHUB_TOKEN to read-only; the steps below request the
-# narrow scopes they actually need.
-permissions: read-all
+# Workflow-level default: minimum needed for actions/checkout. The analysis
+# job declares the additional narrow scopes (security-events: write, id-token:
+# write, actions: read) it actually needs.
+permissions:
+  contents: read
 
 jobs:
   analysis:

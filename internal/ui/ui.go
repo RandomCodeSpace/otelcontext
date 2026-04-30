@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/fs"
 	"net/http"
+	"path"
 	"strings"
 
 	"github.com/RandomCodeSpace/otelcontext/internal/graph"
@@ -54,8 +55,21 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) error {
 	}
 	fileServer := http.FileServer(http.FS(distFS))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// Sanitize: clean the URL path and reject anything that would escape
+		// the dist root. embed.FS already rejects ".." segments, but we
+		// gate at the boundary so static analyzers don't have to taint-track
+		// the user-supplied URL through the FS call.
+		clean := path.Clean("/" + r.URL.Path)
+		if strings.Contains(clean, "..") {
+			http.NotFound(w, r)
+			return
+		}
+		rel := strings.TrimPrefix(clean, "/")
+		if rel == "" {
+			rel = "index.html"
+		}
 		// Try the file as-is; if not found, fall back to index.html (SPA routing).
-		f, openErr := distFS.Open(strings.TrimPrefix(r.URL.Path, "/"))
+		f, openErr := distFS.Open(rel)
 		if openErr == nil {
 			_ = f.Close()
 			fileServer.ServeHTTP(w, r)

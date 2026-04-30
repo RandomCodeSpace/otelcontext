@@ -17,7 +17,11 @@ on:
   schedule:
     - cron: '21 4 * * 1'  # Mondays 04:21 UTC — catch newly-disclosed CVEs
 
-permissions: read-all
+# Workflow-level default: minimum needed for actions/checkout. Each job
+# declares the additional narrow scopes (security-events: write for SARIF
+# uploaders, contents: write for SBOM artifact upload) it actually needs.
+permissions:
+  contents: read
 
 jobs:
   osv-scanner:
