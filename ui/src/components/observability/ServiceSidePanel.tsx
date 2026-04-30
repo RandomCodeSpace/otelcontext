@@ -55,7 +55,7 @@ const ServiceSidePanel: React.FC<ServiceSidePanelProps> = ({
           <Grid.Col span={1}>
             <Stat
               label="Error Rate"
-              value={errorRatePercent.toFixed(1)}
+              value={errorRatePercent.toFixed(2)}
               unit="%"
               delta={isHighError ? { value: errorRatePercent, direction: 'up', tone: 'bad' } : undefined}
             />

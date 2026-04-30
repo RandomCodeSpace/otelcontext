@@ -100,7 +100,7 @@ const ServicesView: React.FC<ServicesViewProps> = ({
           { label: 'Services', value: totalServices },
           {
             label: 'Error rate',
-            value: errorRate.toFixed(1),
+            value: errorRate.toFixed(2),
             unit: '%',
             delta: errorRate > 0
               ? { value: errorRate, direction: 'up', tone: errorRate > 5 ? 'bad' : 'neutral' }
