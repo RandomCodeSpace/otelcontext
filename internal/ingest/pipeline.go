@@ -152,6 +152,15 @@ type Pipeline struct {
 	tenantMu       sync.Mutex
 	tenantInFlight map[string]int
 
+	// storeMinSeverity is the second-tier severity gate applied at persist
+	// time inside process(). Logs in a Batch with severity below this
+	// threshold are dropped from the BatchCreateAll write but still feed
+	// the LogCallback (so vectordb / GraphRAG / Drain mining still see
+	// them). 0 disables the second tier — every log that survived
+	// IngestMinSeverity at the receiver is also persisted.
+	storeMinSeverity int
+	storeFiltered    atomic.Int64
+
 	stopCh chan struct{}
 	once   sync.Once
 	wg     sync.WaitGroup
@@ -223,6 +232,22 @@ func (p *Pipeline) SetPerTenantCap(n int) {
 		n = 0
 	}
 	p.perTenantCap = n
+}
+
+// SetStoreMinSeverity configures the second-tier severity gate applied at
+// persist time. Logs below `level` are dropped from the BatchCreateAll write
+// but still flow through the LogCallback so in-memory consumers (vectordb,
+// GraphRAG Drain mining, anomaly correlation) keep working. 0 disables the
+// second tier — every log surviving IngestMinSeverity at the receiver is
+// also persisted (legacy behavior).
+//
+// `level` is the integer rank from parseSeverity ("DEBUG"=10 .. "FATAL"=50).
+// Startup-only — call before Start().
+func (p *Pipeline) SetStoreMinSeverity(level int) {
+	if level < 0 {
+		level = 0
+	}
+	p.storeMinSeverity = level
 }
 
 // TenantDropped reports the cumulative number of healthy submissions
@@ -353,6 +378,7 @@ func (p *Pipeline) Stats() PipelineStats {
 		DroppedHealthy:  p.droppedHealthy.Load(),
 		RejectedFull:    p.rejectedFull.Load(),
 		ProcessFailures: p.processFailures.Load(),
+		StoreFiltered:   p.storeFiltered.Load(),
 		QueueDepth:      len(p.queue),
 		Capacity:        p.cfg.Capacity,
 	}
@@ -365,6 +391,7 @@ type PipelineStats struct {
 	DroppedHealthy  int64
 	RejectedFull    int64
 	ProcessFailures int64
+	StoreFiltered   int64 // logs dropped by STORE_MIN_SEVERITY at persist time
 	QueueDepth      int
 	Capacity        int
 }
@@ -434,7 +461,23 @@ func (p *Pipeline) process(b *Batch) {
 		return
 	}
 
-	if err := p.writer.BatchCreateAll(b.Traces, b.Spans, b.Logs); err != nil {
+	// Apply the second-tier store-severity gate. Logs below the threshold
+	// are dropped from the persist set but still flow through the callback
+	// so in-memory enrichers (vectordb, GraphRAG Drain) keep seeing them.
+	logsToPersist := b.Logs
+	if p.storeMinSeverity > 0 && len(b.Logs) > 0 {
+		kept := make([]storage.Log, 0, len(b.Logs))
+		for _, l := range b.Logs {
+			if shouldIngestSeverity(l.Severity, p.storeMinSeverity) {
+				kept = append(kept, l)
+			} else {
+				p.storeFiltered.Add(1)
+			}
+		}
+		logsToPersist = kept
+	}
+
+	if err := p.writer.BatchCreateAll(b.Traces, b.Spans, logsToPersist); err != nil {
 		slog.Error("ingest pipeline: BatchCreateAll failed", "error", err)
 		p.processFailures.Add(1)
 		return
@@ -442,7 +485,9 @@ func (p *Pipeline) process(b *Batch) {
 
 	// Callbacks fire only after the transaction commits successfully — a
 	// rolled-back batch must not feed downstream consumers (GraphRAG etc.)
-	// data that no longer exists in the DB.
+	// data that no longer exists in the DB. The LogCallback intentionally
+	// iterates over the FULL b.Logs slice, not logsToPersist — even logs
+	// dropped by the store-severity gate must reach in-memory enrichers.
 	if b.SpanCallback != nil {
 		for _, s := range b.Spans {
 			b.SpanCallback(s)
