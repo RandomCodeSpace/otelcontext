@@ -1,6 +1,6 @@
 import React from 'react'
 import { Alert, Badge, Button, Card, Grid, IconButton, Progress, Space, Stat } from '@ossrandom/design-system'
-import { ArrowRight, X } from 'lucide-react'
+import { X } from 'lucide-react'
 import type { SystemNode, SystemEdge } from '../../types/api'
 
 interface ServiceSidePanelProps {
@@ -8,8 +8,6 @@ interface ServiceSidePanelProps {
   edges: SystemEdge[]
   onClose: () => void
   onSelectService: (id: string) => void
-  onViewTraces: (service: string) => void
-  onViewLogs: (service: string) => void
 }
 
 function statusTone(status: string): 'info' | 'warning' | 'danger' | 'neutral' {
@@ -24,8 +22,6 @@ const ServiceSidePanel: React.FC<ServiceSidePanelProps> = ({
   edges,
   onClose,
   onSelectService,
-  onViewTraces,
-  onViewLogs,
 }) => {
   const upstream = edges.filter((e) => e.target === node.id)
   const downstream = edges.filter((e) => e.source === node.id)
@@ -126,26 +122,6 @@ const ServiceSidePanel: React.FC<ServiceSidePanelProps> = ({
         </Space>
       )}
 
-      <Space size="xs">
-        <Button
-          variant="secondary"
-          size="sm"
-          block
-          iconRight={<ArrowRight size={11} />}
-          onClick={() => onViewTraces(node.id)}
-        >
-          Traces
-        </Button>
-        <Button
-          variant="secondary"
-          size="sm"
-          block
-          iconRight={<ArrowRight size={11} />}
-          onClick={() => onViewLogs(node.id)}
-        >
-          Logs
-        </Button>
-      </Space>
     </Space>
   )
 }

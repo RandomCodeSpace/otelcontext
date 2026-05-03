@@ -24,8 +24,6 @@ function renderPanel(overrides = {}) {
     edges: mockEdges,
     onClose: vi.fn(),
     onSelectService: vi.fn(),
-    onViewTraces: vi.fn(),
-    onViewLogs: vi.fn(),
   };
   const props = { ...defaults, ...overrides };
   return { ...render(<ServiceSidePanel {...props} />), ...props };
@@ -55,13 +53,6 @@ describe('ServiceSidePanel', () => {
     renderPanel();
     expect(screen.getByText('error rate above 5%')).toBeInTheDocument();
     expect(screen.getByText('avg latency above 500ms')).toBeInTheDocument();
-  });
-
-  it('calls onViewTraces when "View Traces" clicked', async () => {
-    const { onViewTraces } = renderPanel();
-    const user = userEvent.setup();
-    await user.click(screen.getByText(/View Traces/));
-    expect(onViewTraces).toHaveBeenCalledWith('inventory');
   });
 
   it('calls onSelectService when upstream service clicked', async () => {

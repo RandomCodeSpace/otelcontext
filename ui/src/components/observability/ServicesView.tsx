@@ -16,6 +16,7 @@ import StatRow from './StatRow'
 import type { DashboardStats, RepoStats, SystemGraphResponse, SystemNode } from '../../types/api'
 import { fmt } from '../../lib/utils'
 import { useMediaQuery } from '../../hooks/useMediaQuery'
+import { useWindowHeight } from '../../hooks/useWindowHeight'
 
 interface ServicesViewProps {
   graph: SystemGraphResponse | null
@@ -23,8 +24,6 @@ interface ServicesViewProps {
   error: string | null
   dashboard: DashboardStats | null
   stats: RepoStats | null
-  onNavigateToTraces: (service: string) => void
-  onNavigateToLogs: (service: string) => void
 }
 
 function toNodeStatus(status: string | undefined): DSNode['status'] {
@@ -43,12 +42,15 @@ const ServicesView: React.FC<ServicesViewProps> = ({
   error,
   dashboard,
   stats,
-  onNavigateToTraces,
-  onNavigateToLogs,
 }) => {
   const [selectedNode, setSelectedNode] = useState<SystemNode | null>(null)
   const [search, setSearch] = useState('')
   const isCompact = useMediaQuery('(max-width: 760px)')
+  const windowH = useWindowHeight()
+  // Subtract chrome above the canvas (TopNav + PageHeader + StatRow + Card
+  // padding + Space gaps + breathing margin). 460px floor so a very short
+  // window still shows a usable canvas.
+  const mapHeight = isCompact ? 460 : Math.max(460, windowH - 320)
 
   const nodes = graph?.nodes ?? []
   const edges = graph?.edges ?? []
@@ -92,7 +94,7 @@ const ServicesView: React.FC<ServicesViewProps> = ({
   }
 
   return (
-    <Space direction="vertical" size="md">
+    <Space direction="vertical" size="md" style={{ display: 'flex', width: '100%' }}>
       <PageHeader
         size="sm"
         title="Service Topology"
@@ -141,7 +143,7 @@ const ServicesView: React.FC<ServicesViewProps> = ({
             nodes={dsNodes}
             edges={dsEdges}
             layout="cose-bilkent"
-            height={isCompact ? 460 : 660}
+            height={mapHeight}
             onNodeClick={handleNodeClick}
           />
         )}
@@ -161,8 +163,6 @@ const ServicesView: React.FC<ServicesViewProps> = ({
             edges={edges}
             onClose={() => setSelectedNode(null)}
             onSelectService={handleSelectService}
-            onViewTraces={onNavigateToTraces}
-            onViewLogs={onNavigateToLogs}
           />
         )}
       </Drawer>
