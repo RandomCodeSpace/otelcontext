@@ -505,6 +505,32 @@ func main() {
 			Workers:  cfg.IngestPipelineWorkers,
 		})
 		ingestPipeline.SetPerTenantCap(cfg.IngestPipelinePerTenantCap)
+
+		// Second-tier severity gate. Empty STORE_MIN_SEVERITY means "use the
+		// same threshold as INGEST_MIN_SEVERITY" — i.e. behavior is identical
+		// to the legacy single-threshold path. Only enable the gate when the
+		// store threshold is strictly higher than the ingest threshold; equal
+		// or lower is wasted work since the receiver has already dropped the
+		// affected logs.
+		ingestRank := ingest.ParseSeverity(cfg.IngestMinSeverity)
+		storeRank := ingestRank
+		if cfg.StoreMinSeverity != "" {
+			storeRank = ingest.ParseSeverity(cfg.StoreMinSeverity)
+		}
+		if storeRank > ingestRank {
+			ingestPipeline.SetStoreMinSeverity(storeRank)
+			slog.Info("🪛 Store-severity gate enabled",
+				"ingest_min", cfg.IngestMinSeverity,
+				"store_min", cfg.StoreMinSeverity,
+				"note", "logs below store_min reach in-memory consumers but are not persisted",
+			)
+		} else if cfg.StoreMinSeverity != "" && storeRank < ingestRank {
+			slog.Warn("STORE_MIN_SEVERITY is lower than INGEST_MIN_SEVERITY — has no effect; receiver already filters",
+				"ingest_min", cfg.IngestMinSeverity,
+				"store_min", cfg.StoreMinSeverity,
+			)
+		}
+
 		ingestPipeline.Start(context.Background())
 		traceServer.SetPipeline(ingestPipeline)
 		logsServer.SetPipeline(ingestPipeline)

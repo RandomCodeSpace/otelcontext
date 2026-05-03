@@ -25,6 +25,14 @@ type Config struct {
 	IngestAllowedServices  string
 	IngestExcludedServices string
 
+	// Storage Filtering. Logs that pass IngestMinSeverity (so they reach the
+	// receiver and feed in-memory consumers like vectordb / GraphRAG) but
+	// fall below StoreMinSeverity are skipped during the DB persist pass —
+	// only the row-write is dropped, not the in-memory enrichment. Empty
+	// (default) means StoreMinSeverity == IngestMinSeverity, i.e. no
+	// behavior change vs. the single-threshold semantics.
+	StoreMinSeverity string
+
 	// DB Connection Pool
 	DBMaxOpenConns    int
 	DBMaxIdleConns    int
@@ -244,6 +252,7 @@ func Load(customPath string) (*Config, error) {
 		DLQReplayInterval: getEnv("DLQ_REPLAY_INTERVAL", "5m"),
 
 		IngestMinSeverity:      getEnv("INGEST_MIN_SEVERITY", "INFO"),
+		StoreMinSeverity:       getEnv("STORE_MIN_SEVERITY", ""),
 		IngestAllowedServices:  getEnv("INGEST_ALLOWED_SERVICES", ""),
 		IngestExcludedServices: getEnv("INGEST_EXCLUDED_SERVICES", ""),
 

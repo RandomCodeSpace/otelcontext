@@ -547,3 +547,127 @@ func TestPipeline_PanicInCallbackRecovered(t *testing.T) {
 		t.Errorf("expected ProcessFailures > 0 after callback panic")
 	}
 }
+
+// TestPipeline_StoreMinSeverity_DropsBelowThresholdFromPersist verifies that
+// when SetStoreMinSeverity is configured, logs below the threshold are
+// dropped from BatchCreateAll — but the LogCallback still fires for them
+// so in-memory enrichers (vectordb, GraphRAG) keep seeing every log that
+// passed IngestMinSeverity at the receiver.
+func TestPipeline_StoreMinSeverity_DropsBelowThresholdFromPersist(t *testing.T) {
+	t.Parallel()
+	w := &fakeWriter{}
+	p := NewPipeline(w, nil, PipelineConfig{Capacity: 10, Workers: 1, SoftThreshold: 0.9})
+	// Threshold = WARN (rank 30); INFO (20) is below, ERROR (40) is above.
+	p.SetStoreMinSeverity(ParseSeverity("WARN"))
+	p.Start(context.Background())
+	defer p.Stop()
+
+	var callbackSeen []string
+	var cbMu sync.Mutex
+	cb := func(l storage.Log) {
+		cbMu.Lock()
+		defer cbMu.Unlock()
+		callbackSeen = append(callbackSeen, l.Severity)
+	}
+
+	b := &Batch{
+		Type:   SignalLogs,
+		Tenant: "t1",
+		Logs: []storage.Log{
+			{Body: "info-row", Severity: "INFO"},
+			{Body: "warn-row", Severity: "WARN"},
+			{Body: "err-row", Severity: "ERROR"},
+		},
+		LogCallback: cb,
+	}
+	if err := p.Submit(b); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+
+	if !waitFor(t, 5*time.Second, func() bool { return p.Stats().Processed >= 1 }) {
+		t.Fatalf("batch never processed")
+	}
+
+	// Persist: only WARN + ERROR should reach the writer.
+	w.mu.Lock()
+	persistedCount := 0
+	persistedSeverities := []string{}
+	for _, call := range w.logsCalls {
+		for _, l := range call {
+			persistedCount++
+			persistedSeverities = append(persistedSeverities, l.Severity)
+		}
+	}
+	w.mu.Unlock()
+	if persistedCount != 2 {
+		t.Fatalf("expected 2 logs persisted (WARN+ERROR), got %d: %v", persistedCount, persistedSeverities)
+	}
+	for _, sev := range persistedSeverities {
+		if sev == "INFO" {
+			t.Errorf("INFO log was persisted but should have been gated by store-min-severity")
+		}
+	}
+
+	// Callback: must fire for ALL THREE logs (INFO included), since the
+	// in-memory enrichment path is independent of the persist gate.
+	cbMu.Lock()
+	defer cbMu.Unlock()
+	if len(callbackSeen) != 3 {
+		t.Fatalf("expected LogCallback to fire 3 times (incl. gated INFO), got %d: %v", len(callbackSeen), callbackSeen)
+	}
+	infoCb := false
+	for _, sev := range callbackSeen {
+		if sev == "INFO" {
+			infoCb = true
+		}
+	}
+	if !infoCb {
+		t.Errorf("INFO log did not reach LogCallback — in-memory enrichment path broken: %v", callbackSeen)
+	}
+
+	// Stats: storeFiltered should report exactly 1 (the INFO drop).
+	if got := p.Stats().StoreFiltered; got != 1 {
+		t.Errorf("Stats().StoreFiltered = %d, want 1", got)
+	}
+}
+
+// TestPipeline_StoreMinSeverity_Disabled_PersistsAllLogs verifies the legacy
+// path: when SetStoreMinSeverity is NOT called (or set to 0), every log in a
+// Batch is persisted regardless of severity.
+func TestPipeline_StoreMinSeverity_Disabled_PersistsAllLogs(t *testing.T) {
+	t.Parallel()
+	w := &fakeWriter{}
+	p := NewPipeline(w, nil, PipelineConfig{Capacity: 10, Workers: 1, SoftThreshold: 0.9})
+	// No SetStoreMinSeverity call → gate disabled.
+	p.Start(context.Background())
+	defer p.Stop()
+
+	b := &Batch{
+		Type:   SignalLogs,
+		Tenant: "t1",
+		Logs: []storage.Log{
+			{Body: "info-row", Severity: "INFO"},
+			{Body: "debug-row", Severity: "DEBUG"},
+			{Body: "err-row", Severity: "ERROR"},
+		},
+	}
+	if err := p.Submit(b); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if !waitFor(t, 5*time.Second, func() bool { return p.Stats().Processed >= 1 }) {
+		t.Fatalf("batch never processed")
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	total := 0
+	for _, call := range w.logsCalls {
+		total += len(call)
+	}
+	if total != 3 {
+		t.Fatalf("expected all 3 logs persisted with gate disabled, got %d", total)
+	}
+	if got := p.Stats().StoreFiltered; got != 0 {
+		t.Errorf("Stats().StoreFiltered = %d, want 0 with gate disabled", got)
+	}
+}

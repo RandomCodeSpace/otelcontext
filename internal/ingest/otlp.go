@@ -682,6 +682,11 @@ func getServiceName(attrs []*commonpb.KeyValue) string {
 	return "unknown-service"
 }
 
+// ParseSeverity is the exported wrapper for parseSeverity. Used by main.go
+// to translate the STORE_MIN_SEVERITY env value into the integer rank the
+// pipeline's second-tier filter expects.
+func ParseSeverity(level string) int { return parseSeverity(level) }
+
 // Filtering Helpers
 func parseSeverity(level string) int {
 	switch strings.ToUpper(level) {
