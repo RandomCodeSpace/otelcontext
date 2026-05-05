@@ -202,6 +202,7 @@ docs/           # Specifications and plans
 Key settings in `internal/config/config.go`:
 - `HTTP_PORT` (8080), `GRPC_PORT` (4317), `DB_DRIVER` (sqlite), `DB_DSN`
 - `DB_AUTOMIGRATE` (true), `DB_MAX_OPEN_CONNS`, `DB_MAX_IDLE_CONNS`, `DB_CONN_MAX_LIFETIME` (internally capped to 30m when `DB_AZURE_AUTH=true`)
+- `DB_SQLITE_READ_POOL_SIZE` (4) — only effective on `DB_DRIVER=sqlite`. Opens a second `*gorm.DB` against the same DB file with `MaxOpen=N` and `PRAGMA query_only=ON`, used by `Repository.reader()` for all read-only queries (`Get*`, `Recent*`, `Search*`, dashboard/metrics/heatmap, GraphRAG span loader, FTS5 search). The writer pool keeps `MaxOpen=1` (SQLite's single-writer model), so reads no longer queue behind in-flight writes/retention/`VACUUM`. Range `[1, 32]`; values `0`, `off`, `false`, `no` disable the pool and reads fall back to the writer. Non-SQLite drivers ignore this setting.
 - `DB_AZURE_AUTH` (false) — see Authentication below
 - `TLS_CERT_FILE`, `TLS_KEY_FILE` — explicit TLS (both or neither)
 - `TLS_AUTO_SELFSIGNED` (false), `TLS_CACHE_DIR` (`./data/tls`) — self-signed bootstrap, ignored if cert files set

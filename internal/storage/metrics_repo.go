@@ -68,7 +68,7 @@ func (r *Repository) BatchCreateMetrics(buckets []MetricBucket) error {
 func (r *Repository) GetMetricBuckets(ctx context.Context, start, end time.Time, serviceName string, metricName string) ([]MetricBucket, error) {
 	tenant := TenantFromContext(ctx)
 	var buckets []MetricBucket
-	query := r.db.WithContext(ctx).Where("tenant_id = ? AND time_bucket BETWEEN ? AND ?", tenant, start, end)
+	query := r.reader().WithContext(ctx).Where("tenant_id = ? AND time_bucket BETWEEN ? AND ?", tenant, start, end)
 	if serviceName != "" {
 		query = query.Where("service_name = ?", serviceName)
 	}
@@ -86,7 +86,7 @@ func (r *Repository) GetMetricBuckets(ctx context.Context, start, end time.Time,
 func (r *Repository) GetMetricNames(ctx context.Context, serviceName string) ([]string, error) {
 	tenant := TenantFromContext(ctx)
 	var names []string
-	query := r.db.WithContext(ctx).Model(&MetricBucket{}).Where("tenant_id = ?", tenant)
+	query := r.reader().WithContext(ctx).Model(&MetricBucket{}).Where("tenant_id = ?", tenant)
 	if serviceName != "" {
 		query = query.Where("service_name = ?", serviceName)
 	}
@@ -182,7 +182,7 @@ func (r *Repository) GetDashboardStats(ctx context.Context, start, end time.Time
 	tenant := TenantFromContext(ctx)
 	var stats DashboardStats
 
-	baseQuery := r.db.WithContext(ctx).Model(&Trace{}).Where(sqlWhereTenantTimeBetween, tenant, start, end)
+	baseQuery := r.reader().WithContext(ctx).Model(&Trace{}).Where(sqlWhereTenantTimeBetween, tenant, start, end)
 	if len(serviceNames) > 0 {
 		baseQuery = baseQuery.Where(sqlWhereServiceIn, serviceNames)
 	}
@@ -193,7 +193,7 @@ func (r *Repository) GetDashboardStats(ctx context.Context, start, end time.Time
 	}
 
 	// 2. Total Logs
-	logQuery := r.db.WithContext(ctx).Model(&Log{}).Where(sqlWhereTenantTimeBetween, tenant, start, end)
+	logQuery := r.reader().WithContext(ctx).Model(&Log{}).Where(sqlWhereTenantTimeBetween, tenant, start, end)
 	if len(serviceNames) > 0 {
 		logQuery = logQuery.Where(sqlWhereServiceIn, serviceNames)
 	}
@@ -285,7 +285,7 @@ func (r *Repository) GetTrafficMetrics(ctx context.Context, start, end time.Time
 	}
 	var rows []traceRow
 
-	query := r.db.WithContext(ctx).Model(&Trace{}).
+	query := r.reader().WithContext(ctx).Model(&Trace{}).
 		Select("timestamp, status").
 		Where("tenant_id = ? AND timestamp BETWEEN ? AND ?", tenant, start, end)
 
@@ -335,7 +335,7 @@ func (r *Repository) GetTrafficMetrics(ctx context.Context, start, end time.Time
 func (r *Repository) GetLatencyHeatmap(ctx context.Context, start, end time.Time, serviceNames []string) ([]LatencyPoint, error) {
 	tenant := TenantFromContext(ctx)
 	var points []LatencyPoint
-	query := r.db.WithContext(ctx).Model(&Trace{}).
+	query := r.reader().WithContext(ctx).Model(&Trace{}).
 		Select("timestamp, duration").
 		Where("tenant_id = ? AND timestamp BETWEEN ? AND ?", tenant, start, end)
 
@@ -393,7 +393,7 @@ func (r *Repository) PurgeMetricBucketsBatched(ctx context.Context, olderThan ti
 func (r *Repository) GetServices(ctx context.Context) ([]string, error) {
 	tenant := TenantFromContext(ctx)
 	var services []string
-	if err := r.db.WithContext(ctx).Model(&Trace{}).
+	if err := r.reader().WithContext(ctx).Model(&Trace{}).
 		Where("tenant_id = ?", tenant).
 		Distinct("service_name").
 		Order("service_name ASC").

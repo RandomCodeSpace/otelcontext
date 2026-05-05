@@ -44,7 +44,7 @@ func (r *Repository) BatchCreateLogs(logs []Log) error {
 func (r *Repository) GetLog(ctx context.Context, id uint) (*Log, error) {
 	tenant := TenantFromContext(ctx)
 	var l Log
-	if err := r.db.WithContext(ctx).Where(sqlWhereTenantID, tenant).First(&l, id).Error; err != nil {
+	if err := r.reader().WithContext(ctx).Where(sqlWhereTenantID, tenant).First(&l, id).Error; err != nil {
 		return nil, fmt.Errorf("failed to get log: %w", err)
 	}
 	return &l, nil
@@ -54,7 +54,7 @@ func (r *Repository) GetLog(ctx context.Context, id uint) (*Log, error) {
 func (r *Repository) GetRecentLogs(ctx context.Context, limit int) ([]Log, error) {
 	tenant := TenantFromContext(ctx)
 	var logs []Log
-	if err := r.db.WithContext(ctx).Where(sqlWhereTenantID, tenant).Order(sqlOrderTimestampDesc).Limit(limit).Find(&logs).Error; err != nil {
+	if err := r.reader().WithContext(ctx).Where(sqlWhereTenantID, tenant).Order(sqlOrderTimestampDesc).Limit(limit).Find(&logs).Error; err != nil {
 		return nil, fmt.Errorf("failed to get recent logs: %w", err)
 	}
 	return logs, nil
@@ -81,7 +81,7 @@ func (r *Repository) GetLogsV2(ctx context.Context, filter LogFilter) ([]Log, in
 		}
 	}
 
-	base := r.db.WithContext(ctx).Model(&Log{}).Where(sqlWhereTenantID, tenant)
+	base := r.reader().WithContext(ctx).Model(&Log{}).Where(sqlWhereTenantID, tenant)
 	if useFTS5 {
 		base = base.Joins("JOIN "+fts5LogsTable+" ON logs.id = "+fts5LogsTable+".rowid").
 			Where(fts5LogsTable+" MATCH ?", matchExpr)
@@ -153,7 +153,7 @@ func applyLogFilterCriteria(base *gorm.DB, filter LogFilter) *gorm.DB {
 func (r *Repository) getLogsV2LikeFallback(ctx context.Context, filter LogFilter, tenant string) ([]Log, int64, error) {
 	var logs []Log
 	var total int64
-	base := r.db.WithContext(ctx).Model(&Log{}).Where(sqlWhereTenantID, tenant)
+	base := r.reader().WithContext(ctx).Model(&Log{}).Where(sqlWhereTenantID, tenant)
 	base = applyLogFilterCriteria(base, filter)
 	if filter.Search != "" {
 		search := "%" + filter.Search + "%"
@@ -180,7 +180,7 @@ func (r *Repository) GetLogContext(ctx context.Context, targetTime time.Time) ([
 	end := targetTime.Add(1 * time.Minute)
 
 	var logs []Log
-	if err := r.db.WithContext(ctx).Where("tenant_id = ? AND timestamp BETWEEN ? AND ?", tenant, start, end).
+	if err := r.reader().WithContext(ctx).Where("tenant_id = ? AND timestamp BETWEEN ? AND ?", tenant, start, end).
 		Order("timestamp asc").
 		Find(&logs).Error; err != nil {
 		return nil, fmt.Errorf("failed to fetch log context: %w", err)
@@ -223,7 +223,7 @@ func (r *Repository) LogsForVectorReplay(ctx context.Context, sinceID uint, limi
 		limit = 10_000
 	}
 	var logs []Log
-	err := r.db.WithContext(ctx).
+	err := r.reader().WithContext(ctx).
 		Where("id > ? AND severity IN ?", sinceID, []string{"ERROR", "WARN", "WARNING", "FATAL", "CRITICAL"}).
 		Order("id ASC").
 		Limit(limit).
@@ -244,7 +244,7 @@ func (r *Repository) ListRecentHighSeverityLogsAllTenants(ctx context.Context, s
 	if limit <= 0 {
 		limit = 5000
 	}
-	q := r.db.WithContext(ctx).Model(&Log{})
+	q := r.reader().WithContext(ctx).Model(&Log{})
 	if severity != "" {
 		q = q.Where(sqlWhereSeverity, severity)
 	}

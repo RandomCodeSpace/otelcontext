@@ -137,6 +137,58 @@ func NewDatabase(driver, dsn string) (*gorm.DB, error) {
 	return db, nil
 }
 
+// NewSQLiteReadPool opens a SECOND GORM handle against the same SQLite file,
+// configured with N connections in the pool. Used to alleviate the
+// MaxOpen=1 single-writer pool's read/write contention: API/MCP read
+// handlers route through this pool, while the writer keeps its
+// single-connection serialized pool. WAL mode (already enabled on the
+// writer pool) gives each reader connection its own snapshot, so they
+// don't block on the writer or on each other.
+//
+// Caveats:
+//   - Caller must ensure NewDatabase has already been called against the
+//     same DSN so WAL/journal-mode/synchronous pragmas are in place. The
+//     read pool inherits those at the file level.
+//   - maxOpen is clamped to [1, 32]. A non-positive maxOpen passed to this
+//     function returns a pool of size 4 (default). Note: the production
+//     caller (NewRepository) short-circuits size == 0 to mean "read pool
+//     disabled" and does not invoke this factory in that case — so the
+//     "0 → 4" path here is only reachable from tests / direct callers.
+//   - Driver string must already be normalised to "sqlite". Other drivers
+//     should not be opened through here — they have their own pool config.
+func NewSQLiteReadPool(dsn string, maxOpen int) (*gorm.DB, error) {
+	if dsn == "" {
+		dsn = "OtelContext.db"
+	}
+	if maxOpen <= 0 {
+		maxOpen = 4
+	}
+	if maxOpen > 32 {
+		maxOpen = 32
+	}
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{
+		Logger:                                   logger.Default.LogMode(logger.Error),
+		DisableForeignKeyConstraintWhenMigrating: true,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("sqlite read-pool open: %s", scrubDSN(err.Error()))
+	}
+	// Defensive — WAL was already set on the writer; idempotent no-op here
+	// but harmless if the read-pool happens to be opened first.
+	db.Exec("PRAGMA journal_mode=WAL")
+	db.Exec("PRAGMA busy_timeout=5000")
+	db.Exec("PRAGMA query_only=ON")
+	sqlDB, err := db.DB()
+	if err != nil {
+		return nil, fmt.Errorf("sqlite read-pool: get *sql.DB: %w", err)
+	}
+	sqlDB.SetMaxOpenConns(maxOpen)
+	sqlDB.SetMaxIdleConns(maxOpen)
+	sqlDB.SetConnMaxLifetime(time.Hour)
+	log.Printf("📖 SQLite read-pool enabled: MaxOpen=%d, query_only=ON", maxOpen)
+	return db, nil
+}
+
 func getEnvPoolInt(key string, fallback int) int {
 	if v, ok := os.LookupEnv(key); ok {
 		if i, err := strconv.Atoi(v); err == nil {

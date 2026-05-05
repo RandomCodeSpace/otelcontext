@@ -146,7 +146,7 @@ func (r *Repository) CreateTrace(trace Trace) error {
 func (r *Repository) GetTrace(ctx context.Context, traceID string) (*Trace, error) {
 	tenant := TenantFromContext(ctx)
 	var trace Trace
-	if err := r.db.WithContext(ctx).
+	if err := r.reader().WithContext(ctx).
 		Preload("Spans", sqlWhereTenantID, tenant).
 		Preload("Logs", sqlWhereTenantID, tenant).
 		Where("tenant_id = ? AND trace_id = ?", tenant, traceID).
@@ -171,7 +171,7 @@ func (r *Repository) GetTracesFiltered(ctx context.Context, start, end time.Time
 	var traces []Trace
 	var total int64
 
-	base := r.db.WithContext(ctx).Model(&Trace{}).Where(sqlWhereTenantID, tenant)
+	base := r.reader().WithContext(ctx).Model(&Trace{}).Where(sqlWhereTenantID, tenant)
 
 	if !start.IsZero() && !end.IsZero() {
 		base = base.Where("timestamp BETWEEN ? AND ?", start, end)
@@ -225,7 +225,7 @@ func (r *Repository) GetTracesFiltered(ctx context.Context, start, end time.Time
 		}
 
 		var summaries []spanSummary
-		r.db.WithContext(ctx).Raw(
+		r.reader().WithContext(ctx).Raw(
 			`SELECT trace_id, COUNT(*) as span_count, MIN(operation_name) as operation_name
 			 FROM spans WHERE tenant_id = ? AND trace_id IN ? GROUP BY trace_id`, tenant, traceIDs,
 		).Scan(&summaries)
@@ -262,7 +262,7 @@ const serviceMapSpanLimit = 500_000
 func (r *Repository) GetServiceMapMetrics(ctx context.Context, start, end time.Time) (*ServiceMapMetrics, error) {
 	tenant := TenantFromContext(ctx)
 	var spans []Span
-	query := r.db.WithContext(ctx).Model(&Span{}).Where(sqlWhereTenantID, tenant)
+	query := r.reader().WithContext(ctx).Model(&Span{}).Where(sqlWhereTenantID, tenant)
 
 	if !start.IsZero() && !end.IsZero() {
 		query = query.Where("start_time BETWEEN ? AND ?", start, end)

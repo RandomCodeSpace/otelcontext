@@ -3,21 +3,22 @@ package storage
 // HotDBSizeBytes returns an approximate size of the hot DB in bytes.
 // For SQLite this reads the file size. For others it queries pg_database_size / information_schema.
 func (r *Repository) HotDBSizeBytes() int64 {
+	rdr := r.reader()
 	switch r.driver {
 	case "sqlite", "":
 		var pageCount, pageSize int64
-		r.db.Raw("PRAGMA page_count").Scan(&pageCount)
-		r.db.Raw("PRAGMA page_size").Scan(&pageSize)
+		rdr.Raw("PRAGMA page_count").Scan(&pageCount)
+		rdr.Raw("PRAGMA page_size").Scan(&pageSize)
 		return pageCount * pageSize
 
 	case "postgres", "postgresql":
 		var size int64
-		r.db.Raw("SELECT pg_database_size(current_database())").Scan(&size)
+		rdr.Raw("SELECT pg_database_size(current_database())").Scan(&size)
 		return size
 
 	case "mysql":
 		var size int64
-		r.db.Raw(`SELECT SUM(data_length + index_length) FROM information_schema.tables
+		rdr.Raw(`SELECT SUM(data_length + index_length) FROM information_schema.tables
 			WHERE table_schema = DATABASE()`).Scan(&size)
 		return size
 

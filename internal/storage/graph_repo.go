@@ -32,7 +32,7 @@ func (r *Repository) GetSpansForGraph(since time.Time) ([]SpanGraphRow, error) {
 	}
 
 	var rows []raw
-	err := r.db.
+	err := r.reader().
 		Table("spans").
 		Select("spans.span_id, spans.parent_span_id, spans.service_name, spans.operation_name, spans.duration, traces.status AS trace_status, spans.start_time").
 		Joins("LEFT JOIN traces ON traces.trace_id = spans.trace_id").

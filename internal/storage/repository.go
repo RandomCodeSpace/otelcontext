@@ -99,6 +99,14 @@ type Repository struct {
 	driver  string
 	metrics *telemetry.Metrics
 
+	// readPool is an optional second GORM handle used for read-only queries
+	// on SQLite. The writer (`db`) keeps MaxOpen=1 to honour SQLite's
+	// single-writer model; without a separate pool, every API/MCP read
+	// serializes behind in-flight writes. WAL mode gives each readPool
+	// connection its own snapshot. Nil for non-SQLite drivers and when the
+	// read pool is explicitly disabled (DB_SQLITE_READ_POOL_SIZE=0).
+	readPool *gorm.DB
+
 	// logsPartitioned is set to true when DB_POSTGRES_PARTITIONING=daily is
 	// active and the `logs` parent has been provisioned as a partitioned
 	// table. RetentionScheduler reads this to skip the logs DELETE — the
@@ -120,6 +128,26 @@ func (r *Repository) LogsPartitioned() bool { return r.logsPartitioned.Load() }
 // MarkLogsPartitioned flips the partitioned flag. Called by the partitioning
 // setup path (factory.go) once the partitioned schema is in place.
 func (r *Repository) MarkLogsPartitioned() { r.logsPartitioned.Store(true) }
+
+// reader returns the connection to use for read-only queries. Falls back to
+// the writer pool when no read pool is configured (non-SQLite drivers, or
+// when the read pool was explicitly disabled).
+//
+// Read methods that route through here are non-blocking against in-flight
+// writes on SQLite; methods that still use r.db serialize through the
+// MaxOpen=1 writer pool, which is correct for transactional / write paths.
+//
+// WAL snapshot caveat: each non-transactional statement on a read-pool
+// connection sees the latest committed WAL frames. Do NOT wrap multiple
+// reader().… calls in a long-lived read transaction (Begin / Session with
+// PrepareStmt) — that pins a snapshot taken at the first statement and
+// will hide subsequent writer commits for the lifetime of the txn.
+func (r *Repository) reader() *gorm.DB {
+	if r.readPool != nil {
+		return r.readPool
+	}
+	return r.db
+}
 
 // NewRepository initializes the database connection using environment variables and migrates the schema.
 func NewRepository(metrics *telemetry.Metrics) (*Repository, error) {
@@ -174,6 +202,25 @@ func NewRepository(metrics *telemetry.Metrics) (*Repository, error) {
 	}
 
 	repo := &Repository{db: db, driver: driver, metrics: metrics}
+
+	// On SQLite, open a separate read pool so API/MCP reads don't serialize
+	// behind writes through the MaxOpen=1 writer pool. Disabled when
+	// DB_SQLITE_READ_POOL_SIZE=0; otherwise size is clamped to [1,32]
+	// (default 4) inside NewSQLiteReadPool.
+	if driver == "sqlite" {
+		size := sqliteReadPoolSizeFromEnv()
+		if size > 0 {
+			rp, err := NewSQLiteReadPool(dsn, size)
+			if err != nil {
+				slog.Warn("SQLite read-pool unavailable, falling back to writer pool for reads",
+					"error", err,
+				)
+			} else {
+				repo.readPool = rp
+			}
+		}
+	}
+
 	// Detect partitioned-logs mode from the live schema so the
 	// RetentionScheduler can skip the row-level DELETE path. We do this from
 	// the DB rather than passing the config flag through several layers,
@@ -188,13 +235,33 @@ func NewRepository(metrics *telemetry.Metrics) (*Repository, error) {
 	return repo, nil
 }
 
+// sqliteReadPoolSizeFromEnv reads DB_SQLITE_READ_POOL_SIZE. Returns:
+//   - 0 when the env var is set to "0" or "off" (read pool disabled)
+//   - the parsed integer when set to a positive number
+//   - 4 (default) when unset or unparseable
+func sqliteReadPoolSizeFromEnv() int {
+	v, ok := os.LookupEnv("DB_SQLITE_READ_POOL_SIZE")
+	if !ok {
+		return 4
+	}
+	s := strings.TrimSpace(strings.ToLower(v))
+	if s == "off" || s == "false" || s == "no" {
+		return 0
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 0 {
+		return 4
+	}
+	return n
+}
+
 // Stats aggregation and DB management
 
 // GetStats returns high-level database stats scoped to the tenant carried on ctx.
 // Unscoped aggregates (DB size, etc.) are not tenant-specific and are reported as-is.
 func (r *Repository) GetStats(ctx context.Context) (map[string]any, error) {
 	tenant := TenantFromContext(ctx)
-	db := r.db.WithContext(ctx)
+	db := r.reader().WithContext(ctx)
 
 	var traceCount int64
 	var logCount int64
@@ -233,8 +300,8 @@ func (r *Repository) GetStats(ctx context.Context) (map[string]any, error) {
 	var dbSizeMB float64
 	if r.driver == "sqlite" {
 		var pageCount, pageSize int64
-		r.db.Raw("PRAGMA page_count").Scan(&pageCount)
-		r.db.Raw("PRAGMA page_size").Scan(&pageSize)
+		r.reader().Raw("PRAGMA page_count").Scan(&pageCount)
+		r.reader().Raw("PRAGMA page_size").Scan(&pageSize)
 		dbSizeMB = float64(pageCount*pageSize) / (1024 * 1024)
 	}
 
@@ -263,8 +330,21 @@ func (r *Repository) VacuumDB() error {
 	return nil
 }
 
-// Close closes the underlying database connection.
+// Close closes the underlying database connection. When a SQLite read pool was
+// opened, it is closed first; the writer pool is closed last so any in-flight
+// reads see the writer's WAL state through the close sequence.
 func (r *Repository) Close() error {
+	if r.readPool != nil {
+		rp, err := r.readPool.DB()
+		switch {
+		case err != nil:
+			slog.Warn("read pool: get underlying sql.DB failed during close", "error", err)
+		default:
+			if cerr := rp.Close(); cerr != nil {
+				slog.Warn("read pool: close failed", "error", cerr)
+			}
+		}
+	}
 	sqlDB, err := r.db.DB()
 	if err != nil {
 		return fmt.Errorf("failed to get underlying sql.DB: %w", err)
@@ -279,6 +359,11 @@ func (r *Repository) DB() *gorm.DB {
 
 // NewRepositoryFromDB constructs a Repository from an existing *gorm.DB.
 // Intended for tests and advanced wiring — production code should use NewRepository.
+//
+// Note: the SQLite read-pool optimization (DB_SQLITE_READ_POOL_SIZE) is
+// bypassed here. Tests that hit this constructor see the legacy single-pool
+// (MaxOpen=1) behavior — fine for correctness, but contention scenarios
+// must use NewRepository to exercise the read pool.
 func NewRepositoryFromDB(db *gorm.DB, driver string) *Repository {
 	if driver == "" {
 		driver = "sqlite"
@@ -290,7 +375,7 @@ func NewRepositoryFromDB(db *gorm.DB, driver string) *Repository {
 func (r *Repository) RecentTraces(ctx context.Context, limit int) ([]Trace, error) {
 	tenant := TenantFromContext(ctx)
 	var traces []Trace
-	if err := r.db.WithContext(ctx).Where(sqlWhereTenantID, tenant).Order(sqlOrderTimestampDesc).Limit(limit).Find(&traces).Error; err != nil {
+	if err := r.reader().WithContext(ctx).Where(sqlWhereTenantID, tenant).Order(sqlOrderTimestampDesc).Limit(limit).Find(&traces).Error; err != nil {
 		return nil, err
 	}
 	return traces, nil
@@ -300,7 +385,7 @@ func (r *Repository) RecentTraces(ctx context.Context, limit int) ([]Trace, erro
 func (r *Repository) RecentLogs(ctx context.Context, limit int) ([]Log, error) {
 	tenant := TenantFromContext(ctx)
 	var logs []Log
-	if err := r.db.WithContext(ctx).Where(sqlWhereTenantID, tenant).Order(sqlOrderTimestampDesc).Limit(limit).Find(&logs).Error; err != nil {
+	if err := r.reader().WithContext(ctx).Where(sqlWhereTenantID, tenant).Order(sqlOrderTimestampDesc).Limit(limit).Find(&logs).Error; err != nil {
 		return nil, err
 	}
 	return logs, nil
@@ -318,7 +403,7 @@ func (r *Repository) SearchLogs(ctx context.Context, query string, limit int) ([
 		return r.searchLogsFTS5(ctx, tenant, query, limit)
 	}
 	var logs []Log
-	db := r.db.WithContext(ctx).Where(sqlWhereTenantID, tenant).Order(sqlOrderTimestampDesc).Limit(limit)
+	db := r.reader().WithContext(ctx).Where(sqlWhereTenantID, tenant).Order(sqlOrderTimestampDesc).Limit(limit)
 	if query != "" {
 		op := r.likeOp()
 		db = db.Where(fmt.Sprintf("body %s ? OR service_name %s ?", op, op), "%"+query+"%", "%"+query+"%")
@@ -337,11 +422,11 @@ func (r *Repository) searchLogsFTS5(ctx context.Context, tenant, query string, l
 	matchExpr := fts5MatchExpr(query)
 	if matchExpr == "" {
 		var logs []Log
-		err := r.db.WithContext(ctx).Where(sqlWhereTenantID, tenant).Order(sqlOrderTimestampDesc).Limit(limit).Find(&logs).Error
+		err := r.reader().WithContext(ctx).Where(sqlWhereTenantID, tenant).Order(sqlOrderTimestampDesc).Limit(limit).Find(&logs).Error
 		return logs, err
 	}
 	var logs []Log
-	err := r.db.WithContext(ctx).
+	err := r.reader().WithContext(ctx).
 		Table("logs").
 		Joins("JOIN "+fts5LogsTable+" ON logs.id = "+fts5LogsTable+".rowid").
 		Where("logs.tenant_id = ? AND "+fts5LogsTable+" MATCH ?", tenant, matchExpr).
@@ -365,7 +450,7 @@ func (r *Repository) searchLogsFTS5(ctx context.Context, tenant, query string, l
 func (r *Repository) searchLogsLikeFallback(ctx context.Context, tenant, query string, limit int) ([]Log, error) {
 	var logs []Log
 	op := r.likeOp()
-	err := r.db.WithContext(ctx).
+	err := r.reader().WithContext(ctx).
 		Where("tenant_id = ?", tenant).
 		Where(fmt.Sprintf("body %s ? OR service_name %s ?", op, op), "%"+query+"%", "%"+query+"%").
 		Order(sqlOrderTimestampDesc).
