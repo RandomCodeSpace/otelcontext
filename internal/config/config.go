@@ -225,7 +225,7 @@ func Load(customPath string) (*Config, error) {
 	}
 
 	env := getEnv("APP_ENV", "development")
-	return &Config{
+	cfg := &Config{
 		Env:               env,
 		DevMode:           env == "development",
 		LogLevel:          getEnv("LOG_LEVEL", "INFO"),
@@ -326,7 +326,56 @@ func Load(customPath string) (*Config, error) {
 
 		// Production safety guard for SQLite
 		AllowSqliteProd: parseTruthy(getEnv("OTELCONTEXT_ALLOW_SQLITE_PROD", "")),
-	}, nil
+	}
+	applyDriverDefaults(cfg)
+	return cfg, nil
+}
+
+// applyDriverDefaults flips defaults on a freshly-Load()'d Config when the
+// driver is SQLite AND the operator did not explicitly set the env var.
+// Postgres/MSSQL/MySQL defaults are unchanged.
+//
+// The platform's stock defaults are tuned for Postgres at 100k events/sec
+// with a parallel writer pool. On SQLite those same defaults overrun the
+// single-writer lock and inflate heap until the process OOMs — see
+// docs/superpowers/specs/2026-05-24-mcp-7tool-sqlite-survival-design.md.
+// This override gives the SQLite path a survivable starting point at
+// 120 services while preserving the existing Postgres path bit-for-bit.
+//
+// "Explicit operator override" is detected via os.LookupEnv (presence)
+// rather than value comparison so that, e.g., DB_MAX_OPEN_CONNS=50 set by
+// hand is still honoured even though it equals the Postgres default.
+func applyDriverDefaults(cfg *Config) {
+	if !strings.EqualFold(cfg.DBDriver, "sqlite") {
+		return
+	}
+	if _, ok := os.LookupEnv("DB_MAX_OPEN_CONNS"); !ok {
+		cfg.DBMaxOpenConns = 1
+	}
+	if _, ok := os.LookupEnv("DB_MAX_IDLE_CONNS"); !ok {
+		cfg.DBMaxIdleConns = 1
+	}
+	if _, ok := os.LookupEnv("INGEST_PIPELINE_WORKERS"); !ok {
+		cfg.IngestPipelineWorkers = 2
+	}
+	if _, ok := os.LookupEnv("INGEST_PIPELINE_QUEUE_SIZE"); !ok {
+		cfg.IngestPipelineQueueSize = 10000
+	}
+	if _, ok := os.LookupEnv("METRIC_MAX_CARDINALITY"); !ok {
+		cfg.MetricMaxCardinality = 3000
+	}
+	if _, ok := os.LookupEnv("STORE_MIN_SEVERITY"); !ok {
+		cfg.StoreMinSeverity = "WARN"
+	}
+	if _, ok := os.LookupEnv("SAMPLING_RATE"); !ok {
+		cfg.SamplingRate = 0.05
+	}
+	if _, ok := os.LookupEnv("GRPC_MAX_CONCURRENT_STREAMS"); !ok {
+		cfg.GRPCMaxConcurrentStreams = 240
+	}
+	if _, ok := os.LookupEnv("LOG_FTS_ENABLED"); !ok {
+		cfg.LogFTSEnabled = true
+	}
 }
 
 func getEnv(key, fallback string) string {

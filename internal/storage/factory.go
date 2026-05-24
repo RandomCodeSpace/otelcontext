@@ -96,11 +96,33 @@ func NewDatabase(driver, dsn string) (*gorm.DB, error) {
 		return nil, fmt.Errorf("failed to connect to database (%s): %s", driver, scrubDSN(err.Error()))
 	}
 
-	// SQLite pragmas must be set via Exec (glebarez/sqlite doesn't support _pragma DSN params)
+	// SQLite pragmas — set via Exec because glebarez/sqlite doesn't honour
+	// _pragma DSN params. Applied fail-closed: any PRAGMA failure aborts
+	// startup with a wrapped error so an unexpected SQLite build that doesn't
+	// support, e.g. mmap_size cannot silently regress the platform to
+	// default-tuned behaviour. The set was hardened on 2026-05-24 to make
+	// the platform survivable at 120 services on SQLite.
+	//
+	// cache_size=-262144 = 256 MB page cache (negative = KB).
+	// mmap_size=1073741824 = 1 GB memory-mapped read window.
+	// wal_autocheckpoint=10000 = checkpoint after 10k pages so WAL stays bounded.
+	// journal_size_limit=67108864 = hard-cap the WAL file at 64 MB.
 	if strings.ToLower(driver) == "sqlite" || driver == "" {
-		db.Exec("PRAGMA journal_mode=WAL")
-		db.Exec("PRAGMA busy_timeout=5000")
-		db.Exec("PRAGMA synchronous=NORMAL")
+		pragmas := []string{
+			"PRAGMA journal_mode=WAL",
+			"PRAGMA synchronous=NORMAL",
+			"PRAGMA cache_size=-262144",
+			"PRAGMA temp_store=MEMORY",
+			"PRAGMA mmap_size=1073741824",
+			"PRAGMA wal_autocheckpoint=10000",
+			"PRAGMA journal_size_limit=67108864",
+			"PRAGMA busy_timeout=5000",
+		}
+		for _, p := range pragmas {
+			if err := db.Exec(p).Error; err != nil {
+				return nil, fmt.Errorf("sqlite pragma %q failed: %w", p, err)
+			}
+		}
 	}
 
 	// Configure Connection Pool — configurable via env vars for non-SQLite drivers.
