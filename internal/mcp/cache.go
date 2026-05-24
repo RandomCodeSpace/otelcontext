@@ -21,11 +21,11 @@ import (
 // changes meaningfully on millisecond scales and the per-call DB cost is
 // already bounded by the storage layer.
 var cacheableTools = map[string]struct{}{
-	"get_service_map":      {},
-	"impact_analysis":      {},
-	"root_cause_analysis":  {},
 	"get_anomaly_timeline": {},
+	"get_service_map":      {},
 	"get_service_health":   {},
+	"root_cause_analysis":  {},
+	"impact_analysis":      {},
 }
 
 // isCacheable reports whether a tool name is on the cache whitelist.
