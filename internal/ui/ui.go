@@ -11,7 +11,6 @@ import (
 	"github.com/RandomCodeSpace/otelcontext/internal/graph"
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 	"github.com/RandomCodeSpace/otelcontext/internal/telemetry"
-	"github.com/RandomCodeSpace/otelcontext/internal/vectordb"
 )
 
 // spaFS wraps an fs.FS so http.FileServer transparently serves index.html
@@ -48,17 +47,19 @@ type Server struct {
 	repo       *storage.Repository
 	metrics    *telemetry.Metrics
 	topo       *graph.Graph
-	vidx       *vectordb.Index
 	mcpEnabled bool
 	mcpPath    string
 }
 
-func NewServer(repo *storage.Repository, metrics *telemetry.Metrics, topo *graph.Graph, vidx *vectordb.Index) *Server {
+// NewServer constructs the embedded-UI server.
+//
+// The vectordb argument was removed on 2026-05-24 when the vectordb package
+// was deleted alongside the find_similar_logs MCP tool cut.
+func NewServer(repo *storage.Repository, metrics *telemetry.Metrics, topo *graph.Graph) *Server {
 	return &Server{
 		repo:    repo,
 		metrics: metrics,
 		topo:    topo,
-		vidx:    vidx,
 		mcpPath: "/mcp",
 	}
 }

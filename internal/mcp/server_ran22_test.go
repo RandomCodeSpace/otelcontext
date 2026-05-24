@@ -18,19 +18,19 @@ import (
 // no-header caller).
 func TestNew_DefaultTenant_FromConstructor(t *testing.T) {
 	t.Run("empty falls back to storage.DefaultTenantID", func(t *testing.T) {
-		srv := New("", nil, nil, nil, nil)
+		srv := New("", nil, nil, nil)
 		if srv.defaultTenant != storage.DefaultTenantID {
 			t.Fatalf(`New("") defaultTenant = %q, want %q`, srv.defaultTenant, storage.DefaultTenantID)
 		}
 	})
 	t.Run("non-empty value is preserved", func(t *testing.T) {
-		srv := New("acme", nil, nil, nil, nil)
+		srv := New("acme", nil, nil, nil)
 		if srv.defaultTenant != "acme" {
 			t.Fatalf(`New("acme") defaultTenant = %q, want "acme"`, srv.defaultTenant)
 		}
 	})
 	t.Run("SetDefaultTenant runtime override still works", func(t *testing.T) {
-		srv := New("acme", nil, nil, nil, nil)
+		srv := New("acme", nil, nil, nil)
 		srv.SetDefaultTenant("globex")
 		if srv.defaultTenant != "globex" {
 			t.Fatalf(`SetDefaultTenant("globex") defaultTenant = %q, want "globex"`, srv.defaultTenant)

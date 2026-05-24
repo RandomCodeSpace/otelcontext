@@ -11,7 +11,6 @@ import (
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 	"github.com/RandomCodeSpace/otelcontext/internal/telemetry"
 	"github.com/RandomCodeSpace/otelcontext/internal/tsdb"
-	"github.com/RandomCodeSpace/otelcontext/internal/vectordb"
 )
 
 // panicMetrics is an optional hook for incrementing the panics-recovered
@@ -90,10 +89,9 @@ type GraphRAG struct {
 	tenants   map[string]*tenantStores
 	tenantsMu sync.RWMutex
 
-	repo      *storage.Repository
-	vectorIdx *vectordb.Index
-	tsdbAgg   *tsdb.Aggregator
-	ringBuf   *tsdb.RingBuffer
+	repo    *storage.Repository
+	tsdbAgg *tsdb.Aggregator
+	ringBuf *tsdb.RingBuffer
 
 	drain *Drain // Drain log-template miner (see drain.go)
 
@@ -206,7 +204,11 @@ func DefaultConfig() Config {
 }
 
 // New creates a new GraphRAG coordinator.
-func New(repo *storage.Repository, vectorIdx *vectordb.Index, tsdbAgg *tsdb.Aggregator, ringBuf *tsdb.RingBuffer, cfg Config) *GraphRAG {
+//
+// The vectordb-backed semantic similarity path was removed on 2026-05-24
+// along with the find_similar_logs MCP tool — log clustering now relies
+// solely on the Drain template miner (see drain.go).
+func New(repo *storage.Repository, tsdbAgg *tsdb.Aggregator, ringBuf *tsdb.RingBuffer, cfg Config) *GraphRAG {
 	if cfg.TraceTTL == 0 {
 		cfg.TraceTTL = defaultTraceTTL
 	}
@@ -229,7 +231,6 @@ func New(repo *storage.Repository, vectorIdx *vectordb.Index, tsdbAgg *tsdb.Aggr
 	g := &GraphRAG{
 		tenants:       make(map[string]*tenantStores),
 		repo:          repo,
-		vectorIdx:     vectorIdx,
 		tsdbAgg:       tsdbAgg,
 		ringBuf:       ringBuf,
 		drain:         NewDrain(),

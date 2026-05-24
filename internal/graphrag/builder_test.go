@@ -30,7 +30,7 @@ func newTestRepo(t *testing.T) *storage.Repository {
 // events asynchronously; tests must call Stop() via t.Cleanup.
 func newTestGraphRAG(t *testing.T) *GraphRAG {
 	t.Helper()
-	g := New(nil, nil, nil, nil, DefaultConfig())
+	g := New(nil, nil, nil, DefaultConfig())
 	// Start only the event workers — the background refresh/snapshot/anomaly
 	// loops require a repo, which this helper intentionally does not wire.
 	ctx, cancel := context.WithCancel(context.Background())
@@ -112,7 +112,7 @@ func TestRefresh_PopulatesErrorCountFromDBStatus(t *testing.T) {
 
 	// Build GraphRAG with the seeded repo, skip starting background loops;
 	// invoke the rebuild path directly.
-	g := New(repo, nil, nil, nil, DefaultConfig())
+	g := New(repo, nil, nil, DefaultConfig())
 	t.Cleanup(g.Stop)
 
 	g.rebuildAllTenantsFromDB(context.Background())
@@ -134,7 +134,7 @@ func TestRefresh_PopulatesErrorCountFromDBStatus(t *testing.T) {
 func TestOnSpanIngested_DropsIncrementMetric(t *testing.T) {
 	// Build a GraphRAG WITHOUT starting any event workers so the channel
 	// fills up and overflows.
-	g := New(nil, nil, nil, nil, DefaultConfig())
+	g := New(nil, nil, nil, DefaultConfig())
 	t.Cleanup(g.Stop)
 
 	// Fill the buffer beyond capacity. Use the package constant so the test

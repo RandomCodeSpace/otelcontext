@@ -31,7 +31,7 @@ func newTestGraphRAGWithDB(t *testing.T) (*GraphRAG, *gorm.DB) {
 	t.Helper()
 	db := newTestGraphRAGDB(t)
 	repo := storage.NewRepositoryFromDB(db, "sqlite")
-	g := New(repo, nil, nil, nil, DefaultConfig())
+	g := New(repo, nil, nil, DefaultConfig())
 	t.Cleanup(func() { g.Stop() })
 	return g, db
 }

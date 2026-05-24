@@ -19,7 +19,6 @@ import (
 
 	"github.com/RandomCodeSpace/otelcontext/internal/graphrag"
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
-	"github.com/RandomCodeSpace/otelcontext/internal/vectordb"
 )
 
 // tenants exercised by the test. The third row uses an empty header to
@@ -67,7 +66,7 @@ func markersFor(scoped string, others []string) (own []string, leak []string) {
 // snapshot, and anomaly loops are stretched to "never" inside the test
 // window so the only state that lands in the stores is the data the test
 // seeds explicitly — making leak assertions deterministic.
-func setupTenantIsolationServer(t *testing.T) (*httptest.Server, *graphrag.GraphRAG, *storage.Repository, *vectordb.Index) {
+func setupTenantIsolationServer(t *testing.T) (*httptest.Server, *graphrag.GraphRAG, *storage.Repository) {
 	t.Helper()
 
 	db, err := storage.NewDatabase("sqlite", ":memory:")
@@ -82,19 +81,17 @@ func setupTenantIsolationServer(t *testing.T) (*httptest.Server, *graphrag.Graph
 	}
 	repo := storage.NewRepositoryFromDB(db, "sqlite")
 
-	vIdx := vectordb.New(1000)
-
 	cfg := graphrag.DefaultConfig()
 	cfg.RefreshEvery = 24 * time.Hour
 	cfg.SnapshotEvery = 24 * time.Hour
 	cfg.AnomalyEvery = 24 * time.Hour
 	cfg.WorkerCount = 4
 
-	g := graphrag.New(repo, vIdx, nil, nil, cfg)
+	g := graphrag.New(repo, nil, nil, cfg)
 	bgCtx, cancel := context.WithCancel(context.Background())
 	go g.Start(bgCtx)
 
-	srv := New("", repo, nil, nil, vIdx)
+	srv := New("", repo, nil, nil)
 	srv.SetGraphRAG(g)
 
 	httpSrv := httptest.NewServer(srv.Handler())
@@ -106,7 +103,7 @@ func setupTenantIsolationServer(t *testing.T) (*httptest.Server, *graphrag.Graph
 		_ = repo.Close()
 	})
 
-	return httpSrv, g, repo, vIdx
+	return httpSrv, g, repo
 }
 
 // seedTenant ingests a small but representative slice of telemetry for
@@ -300,7 +297,7 @@ func truncate(s string) string {
 // asserts each response contains only the caller-tenant's data and never
 // leaks another tenant's service name, log marker, operation, or anomaly.
 func TestMCP_TenantIsolation_AllGraphRAGTools(t *testing.T) {
-	ts, g, repo, _ := setupTenantIsolationServer(t)
+	ts, g, repo := setupTenantIsolationServer(t)
 
 	now := time.Now().Add(-time.Minute) // a hair in the past so since=now-15m sees us
 
@@ -382,7 +379,7 @@ func TestMCP_TenantIsolation_AllGraphRAGTools(t *testing.T) {
 // CorrelatedSignals (not just the response text) and asserts each tenant
 // only ever sees rows tagged with its own marker.
 func TestMCP_TenantIsolation_DrainClusterIDsStayPerTenant(t *testing.T) {
-	ts, g, _, _ := setupTenantIsolationServer(t)
+	ts, g, _ := setupTenantIsolationServer(t)
 	now := time.Now().Add(-time.Minute)
 
 	// Identical service AND identical log template across tenants — Drain

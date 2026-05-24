@@ -17,7 +17,6 @@ import (
 	"github.com/RandomCodeSpace/otelcontext/internal/httpconst"
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 	"github.com/RandomCodeSpace/otelcontext/internal/telemetry"
-	"github.com/RandomCodeSpace/otelcontext/internal/vectordb"
 )
 
 const (
@@ -71,7 +70,6 @@ type Server struct {
 	repo          *storage.Repository
 	metrics       *telemetry.Metrics
 	svcGraph      *graph.Graph
-	vectorIdx     *vectordb.Index
 	graphRAG      *graphrag.GraphRAG
 	defaultTenant string
 
@@ -99,12 +97,15 @@ type Server struct {
 // storage.DefaultTenantID. Required at construction time so production startup
 // cannot accidentally drop cfg.DefaultTenant — a missing argument is a compile
 // error rather than a silent regression.
+//
+// The vectordb-backed semantic similarity argument was removed on 2026-05-24
+// when find_similar_logs was cut from the MCP surface and the vectordb package
+// was deleted.
 func New(
 	defaultTenant string,
 	repo *storage.Repository,
 	metrics *telemetry.Metrics,
 	svcGraph *graph.Graph,
-	vectorIdx *vectordb.Index,
 ) *Server {
 	if defaultTenant == "" {
 		defaultTenant = storage.DefaultTenantID
@@ -113,7 +114,6 @@ func New(
 		repo:          repo,
 		metrics:       metrics,
 		svcGraph:      svcGraph,
-		vectorIdx:     vectorIdx,
 		defaultTenant: defaultTenant,
 		callSlots:     make(chan struct{}, defaultMaxConcurrentCalls),
 		callTimeout:   defaultCallTimeout,

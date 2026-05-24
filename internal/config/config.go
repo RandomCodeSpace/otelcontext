@@ -114,21 +114,6 @@ type Config struct {
 	// Compression
 	CompressionLevel string // "default", "fast", "best"
 
-	// Vector Index
-	VectorIndexMaxEntries int
-
-	// VectorIndexSnapshotPath is the on-disk location for periodic vectordb
-	// snapshots. When empty, persistence is disabled and the index rebuilds
-	// from DB on every restart (legacy behaviour). Default
-	// "data/vectordb.snapshot".
-	VectorIndexSnapshotPath string
-
-	// VectorIndexSnapshotInterval, e.g. "5m". When set and
-	// VectorIndexSnapshotPath is non-empty, the index serializes its state
-	// to disk on this cadence. "0" / empty disables periodic writes (a
-	// final snapshot still fires on graceful shutdown). Default "5m".
-	VectorIndexSnapshotInterval string
-
 	// LogFTSEnabled toggles SQLite FTS5 provisioning + querying. The FTS5
 	// inverted index typically consumes 30-40% of SQLite DB disk for
 	// log-heavy workloads, while the LIKE fallback (log_repo.go:105) keeps
@@ -301,11 +286,6 @@ func Load(customPath string) (*Config, error) {
 
 		// Compression
 		CompressionLevel: getEnv("COMPRESSION_LEVEL", "default"),
-
-		// Vector
-		VectorIndexMaxEntries:       getEnvInt("VECTOR_INDEX_MAX_ENTRIES", 100000),
-		VectorIndexSnapshotPath:     getEnv("VECTOR_INDEX_SNAPSHOT_PATH", "data/vectordb.snapshot"),
-		VectorIndexSnapshotInterval: getEnv("VECTOR_INDEX_SNAPSHOT_INTERVAL", "5m"),
 
 		// Log search FTS5 toggle (SQLite only). Default off — see field comment.
 		LogFTSEnabled: parseTruthy(getEnv("LOG_FTS_ENABLED", "")),

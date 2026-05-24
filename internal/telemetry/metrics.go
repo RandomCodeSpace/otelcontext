@@ -127,26 +127,6 @@ type Metrics struct {
 	// --- Dashboard p99 (Task 10) ---
 	DashboardP99RowCapHitsTotal prometheus.Counter
 
-	// --- Vectordb persistence ---
-	// VectorSnapshotWritesTotal counts snapshot write attempts, labeled
-	// {result=success|failure}. Alert on rate(failure[10m]) > 0.
-	VectorSnapshotWritesTotal *prometheus.CounterVec
-	// VectorSnapshotDurationSeconds is the WriteSnapshot wall-clock
-	// duration. Histogram so operators can SLO p95 / p99.
-	VectorSnapshotDurationSeconds prometheus.Histogram
-	// VectorSnapshotSizeBytes gauges the on-disk size of the latest
-	// successful snapshot. Sudden growth signals a maxSize bump or a
-	// schema change worth investigating.
-	VectorSnapshotSizeBytes prometheus.Gauge
-	// VectorSnapshotLoadTotal counts startup snapshot loads, labeled
-	// {result=success|missing|corrupt}. corrupt = magic/version/crc/decode
-	// failure — caller falls back to a full DB rebuild.
-	VectorSnapshotLoadTotal *prometheus.CounterVec
-	// VectorReplayLogsTotal accumulates rows processed by ReplayFromDB
-	// across the daemon's lifetime. The rate spikes only at startup
-	// (catching the snapshot→now gap), then stays flat.
-	VectorReplayLogsTotal prometheus.Counter
-
 	// Atomic counters for JSON health endpoint (avoids scraping Prometheus)
 	totalIngested  atomic.Int64
 	activeConns    atomic.Int64
@@ -391,62 +371,7 @@ func New() *Metrics {
 		Name: "otelcontext_dashboard_p99_row_cap_hits_total",
 		Help: "Number of dashboard p99 computations that hit the SQLite row cap (200k). Indicates the dataset is too large for in-memory p99 — use Postgres for prod.",
 	})
-	m.VectorSnapshotWritesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "otelcontext_vectordb_snapshot_writes_total",
-		Help: "Vectordb snapshot write attempts by result (success|failure). Alert on rate(...{result=\"failure\"}[10m]) > 0.",
-	}, []string{"result"})
-	m.VectorSnapshotDurationSeconds = promauto.NewHistogram(prometheus.HistogramOpts{
-		Name:    "otelcontext_vectordb_snapshot_duration_seconds",
-		Help:    "Wall-clock duration of WriteSnapshot, including encode + atomic rename.",
-		Buckets: []float64{.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5},
-	})
-	m.VectorSnapshotSizeBytes = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "otelcontext_vectordb_snapshot_size_bytes",
-		Help: "On-disk size of the latest successful vectordb snapshot.",
-	})
-	m.VectorSnapshotLoadTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "otelcontext_vectordb_snapshot_load_total",
-		Help: "Vectordb snapshot load attempts at startup by result (success|missing|corrupt).",
-	}, []string{"result"})
-	m.VectorReplayLogsTotal = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "otelcontext_vectordb_replay_logs_total",
-		Help: "Total log rows processed by vectordb ReplayFromDB across the daemon's lifetime.",
-	})
 	return m
-}
-
-// RecordVectorSnapshotWrite is the observer hook the vectordb snapshot
-// path calls after each WriteSnapshot attempt. result is "success" or
-// "failure"; size is the on-disk byte count after a successful rename
-// (zero on failure).
-func (m *Metrics) RecordVectorSnapshotWrite(result string, duration time.Duration, size int64) {
-	if m == nil || m.VectorSnapshotWritesTotal == nil {
-		return
-	}
-	m.VectorSnapshotWritesTotal.WithLabelValues(result).Inc()
-	m.VectorSnapshotDurationSeconds.Observe(duration.Seconds())
-	if result == "success" && size > 0 {
-		m.VectorSnapshotSizeBytes.Set(float64(size))
-	}
-}
-
-// RecordVectorSnapshotLoad is the observer hook for startup snapshot
-// loads. result is "success", "missing" (first start, no prior file),
-// or "corrupt" (any decode/CRC/version error → full rebuild fallback).
-func (m *Metrics) RecordVectorSnapshotLoad(result string) {
-	if m == nil || m.VectorSnapshotLoadTotal == nil {
-		return
-	}
-	m.VectorSnapshotLoadTotal.WithLabelValues(result).Inc()
-}
-
-// RecordVectorReplayLogs adds rows processed by ReplayFromDB to the
-// lifetime counter. Called once after the startup tail-replay completes.
-func (m *Metrics) RecordVectorReplayLogs(count int) {
-	if m == nil || m.VectorReplayLogsTotal == nil || count <= 0 {
-		return
-	}
-	m.VectorReplayLogsTotal.Add(float64(count))
 }
 
 // StartRuntimeMetrics samples Go runtime stats every 15 seconds.
