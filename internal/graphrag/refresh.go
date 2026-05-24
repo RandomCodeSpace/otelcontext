@@ -49,7 +49,14 @@ func (g *GraphRAG) refreshLoop(ctx context.Context) {
 	}
 }
 
-// snapshotLoop takes periodic snapshots and prunes old ones.
+// snapshotLoop persists Drain templates on the configured cadence so a
+// restart recovers the learned templates instead of rebuilding from scratch.
+//
+// Historically this loop also captured a periodic GraphSnapshot row into
+// the `graph_snapshots` table and pruned aged-out snapshots; both were
+// removed on 2026-05-24 alongside the get_graph_snapshot MCP tool. The
+// `snapshotLoop` / `snapshotEvery` names are retained for wiring stability
+// — callers still tune the persistence cadence via `Config.SnapshotEvery`.
 func (g *GraphRAG) snapshotLoop(ctx context.Context) {
 	ticker := time.NewTicker(g.snapshotEvery)
 	defer ticker.Stop()
@@ -60,8 +67,6 @@ func (g *GraphRAG) snapshotLoop(ctx context.Context) {
 		case <-g.stopCh:
 			return
 		case <-ticker.C:
-			g.takeSnapshot(ctx)
-			g.pruneOldSnapshots()
 			g.persistDrainTemplates()
 		}
 	}

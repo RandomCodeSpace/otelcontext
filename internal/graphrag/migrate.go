@@ -30,9 +30,13 @@ import (
 	"gorm.io/gorm"
 )
 
-// graphRAGTables are the three persisted tables that carry tenant_id after
+// graphRAGTables are the persisted tables that carry tenant_id after
 // RAN-38. Order matches AutoMigrate order so log lines line up.
-var graphRAGTables = []string{"investigations", "graph_snapshots", "drain_templates"}
+//
+// `graph_snapshots` was dropped from the AutoMigrate slice on 2026-05-24;
+// existing tables are left in place on operator databases (drop manually
+// with `DROP TABLE graph_snapshots` to reclaim disk).
+var graphRAGTables = []string{"investigations", "drain_templates"}
 
 // AutoMigrateGraphRAG runs GORM auto-migration for GraphRAG models and
 // applies tenant backfill + drain_templates composite-PK promotion. Safe to
@@ -41,7 +45,7 @@ func AutoMigrateGraphRAG(db *gorm.DB) error {
 	if db == nil {
 		return nil
 	}
-	if err := db.AutoMigrate(&Investigation{}, &GraphSnapshot{}, &DrainTemplateRow{}); err != nil {
+	if err := db.AutoMigrate(&Investigation{}, &DrainTemplateRow{}); err != nil {
 		return fmt.Errorf("graphrag automigrate: %w", err)
 	}
 	if err := backfillTenantIDs(db); err != nil {

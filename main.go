@@ -379,7 +379,7 @@ func main() {
 		"event_queue_size", cfg.GraphRAGEventQueueSize,
 	)
 
-	// Auto-migrate GraphRAG models (Investigation, GraphSnapshot)
+	// Auto-migrate GraphRAG models (Investigation, DrainTemplateRow)
 	if err := graphrag.AutoMigrateGraphRAG(repo.DB()); err != nil {
 		slog.Error("Failed to migrate GraphRAG models", "error", err)
 	}

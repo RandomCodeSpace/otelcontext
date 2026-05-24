@@ -2,7 +2,6 @@ package graphrag
 
 import (
 	"context"
-	"strings"
 	"testing"
 	"time"
 
@@ -50,7 +49,6 @@ func TestAutoMigrateGraphRAG_CreatesTenantCompositeIndexes(t *testing.T) {
 		index string
 	}{
 		{"investigations", "idx_investigations_tenant_created"},
-		{"graph_snapshots", "idx_graph_snapshots_tenant_created"},
 	}
 	for _, tc := range expected {
 		var count int
@@ -115,15 +113,12 @@ func TestAutoMigrateGraphRAG_BackfillsLegacyRows(t *testing.T) {
 	if err := AutoMigrateGraphRAG(db); err != nil {
 		t.Fatalf("first migrate: %v", err)
 	}
-	// Insert rows with empty tenant_id directly via raw SQL — Investigation,
-	// GraphSnapshot and DrainTemplateRow's GORM defaults would otherwise fill
-	// the column on insert.
+	// Insert rows with empty tenant_id directly via raw SQL — Investigation and
+	// DrainTemplateRow's GORM defaults would otherwise fill the column on
+	// insert.
 	now := time.Now().UTC()
 	if err := db.Exec(`INSERT INTO investigations (tenant_id, id, created_at, status, severity, trigger_service, trigger_operation, error_message, root_service, root_operation, causal_chain, trace_ids, error_logs, anomalous_metrics, affected_services, span_chain) VALUES ('', 'inv_legacy', ?, 'detected', 'warning', 'svc', 'op', 'boom', 'svc', 'op', '[]', '[]', '[]', '[]', '[]', '[]')`, now).Error; err != nil {
 		t.Fatalf("seed legacy investigation: %v", err)
-	}
-	if err := db.Exec(`INSERT INTO graph_snapshots (tenant_id, id, created_at, nodes, edges, service_count, total_calls, avg_health_score) VALUES ('', 'snap_legacy', ?, '[]', '[]', 0, 0, 0)`, now).Error; err != nil {
-		t.Fatalf("seed legacy snapshot: %v", err)
 	}
 	// Drain rows: tenant_id is part of the PK so we must give it *something*
 	// — empty string is allowed by SQLite. The backfill is expected to fix it.
@@ -138,7 +133,7 @@ func TestAutoMigrateGraphRAG_BackfillsLegacyRows(t *testing.T) {
 
 	for _, tbl := range graphRAGTables {
 		var stragglers int
-		if err := db.Raw(`SELECT COUNT(*) FROM `+tbl+` WHERE tenant_id IS NULL OR tenant_id = ''`).Scan(&stragglers).Error; err != nil {
+		if err := db.Raw(`SELECT COUNT(*) FROM ` + tbl + ` WHERE tenant_id IS NULL OR tenant_id = ''`).Scan(&stragglers).Error; err != nil {
 			t.Fatalf("count empty tenant in %s: %v", tbl, err)
 		}
 		if stragglers != 0 {
@@ -256,42 +251,5 @@ func TestGraphRAG_GetInvestigations_TenantScoped(t *testing.T) {
 	}
 	if got.TenantID != "globex" {
 		t.Errorf("expected globex row; got tenant=%q", got.TenantID)
-	}
-}
-
-// TestGraphRAG_GetGraphSnapshot_TenantScoped seeds two snapshots (one per
-// tenant) at the same instant and asserts each tenant only retrieves its own.
-func TestGraphRAG_GetGraphSnapshot_TenantScoped(t *testing.T) {
-	g, db := newTestGraphRAGWithDB(t)
-	if err := AutoMigrateGraphRAG(db); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	now := time.Now().UTC()
-	for _, tenant := range []string{"acme", "globex"} {
-		snap := GraphSnapshot{
-			TenantID:       tenant,
-			ID:             "snap_" + tenant,
-			CreatedAt:      now,
-			Nodes:          []byte(`[]`),
-			Edges:          []byte(`[]`),
-			ServiceCount:   1,
-			AvgHealthScore: 1,
-		}
-		if err := db.Create(&snap).Error; err != nil {
-			t.Fatalf("seed %s: %v", tenant, err)
-		}
-	}
-	for _, tenant := range []string{"acme", "globex"} {
-		ctx := storage.WithTenantContext(context.Background(), tenant)
-		snap, err := g.GetGraphSnapshot(ctx, now.Add(time.Second))
-		if err != nil {
-			t.Fatalf("get %s: %v", tenant, err)
-		}
-		if snap.TenantID != tenant {
-			t.Errorf("ctx %s returned snapshot for tenant %q", tenant, snap.TenantID)
-		}
-		if !strings.HasSuffix(snap.ID, tenant) {
-			t.Errorf("ctx %s returned snapshot id %s", tenant, snap.ID)
-		}
 	}
 }
