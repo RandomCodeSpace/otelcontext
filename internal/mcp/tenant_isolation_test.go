@@ -19,7 +19,6 @@ import (
 
 	"github.com/RandomCodeSpace/otelcontext/internal/graphrag"
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
-	"github.com/RandomCodeSpace/otelcontext/internal/vectordb"
 )
 
 // tenants exercised by the test. The third row uses an empty header to
@@ -67,7 +66,7 @@ func markersFor(scoped string, others []string) (own []string, leak []string) {
 // snapshot, and anomaly loops are stretched to "never" inside the test
 // window so the only state that lands in the stores is the data the test
 // seeds explicitly — making leak assertions deterministic.
-func setupTenantIsolationServer(t *testing.T) (*httptest.Server, *graphrag.GraphRAG, *storage.Repository, *vectordb.Index) {
+func setupTenantIsolationServer(t *testing.T) (*httptest.Server, *graphrag.GraphRAG, *storage.Repository) {
 	t.Helper()
 
 	db, err := storage.NewDatabase("sqlite", ":memory:")
@@ -82,19 +81,17 @@ func setupTenantIsolationServer(t *testing.T) (*httptest.Server, *graphrag.Graph
 	}
 	repo := storage.NewRepositoryFromDB(db, "sqlite")
 
-	vIdx := vectordb.New(1000)
-
 	cfg := graphrag.DefaultConfig()
 	cfg.RefreshEvery = 24 * time.Hour
 	cfg.SnapshotEvery = 24 * time.Hour
 	cfg.AnomalyEvery = 24 * time.Hour
 	cfg.WorkerCount = 4
 
-	g := graphrag.New(repo, vIdx, nil, nil, cfg)
+	g := graphrag.New(repo, nil, nil, cfg)
 	bgCtx, cancel := context.WithCancel(context.Background())
 	go g.Start(bgCtx)
 
-	srv := New("", repo, nil, nil, vIdx)
+	srv := New("", repo, nil, nil)
 	srv.SetGraphRAG(g)
 
 	httpSrv := httptest.NewServer(srv.Handler())
@@ -106,16 +103,19 @@ func setupTenantIsolationServer(t *testing.T) (*httptest.Server, *graphrag.Graph
 		_ = repo.Close()
 	})
 
-	return httpSrv, g, repo, vIdx
+	return httpSrv, g, repo
 }
 
 // seedTenant ingests a small but representative slice of telemetry for
 // tenant T: a parent OK span, a child ERROR span, a matching ERROR log,
-// a vector-index doc, an injected anomaly, a persisted investigation,
-// and a graph snapshot row. All identifiers (trace_id, span_id) collide
+// and an injected anomaly. All identifiers (trace_id, span_id) collide
 // across tenants on purpose — the tenant slice is the only thing keeping
 // them apart.
-func seedTenant(t *testing.T, g *graphrag.GraphRAG, repo *storage.Repository, vIdx *vectordb.Index, tenant string, ts time.Time) {
+//
+// repo is accepted but currently unused; future tests may seed DB rows
+// directly. It is preserved so callers can switch back to DB-shaped
+// seeding without a signature change.
+func seedTenant(t *testing.T, g *graphrag.GraphRAG, _ *storage.Repository, _ any, tenant string, ts time.Time) {
 	t.Helper()
 
 	service := tenant + "-orders"
@@ -153,8 +153,8 @@ func seedTenant(t *testing.T, g *graphrag.GraphRAG, repo *storage.Repository, vI
 		Duration:      1000,
 	})
 
-	// Log carrying the per-tenant marker — drives Drain clustering and
-	// CorrelatedSignals; the body is also stored in the vector index.
+	// Log carrying the per-tenant marker — drives Drain clustering and the
+	// LogClusterNode side-effect that CorrelatedSignals would consume.
 	g.OnLogIngested(storage.Log{
 		TenantID:    tenant,
 		TraceID:     traceID,
@@ -164,9 +164,6 @@ func seedTenant(t *testing.T, g *graphrag.GraphRAG, repo *storage.Repository, vI
 		Body:        logBody,
 		Timestamp:   ts.Add(2 * time.Millisecond),
 	})
-
-	// Vector index doc — find_similar_logs path is keyed by tenant.
-	vIdx.Add(0, tenant, service, "ERROR", logBody)
 
 	// Inject a per-tenant anomaly directly so AnomalyTimeline has
 	// something to return without depending on the anomaly detector
@@ -179,21 +176,6 @@ func seedTenant(t *testing.T, g *graphrag.GraphRAG, repo *storage.Repository, vI
 		Evidence:  tenant + "-anomaly-marker error_rate=0.95",
 		Timestamp: ts.Add(3 * time.Millisecond),
 	})
-
-	// Snapshot row — insert directly so we control the tenant_id and ID
-	// (takeSnapshot is the production loop, but it is package-private).
-	snap := graphrag.GraphSnapshot{
-		TenantID:       tenant,
-		ID:             "snap-" + tenant,
-		CreatedAt:      ts,
-		Nodes:          json.RawMessage(`[{"name":"` + service + `","marker":"` + tenant + `-marker"}]`),
-		Edges:          json.RawMessage(`[]`),
-		ServiceCount:   1,
-		AvgHealthScore: 0.5,
-	}
-	if err := repo.DB().Create(&snap).Error; err != nil {
-		t.Fatalf("seed snapshot for %q: %v", tenant, err)
-	}
 }
 
 // waitForServiceMaps polls until every seeded tenant's ServiceMap reflects
@@ -216,35 +198,6 @@ func waitForServiceMaps(t *testing.T, g *graphrag.GraphRAG, tenants []string) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for ServiceMap to reflect ingested spans for %v", tenants)
-}
-
-// seedInvestigations relies on the in-memory state already being warm
-// (see waitForServiceMaps). PersistInvestigation reaches into ImpactAnalysis
-// internally, which reads from the per-tenant ServiceStore.
-func seedInvestigations(t *testing.T, g *graphrag.GraphRAG, ts time.Time) {
-	t.Helper()
-	for _, tenant := range allTenants {
-		service := tenant + "-orders"
-		chain := graphrag.ErrorChainResult{
-			RootCause: &graphrag.RootCauseInfo{
-				Service:      service,
-				Operation:    tenant + "-op-checkout",
-				ErrorMessage: tenant + "-marker connection refused upstream",
-				SpanID:       "span-child",
-				TraceID:      "trace-shared",
-			},
-			SpanChain: []graphrag.SpanNode{{
-				ID:        "span-child",
-				TraceID:   "trace-shared",
-				Service:   service,
-				Operation: tenant + "-op-checkout",
-				IsError:   true,
-				Timestamp: ts,
-			}},
-			TraceID: "trace-shared",
-		}
-		g.PersistInvestigation(tenant, service, []graphrag.ErrorChainResult{chain}, nil)
-	}
 }
 
 // callTool sends a JSON-RPC tools/call request to the test MCP server
@@ -337,42 +290,21 @@ func truncate(s string) string {
 	return s[:max] + "…(truncated)"
 }
 
-// TestMCP_TenantIsolation_AllGraphRAGTools is the merge gate for RAN-19.
-// For every GraphRAG-backed (and GraphRAG-rewired) MCP tool, it issues
-// the same call from three callers — X-Tenant-ID: acme, X-Tenant-ID: beta,
-// no header — against overlapping seeded data and asserts each response
-// contains only the caller-tenant's data and never leaks another tenant's
-// service name, log marker, operation, anomaly, or snapshot row.
+// TestMCP_TenantIsolation_AllGraphRAGTools is the merge gate for the 7-tool
+// triage MCP surface (post-2026-05-24 reduction). For every kept tool, it
+// issues the same call from three callers — X-Tenant-ID: acme,
+// X-Tenant-ID: beta, no header — against overlapping seeded data and
+// asserts each response contains only the caller-tenant's data and never
+// leaks another tenant's service name, log marker, operation, or anomaly.
 func TestMCP_TenantIsolation_AllGraphRAGTools(t *testing.T) {
-	ts, g, repo, vIdx := setupTenantIsolationServer(t)
+	ts, g, repo := setupTenantIsolationServer(t)
 
 	now := time.Now().Add(-time.Minute) // a hair in the past so since=now-15m sees us
 
 	for _, tenant := range allTenants {
-		seedTenant(t, g, repo, vIdx, tenant, now)
+		seedTenant(t, g, repo, nil, tenant, now)
 	}
 	waitForServiceMaps(t, g, allTenants)
-	seedInvestigations(t, g, now)
-
-	// Resolve investigation IDs per tenant (PersistInvestigation generates
-	// them internally; we discover them by querying after the fact, then
-	// hand them back into get_investigation in the per-caller assertions).
-	invIDsByTenant := map[string]string{}
-	for _, tenant := range allTenants {
-		ctx := storage.WithTenantContext(context.Background(), tenant)
-		invs, err := g.GetInvestigations(ctx, "", "", "", 10)
-		if err != nil {
-			t.Fatalf("GetInvestigations(%s): %v", tenant, err)
-		}
-		if len(invs) == 0 {
-			t.Fatalf("expected at least one persisted investigation for %s, got 0", tenant)
-		}
-		invIDsByTenant[tenant] = invs[0].ID
-	}
-
-	// snapshot lookup time — slightly in the future so "<= at" matches every
-	// seeded row regardless of microsecond drift.
-	snapAt := time.Now().Add(time.Minute).UTC().Format(time.RFC3339)
 
 	for _, caller := range isolationCallers {
 		caller := caller
@@ -385,6 +317,7 @@ func TestMCP_TenantIsolation_AllGraphRAGTools(t *testing.T) {
 		ownLogMarker := caller.scoped + "-marker"
 		ownAnomalyMarker := caller.scoped + "-anomaly-marker"
 		_ = ownMarkers
+		_ = ownLogMarker
 
 		// --- in-memory GraphRAG tools ---
 
@@ -398,15 +331,6 @@ func TestMCP_TenantIsolation_AllGraphRAGTools(t *testing.T) {
 				"service_name": ownService,
 			})
 			assertNoLeak(t, "get_service_health", body, ownService, leakMarkers)
-		})
-
-		t.Run(caller.name+"/get_error_chains", func(t *testing.T) {
-			_, body := callTool(t, ts, caller.header, "get_error_chains", map[string]any{
-				"service":    ownService,
-				"time_range": "1h",
-				"limit":      10,
-			})
-			assertNoLeak(t, "get_error_chains", body, ownService, leakMarkers)
 		})
 
 		t.Run(caller.name+"/trace_graph", func(t *testing.T) {
@@ -438,74 +362,11 @@ func TestMCP_TenantIsolation_AllGraphRAGTools(t *testing.T) {
 			assertNoLeak(t, "root_cause_analysis", body, ownService, leakMarkers)
 		})
 
-		t.Run(caller.name+"/correlated_signals", func(t *testing.T) {
-			_, body := callTool(t, ts, caller.header, "correlated_signals", map[string]any{
-				"service":    ownService,
-				"time_range": "1h",
-			})
-			// CorrelatedSignals collects logs/metrics for the service, so the
-			// per-tenant log marker should appear.
-			assertNoLeak(t, "correlated_signals", body, ownLogMarker, leakMarkers)
-		})
-
 		t.Run(caller.name+"/get_anomaly_timeline", func(t *testing.T) {
 			_, body := callTool(t, ts, caller.header, "get_anomaly_timeline", nil)
 			assertNoLeak(t, "get_anomaly_timeline", body, ownAnomalyMarker, leakMarkers)
 		})
 
-		// --- DB-backed GraphRAG tools ---
-
-		t.Run(caller.name+"/get_investigations", func(t *testing.T) {
-			_, body := callTool(t, ts, caller.header, "get_investigations", nil)
-			assertNoLeak(t, "get_investigations", body, ownService, leakMarkers)
-		})
-
-		t.Run(caller.name+"/get_investigation_by_id_own_tenant", func(t *testing.T) {
-			_, body := callTool(t, ts, caller.header, "get_investigation", map[string]any{
-				"investigation_id": invIDsByTenant[caller.scoped],
-			})
-			assertNoLeak(t, "get_investigation/own", body, ownService, leakMarkers)
-		})
-
-		t.Run(caller.name+"/get_investigation_by_id_other_tenant_blocks", func(t *testing.T) {
-			// Asking by another tenant's ID must NOT return that row — id-
-			// guessing would otherwise leak across tenants. The handler
-			// surfaces a tool-level error result, which is fine; what
-			// matters is that the foreign tenant's data does not appear.
-			otherTenant := caller.otherSeeded[0]
-			_, body := callTool(t, ts, caller.header, "get_investigation", map[string]any{
-				"investigation_id": invIDsByTenant[otherTenant],
-			})
-			assertNoLeak(t, "get_investigation/cross-tenant", body, "", leakMarkers)
-		})
-
-		t.Run(caller.name+"/get_graph_snapshot", func(t *testing.T) {
-			_, body := callTool(t, ts, caller.header, "get_graph_snapshot", map[string]any{
-				"time": snapAt,
-			})
-			// Snapshot rows are tagged with the tenant marker so the leak
-			// scan covers both ID prefixes (snap-acme/snap-beta/snap-default)
-			// and the inline node markers.
-			assertNoLeak(t, "get_graph_snapshot", body, "snap-"+caller.scoped, leakMarkers)
-		})
-
-		// --- vectordb-backed tool (Drain path is exercised by ingestion above) ---
-
-		t.Run(caller.name+"/find_similar_logs", func(t *testing.T) {
-			_, body := callTool(t, ts, caller.header, "find_similar_logs", map[string]any{
-				"query": "connection refused upstream",
-				"limit": 10,
-			})
-			assertNoLeak(t, "find_similar_logs", body, ownLogMarker, leakMarkers)
-		})
-
-		// --- Legacy/rewired surface ---
-		// get_system_graph is rewired onto GraphRAG by RAN-39, so the same
-		// per-tenant invariants apply.
-		t.Run(caller.name+"/get_system_graph", func(t *testing.T) {
-			_, body := callTool(t, ts, caller.header, "get_system_graph", nil)
-			assertNoLeak(t, "get_system_graph", body, ownService, leakMarkers)
-		})
 	}
 }
 
@@ -518,7 +379,7 @@ func TestMCP_TenantIsolation_AllGraphRAGTools(t *testing.T) {
 // CorrelatedSignals (not just the response text) and asserts each tenant
 // only ever sees rows tagged with its own marker.
 func TestMCP_TenantIsolation_DrainClusterIDsStayPerTenant(t *testing.T) {
-	ts, g, _, _ := setupTenantIsolationServer(t)
+	ts, g, _ := setupTenantIsolationServer(t)
 	now := time.Now().Add(-time.Minute)
 
 	// Identical service AND identical log template across tenants — Drain
@@ -605,23 +466,11 @@ func TestMCP_TenantIsolation_DrainClusterIDsStayPerTenant(t *testing.T) {
 	// the assertion above.
 	t.Logf("drain cluster IDs: acme=%v beta=%v", idsA, idsB)
 
-	// End-to-end probe: the same isolation must hold via the MCP HTTP
-	// surface, not just the in-process API.
-	for _, scoped := range []string{"acme", "beta"} {
-		_, body := callTool(t, ts, scoped, "correlated_signals", map[string]any{
-			"service":    sharedService,
-			"time_range": "1h",
-		})
-		other := "beta"
-		if scoped == "beta" {
-			other = "acme"
-		}
-		if !strings.Contains(body, scoped+"-marker") {
-			t.Errorf("%s correlated_signals (HTTP) missing own marker, body=%s", scoped, truncate(body))
-		}
-		if strings.Contains(body, other+"-marker") {
-			t.Errorf("%s correlated_signals (HTTP) leaked %s marker, body=%s", scoped, other, truncate(body))
-		}
-	}
+	// Note: the legacy end-to-end probe used the `correlated_signals` MCP
+	// tool to assert the same isolation across the HTTP transport. That
+	// tool was cut on 2026-05-24 alongside 13 others; the in-process
+	// CorrelatedSignals invariant above is still the truth-test for Drain
+	// + SignalStore tenant partitioning. The 7-tool MCP transport invariant
+	// for the kept tools is covered by TestMCP_TenantIsolation_AllGraphRAGTools.
+	_ = ts
 }
-

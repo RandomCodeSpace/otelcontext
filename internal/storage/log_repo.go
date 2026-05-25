@@ -206,61 +206,6 @@ func (r *Repository) UpdateLogInsight(ctx context.Context, logID uint, insight s
 	return nil
 }
 
-// LogsForVectorReplay returns ERROR/WARN-family logs with id > sinceID,
-// page-bounded by limit and ordered by id ASC. Used at startup by the
-// vector-index tail-replay path to pick up DB rows inserted after the last
-// snapshot. The id-ascending order lets the caller use the last row's id
-// as the next page's sinceID — clean cursor pagination, no offset cost.
-//
-// Cross-tenant by design: vectordb is a global index with per-doc tenant
-// tags enforced at Search time. Not exposed on any tenant-scoped API.
-//
-// Severity filter is intentionally narrow (ERROR / WARN / WARNING / FATAL /
-// CRITICAL) so non-indexed rows don't waste page space; this matches
-// vectordb.shouldIndex().
-func (r *Repository) LogsForVectorReplay(ctx context.Context, sinceID uint, limit int) ([]Log, error) {
-	if limit <= 0 || limit > 100_000 {
-		limit = 10_000
-	}
-	var logs []Log
-	err := r.db.WithContext(ctx).
-		Where("id > ? AND severity IN ?", sinceID, []string{"ERROR", "WARN", "WARNING", "FATAL", "CRITICAL"}).
-		Order("id ASC").
-		Limit(limit).
-		Find(&logs).Error
-	if err != nil {
-		return nil, fmt.Errorf("logs for vector replay: %w", err)
-	}
-	return logs, nil
-}
-
-// ListRecentHighSeverityLogsAllTenants returns recent logs of the given
-// severity across EVERY tenant, each row carrying its own TenantID. This is an
-// administrative read used exclusively by the vector index's startup
-// hydration path, which fans rows out to per-tenant shards. It is not exposed
-// on any tenant-scoped API surface — tenant isolation for read paths must
-// otherwise be preserved via the context-driven WHERE clause.
-func (r *Repository) ListRecentHighSeverityLogsAllTenants(ctx context.Context, severity string, since, until time.Time, limit int) ([]Log, error) {
-	if limit <= 0 {
-		limit = 5000
-	}
-	q := r.db.WithContext(ctx).Model(&Log{})
-	if severity != "" {
-		q = q.Where(sqlWhereSeverity, severity)
-	}
-	if !since.IsZero() {
-		q = q.Where(sqlWhereTimestampGTE, since)
-	}
-	if !until.IsZero() {
-		q = q.Where(sqlWhereTimestampLTE, until)
-	}
-	var logs []Log
-	if err := q.Order(sqlOrderTimestampDesc).Limit(limit).Find(&logs).Error; err != nil {
-		return nil, fmt.Errorf("failed to list recent logs all tenants: %w", err)
-	}
-	return logs, nil
-}
-
 // PurgeLogs deletes logs older than the given timestamp in a single statement.
 // Suitable for SQLite; for Postgres at large retention volumes prefer PurgeLogsBatched.
 func (r *Repository) PurgeLogs(olderThan time.Time) (int64, error) {

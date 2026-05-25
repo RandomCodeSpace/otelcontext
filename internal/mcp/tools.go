@@ -12,252 +12,81 @@ import (
 )
 
 const (
-	errSvcGraphNotInit = "service graph not yet initialized"
 	errGraphRAGNotInit = "GraphRAG not initialized"
 	errServiceRequired = "service is required"
 	resourceURIPrefix  = "OtelContext://"
 )
 
-// toolDefs is the canonical list of all tools exposed by the OtelContext MCP server.
+// toolDefs is the canonical list of triage-essential tools exposed by the
+// OtelContext MCP server. The surface was reduced from 21 to 7 in
+// 2026-05-24 so the platform survives 120 services on SQLite — see
+// docs/superpowers/specs/2026-05-24-mcp-7tool-sqlite-survival-design.md.
+// schemaOpt mutates an InputSchema being built by mkTool. Use param(...) and
+// required(...) to compose schemas without re-typing the InputSchema /
+// Properties scaffolding on every tool definition.
+type schemaOpt func(*InputSchema)
+
+// param adds a single Property to the schema. Type is "string" or "number".
+func param(name, typ, desc string) schemaOpt {
+	return func(s *InputSchema) {
+		s.Properties[name] = Property{Type: typ, Description: desc}
+	}
+}
+
+// required marks one or more parameter names as required by JSON-schema.
+func required(fields ...string) schemaOpt {
+	return func(s *InputSchema) { s.Required = append(s.Required, fields...) }
+}
+
+// mkTool builds a Tool with a freshly-initialised InputSchema. Centralising
+// the InputSchema/Properties scaffolding here keeps the toolDefs list one
+// call per tool and avoids the repeated struct-literal boilerplate that
+// SonarCloud (rightly) flagged as duplication.
+func mkTool(name, desc string, opts ...schemaOpt) Tool {
+	s := InputSchema{Type: "object", Properties: map[string]Property{}}
+	for _, opt := range opts {
+		opt(&s)
+	}
+	return Tool{Name: name, Description: desc, InputSchema: s}
+}
+
 var toolDefs = []Tool{
-	{
-		Name:        "get_system_graph",
-		Description: "Returns the full service topology with health scores (0-1), error rates, latencies, and dependency edges. Use this to understand overall system health.",
-		InputSchema: InputSchema{
-			Type: "object",
-			Properties: map[string]Property{
-				"time_range": {Type: "string", Description: "Lookback window, e.g. '1h', '30m'. Defaults to '1h'."},
-			},
-		},
-	},
-	{
-		Name:        "get_service_health",
-		Description: "Returns detailed health metrics for a specific service: error rate, latency percentiles, request rate, and active alerts.",
-		InputSchema: InputSchema{
-			Type:     "object",
-			Required: []string{"service_name"},
-			Properties: map[string]Property{
-				"service_name": {Type: "string", Description: "The service name to query."},
-			},
-		},
-	},
-	{
-		Name:        "search_logs",
-		Description: "Searches log entries by severity, service, body text, trace ID, and time range. Returns id, timestamp, severity, service_name, body, trace_id. **Limited to the last 24 hours** — windows entirely outside the 24h cap are rejected. Strongly recommend setting `service` and/or `severity` to scope the search; unscoped keyword queries scan large row counts when FTS5 is disabled (the default). Use severity=ERROR to find errors, query= for full-text search, trace_id= to correlate with a trace. Use page= for pagination.",
-		InputSchema: InputSchema{
-			Type: "object",
-			Properties: map[string]Property{
-				"query":    {Type: "string", Description: "Full-text search in log body."},
-				"severity": {Type: "string", Description: "Filter by severity level: ERROR, WARN, INFO, DEBUG."},
-				"service":  {Type: "string", Description: "Filter by service name (exact match)."},
-				"trace_id": {Type: "string", Description: "Filter logs belonging to a specific trace ID."},
-				"start":    {Type: "string", Description: "Start time RFC3339. Defaults to 24h ago. Cannot be earlier than now-24h; older values are clamped."},
-				"end":      {Type: "string", Description: "End time RFC3339. Defaults to now. Cannot exceed now; future values are clamped."},
-				"limit":    {Type: "number", Description: "Max results per page (default 50, max 200)."},
-				"page":     {Type: "number", Description: "Page number for pagination (default 0)."},
-			},
-		},
-	},
-	{
-		Name:        "tail_logs",
-		Description: "Returns the N most recent log entries, optionally filtered by service and/or severity. No time range needed — fastest way to see what's happening right now.",
-		InputSchema: InputSchema{
-			Type: "object",
-			Properties: map[string]Property{
-				"service":  {Type: "string", Description: "Filter by service name."},
-				"severity": {Type: "string", Description: "Filter by severity: ERROR, WARN, INFO, DEBUG."},
-				"limit":    {Type: "number", Description: "Number of recent entries to return (default 20, max 100)."},
-			},
-		},
-	},
-	{
-		Name:        "get_trace",
-		Description: "Returns full trace detail with all spans for a given trace ID.",
-		InputSchema: InputSchema{
-			Type:     "object",
-			Required: []string{"trace_id"},
-			Properties: map[string]Property{
-				"trace_id": {Type: "string", Description: "The trace ID to retrieve."},
-			},
-		},
-	},
-	{
-		Name:        "search_traces",
-		Description: "Searches traces by service, status code, minimum duration, and time range.",
-		InputSchema: InputSchema{
-			Type: "object",
-			Properties: map[string]Property{
-				"service":         {Type: "string", Description: "Filter by service name."},
-				"status":          {Type: "string", Description: "Filter by status: OK, ERROR."},
-				"min_duration_ms": {Type: "number", Description: "Minimum trace duration in ms."},
-				"start":           {Type: "string", Description: "Start time RFC3339."},
-				"end":             {Type: "string", Description: "End time RFC3339."},
-				"limit":           {Type: "number", Description: "Max results (default 20, max 100)."},
-			},
-		},
-	},
-	{
-		Name:        "get_metrics",
-		Description: "Queries metric time series for a given metric name and optional service.",
-		InputSchema: InputSchema{
-			Type: "object",
-			Properties: map[string]Property{
-				"name":    {Type: "string", Description: "Metric name to query."},
-				"service": {Type: "string", Description: "Filter by service name."},
-				"start":   {Type: "string", Description: "Start time RFC3339."},
-				"end":     {Type: "string", Description: "End time RFC3339."},
-			},
-		},
-	},
-	{
-		Name:        "get_dashboard_stats",
-		Description: "Returns dashboard summary: total requests, error rate, avg latency, ingestion rate, and per-service breakdown.",
-		InputSchema: InputSchema{
-			Type: "object",
-			Properties: map[string]Property{
-				"start": {Type: "string", Description: "Start time RFC3339. Defaults to 1h ago."},
-				"end":   {Type: "string", Description: "End time RFC3339. Defaults to now."},
-			},
-		},
-	},
-	{
-		Name:        "get_storage_status",
-		Description: "Returns hot DB size, DLQ size, and database health.",
-		InputSchema: InputSchema{Type: "object"},
-	},
-	{
-		Name:        "find_similar_logs",
-		Description: "Finds logs semantically similar to a query text using TF-IDF vector similarity. Useful for clustering errors and finding root causes.",
-		InputSchema: InputSchema{
-			Type: "object",
-			Properties: map[string]Property{
-				"query": {Type: "string", Description: "Text query to find similar logs."},
-				"limit": {Type: "number", Description: "Max results (default 10)."},
-			},
-		},
-	},
-	{
-		Name:        "get_alerts",
-		Description: "Returns active alerts and anomalies: services with high error rates, p99 latency spikes, and degraded health scores.",
-		InputSchema: InputSchema{Type: "object"},
-	},
-	{
-		Name:        "get_service_map",
-		Description: "Returns the service topology with health scores, error rates, call counts, and dependency edges. Powered by the live GraphRAG.",
-		InputSchema: InputSchema{
-			Type: "object",
-			Properties: map[string]Property{
-				"depth":   {Type: "number", Description: "Max traversal depth (default 3)."},
-				"service": {Type: "string", Description: "Focus on a specific service and its neighbors."},
-			},
-		},
-	},
-	{
-		Name:        "get_error_chains",
-		Description: "Traces recent error spans upstream to identify root cause services. Returns span path, root cause service/operation, and correlated error logs.",
-		InputSchema: InputSchema{
-			Type:     "object",
-			Required: []string{"service"},
-			Properties: map[string]Property{
-				"service":    {Type: "string", Description: "Service experiencing errors."},
-				"time_range": {Type: "string", Description: "Lookback window, e.g. '5m', '1h'. Defaults to '15m'."},
-				"limit":      {Type: "number", Description: "Max error chains to return (default 10)."},
-			},
-		},
-	},
-	{
-		Name:        "trace_graph",
-		Description: "Returns the full span tree for a trace with service names, durations, errors, and linked logs.",
-		InputSchema: InputSchema{
-			Type:     "object",
-			Required: []string{"trace_id"},
-			Properties: map[string]Property{
-				"trace_id": {Type: "string", Description: "The trace ID to visualize."},
-			},
-		},
-	},
-	{
-		Name:        "impact_analysis",
-		Description: "BFS downstream from a service to find all affected services and impact scores.",
-		InputSchema: InputSchema{
-			Type:     "object",
-			Required: []string{"service"},
-			Properties: map[string]Property{
-				"service": {Type: "string", Description: "Service to analyze blast radius for."},
-				"depth":   {Type: "number", Description: "Max traversal depth (default 5)."},
-			},
-		},
-	},
-	{
-		Name:        "root_cause_analysis",
-		Description: "Ranked probable root causes with evidence: error chains, anomalous metrics, correlated logs.",
-		InputSchema: InputSchema{
-			Type:     "object",
-			Required: []string{"service"},
-			Properties: map[string]Property{
-				"service":    {Type: "string", Description: "Service experiencing issues."},
-				"time_range": {Type: "string", Description: "Lookback window. Defaults to '15m'."},
-			},
-		},
-	},
-	{
-		Name:        "correlated_signals",
-		Description: "All related signals for a service: error logs, metric anomalies, traces, and investigations.",
-		InputSchema: InputSchema{
-			Type:     "object",
-			Required: []string{"service"},
-			Properties: map[string]Property{
-				"service":    {Type: "string", Description: "Service to gather signals for."},
-				"time_range": {Type: "string", Description: "Lookback window. Defaults to '1h'."},
-			},
-		},
-	},
-	{
-		Name:        "get_investigations",
-		Description: "Lists persisted investigation records from automated error analysis.",
-		InputSchema: InputSchema{
-			Type: "object",
-			Properties: map[string]Property{
-				"service":  {Type: "string", Description: "Filter by service."},
-				"severity": {Type: "string", Description: "Filter: critical, warning, info."},
-				"status":   {Type: "string", Description: "Filter: detected, triaged, resolved."},
-				"limit":    {Type: "number", Description: "Max results (default 20)."},
-			},
-		},
-	},
-	{
-		Name:        "get_investigation",
-		Description: "Returns a full investigation record with causal chain, evidence, and affected services.",
-		InputSchema: InputSchema{
-			Type:     "object",
-			Required: []string{"investigation_id"},
-			Properties: map[string]Property{
-				"investigation_id": {Type: "string", Description: "The investigation ID."},
-			},
-		},
-	},
-	{
-		Name:        "get_graph_snapshot",
-		Description: "Returns the historical service topology closest to the requested time.",
-		InputSchema: InputSchema{
-			Type:     "object",
-			Required: []string{"time"},
-			Properties: map[string]Property{
-				"time": {Type: "string", Description: "RFC3339 timestamp to query the snapshot for."},
-			},
-		},
-	},
-	{
-		Name:        "get_anomaly_timeline",
-		Description: "Returns recent anomalies with temporal causal links, optionally filtered by service.",
-		InputSchema: InputSchema{
-			Type: "object",
-			Properties: map[string]Property{
-				"since":   {Type: "string", Description: "Start time RFC3339. Defaults to 1h ago."},
-				"service": {Type: "string", Description: "Filter by service."},
-			},
-		},
-	},
+	mkTool("get_anomaly_timeline", "Returns recent anomalies with temporal causal links, optionally filtered by service. The triage entry point — answers \"what's wrong right now\".",
+		param("since", "string", "Start time RFC3339. Defaults to 1h ago."),
+		param("service", "string", "Filter by service."),
+	),
+	mkTool("get_service_map", "Returns the service topology with health scores, error rates, call counts, and dependency edges. Powered by the live GraphRAG.",
+		param("depth", "number", "Max traversal depth (default 3)."),
+		param("service", "string", "Focus on a specific service and its neighbors."),
+	),
+	mkTool("get_service_health", "Returns detailed health metrics for a specific service: error rate, latency percentiles, request rate, and active alerts.",
+		required("service_name"),
+		param("service_name", "string", "The service name to query."),
+	),
+	mkTool("root_cause_analysis", "Ranked probable root causes with evidence: error chains, anomalous metrics, correlated logs.",
+		required("service"),
+		param("service", "string", "Service experiencing issues."),
+		param("time_range", "string", "Lookback window. Defaults to '15m'."),
+	),
+	mkTool("impact_analysis", "BFS downstream from a service to find all affected services and impact scores.",
+		required("service"),
+		param("service", "string", "Service to analyze blast radius for."),
+		param("depth", "number", "Max traversal depth (default 5)."),
+	),
+	mkTool("trace_graph", "Returns the full span tree for a trace with service names, durations, errors, and linked logs.",
+		required("trace_id"),
+		param("trace_id", "string", "The trace ID to visualize."),
+	),
+	mkTool("search_logs", "Searches log entries by severity, service, body text, trace ID, and time range. Returns id, timestamp, severity, service_name, body, trace_id. **Limited to the last 24 hours** — windows entirely outside the 24h cap are rejected. Strongly recommend setting `service` and/or `severity` to scope the search; unscoped keyword queries scan large row counts when FTS5 is disabled. Use severity=ERROR to find errors, query= for full-text search, trace_id= to correlate with a trace. Use page= for pagination.",
+		param("query", "string", "Full-text search in log body."),
+		param("severity", "string", "Filter by severity level: ERROR, WARN, INFO, DEBUG."),
+		param("service", "string", "Filter by service name (exact match)."),
+		param("trace_id", "string", "Filter logs belonging to a specific trace ID."),
+		param("start", "string", "Start time RFC3339. Defaults to 24h ago. Cannot be earlier than now-24h; older values are clamped."),
+		param("end", "string", "End time RFC3339. Defaults to now. Cannot exceed now; future values are clamped."),
+		param("limit", "number", "Max results per page (default 50, max 200)."),
+		param("page", "number", "Page number for pagination (default 0)."),
+	),
 }
 
 // mcpCtx returns a tenant-scoped context for repository calls. If the caller's
@@ -292,122 +121,46 @@ func (s *Server) toolHandler(ctx context.Context, name string, args map[string]a
 		}
 		s.metrics.MCPToolInvocationsTotal.WithLabelValues(name, status).Inc()
 	}()
-	switch name {
-	case "get_system_graph":
-		return s.toolGetSystemGraph(ctx, args)
-	case "get_service_health":
-		return s.toolGetServiceHealth(ctx, args)
-	case "search_logs":
-		return s.toolSearchLogs(ctx, args)
-	case "tail_logs":
-		return s.toolTailLogs(ctx, args)
-	case "get_trace":
-		return s.toolGetTrace(ctx, args)
-	case "search_traces":
-		return s.toolSearchTraces(ctx, args)
-	case "get_metrics":
-		return s.toolGetMetrics(ctx, args)
-	case "get_dashboard_stats":
-		return s.toolGetDashboardStats(ctx, args)
-	case "get_storage_status":
-		return s.toolGetStorageStatus()
-	case "find_similar_logs":
-		return s.toolFindSimilarLogs(ctx, args)
-	case "get_alerts":
-		return s.toolGetAlerts()
-	case "get_service_map":
-		return s.toolGetServiceMap(ctx, args)
-	case "get_error_chains":
-		return s.toolGetErrorChains(ctx, args)
-	case "trace_graph":
-		return s.toolTraceGraph(ctx, args)
-	case "impact_analysis":
-		return s.toolImpactAnalysis(ctx, args)
-	case "root_cause_analysis":
-		return s.toolRootCauseAnalysis(ctx, args)
-	case "correlated_signals":
-		return s.toolCorrelatedSignals(ctx, args)
-	case "get_investigations":
-		return s.toolGetInvestigations(ctx, args)
-	case "get_investigation":
-		return s.toolGetInvestigationByID(ctx, args)
-	case "get_graph_snapshot":
-		return s.toolGetGraphSnapshot(ctx, args)
-	case "get_anomaly_timeline":
-		return s.toolGetAnomalyTimeline(ctx, args)
-	default:
-		return errorResult(fmt.Sprintf("unknown tool: %s", name))
+	// Map dispatch: the name -> handler binding is the single source of truth
+	// for which tools the surface exposes. Adding a new tool means one entry
+	// in this map plus a definition in toolDefs, nothing else.
+	dispatch := map[string]func(context.Context, map[string]any) ToolCallResult{
+		"get_anomaly_timeline": s.toolGetAnomalyTimeline,
+		"get_service_map":      s.toolGetServiceMap,
+		"get_service_health":   s.toolGetServiceHealth,
+		"root_cause_analysis":  s.toolRootCauseAnalysis,
+		"impact_analysis":      s.toolImpactAnalysis,
+		"trace_graph":          s.toolTraceGraph,
+		"search_logs":          s.toolSearchLogs,
 	}
+	if fn, ok := dispatch[name]; ok {
+		return fn(ctx, args)
+	}
+	return errorResult(fmt.Sprintf("unknown tool: %s", name))
 }
 
 // --- Tool implementations ---
 
-// toolGetSystemGraph returns a tenant-scoped service topology snapshot.
-//
-// When GraphRAG is wired (the default in production) the response is built
-// from its per-tenant ServiceMap and AllServiceEdges, so two tenants with
-// overlapping service names cannot see each other's nodes or edges. The
-// legacy *graph.Graph remains as a fallback for boot windows when GraphRAG
-// is still warming up; that fallback is cross-tenant by construction and
-// is the documented legacy code path called out in RAN-39.
-func (s *Server) toolGetSystemGraph(ctx context.Context, _ map[string]any) ToolCallResult {
-	if s.graphRAG != nil {
-		entries := s.graphRAG.ServiceMap(mcpCtx(ctx), 0)
-		edges := s.graphRAG.AllServiceEdges(mcpCtx(ctx))
-		payload := map[string]any{
-			"services": entries,
-			"edges":    edges,
-		}
-		data, err := json.MarshalIndent(payload, "", "  ")
-		if err != nil {
-			return errorResult(fmt.Sprintf("failed to marshal system graph: %v", err))
-		}
-		return textResult(string(data))
-	}
-	if s.svcGraph == nil {
-		return errorResult(errSvcGraphNotInit)
-	}
-	snap := s.svcGraph.Snapshot()
-	data, err := json.MarshalIndent(snap, "", "  ")
-	if err != nil {
-		return errorResult(fmt.Sprintf("failed to marshal system graph: %v", err))
-	}
-	return textResult(string(data))
-}
-
 // toolGetServiceHealth returns the ServiceMap entry for svcName scoped to
-// the tenant on ctx. Falls back to the legacy svcGraph snapshot when
-// GraphRAG is not yet wired.
+// the tenant on ctx.
 func (s *Server) toolGetServiceHealth(ctx context.Context, args map[string]any) ToolCallResult {
 	svcName, _ := args["service_name"].(string)
 	if svcName == "" {
 		return errorResult("service_name is required")
 	}
-	if s.graphRAG != nil {
-		for _, entry := range s.graphRAG.ServiceMap(mcpCtx(ctx), 0) {
-			if entry.Service != nil && entry.Service.Name == svcName {
-				data, err := json.MarshalIndent(entry, "", "  ")
-				if err != nil {
-					return errorResult(fmt.Sprintf("failed to marshal service health: %v", err))
-				}
-				return textResult(string(data))
+	if s.graphRAG == nil {
+		return errorResult(errGraphRAGNotInit)
+	}
+	for _, entry := range s.graphRAG.ServiceMap(mcpCtx(ctx), 0) {
+		if entry.Service != nil && entry.Service.Name == svcName {
+			data, err := json.MarshalIndent(entry, "", "  ")
+			if err != nil {
+				return errorResult(fmt.Sprintf("failed to marshal service health: %v", err))
 			}
+			return textResult(string(data))
 		}
-		return textResult(fmt.Sprintf("service %q not found in the current tenant window", svcName))
 	}
-	if s.svcGraph == nil {
-		return errorResult(errSvcGraphNotInit)
-	}
-	snap := s.svcGraph.Snapshot()
-	node, ok := snap.Nodes[svcName]
-	if !ok {
-		return textResult(fmt.Sprintf("service %q not found in the current graph window", svcName))
-	}
-	data, err := json.MarshalIndent(node, "", "  ")
-	if err != nil {
-		return errorResult(fmt.Sprintf("failed to marshal service health: %v", err))
-	}
-	return textResult(string(data))
+	return textResult(fmt.Sprintf("service %q not found in the current tenant window", svcName))
 }
 
 // logSummary is a lean projection of storage.Log for AI consumption.
@@ -496,193 +249,6 @@ func (s *Server) toolSearchLogs(ctx context.Context, args map[string]any) ToolCa
 	return resourceResult(resourceURIPrefix+"logs/search", httpconst.ContentTypeJSON, string(data))
 }
 
-func (s *Server) toolTailLogs(ctx context.Context, args map[string]any) ToolCallResult {
-	limit := argInt(args, "limit", 20)
-	if limit > 100 {
-		limit = 100
-	}
-
-	filter := storage.LogFilter{
-		EndTime: time.Now(),
-		Limit:   limit,
-	}
-	if v, ok := args["service"].(string); ok && v != "" {
-		filter.ServiceName = v
-	}
-	if v, ok := args["severity"].(string); ok && v != "" {
-		filter.Severity = v
-	}
-
-	logs, _, err := s.repo.GetLogsV2(mcpCtx(ctx), filter)
-	if err != nil {
-		return errorResult(fmt.Sprintf("tail_logs failed: %v", err))
-	}
-	data, err := json.MarshalIndent(toLogSummaries(logs), "", "  ")
-	if err != nil {
-		return errorResult(fmt.Sprintf("failed to marshal tail results: %v", err))
-	}
-	return resourceResult(resourceURIPrefix+"logs/tail", httpconst.ContentTypeJSON, string(data))
-}
-
-func (s *Server) toolGetTrace(ctx context.Context, args map[string]any) ToolCallResult {
-	traceID, _ := args["trace_id"].(string)
-	if traceID == "" {
-		return errorResult("trace_id is required")
-	}
-	trace, err := s.repo.GetTrace(mcpCtx(ctx), traceID)
-	if err != nil {
-		return errorResult(fmt.Sprintf("get_trace failed: %v", err))
-	}
-	data, err := json.MarshalIndent(trace, "", "  ")
-	if err != nil {
-		return errorResult(fmt.Sprintf("failed to marshal trace: %v", err))
-	}
-	return resourceResult(resourceURIPrefix+"traces/"+traceID, httpconst.ContentTypeJSON, string(data))
-}
-
-func (s *Server) toolSearchTraces(ctx context.Context, args map[string]any) ToolCallResult {
-	end := time.Now()
-	start := end.Add(-1 * time.Hour)
-	parseTime(args, "start", &start)
-	parseTime(args, "end", &end)
-
-	limit := argInt(args, "limit", 20)
-	if limit > 100 {
-		limit = 100
-	}
-
-	svcName, _ := args["service"].(string)
-	status, _ := args["status"].(string)
-	search := ""
-
-	var services []string
-	if svcName != "" {
-		services = []string{svcName}
-	}
-
-	resp, err := s.repo.GetTracesFiltered(mcpCtx(ctx), start, end, services, status, search, limit, 0, "timestamp", "desc")
-	if err != nil {
-		return errorResult(fmt.Sprintf("search_traces failed: %v", err))
-	}
-	data, err := json.MarshalIndent(resp, "", "  ")
-	if err != nil {
-		return errorResult(fmt.Sprintf("failed to marshal trace search results: %v", err))
-	}
-	return resourceResult(resourceURIPrefix+"traces/search", httpconst.ContentTypeJSON, string(data))
-}
-
-func (s *Server) toolGetMetrics(ctx context.Context, args map[string]any) ToolCallResult {
-	end := time.Now()
-	start := end.Add(-1 * time.Hour)
-	parseTime(args, "start", &start)
-	parseTime(args, "end", &end)
-
-	metricName, _ := args["name"].(string)
-	svcName, _ := args["service"].(string)
-
-	buckets, err := s.repo.GetMetricBuckets(mcpCtx(ctx), start, end, svcName, metricName)
-	if err != nil {
-		return errorResult(fmt.Sprintf("get_metrics failed: %v", err))
-	}
-	data, err := json.MarshalIndent(buckets, "", "  ")
-	if err != nil {
-		return errorResult(fmt.Sprintf("failed to marshal metrics: %v", err))
-	}
-	return resourceResult(resourceURIPrefix+"metrics/query", httpconst.ContentTypeJSON, string(data))
-}
-
-func (s *Server) toolGetDashboardStats(ctx context.Context, args map[string]any) ToolCallResult {
-	end := time.Now()
-	start := end.Add(-1 * time.Hour)
-	parseTime(args, "start", &start)
-	parseTime(args, "end", &end)
-
-	stats, err := s.repo.GetDashboardStats(mcpCtx(ctx), start, end, nil)
-	if err != nil {
-		return errorResult(fmt.Sprintf("get_dashboard_stats failed: %v", err))
-	}
-	data, err := json.MarshalIndent(stats, "", "  ")
-	if err != nil {
-		return errorResult(fmt.Sprintf("failed to marshal dashboard stats: %v", err))
-	}
-	return textResult(string(data))
-}
-
-func (s *Server) toolGetStorageStatus() ToolCallResult {
-	health := s.metrics.GetHealthStats()
-	result := map[string]any{
-		"hot_db_size_mb":    float64(s.repo.HotDBSizeBytes()) / 1024 / 1024,
-		"dlq_size_files":    health.DLQSize,
-		"active_conns":      health.ActiveConns,
-		"goroutines":        health.Goroutines,
-		"heap_alloc_mb":     health.HeapAllocMB,
-		"uptime_seconds":    health.UptimeSeconds,
-		"ingestion_total":   health.IngestionRate,
-		"db_latency_p99_ms": health.DBLatencyP99Ms,
-	}
-	data, err := json.MarshalIndent(result, "", "  ")
-	if err != nil {
-		return errorResult(fmt.Sprintf("failed to marshal storage status: %v", err))
-	}
-	return textResult(string(data))
-}
-
-// toolFindSimilarLogs returns logs semantically similar to the query text
-// scoped to the tenant resolved from the MCP transport (X-Tenant-ID header or
-// the server's default tenant). Cross-tenant rows are never returned.
-func (s *Server) toolFindSimilarLogs(ctx context.Context, args map[string]any) ToolCallResult {
-	query, _ := args["query"].(string)
-	if query == "" {
-		return errorResult("query is required")
-	}
-	limit := argInt(args, "limit", 20)
-	if limit > 100 {
-		limit = 100
-	}
-	if s.vectorIdx == nil {
-		return errorResult("vector index not yet initialized")
-	}
-	tenant := storage.TenantFromContext(mcpCtx(ctx))
-	results := s.vectorIdx.Search(tenant, query, limit)
-	data, err := json.MarshalIndent(results, "", "  ")
-	if err != nil {
-		return errorResult(fmt.Sprintf("failed to marshal similar logs: %v", err))
-	}
-	return textResult(string(data))
-}
-
-func (s *Server) toolGetAlerts() ToolCallResult {
-	if s.svcGraph == nil {
-		return errorResult(errSvcGraphNotInit)
-	}
-	snap := s.svcGraph.Snapshot()
-	type alertEntry struct {
-		Service string   `json:"service"`
-		Status  string   `json:"status"`
-		Score   float64  `json:"health_score"`
-		Alerts  []string `json:"alerts"`
-	}
-	var entries []alertEntry
-	for _, n := range snap.Nodes {
-		if len(n.Alerts) > 0 || n.Status != "healthy" {
-			entries = append(entries, alertEntry{
-				Service: n.Name,
-				Status:  n.Status,
-				Score:   n.HealthScore,
-				Alerts:  n.Alerts,
-			})
-		}
-	}
-	if len(entries) == 0 {
-		return textResult("No active alerts. All services are healthy.")
-	}
-	data, err := json.MarshalIndent(entries, "", "  ")
-	if err != nil {
-		return errorResult(fmt.Sprintf("failed to marshal alerts: %v", err))
-	}
-	return textResult(string(data))
-}
-
 // --- GraphRAG Tool implementations ---
 
 func (s *Server) toolGetServiceMap(ctx context.Context, args map[string]any) ToolCallResult {
@@ -694,26 +260,6 @@ func (s *Server) toolGetServiceMap(ctx context.Context, args map[string]any) Too
 	data, err := json.MarshalIndent(result, "", "  ")
 	if err != nil {
 		return errorResult(fmt.Sprintf("failed to marshal service map: %v", err))
-	}
-	return textResult(string(data))
-}
-
-func (s *Server) toolGetErrorChains(ctx context.Context, args map[string]any) ToolCallResult {
-	if s.graphRAG == nil {
-		return errorResult(errGraphRAGNotInit)
-	}
-	svcName, _ := args["service"].(string)
-	if svcName == "" {
-		return errorResult(errServiceRequired)
-	}
-	since := time.Now().Add(-15 * time.Minute)
-	parseTimeRange(args, "time_range", &since)
-	limit := argInt(args, "limit", 10)
-
-	chains := s.graphRAG.ErrorChain(mcpCtx(ctx), svcName, since, limit)
-	data, err := json.MarshalIndent(chains, "", "  ")
-	if err != nil {
-		return errorResult(fmt.Sprintf("failed to marshal error chains: %v", err))
 	}
 	return textResult(string(data))
 }
@@ -782,84 +328,6 @@ func (s *Server) toolRootCauseAnalysis(ctx context.Context, args map[string]any)
 	return textResult(string(data))
 }
 
-func (s *Server) toolCorrelatedSignals(ctx context.Context, args map[string]any) ToolCallResult {
-	if s.graphRAG == nil {
-		return errorResult(errGraphRAGNotInit)
-	}
-	svcName, _ := args["service"].(string)
-	if svcName == "" {
-		return errorResult(errServiceRequired)
-	}
-	since := time.Now().Add(-1 * time.Hour)
-	parseTimeRange(args, "time_range", &since)
-
-	result := s.graphRAG.CorrelatedSignals(mcpCtx(ctx), svcName, since)
-	data, err := json.MarshalIndent(result, "", "  ")
-	if err != nil {
-		return errorResult(fmt.Sprintf("failed to marshal correlated signals: %v", err))
-	}
-	return textResult(string(data))
-}
-
-func (s *Server) toolGetInvestigations(ctx context.Context, args map[string]any) ToolCallResult {
-	if s.graphRAG == nil {
-		return errorResult(errGraphRAGNotInit)
-	}
-	service, _ := args["service"].(string)
-	severity, _ := args["severity"].(string)
-	status, _ := args["status"].(string)
-	limit := argInt(args, "limit", 20)
-
-	investigations, err := s.graphRAG.GetInvestigations(ctx, service, severity, status, limit)
-	if err != nil {
-		return errorResult(fmt.Sprintf("failed to query investigations: %v", err))
-	}
-	data, err := json.MarshalIndent(investigations, "", "  ")
-	if err != nil {
-		return errorResult(fmt.Sprintf("failed to marshal investigations: %v", err))
-	}
-	return textResult(string(data))
-}
-
-func (s *Server) toolGetInvestigationByID(ctx context.Context, args map[string]any) ToolCallResult {
-	if s.graphRAG == nil {
-		return errorResult(errGraphRAGNotInit)
-	}
-	id, _ := args["investigation_id"].(string)
-	if id == "" {
-		return errorResult("investigation_id is required")
-	}
-	inv, err := s.graphRAG.GetInvestigation(ctx, id)
-	if err != nil {
-		return errorResult(fmt.Sprintf("investigation not found: %v", err))
-	}
-	data, err := json.MarshalIndent(inv, "", "  ")
-	if err != nil {
-		return errorResult(fmt.Sprintf("failed to marshal investigation: %v", err))
-	}
-	return textResult(string(data))
-}
-
-func (s *Server) toolGetGraphSnapshot(ctx context.Context, args map[string]any) ToolCallResult {
-	if s.graphRAG == nil {
-		return errorResult(errGraphRAGNotInit)
-	}
-	var at time.Time
-	parseTime(args, "time", &at)
-	if at.IsZero() {
-		at = time.Now()
-	}
-	snap, err := s.graphRAG.GetGraphSnapshot(ctx, at)
-	if err != nil {
-		return errorResult(fmt.Sprintf("no snapshot found: %v", err))
-	}
-	data, err := json.MarshalIndent(snap, "", "  ")
-	if err != nil {
-		return errorResult(fmt.Sprintf("failed to marshal snapshot: %v", err))
-	}
-	return textResult(string(data))
-}
-
 func (s *Server) toolGetAnomalyTimeline(ctx context.Context, args map[string]any) ToolCallResult {
 	if s.graphRAG == nil {
 		return errorResult(errGraphRAGNotInit)
@@ -893,9 +361,9 @@ func parseTimeRange(args map[string]any, key string, since *time.Time) {
 // --- Helpers ---
 
 // MaxToolResponseBytes caps the rendered length of any tool response. Without
-// this, get_trace / get_graph_snapshot / correlated_signals can produce
-// 100MB+ JSON on adversarial input, OOM the process, and stall every
-// concurrent MCP call until MCP_CALL_TIMEOUT_MS fires.
+// this, large in-memory GraphRAG dumps can produce 100MB+ JSON on adversarial
+// input, OOM the process, and stall every concurrent MCP call until
+// MCP_CALL_TIMEOUT_MS fires.
 //
 // The cap is intentionally set well above any legitimate row-capped tool
 // response (search_logs at 200 rows is typically <1 MB) so it triggers only

@@ -25,12 +25,11 @@ HTTP :8080/v1/* (OTLP HTTP)─┘       │                    │
                                      ▼                    ▼
                                In-Memory Accel.      Relational DB
                                (TSDB Ring,           (Source of Truth,
-                                GraphRAG,             7-15 day retention)
-                                Vector)
+                                GraphRAG)             7-15 day retention)
                                      │
 HTTP :8080 ◄── REST API ◄───────────┘
            ◄── WebSocket (real-time)
-           ◄── MCP Server (AI agents, 21 tools)
+           ◄── MCP Server (AI agents, 7-tool triage surface)
            ◄── Prometheus /metrics
 ```
 
@@ -59,8 +58,7 @@ When none are present, `DEFAULT_TENANT` (default `"default"`) is assigned. Every
 | GraphRAG (in-memory) | `internal/graphrag/` | Layered graph: 4 typed stores, error chains, root cause analysis, anomaly detection |
 | Time Series (in-memory) | `internal/tsdb/` | Ring buffer, sliding windows, pre-computed percentiles |
 | Graph (in-memory, legacy) | `internal/graph/` | Simple service topology — **being replaced by GraphRAG** |
-| Vector (embedded) | `internal/vectordb/` | TF-IDF index for semantic log search (pure Go, no CGO). Persisted across restarts via gob+CRC32 snapshot (default `data/vectordb.snapshot`, 5m interval) plus a startup tail-replay from the DB so the index is warm before listeners accept traffic — eliminating the legacy minutes of cold-start blindness. `find_similar_logs` and `SimilarErrors` (within a Drain template cluster) are the read-side consumers. |
-| Relational (persistent) | `internal/storage/` | GORM-based, multi-DB, single source of truth. Driven by `RetentionScheduler` (hourly batched purge + daily VACUUM/ANALYZE). `logs.body` is plain TEXT. **Log search**: vectordb (TF-IDF) is the default semantic-search path. Optional SQLite FTS5 (`logs_fts`, porter+unicode61, ordered by `bm25()`, AFTER INSERT/DELETE/UPDATE triggers) is **opt-in via `LOG_FTS_ENABLED=true`** and disabled by default — operators who toggle it off can reclaim the FTS table + indexes via `POST /api/admin/drop_fts`. Postgres uses `pg_trgm` GIN on `logs.body` and `logs.service_name`. `AttributesJSON` and `AIInsight` remain `CompressedText`. The `search_logs` MCP tool and the API `/api/logs?q=…` filter are clamped to the **last 24 hours** to bound the LIKE-fallback worst case. |
+| Relational (persistent) | `internal/storage/` | GORM-based, multi-DB, single source of truth. Driven by `RetentionScheduler` (hourly batched purge + daily VACUUM/ANALYZE). `logs.body` is plain TEXT. **Log search**: SQLite FTS5 (`logs_fts`, porter+unicode61, ordered by `bm25()`, AFTER INSERT/DELETE/UPDATE triggers) is the default path — `LOG_FTS_ENABLED` defaults to `true` when `DB_DRIVER=sqlite` and `false` otherwise. Operators who want the ~30% disk savings can set `LOG_FTS_ENABLED=false` and reclaim the FTS table + indexes via `POST /api/admin/drop_fts`. Postgres uses `pg_trgm` GIN on `logs.body` and `logs.service_name`. `AttributesJSON` and `AIInsight` remain `CompressedText`. The `search_logs` MCP tool and the API `/api/logs?q=…` filter are clamped to the **last 24 hours** to bound the LIKE-fallback worst case. The `vectordb` package (TF-IDF semantic search) was removed on 2026-05-24 alongside the `find_similar_logs` MCP tool — `data/vectordb.snapshot` is left on disk for operators to delete by hand. |
 
 ## GraphRAG Architecture
 
@@ -91,23 +89,23 @@ The `internal/graphrag/` package is the core intelligence layer. It replaces the
 | `CorrelatedSignals(service, timeRange)` | Gather all edges | Related logs/metrics/traces |
 | `ShortestPath(from, to)` | Dijkstra weighted by inverse call freq | Service communication path |
 | `AnomalyTimeline(since)` | Time-sorted anomalies + PRECEDED_BY | Recent anomaly overview |
-| `SimilarErrors(clusterID, k)` | k-NN cosine similarity via vectordb | Related error patterns |
 | `ServiceMap(depth)` | Full topology dump | Service topology + health |
 
 ### Background Processes
 - **4 event workers** consume from a 10,000-capacity buffered channel (best-effort; DB is source of truth)
 - **Refresh loop** (60s) — rebuilds from DB, prunes expired TraceStore nodes, cleans old anomalies
-- **Snapshot loop** (15min) — persists topology snapshot to DB, prunes snapshots > 7 days
+- **Snapshot loop** (15min) — persists Drain templates so cluster IDs survive restart (the `graph_snapshots` write side was removed on 2026-05-24; the loop name is retained for wiring stability)
 - **Anomaly loop** (10s) — detects error spikes, latency degradation, metric z-score anomalies
 
 ### Persistence Models (GORM)
 - `Investigation` — automated error analysis records (trigger, root cause, causal chain, evidence)
-- `GraphSnapshot` — periodic topology snapshots (nodes, edges, health scores)
 - `DrainTemplateRow` — persisted Drain log templates (table `drain_templates`), loaded on startup to warm the miner
+
+> Note: `GraphSnapshot` (table `graph_snapshots`) was removed on 2026-05-24. AutoMigrate no longer creates the table on fresh deploys; existing populated tables are left in place — operators can `DROP TABLE graph_snapshots; VACUUM;` to reclaim disk.
 
 ### Log Clustering (Drain)
 
-Log clustering uses **Drain** template mining (`internal/graphrag/drain.go`) — a deterministic fixed-depth prefix tree with O(1) LRU via `container/list`. It replaces the older hash-based clustering. Templates are persisted to the `drain_templates` table and reloaded on startup so cluster IDs stay stable across restarts. The TF-IDF `vectordb` is retained as a fallback similarity ranker inside a template bucket (`SimilarErrors`).
+Log clustering uses **Drain** template mining (`internal/graphrag/drain.go`) — a deterministic fixed-depth prefix tree with O(1) LRU via `container/list`. Templates are persisted to the `drain_templates` table and reloaded on startup so cluster IDs stay stable across restarts.
 
 ### Ingestion Callbacks
 ```
@@ -116,26 +114,31 @@ LogsServer.Export()  → DB persist → logCallback  → GraphRAG.OnLogIngested(
 MetricsServer.Export() → TSDB    → metricCallback → GraphRAG.OnMetricIngested()
 ```
 
-## MCP Server — 21 Tools
+## MCP Server — 7-Tool Triage Surface
 
-The MCP server (`internal/mcp/`) exposes tools via HTTP Streamable MCP (JSON-RPC 2.0 POST + SSE GET).
+The MCP server (`internal/mcp/`) exposes a focused 7-tool triage surface via
+HTTP Streamable MCP (JSON-RPC 2.0 POST + SSE GET). The surface was reduced
+from 21 → 7 on 2026-05-24 so the platform survives 120 services on SQLite —
+see `docs/superpowers/specs/2026-05-24-mcp-7tool-sqlite-survival-design.md`
+for the full rationale.
 
-### Legacy Tools (11)
-`get_system_graph`, `get_service_health`, `search_logs`, `tail_logs`, `get_trace`, `search_traces`, `get_metrics`, `get_dashboard_stats`, `get_storage_status`, `find_similar_logs`, `get_alerts`
-
-### GraphRAG Tools (10)
 | Tool | Input | Source |
 |------|-------|--------|
-| `get_service_map` | `{depth?, service?}` | In-memory (instant) |
-| `get_error_chains` | `{service, time_range?, limit?}` | In-memory + DB fallback |
-| `trace_graph` | `{trace_id}` | In-memory + DB fallback |
-| `impact_analysis` | `{service, depth?}` | In-memory (instant) |
-| `root_cause_analysis` | `{service, time_range?}` | In-memory (instant) |
-| `correlated_signals` | `{service, time_range?}` | In-memory + DB |
-| `get_investigations` | `{service?, severity?, status?, limit?}` | DB query |
-| `get_investigation` | `{investigation_id}` | DB query |
-| `get_graph_snapshot` | `{time}` | DB query |
-| `get_anomaly_timeline` | `{since?, service?}` | In-memory (instant) |
+| `get_anomaly_timeline` | `{since?, service?}` | In-memory (instant) — triage entry point |
+| `get_service_map` | `{depth?, service?}` | In-memory (instant) — topology + health overlay |
+| `get_service_health` | `{service_name}` | In-memory (instant) — per-service drill-down |
+| `root_cause_analysis` | `{service, time_range?}` | In-memory (instant) — ranked probable causes |
+| `impact_analysis` | `{service, depth?}` | In-memory (instant) — blast radius |
+| `trace_graph` | `{trace_id}` | In-memory + DB fallback — trace tree visualisation |
+| `search_logs` | `{query?, severity?, service?, trace_id?, start?, end?, limit?, page?}` | DB (FTS5 default on SQLite, LIKE fallback, 24h-clamped) |
+
+Cut tools (clients now receive an `unknown tool` RPC error): `get_system_graph`,
+`tail_logs`, `get_trace`, `search_traces`, `get_metrics`, `get_dashboard_stats`,
+`get_storage_status`, `find_similar_logs`, `get_alerts`, `correlated_signals`,
+`get_error_chains`, `get_investigations`, `get_investigation`, `get_graph_snapshot`.
+
+Cacheable surface (5s TTL via `MCP_CACHE_TTL_MS`): `get_anomaly_timeline`,
+`get_service_map`, `get_service_health`, `root_cause_analysis`, `impact_analysis`.
 
 Every error-identifying tool returns a `root_cause` block:
 ```json
@@ -176,23 +179,21 @@ internal/
     builder.go      # Event workers, ingestion callbacks, GraphRAG coordinator
     queries.go      # ErrorChain, ImpactAnalysis, RootCause, ShortestPath, etc.
     investigation.go # GORM Investigation model + persistence
-    snapshot.go     # GORM GraphSnapshot model + scheduler
     anomaly.go      # Z-score, error spike, latency degradation detection
     drain.go        # Log clustering via Drain template mining — pure-Go, stdlib-only, deterministic fixed-depth prefix tree
-    refresh.go      # Periodic DB rebuild + pruning
+    refresh.go      # Periodic DB rebuild + pruning + Drain template persistence
   ingest/       # OTLP receivers (gRPC + HTTP), adaptive sampling
     otlp.go         # gRPC TraceServer, LogsServer, MetricsServer
     otlp_http.go    # HTTP OTLP handler (protobuf + JSON, gzip, 4MB limit)
     sampler.go      # Per-service token bucket sampler
-  mcp/          # MCP server (21 tools, JSON-RPC 2.0 + SSE)
+  mcp/          # MCP server (7-tool triage surface, JSON-RPC 2.0 + SSE)
   queue/        # Dead Letter Queue (typed envelopes, bounded disk, exp backoff)
   realtime/     # WebSocket hub + event streaming
-  storage/      # GORM repository, models, migrations, Close() method
+  storage/      # GORM repository, models, migrations, Close() method, SQLite PRAGMA stanza
   telemetry/    # Prometheus metrics + health (19 metrics)
   tsdb/         # Time series aggregator + ring buffer (lock-free Windows())
-  vectordb/     # Embedded TF-IDF vector index (FIFO eviction with copy, clean IDF rebuild). Persisted via gob+CRC32 snapshot + startup DB tail-replay (snapshot.go, replay.go).
   ui/           # Embedded React frontend
-ui/             # React frontend (Vite + Mantine)
+ui/             # React frontend (Vite + @ossrandom/design-system)
 test/           # Microservice simulation (7 services)
 docs/           # Specifications and plans
 ```
@@ -213,16 +214,33 @@ Key settings in `internal/config/config.go`:
 - `METRIC_MAX_CARDINALITY` (10000), `METRIC_MAX_CARDINALITY_PER_TENANT` (0 = unlimited), `API_RATE_LIMIT_RPS` (100). The per-tenant cap is checked first; when set, a noisy tenant cannot exhaust the global pool. Overflow is labeled by tenant via `otelcontext_tsdb_cardinality_overflow_by_tenant_total{tenant_id}` (`__global__` sentinel when the global cap was the trigger).
 - `MCP_ENABLED` (true), `MCP_PATH` (/mcp)
 - `MCP_MAX_CONCURRENT` (32), `MCP_CALL_TIMEOUT_MS` (30000), `MCP_CACHE_TTL_MS` (5000) — MCP HTTP streamable robustness. Counting semaphore gates concurrent `tools/call` (JSON-RPC `-32000` past the cap), per-call deadlines abort runaway handlers (JSON-RPC `-32001`), and a 5s TTL cache memoizes the cheap in-memory GraphRAG tools (`get_service_map`, `impact_analysis`, `root_cause_analysis`, `get_anomaly_timeline`, `get_service_health`). SSE GET sends a `: keep-alive\n\n` comment every 25s to keep the stream alive across reverse-proxy idle timeouts. Set any to 0 to disable.
-- `VECTOR_INDEX_MAX_ENTRIES` (100000), `VECTOR_INDEX_SNAPSHOT_PATH` (`data/vectordb.snapshot`), `VECTOR_INDEX_SNAPSHOT_INTERVAL` (`5m`) — vectordb persistence. Empty `VECTOR_INDEX_SNAPSHOT_PATH` or non-positive interval disables the snapshot loop. The snapshot file uses a magic+version+CRC32 wire format with gob payload; corrupt or version-mismatched files are rejected and the loader falls back to a full DB rebuild via `ReplayFromDB`. Watch `otelcontext_vectordb_snapshot_writes_total{result}`, `otelcontext_vectordb_snapshot_load_total{result}`, `otelcontext_vectordb_snapshot_size_bytes`, and `otelcontext_vectordb_replay_logs_total`.
-- `LOG_FTS_ENABLED` (false) — when truthy (`true`/`yes`/`on`/`1`), provisions the SQLite FTS5 `logs_fts` virtual table + sync triggers at startup; when false, log-search uses vectordb (semantic) plus a 24h-clamped LIKE fallback. Toggle off and reclaim disk via `POST /api/admin/drop_fts` (refused while the flag is on).
+- `LOG_FTS_ENABLED` — when truthy (`true`/`yes`/`on`/`1`), provisions the SQLite FTS5 `logs_fts` virtual table + sync triggers at startup; when false, log-search uses a 24h-clamped LIKE fallback. **Defaults to `true` when `DB_DRIVER=sqlite`** (BM25 is dramatically faster than LIKE on the kept `search_logs` MCP tool) and `false` otherwise. Toggle off and reclaim the ~30% disk overhead via `POST /api/admin/drop_fts` (refused while the flag is on). The vectordb-backed semantic-search path was removed on 2026-05-24.
 - `DLQ_MAX_FILES` (1000), `DLQ_MAX_DISK_MB` (500), `DLQ_MAX_RETRIES` (10)
 - `GRAPHRAG_WORKER_COUNT` (16), `GRAPHRAG_EVENT_QUEUE_SIZE` (100000) — sized for 100–200 services; raise further if `otelcontext_graphrag_events_dropped_total` climbs
-- `INGEST_MIN_SEVERITY` (`INFO`), `STORE_MIN_SEVERITY` (`""` = same as ingest) — two-tier log severity gate. The ingest gate runs at the OTLP receiver and **drops the log entirely** below the threshold (no in-memory enrichment either). The store gate runs at the persist boundary inside the async pipeline (`internal/ingest/pipeline.go:process`) and **only skips the DB row write** — the log still flows through `LogCallback` so vectordb indexing, GraphRAG Drain template mining, and span/trace correlation see it. Use case: `INGEST_MIN_SEVERITY=DEBUG STORE_MIN_SEVERITY=WARN` keeps SQLite small while letting in-memory anomaly detection benefit from the verbose stream. Setting `STORE_MIN_SEVERITY` ≤ `INGEST_MIN_SEVERITY` is a no-op (logged as a warning at startup). Drops surface via `Pipeline.Stats().StoreFiltered`.
+- `INGEST_MIN_SEVERITY` (`INFO`), `STORE_MIN_SEVERITY` (`""` = same as ingest; **defaults to `"WARN"` when `DB_DRIVER=sqlite`**) — two-tier log severity gate. The ingest gate runs at the OTLP receiver and **drops the log entirely** below the threshold (no in-memory enrichment either). The store gate runs at the persist boundary inside the async pipeline (`internal/ingest/pipeline.go:process`) and **only skips the DB row write** — the log still flows through `LogCallback` so GraphRAG Drain template mining and span/trace correlation see it. Use case: `INGEST_MIN_SEVERITY=DEBUG STORE_MIN_SEVERITY=WARN` keeps SQLite small while letting in-memory anomaly detection benefit from the verbose stream. Setting `STORE_MIN_SEVERITY` ≤ `INGEST_MIN_SEVERITY` is a no-op (logged as a warning at startup). Drops surface via `Pipeline.Stats().StoreFiltered`.
 - `INGEST_ASYNC_ENABLED` (true), `INGEST_PIPELINE_QUEUE_SIZE` (50000), `INGEST_PIPELINE_WORKERS` (8) — async ingest pipeline (`internal/ingest/pipeline.go`). Hybrid backpressure: <90% accept all, 90–100% drop healthy batches (errors/slow always pass), 100% return gRPC `RESOURCE_EXHAUSTED`. Set `INGEST_ASYNC_ENABLED=false` to revert to synchronous DB writes inside `Export()`. Drops surface as `otelcontext_ingest_pipeline_dropped_total{signal,reason}`.
 - `GRPC_MAX_RECV_MB` (16), `GRPC_MAX_CONCURRENT_STREAMS` (1000) — OTLP gRPC server caps, validated to 1..256 and 1..1_000_000
 - `RETENTION_BATCH_SIZE` (50000), `RETENTION_BATCH_SLEEP_MS` (1) — purge pacing; raise the sleep on busy production DBs
 - `DB_POSTGRES_PARTITIONING` (`""`), `DB_PARTITION_LOOKAHEAD_DAYS` (3) — opt-in Postgres declarative range partitioning of the `logs` table by day. When `daily`, `logs` is provisioned as a partitioned parent (greenfield only — refuses to start if `logs` already exists unpartitioned), the `PartitionScheduler` maintains lookahead partitions and drops expired ones via `DROP TABLE`, and `RetentionScheduler` skips the row-level DELETE for `logs`. Watch `otelcontext_partitions_dropped_total` and `otelcontext_partitions_active`.
 - `APP_ENV` (`"development"`), `OTELCONTEXT_ALLOW_SQLITE_PROD` (false) — SQLite is refused when `APP_ENV=production` unless the allow flag is set
+
+### SQLite per-driver defaults (auto-flipped when DB_DRIVER=sqlite)
+
+So a 100+ service deployment on SQLite survives without OOM, `config.Load()` overrides nine defaults at the end of the Load() pass — but **only when the operator did not explicitly set the env var** (detected via `os.LookupEnv` presence, not value comparison). Postgres/MSSQL/MySQL paths are untouched.
+
+| Env var | SQLite default | Postgres default | Rationale |
+|---|---|---|---|
+| `DB_MAX_OPEN_CONNS` | 1 | 50 | SQLite is single-writer; extra conns are wasted slots. |
+| `DB_MAX_IDLE_CONNS` | 1 | 10 | Match open conns. |
+| `INGEST_PIPELINE_WORKERS` | 2 | 8 | Workers all serialise through the SQLite writer lock; 2 is enough to keep the queue non-empty. |
+| `INGEST_PIPELINE_QUEUE_SIZE` | 10000 | 50000 | Lower heap watermark; backpressure kicks in earlier so OTLP clients back off. |
+| `METRIC_MAX_CARDINALITY` | 3000 | 10000 | Bound the in-memory TSDB series map. |
+| `STORE_MIN_SEVERITY` | `"WARN"` | `""` | Skip INFO/DEBUG persists; in-memory GraphRAG/Drain still sees them. |
+| `SAMPLING_RATE` | 0.05 | 1.0 | Errors and slow spans are always kept by `SAMPLING_ALWAYS_ON_ERRORS`. |
+| `GRPC_MAX_CONCURRENT_STREAMS` | 240 | 1000 | ~2 streams per service at 120 services with headroom. |
+| `LOG_FTS_ENABLED` | `true` | n/a | FTS5 BM25 is dramatically faster than LIKE on the kept `search_logs` path. |
+
+Also at SQLite startup, `internal/storage/factory.go` applies a fail-closed PRAGMA stanza: `journal_mode=WAL`, `synchronous=NORMAL`, `cache_size=-262144` (256 MB page cache), `temp_store=MEMORY`, `mmap_size=1073741824` (1 GB mmap), `wal_autocheckpoint=10000`, `journal_size_limit=67108864` (64 MB WAL cap), `busy_timeout=5000`. Any PRAGMA failure aborts startup with a wrapped error — these are not optional. See `docs/superpowers/specs/2026-05-24-mcp-7tool-sqlite-survival-design.md` for per-default reasoning.
 
 ### Authentication
 

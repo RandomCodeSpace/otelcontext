@@ -107,7 +107,7 @@ See `docs/otel-collector-example.yaml` for a complete example.
 - **OTLP gRPC + HTTP ingest** — traces, logs, metrics; gzip and protobuf/JSON supported.
 - **GraphRAG** — layered in-memory graph with error-chain, impact, and root-cause queries.
 - **Drain log clustering** — deterministic template mining, persisted across restarts.
-- **MCP server** — 21 tools exposing the platform to AI agents over JSON-RPC 2.0 + SSE.
+- **MCP server** — 7-tool triage surface for AI agents over JSON-RPC 2.0 + SSE (get_anomaly_timeline, get_service_map, get_service_health, root_cause_analysis, impact_analysis, trace_graph, search_logs).
 - **Multi-tenancy** — per-row `tenant_id`, `X-Tenant-ID` header / `x-tenant-id` gRPC metadata.
 - **Adaptive sampling** — always-on for errors and slow spans, probabilistic otherwise.
 - **DLQ** — durable typed envelopes with disk-bounded replay.

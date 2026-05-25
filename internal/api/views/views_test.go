@@ -164,13 +164,6 @@ func TestViews_NoGormBookkeepingLeaksThroughJSON(t *testing.T) {
 		SpanChain:        json.RawMessage(`[]`),
 	})
 	assertNoLeak(t, "Investigation", inv, "tenant_id")
-
-	gs := GraphSnapshotFromModel(graphrag.GraphSnapshot{
-		ID: "snap1", CreatedAt: ts,
-		Nodes: json.RawMessage(`[]`), Edges: json.RawMessage(`[]`),
-		ServiceCount: 1, TotalCalls: 10, AvgHealthScore: 0.9,
-	})
-	assertNoLeak(t, "GraphSnapshot", gs, "tenant_id")
 }
 
 // TestTraceView_PreservesJSONFieldNames asserts the exact JSON shape consumed by

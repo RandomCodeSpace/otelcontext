@@ -14,8 +14,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/RandomCodeSpace/central-ops/pkg/version"
-
 	"github.com/RandomCodeSpace/otelcontext/internal/ai"
 	"github.com/RandomCodeSpace/otelcontext/internal/api"
 	"github.com/RandomCodeSpace/otelcontext/internal/config"
@@ -30,7 +28,6 @@ import (
 	tlsbootstrap "github.com/RandomCodeSpace/otelcontext/internal/tls"
 	"github.com/RandomCodeSpace/otelcontext/internal/tsdb"
 	"github.com/RandomCodeSpace/otelcontext/internal/ui"
-	"github.com/RandomCodeSpace/otelcontext/internal/vectordb"
 
 	"runtime/debug"
 	"sync"
@@ -56,7 +53,20 @@ import (
 
 // Version is detected from build info at startup.
 // Returns the real tag when installed via `go install`, "local" otherwise.
-var Version = version.Detect()
+var Version = detectVersion()
+
+// detectVersion reads runtime/debug.BuildInfo to return the module version
+// that go install or go build stamped into the binary. Falls back to "local"
+// for go run, raw go build, or any path that does not produce a stamped
+// build (e.g. `(devel)` from module-aware development builds).
+func detectVersion() string {
+	if info, ok := debug.ReadBuildInfo(); ok {
+		if v := info.Main.Version; v != "" && v != "(devel)" {
+			return v
+		}
+	}
+	return "local"
+}
 
 // cleanupStack is an ordered LIFO list of cleanup closures registered during
 // startup. fatal() walks it before os.Exit so DBs, DLQs, and tracer providers
@@ -366,75 +376,12 @@ func main() {
 	go svcGraph.Start(ctxGraph)
 	slog.Info("🕸️  In-memory service graph started (5m window, 30s refresh)")
 
-	// 4f. Initialize vector index for semantic log search.
-	vectorIdx := vectordb.New(cfg.VectorIndexMaxEntries)
-	slog.Info("🔍 Vector index initialized", "max_entries", cfg.VectorIndexMaxEntries)
-
-	// Vector index hydration:
-	//   1) LoadSnapshot — restores the prior process's state in O(file size)
-	//      so find_similar_logs returns useful results in <1s after restart
-	//      instead of the legacy minutes of cold-start blindness.
-	//   2) ReplayFromDB — picks up any DB rows ingested after the last
-	//      snapshot. Severity-filtered + cursor-paged from LastIndexedID.
-	//
-	// Both run in a boot goroutine so a slow disk doesn't delay listener
-	// startup. SIGTERM during boot cancels via appCtx — bootWG ensures the
-	// hydrator finishes (or aborts cleanly) before DB close at shutdown.
-	// Wire snapshot write observer before any WriteSnapshot can fire (the
-	// hydrator goroutine doesn't write, but SnapshotLoop below will).
-	vectorIdx.SetSnapshotObserver(metrics.RecordVectorSnapshotWrite)
-
-	bootWG.Add(1)
-	go func() {
-		defer bootWG.Done()
-		if cfg.VectorIndexSnapshotPath != "" {
-			if err := vectorIdx.LoadSnapshot(cfg.VectorIndexSnapshotPath); err != nil {
-				if os.IsNotExist(err) {
-					metrics.RecordVectorSnapshotLoad("missing")
-					slog.Info("🔍 Vector index: no prior snapshot, will hydrate from DB", "path", cfg.VectorIndexSnapshotPath)
-				} else {
-					metrics.RecordVectorSnapshotLoad("corrupt")
-					slog.Warn("🔍 Vector index: snapshot load failed, will rebuild from DB", "path", cfg.VectorIndexSnapshotPath, "error", err)
-				}
-			} else {
-				metrics.RecordVectorSnapshotLoad("success")
-				slog.Info("🔍 Vector index: loaded snapshot", "path", cfg.VectorIndexSnapshotPath, "entries", vectorIdx.Size(), "since_id", vectorIdx.LastIndexedID())
-			}
-		}
-		replayed, err := vectorIdx.ReplayFromDB(appCtx, vectorReplayAdapter{repo: repo})
-		metrics.RecordVectorReplayLogs(replayed)
-		if err != nil {
-			slog.Warn("🔍 Vector index: tail replay errored", "replayed", replayed, "error", err)
-		} else if replayed > 0 {
-			slog.Info("🔍 Vector index: tail replay complete", "rows", replayed, "size", vectorIdx.Size(), "since_id", vectorIdx.LastIndexedID())
-		}
-	}()
-
-	// Periodic snapshot loop. Empty path or non-positive interval disables.
-	// snapCtx is cancelled in the shutdown sequence right after graphRAG.Stop()
-	// so the loop's ctx-done branch fires the final write before exit.
-	snapCtx, snapCancel := context.WithCancel(appCtx)
-	snapDone := make(chan struct{})
-	go func() {
-		defer close(snapDone)
-		if cfg.VectorIndexSnapshotPath == "" {
-			return
-		}
-		interval, err := time.ParseDuration(cfg.VectorIndexSnapshotInterval)
-		if err != nil || interval <= 0 {
-			slog.Info("🔍 Vector index: periodic snapshot disabled", "interval", cfg.VectorIndexSnapshotInterval)
-			return
-		}
-		slog.Info("🔍 Vector index: periodic snapshot enabled", "interval", interval, "path", cfg.VectorIndexSnapshotPath)
-		vectorIdx.SnapshotLoop(snapCtx, cfg.VectorIndexSnapshotPath, interval)
-	}()
-
 	// 4g. Initialize GraphRAG (replaces simple graph for advanced queries)
 	graphrag.SetPanicMetrics(metrics)
 	graphRAGCfg := graphrag.DefaultConfig()
 	graphRAGCfg.WorkerCount = cfg.GraphRAGWorkerCount
 	graphRAGCfg.ChannelSize = cfg.GraphRAGEventQueueSize
-	graphRAG := graphrag.New(repo, vectorIdx, tsdbAgg, ringBuf, graphRAGCfg)
+	graphRAG := graphrag.New(repo, tsdbAgg, ringBuf, graphRAGCfg)
 	graphRAG.SetMetrics(metrics)
 	ctxGraphRAG, cancelGraphRAG := context.WithCancel(context.Background())
 	go graphRAG.Start(ctxGraphRAG)
@@ -443,7 +390,7 @@ func main() {
 		"event_queue_size", cfg.GraphRAGEventQueueSize,
 	)
 
-	// Auto-migrate GraphRAG models (Investigation, GraphSnapshot)
+	// Auto-migrate GraphRAG models (Investigation, DrainTemplateRow)
 	if err := graphrag.AutoMigrateGraphRAG(repo.DB()); err != nil {
 		slog.Error("Failed to migrate GraphRAG models", "error", err)
 	}
@@ -461,10 +408,9 @@ func main() {
 	apiServer := api.NewServer(repo, hub, eventHub, metrics)
 	apiServer.SetGraph(svcGraph)
 	apiServer.SetGraphRAG(graphRAG)
-	apiServer.SetVectorIndex(vectorIdx)
 
 	// 6b. Initialize MCP Server (HTTP Streamable, JSON-RPC 2.0 + SSE)
-	mcpServer := mcp.New(cfg.DefaultTenant, repo, metrics, svcGraph, vectorIdx)
+	mcpServer := mcp.New(cfg.DefaultTenant, repo, metrics, svcGraph)
 	mcpServer.SetGraphRAG(graphRAG)
 	mcpServer.SetCallLimit(cfg.MCPMaxConcurrent)
 	mcpServer.SetCallTimeout(time.Duration(cfg.MCPCallTimeoutMs) * time.Millisecond)
@@ -578,7 +524,6 @@ func main() {
 			Timestamp:      l.Timestamp,
 		})
 		aiService.EnqueueLog(l)
-		vectorIdx.Add(l.ID, l.TenantID, l.ServiceName, l.Severity, l.Body)
 		eventHub.NotifyRefresh()
 		if time.Since(start) > 100*time.Millisecond {
 			slog.Warn("Slow broadcast/enqueue", "duration", time.Since(start))
@@ -753,7 +698,7 @@ func main() {
 	}
 
 	// Embedded UI Server
-	uiServer := ui.NewServer(repo, metrics, svcGraph, vectorIdx)
+	uiServer := ui.NewServer(repo, metrics, svcGraph)
 	uiServer.SetMCPConfig(cfg.MCPEnabled, cfg.MCPPath)
 	if err := uiServer.RegisterRoutes(mux); err != nil {
 		fatal("Failed to register UI routes", err)
@@ -936,19 +881,6 @@ func main() {
 	graphRAG.Stop()
 	cancelGraphRAG()
 
-	// 3a. Cancel vectordb snapshot loop. The loop's ctx.Done branch fires a
-	// final WriteSnapshot before exit, capturing the maximum in-memory state
-	// (every Add() that drained from GraphRAG above is persisted). We wait
-	// briefly so the final snapshot hits disk before DB close — the snapshot
-	// is independent of repo, but ordered shutdown is cheaper than a stale
-	// snapshot on the next boot.
-	snapCancel()
-	select {
-	case <-snapDone:
-	case <-time.After(5 * time.Second):
-		slog.Warn("vectordb snapshot loop did not finish in 5s; final snapshot may be incomplete")
-	}
-
 	// 3a. Drain async ingest pipeline. gRPC GracefulStop above guarantees
 	// no new Submits land; this blocks until workers finish in-flight
 	// batches so a graceful shutdown doesn't lose buffered ingest.
@@ -1081,30 +1013,6 @@ func initTracerProvider(endpoint string) (*sdktrace.TracerProvider, error) {
 		sdktrace.WithResource(res),
 	)
 	return tp, nil
-}
-
-// vectorReplayAdapter projects storage.Log into vectordb.ReplayRow so the
-// vectordb package stays free of storage imports while still consuming the
-// repository's tail-replay query. Lives at the wiring layer because both
-// packages can be imported here, but neither imports the other.
-type vectorReplayAdapter struct{ repo *storage.Repository }
-
-func (a vectorReplayAdapter) LogsForVectorReplay(ctx context.Context, sinceID uint, limit int) ([]vectordb.ReplayRow, error) {
-	logs, err := a.repo.LogsForVectorReplay(ctx, sinceID, limit)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]vectordb.ReplayRow, len(logs))
-	for i, l := range logs {
-		out[i] = vectordb.ReplayRow{
-			ID:          l.ID,
-			Tenant:      l.TenantID,
-			ServiceName: l.ServiceName,
-			Severity:    l.Severity,
-			Body:        l.Body,
-		}
-	}
-	return out, nil
 }
 
 func printBanner() {

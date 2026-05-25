@@ -114,21 +114,6 @@ type Config struct {
 	// Compression
 	CompressionLevel string // "default", "fast", "best"
 
-	// Vector Index
-	VectorIndexMaxEntries int
-
-	// VectorIndexSnapshotPath is the on-disk location for periodic vectordb
-	// snapshots. When empty, persistence is disabled and the index rebuilds
-	// from DB on every restart (legacy behaviour). Default
-	// "data/vectordb.snapshot".
-	VectorIndexSnapshotPath string
-
-	// VectorIndexSnapshotInterval, e.g. "5m". When set and
-	// VectorIndexSnapshotPath is non-empty, the index serializes its state
-	// to disk on this cadence. "0" / empty disables periodic writes (a
-	// final snapshot still fires on graceful shutdown). Default "5m".
-	VectorIndexSnapshotInterval string
-
 	// LogFTSEnabled toggles SQLite FTS5 provisioning + querying. The FTS5
 	// inverted index typically consumes 30-40% of SQLite DB disk for
 	// log-heavy workloads, while the LIKE fallback (log_repo.go:105) keeps
@@ -240,7 +225,7 @@ func Load(customPath string) (*Config, error) {
 	}
 
 	env := getEnv("APP_ENV", "development")
-	return &Config{
+	cfg := &Config{
 		Env:               env,
 		DevMode:           env == "development",
 		LogLevel:          getEnv("LOG_LEVEL", "INFO"),
@@ -302,11 +287,6 @@ func Load(customPath string) (*Config, error) {
 		// Compression
 		CompressionLevel: getEnv("COMPRESSION_LEVEL", "default"),
 
-		// Vector
-		VectorIndexMaxEntries:       getEnvInt("VECTOR_INDEX_MAX_ENTRIES", 100000),
-		VectorIndexSnapshotPath:     getEnv("VECTOR_INDEX_SNAPSHOT_PATH", "data/vectordb.snapshot"),
-		VectorIndexSnapshotInterval: getEnv("VECTOR_INDEX_SNAPSHOT_INTERVAL", "5m"),
-
 		// Log search FTS5 toggle (SQLite only). Default off — see field comment.
 		LogFTSEnabled: parseTruthy(getEnv("LOG_FTS_ENABLED", "")),
 
@@ -346,7 +326,54 @@ func Load(customPath string) (*Config, error) {
 
 		// Production safety guard for SQLite
 		AllowSqliteProd: parseTruthy(getEnv("OTELCONTEXT_ALLOW_SQLITE_PROD", "")),
-	}, nil
+	}
+	applyDriverDefaults(cfg)
+	return cfg, nil
+}
+
+// applyDriverDefaults flips defaults on a freshly-Load()'d Config when the
+// driver is SQLite AND the operator did not explicitly set the env var.
+// Postgres/MSSQL/MySQL defaults are unchanged.
+//
+// The platform's stock defaults are tuned for Postgres at 100k events/sec
+// with a parallel writer pool. On SQLite those same defaults overrun the
+// single-writer lock and inflate heap until the process OOMs — see
+// docs/superpowers/specs/2026-05-24-mcp-7tool-sqlite-survival-design.md.
+// This override gives the SQLite path a survivable starting point at
+// 120 services while preserving the existing Postgres path bit-for-bit.
+//
+// "Explicit operator override" is detected via os.LookupEnv (presence)
+// rather than value comparison so that, e.g., DB_MAX_OPEN_CONNS=50 set by
+// hand is still honoured even though it equals the Postgres default.
+// sqliteOverrides is the table of (env-var, apply) pairs that
+// applyDriverDefaults walks when DB_DRIVER=sqlite. Add a row here to
+// introduce a new SQLite-only default; the apply closure is the only place
+// that names the Config field, so the surrounding lookup/skip logic stays
+// in one spot.
+var sqliteOverrides = []struct {
+	envKey string
+	apply  func(*Config)
+}{
+	{"DB_MAX_OPEN_CONNS", func(c *Config) { c.DBMaxOpenConns = 1 }},
+	{"DB_MAX_IDLE_CONNS", func(c *Config) { c.DBMaxIdleConns = 1 }},
+	{"INGEST_PIPELINE_WORKERS", func(c *Config) { c.IngestPipelineWorkers = 2 }},
+	{"INGEST_PIPELINE_QUEUE_SIZE", func(c *Config) { c.IngestPipelineQueueSize = 10000 }},
+	{"METRIC_MAX_CARDINALITY", func(c *Config) { c.MetricMaxCardinality = 3000 }},
+	{"STORE_MIN_SEVERITY", func(c *Config) { c.StoreMinSeverity = "WARN" }},
+	{"SAMPLING_RATE", func(c *Config) { c.SamplingRate = 0.05 }},
+	{"GRPC_MAX_CONCURRENT_STREAMS", func(c *Config) { c.GRPCMaxConcurrentStreams = 240 }},
+	{"LOG_FTS_ENABLED", func(c *Config) { c.LogFTSEnabled = true }},
+}
+
+func applyDriverDefaults(cfg *Config) {
+	if !strings.EqualFold(cfg.DBDriver, "sqlite") {
+		return
+	}
+	for _, ov := range sqliteOverrides {
+		if _, ok := os.LookupEnv(ov.envKey); !ok {
+			ov.apply(cfg)
+		}
+	}
 }
 
 func getEnv(key, fallback string) string {

@@ -10,19 +10,17 @@ import (
 	"github.com/RandomCodeSpace/otelcontext/internal/realtime"
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 	"github.com/RandomCodeSpace/otelcontext/internal/telemetry"
-	"github.com/RandomCodeSpace/otelcontext/internal/vectordb"
 )
 
 // Server handles HTTP API requests.
 type Server struct {
-	repo      *storage.Repository
-	hub       *realtime.Hub
-	eventHub  *realtime.EventHub
-	metrics   *telemetry.Metrics
-	cache     *cache.TTLCache
-	graph     *graph.Graph       // in-memory service dependency graph (may be nil before first build)
-	graphRAG  *graphrag.GraphRAG // layered GraphRAG for advanced queries
-	vectorIdx *vectordb.Index    // TF-IDF semantic log search index
+	repo     *storage.Repository
+	hub      *realtime.Hub
+	eventHub *realtime.EventHub
+	metrics  *telemetry.Metrics
+	cache    *cache.TTLCache
+	graph    *graph.Graph       // in-memory service dependency graph (may be nil before first build)
+	graphRAG *graphrag.GraphRAG // layered GraphRAG for advanced queries
 
 	// Saturation probes consulted by /ready. Each returns a fullness
 	// fraction in [0.0, 1.0]; nil disables the corresponding check.
@@ -51,11 +49,6 @@ func (s *Server) SetGraph(g *graph.Graph) {
 // SetGraphRAG wires the GraphRAG instance for advanced queries.
 func (s *Server) SetGraphRAG(g *graphrag.GraphRAG) {
 	s.graphRAG = g
-}
-
-// SetVectorIndex wires the TF-IDF vector index for semantic log search.
-func (s *Server) SetVectorIndex(idx *vectordb.Index) {
-	s.vectorIdx = idx
 }
 
 // SetDLQSaturationProbe registers a callback returning DLQ disk fullness as
@@ -96,7 +89,6 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	// Logs
 	mux.HandleFunc("GET /api/logs", s.handleGetLogs)
 	mux.HandleFunc("GET /api/logs/context", s.handleGetLogContext)
-	mux.HandleFunc("GET /api/logs/similar", s.handleGetSimilarLogs)
 	mux.HandleFunc("GET /api/logs/{id}/insight", s.handleGetLogInsight)
 
 	// Admin & System

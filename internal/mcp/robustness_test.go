@@ -20,7 +20,7 @@ import (
 // not the tool internals.
 func minimalServer(t *testing.T) *Server {
 	t.Helper()
-	return New("default", nil, nil, nil, nil)
+	return New("default", nil, nil, nil)
 }
 
 // jsonRPCCallToolBody marshals a tools/call envelope for a fake tool name.

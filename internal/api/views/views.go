@@ -198,17 +198,6 @@ type Investigation struct {
 	SpanChain        any       `json:"span_chain"`
 }
 
-// GraphSnapshot is the wire shape of a persisted topology snapshot.
-type GraphSnapshot struct {
-	ID             string    `json:"id"`
-	CreatedAt      time.Time `json:"created_at"`
-	Nodes          any       `json:"nodes"`
-	Edges          any       `json:"edges"`
-	ServiceCount   int       `json:"service_count"`
-	TotalCalls     int64     `json:"total_calls"`
-	AvgHealthScore float64   `json:"avg_health_score"`
-}
-
 // --- Conversion functions ---
 
 // TraceFromModel converts a storage.Trace (with possibly-Preloaded children)
@@ -466,19 +455,6 @@ func InvestigationFromModel(m graphrag.Investigation) Investigation {
 		AnomalousMetrics: rawToAny(m.AnomalousMetrics),
 		AffectedServices: rawToAny(m.AffectedServices),
 		SpanChain:        rawToAny(m.SpanChain),
-	}
-}
-
-// GraphSnapshotFromModel converts a persisted GraphRAG snapshot into its view.
-func GraphSnapshotFromModel(m graphrag.GraphSnapshot) GraphSnapshot {
-	return GraphSnapshot{
-		ID:             m.ID,
-		CreatedAt:      m.CreatedAt,
-		Nodes:          rawToAny(m.Nodes),
-		Edges:          rawToAny(m.Edges),
-		ServiceCount:   m.ServiceCount,
-		TotalCalls:     m.TotalCalls,
-		AvgHealthScore: m.AvgHealthScore,
 	}
 }
 
