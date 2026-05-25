@@ -107,42 +107,25 @@ forensic-analytics workflow (`get_investigations`, `get_investigation`,
 
 ### SQLite tuning
 
-After `gorm.Open` succeeds with `DB_DRIVER=sqlite`, apply these PRAGMAs in
-order with fail-closed error handling:
-
-```go
-pragmas := []string{
-    "PRAGMA journal_mode=WAL",          // existing
-    "PRAGMA synchronous=NORMAL",        // existing
-    "PRAGMA cache_size=-262144",        // 256 MB page cache (new)
-    "PRAGMA temp_store=MEMORY",         // new
-    "PRAGMA mmap_size=1073741824",      // 1 GB mmap (new)
-    "PRAGMA wal_autocheckpoint=10000",  // new — keeps WAL bounded
-    "PRAGMA journal_size_limit=67108864", // cap WAL at 64 MB (new)
-    "PRAGMA busy_timeout=5000",         // existing
-}
-```
-
-A PRAGMA failure is fatal — these are not optional, and silent fallback
-to defaults defeats the survivability goal.
+`internal/storage/factory.go` applies an 8-PRAGMA stanza (WAL mode, sync
+NORMAL, 256 MB page cache, MEMORY temp store, 1 GB mmap, 10k-page
+autocheckpoint, 64 MB WAL cap, 5s busy_timeout) immediately after
+`gorm.Open` when the driver is SQLite. Any PRAGMA failure aborts startup
+— these are not optional, and silent fallback to defaults defeats the
+survivability goal. CLAUDE.md "SQLite PRAGMA stanza" enumerates each
+PRAGMA with its rationale.
 
 ### Per-driver config defaults
 
-The following defaults override the Postgres-tuned defaults when
-`DB_DRIVER=sqlite`, only if the operator has not explicitly set the env
-var (detected via `os.LookupEnv`, not value comparison):
-
-| Env var | SQLite default | Postgres/MSSQL default | Reason |
-|---|---|---|---|
-| `DB_MAX_OPEN_CONNS` | 1 | 50 | SQLite single-writer; multiple open conns are wasted slots. |
-| `DB_MAX_IDLE_CONNS` | 1 | 10 | Match open conns. |
-| `INGEST_PIPELINE_WORKERS` | 2 | 8 | 8 workers all serialize through the SQLite writer lock anyway; 2 is enough to keep the writer queue non-empty without pushing extra work into heap. |
-| `INGEST_PIPELINE_QUEUE_SIZE` | 10000 | 50000 | Smaller queue = lower heap watermark; backpressure kicks in earlier so OTLP clients back off rather than us OOMing. |
-| `METRIC_MAX_CARDINALITY` | 3000 | 10000 | Bound the TSDB series map. 120 services × 25 series/service still fits. |
-| `STORE_MIN_SEVERITY` | `WARN` | `""` (== ingest) | Skip INFO/DEBUG persists on the SQLite path — in-memory GraphRAG/anomaly detection still benefits from the full stream. |
-| `SAMPLING_RATE` | 0.05 | 1.0 | Trace volume is the primary disk-growth contributor. 5% sample at 120 services ≈ what 1.0 used to do at 6 services. |
-| `GRPC_MAX_CONCURRENT_STREAMS` | 240 | 1000 | Each stream costs heap; 120 services × 2 = 240 covers the deployment with no overhead. |
-| `LOG_FTS_ENABLED` | `true` | n/a | FTS5 is dramatically faster than LIKE on the kept `search_logs` path; operators who want the ~30% disk savings can opt out. |
+When `DB_DRIVER=sqlite`, `config.Load()` overrides nine defaults that are
+otherwise Postgres-tuned. The override applies only when the operator did
+not set the env var explicitly (detected via `os.LookupEnv` presence, not
+value comparison). The authoritative table — env var, SQLite default,
+Postgres default, and per-row rationale — lives in `CLAUDE.md` under
+"SQLite per-driver defaults". The implementation in
+`internal/config/config.go::applyDriverDefaults` and its tests in
+`internal/config/driver_defaults_test.go` are the runtime source of
+truth.
 
 ### `search_logs` backend swap
 
