@@ -11,7 +11,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/RandomCodeSpace/central-ops/pkg/httputil"
 	"github.com/RandomCodeSpace/otelcontext/internal/graph"
 	"github.com/RandomCodeSpace/otelcontext/internal/graphrag"
 	"github.com/RandomCodeSpace/otelcontext/internal/httpconst"
@@ -193,7 +192,27 @@ func (s *Server) SetGraphRAG(g *graphrag.GraphRAG) {
 // Handler returns an http.Handler for the MCP server with CORS applied.
 // Works correctly when mounted with http.StripPrefix.
 func (s *Server) Handler() http.Handler {
-	return httputil.CORSMiddleware("*", http.HandlerFunc(s.ServeHTTP))
+	return corsMiddleware("*", http.HandlerFunc(s.ServeHTTP))
+}
+
+// corsMiddleware wraps next with permissive CORS headers so MCP clients
+// running in a browser (or any cross-origin caller) can hit /mcp. Allows
+// only the verbs and request headers the MCP transport actually uses;
+// preflight short-circuits with 204. Inlined here to avoid pulling a
+// private helper module just for one ~10-line middleware.
+func corsMiddleware(origin string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("Access-Control-Allow-Origin", origin)
+		h.Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		h.Set("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept, "+mcpTenantHeader+", Mcp-Session-Id")
+		h.Set("Access-Control-Expose-Headers", "Mcp-Session-Id")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // ServeHTTP dispatches by HTTP method — no path routing needed.
