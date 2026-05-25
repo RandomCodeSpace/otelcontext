@@ -25,9 +25,9 @@
 >   older") shipped only the hot side. There is no cold-archive subsystem
 >   today; retention drops by age via `RetentionScheduler`.
 >
-> The current authoritative documents are:
-> - [`CLAUDE.md`](../CLAUDE.md) — operator/agent SSoT for what runs today.
-> - [`docs/superpowers/specs/2026-05-24-mcp-7tool-sqlite-survival-design.md`](superpowers/specs/2026-05-24-mcp-7tool-sqlite-survival-design.md) — design record for the 7-tool reduction + SQLite tuning.
+> The current authoritative source is [`CLAUDE.md`](../CLAUDE.md) — the
+> operator/agent SSoT for what runs today (architecture, GraphRAG, MCP
+> surface, storage, SQLite per-driver defaults).
 >
 > Read the rest of this file as the original intent, not the current spec.
 

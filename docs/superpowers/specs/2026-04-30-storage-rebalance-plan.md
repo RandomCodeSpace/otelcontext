@@ -1,17 +1,6 @@
 # Plan — Storage rebalance: drop FTS5, persist vectordb, cap log search
 
-> **⚠️ SUPERSEDED on 2026-05-24 by PR #91 — do not implement this plan as written.**
->
-> When 120-service production load surfaced OOMs in May 2026, the diagnosis
-> in [`2026-05-24-mcp-7tool-sqlite-survival-design.md`](2026-05-24-mcp-7tool-sqlite-survival-design.md)
-> reversed the central trade-off here: vectordb was **removed entirely**
-> (along with `find_similar_logs`) and FTS5 was **kept** as the default
-> SQLite log-search backend. The 24-hour `search_logs` time-window cap
-> from this plan did ship and remains in effect.
->
-> Preserved verbatim below for historical reference.
-
-**Status:** Approved 2026-04-30 — superseded 2026-05-24 by PR #91.
+**Status:** Approved scope, ready for implementation
 **Date:** 2026-04-30
 **Reviewers:** codex (vectordb persistence design, 2026-04-30); user (scope sign-off, 2026-04-30)
 

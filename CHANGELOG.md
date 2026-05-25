@@ -23,9 +23,8 @@ last published pre-release tag (`v0.0.11-beta.15`).
     9 tunables (conn pool, ingest workers/queue, metric cardinality,
     store-min-severity, sampling rate, gRPC stream cap, `LOG_FTS_ENABLED`)
     when `DB_DRIVER=sqlite` and the operator did not set the env var
-    explicitly.
-  - Design spec at
-    [`docs/superpowers/specs/2026-05-24-mcp-7tool-sqlite-survival-design.md`](docs/superpowers/specs/2026-05-24-mcp-7tool-sqlite-survival-design.md).
+    explicitly. See [`CLAUDE.md`](CLAUDE.md) "SQLite per-driver defaults"
+    for the full table.
 - **Multi-tenancy across the stack** — tenant context plumbed end-to-end:
   - GraphRAG: in-memory stores partitioned per tenant + query context
     propagation. ([#27], RAN-37)
