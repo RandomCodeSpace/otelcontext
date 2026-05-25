@@ -1,5 +1,36 @@
 # OtelContext Observability & Performance Improvement Plan
 
+> **Status — historical planning intent (2026-Q1/Q2). The shipped system has diverged.**
+>
+> This document captures the *original* design exploration that drove the
+> early implementation work. Significant pieces of it no longer reflect
+> reality after PR #91 (2026-05-24, "7-tool MCP triage surface + SQLite
+> survival tuning"):
+>
+> - **Vector (embedded) layer — removed.** `internal/vectordb/` (TF-IDF
+>   index, `find_similar_logs` MCP tool, Section 5.3 below) was deleted
+>   entirely. GraphRAG's `SimilarErrors` was unused and was dropped with
+>   it. Log similarity now comes from Drain template clustering plus FTS5
+>   BM25 ranking — see CLAUDE.md "Storage Architecture".
+> - **MCP surface — 11 → 7 tools.** Section 5.4 lists 11 MCP tools as the
+>   planned surface. The shipped MCP surface is 7: `get_anomaly_timeline`,
+>   `get_service_map`, `get_service_health`, `root_cause_analysis`,
+>   `impact_analysis`, `trace_graph`, `search_logs`. Cut: `get_system_graph`,
+>   `tail_logs`, `get_trace`, `search_traces`, `get_metrics`,
+>   `get_dashboard_stats`, `get_storage_status`, `find_similar_logs`,
+>   `get_alerts`, `correlated_signals`, `get_error_chains`,
+>   `get_investigations`, `get_investigation`, `get_graph_snapshot`,
+>   `search_cold_archive`.
+> - **Hot/cold storage tiering** (goal #4 below, "7 days hot, archive
+>   older") shipped only the hot side. There is no cold-archive subsystem
+>   today; retention drops by age via `RetentionScheduler`.
+>
+> The current authoritative documents are:
+> - [`CLAUDE.md`](../CLAUDE.md) — operator/agent SSoT for what runs today.
+> - [`docs/superpowers/specs/2026-05-24-mcp-7tool-sqlite-survival-design.md`](superpowers/specs/2026-05-24-mcp-7tool-sqlite-survival-design.md) — design record for the 7-tool reduction + SQLite tuning.
+>
+> Read the rest of this file as the original intent, not the current spec.
+
 ## Context
 
 OtelContext is a self-hosted OTLP observability platform (Go backend + React frontend) that ingests traces, logs, and metrics via gRPC, stores them in a relational DB (SQLite/MySQL/PostgreSQL/MSSQL), and serves dashboards via HTTP/WebSocket. When connected to active services pushing continuous telemetry, the DB will grow unbounded and performance will degrade. The goal is to:
