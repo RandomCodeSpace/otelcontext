@@ -79,6 +79,25 @@ DB_DSN="root:password@tcp(localhost:3306)/otelcontext?charset=utf8mb4&parseTime=
 
 See [`.env.example`](.env.example) for SQL Server and Azure Entra (passwordless Postgres) configurations.
 
+## Production sizing
+
+OtelContext auto-tunes itself by driver. The numbers below assume the
+auto-flipped SQLite defaults (5% sampling baseline, `STORE_MIN_SEVERITY=WARN`,
+3k metric cardinality cap, FTS5 enabled, 1 SQLite writer with WAL + 256 MB
+page cache + 1 GB mmap). Postgres keeps the looser defaults.
+
+| Workload | DB | Steady RSS | Notes |
+|---|---|---|---|
+| Dev / <10 services | SQLite | <500 MB | Default config; no tuning needed. |
+| 50–120 services, 7-day retention | **SQLite (auto-tuned)** or Postgres | ~1.8 GB | SQLite survives this band on the auto-flipped defaults. |
+| >120 services, or >7-day retention, or sustained 50+ writes/sec | **Postgres** | depends on host | SQLite's single-writer serialization becomes the bottleneck. |
+
+`OTELCONTEXT_ALLOW_SQLITE_PROD=false` is the guardrail — `APP_ENV=production` with `DB_DRIVER=sqlite` refuses to start unless the operator opts in.
+
+See [`CLAUDE.md`](CLAUDE.md) "SQLite per-driver defaults" for the full
+table of which env vars get auto-overridden on SQLite, and the rationale
+per entry.
+
 ## OTLP Integration
 
 OtelContext accepts OTLP gRPC on `:4317` and OTLP HTTP on `:8080/v1/{traces,logs,metrics}`. Point any OpenTelemetry Collector (or SDK) at it:
@@ -104,14 +123,16 @@ See `docs/otel-collector-example.yaml` for a complete example.
 
 ## Features
 
-- **OTLP gRPC + HTTP ingest** — traces, logs, metrics; gzip and protobuf/JSON supported.
-- **GraphRAG** — layered in-memory graph with error-chain, impact, and root-cause queries.
+- **OTLP gRPC + HTTP ingest** — traces, logs, metrics; gzip and protobuf/JSON supported. Hybrid backpressure (90% soft-drop, 100% reject) prevents queue OOMs.
+- **GraphRAG** — layered in-memory graph with `error_chain`, `impact_analysis`, `root_cause_analysis`, and anomaly-correlation queries.
 - **Drain log clustering** — deterministic template mining, persisted across restarts.
-- **MCP server** — 7-tool triage surface for AI agents over JSON-RPC 2.0 + SSE (get_anomaly_timeline, get_service_map, get_service_health, root_cause_analysis, impact_analysis, trace_graph, search_logs).
-- **Multi-tenancy** — per-row `tenant_id`, `X-Tenant-ID` header / `x-tenant-id` gRPC metadata.
-- **Adaptive sampling** — always-on for errors and slow spans, probabilistic otherwise.
+- **MCP server** — 7-tool triage surface for AI agents over JSON-RPC 2.0 + SSE: `get_anomaly_timeline`, `get_service_map`, `get_service_health`, `root_cause_analysis`, `impact_analysis`, `trace_graph`, `search_logs`. Per-call deadlines, concurrency semaphore, 5 s TTL cache for cheap in-memory tools, SSE keep-alives every 25 s.
+- **Log search** — SQLite FTS5 (BM25-ranked) on by default; `pg_trgm` GIN on Postgres; LIKE fallback. `search_logs` is 24-hour-capped to bound the worst-case scan.
+- **Multi-tenancy** — per-row `tenant_id`, `X-Tenant-ID` header / `x-tenant-id` gRPC metadata, per-tenant cardinality caps.
+- **Adaptive sampling** — always-on for errors and slow spans, probabilistic otherwise (defaults to 5 % on SQLite, 100 % on Postgres).
+- **Auto-tuned SQLite path** — fail-closed PRAGMA stanza (WAL, NORMAL sync, 256 MB cache, 1 GB mmap, 64 MB WAL cap) + 9 per-driver config defaults so single-binary deploys survive 120 services on a 4 GB host.
 - **DLQ** — durable typed envelopes with disk-bounded replay.
-- **Self-instrumentation** — export OtelContext's own spans via `OTEL_EXPORTER_OTLP_ENDPOINT`.
+- **Self-instrumentation** — export OtelContext's own spans via `OTEL_EXPORTER_OTLP_ENDPOINT`. Loopback guard prevents recursive feedback.
 
 ## Security
 
