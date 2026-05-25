@@ -21,92 +21,72 @@ const (
 // OtelContext MCP server. The surface was reduced from 21 to 7 in
 // 2026-05-24 so the platform survives 120 services on SQLite — see
 // docs/superpowers/specs/2026-05-24-mcp-7tool-sqlite-survival-design.md.
+// schemaOpt mutates an InputSchema being built by mkTool. Use param(...) and
+// required(...) to compose schemas without re-typing the InputSchema /
+// Properties scaffolding on every tool definition.
+type schemaOpt func(*InputSchema)
+
+// param adds a single Property to the schema. Type is "string" or "number".
+func param(name, typ, desc string) schemaOpt {
+	return func(s *InputSchema) {
+		s.Properties[name] = Property{Type: typ, Description: desc}
+	}
+}
+
+// required marks one or more parameter names as required by JSON-schema.
+func required(fields ...string) schemaOpt {
+	return func(s *InputSchema) { s.Required = append(s.Required, fields...) }
+}
+
+// mkTool builds a Tool with a freshly-initialised InputSchema. Centralising
+// the InputSchema/Properties scaffolding here keeps the toolDefs list one
+// call per tool and avoids the repeated struct-literal boilerplate that
+// SonarCloud (rightly) flagged as duplication.
+func mkTool(name, desc string, opts ...schemaOpt) Tool {
+	s := InputSchema{Type: "object", Properties: map[string]Property{}}
+	for _, opt := range opts {
+		opt(&s)
+	}
+	return Tool{Name: name, Description: desc, InputSchema: s}
+}
+
 var toolDefs = []Tool{
-	{
-		Name:        "get_anomaly_timeline",
-		Description: "Returns recent anomalies with temporal causal links, optionally filtered by service. The triage entry point — answers \"what's wrong right now\".",
-		InputSchema: InputSchema{
-			Type: "object",
-			Properties: map[string]Property{
-				"since":   {Type: "string", Description: "Start time RFC3339. Defaults to 1h ago."},
-				"service": {Type: "string", Description: "Filter by service."},
-			},
-		},
-	},
-	{
-		Name:        "get_service_map",
-		Description: "Returns the service topology with health scores, error rates, call counts, and dependency edges. Powered by the live GraphRAG.",
-		InputSchema: InputSchema{
-			Type: "object",
-			Properties: map[string]Property{
-				"depth":   {Type: "number", Description: "Max traversal depth (default 3)."},
-				"service": {Type: "string", Description: "Focus on a specific service and its neighbors."},
-			},
-		},
-	},
-	{
-		Name:        "get_service_health",
-		Description: "Returns detailed health metrics for a specific service: error rate, latency percentiles, request rate, and active alerts.",
-		InputSchema: InputSchema{
-			Type:     "object",
-			Required: []string{"service_name"},
-			Properties: map[string]Property{
-				"service_name": {Type: "string", Description: "The service name to query."},
-			},
-		},
-	},
-	{
-		Name:        "root_cause_analysis",
-		Description: "Ranked probable root causes with evidence: error chains, anomalous metrics, correlated logs.",
-		InputSchema: InputSchema{
-			Type:     "object",
-			Required: []string{"service"},
-			Properties: map[string]Property{
-				"service":    {Type: "string", Description: "Service experiencing issues."},
-				"time_range": {Type: "string", Description: "Lookback window. Defaults to '15m'."},
-			},
-		},
-	},
-	{
-		Name:        "impact_analysis",
-		Description: "BFS downstream from a service to find all affected services and impact scores.",
-		InputSchema: InputSchema{
-			Type:     "object",
-			Required: []string{"service"},
-			Properties: map[string]Property{
-				"service": {Type: "string", Description: "Service to analyze blast radius for."},
-				"depth":   {Type: "number", Description: "Max traversal depth (default 5)."},
-			},
-		},
-	},
-	{
-		Name:        "trace_graph",
-		Description: "Returns the full span tree for a trace with service names, durations, errors, and linked logs.",
-		InputSchema: InputSchema{
-			Type:     "object",
-			Required: []string{"trace_id"},
-			Properties: map[string]Property{
-				"trace_id": {Type: "string", Description: "The trace ID to visualize."},
-			},
-		},
-	},
-	{
-		Name:        "search_logs",
-		Description: "Searches log entries by severity, service, body text, trace ID, and time range. Returns id, timestamp, severity, service_name, body, trace_id. **Limited to the last 24 hours** — windows entirely outside the 24h cap are rejected. Strongly recommend setting `service` and/or `severity` to scope the search; unscoped keyword queries scan large row counts when FTS5 is disabled. Use severity=ERROR to find errors, query= for full-text search, trace_id= to correlate with a trace. Use page= for pagination.",
-		InputSchema: InputSchema{
-			Type: "object",
-			Properties: map[string]Property{
-				"query":    {Type: "string", Description: "Full-text search in log body."},
-				"severity": {Type: "string", Description: "Filter by severity level: ERROR, WARN, INFO, DEBUG."},
-				"service":  {Type: "string", Description: "Filter by service name (exact match)."},
-				"trace_id": {Type: "string", Description: "Filter logs belonging to a specific trace ID."},
-				"start":    {Type: "string", Description: "Start time RFC3339. Defaults to 24h ago. Cannot be earlier than now-24h; older values are clamped."},
-				"end":      {Type: "string", Description: "End time RFC3339. Defaults to now. Cannot exceed now; future values are clamped."},
-				"limit":    {Type: "number", Description: "Max results per page (default 50, max 200)."},
-				"page":     {Type: "number", Description: "Page number for pagination (default 0)."},
-			},
-		},
-	},
+	mkTool("get_anomaly_timeline", "Returns recent anomalies with temporal causal links, optionally filtered by service. The triage entry point — answers \"what's wrong right now\".",
+		param("since", "string", "Start time RFC3339. Defaults to 1h ago."),
+		param("service", "string", "Filter by service."),
+	),
+	mkTool("get_service_map", "Returns the service topology with health scores, error rates, call counts, and dependency edges. Powered by the live GraphRAG.",
+		param("depth", "number", "Max traversal depth (default 3)."),
+		param("service", "string", "Focus on a specific service and its neighbors."),
+	),
+	mkTool("get_service_health", "Returns detailed health metrics for a specific service: error rate, latency percentiles, request rate, and active alerts.",
+		required("service_name"),
+		param("service_name", "string", "The service name to query."),
+	),
+	mkTool("root_cause_analysis", "Ranked probable root causes with evidence: error chains, anomalous metrics, correlated logs.",
+		required("service"),
+		param("service", "string", "Service experiencing issues."),
+		param("time_range", "string", "Lookback window. Defaults to '15m'."),
+	),
+	mkTool("impact_analysis", "BFS downstream from a service to find all affected services and impact scores.",
+		required("service"),
+		param("service", "string", "Service to analyze blast radius for."),
+		param("depth", "number", "Max traversal depth (default 5)."),
+	),
+	mkTool("trace_graph", "Returns the full span tree for a trace with service names, durations, errors, and linked logs.",
+		required("trace_id"),
+		param("trace_id", "string", "The trace ID to visualize."),
+	),
+	mkTool("search_logs", "Searches log entries by severity, service, body text, trace ID, and time range. Returns id, timestamp, severity, service_name, body, trace_id. **Limited to the last 24 hours** — windows entirely outside the 24h cap are rejected. Strongly recommend setting `service` and/or `severity` to scope the search; unscoped keyword queries scan large row counts when FTS5 is disabled. Use severity=ERROR to find errors, query= for full-text search, trace_id= to correlate with a trace. Use page= for pagination.",
+		param("query", "string", "Full-text search in log body."),
+		param("severity", "string", "Filter by severity level: ERROR, WARN, INFO, DEBUG."),
+		param("service", "string", "Filter by service name (exact match)."),
+		param("trace_id", "string", "Filter logs belonging to a specific trace ID."),
+		param("start", "string", "Start time RFC3339. Defaults to 24h ago. Cannot be earlier than now-24h; older values are clamped."),
+		param("end", "string", "End time RFC3339. Defaults to now. Cannot exceed now; future values are clamped."),
+		param("limit", "number", "Max results per page (default 50, max 200)."),
+		param("page", "number", "Page number for pagination (default 0)."),
+	),
 }
 
 // mcpCtx returns a tenant-scoped context for repository calls. If the caller's
