@@ -152,8 +152,9 @@ func main() {
 		fatal("DB/Env validation", err)
 	}
 	if strings.EqualFold(cfg.DBDriver, "sqlite") {
-		slog.Warn("SQLite driver in use — suitable for dev/small deployments only. " +
-			"Expected cap: ~5 services, ~1k events/sec sustained.")
+		slog.Warn("SQLite driver in use. Auto-tuned defaults survive ~50-120 services " +
+			"on a 4 GB host with 7-day retention. Switch to Postgres beyond that band, " +
+			"or for sustained >50 writes/sec. See README 'Production sizing'.")
 	}
 
 	// Initialize structured logger
