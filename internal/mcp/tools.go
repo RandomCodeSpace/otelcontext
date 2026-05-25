@@ -141,24 +141,22 @@ func (s *Server) toolHandler(ctx context.Context, name string, args map[string]a
 		}
 		s.metrics.MCPToolInvocationsTotal.WithLabelValues(name, status).Inc()
 	}()
-	switch name {
-	case "get_anomaly_timeline":
-		return s.toolGetAnomalyTimeline(ctx, args)
-	case "get_service_map":
-		return s.toolGetServiceMap(ctx, args)
-	case "get_service_health":
-		return s.toolGetServiceHealth(ctx, args)
-	case "root_cause_analysis":
-		return s.toolRootCauseAnalysis(ctx, args)
-	case "impact_analysis":
-		return s.toolImpactAnalysis(ctx, args)
-	case "trace_graph":
-		return s.toolTraceGraph(ctx, args)
-	case "search_logs":
-		return s.toolSearchLogs(ctx, args)
-	default:
-		return errorResult(fmt.Sprintf("unknown tool: %s", name))
+	// Map dispatch: the name -> handler binding is the single source of truth
+	// for which tools the surface exposes. Adding a new tool means one entry
+	// in this map plus a definition in toolDefs, nothing else.
+	dispatch := map[string]func(context.Context, map[string]any) ToolCallResult{
+		"get_anomaly_timeline": s.toolGetAnomalyTimeline,
+		"get_service_map":      s.toolGetServiceMap,
+		"get_service_health":   s.toolGetServiceHealth,
+		"root_cause_analysis":  s.toolRootCauseAnalysis,
+		"impact_analysis":      s.toolImpactAnalysis,
+		"trace_graph":          s.toolTraceGraph,
+		"search_logs":          s.toolSearchLogs,
 	}
+	if fn, ok := dispatch[name]; ok {
+		return fn(ctx, args)
+	}
+	return errorResult(fmt.Sprintf("unknown tool: %s", name))
 }
 
 // --- Tool implementations ---
