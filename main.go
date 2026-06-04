@@ -177,6 +177,11 @@ func main() {
 
 	slog.Info("🚀 Starting OtelContext", "version", Version, "env", cfg.Env, "log_level", level)
 
+	// Pace the GC against a soft memory ceiling so RSS stays bounded under
+	// sustained ingest (honors an explicit GOMEMLIMIT; otherwise 75% of the
+	// detected cgroup/host budget). See applyMemoryLimit in memlimit.go.
+	applyMemoryLimit(75)
+
 	// 1. Initialize Internal Telemetry (first — everything registers metrics against this)
 	metrics := telemetry.New()
 	slog.Info("📊 Internal telemetry initialized")
