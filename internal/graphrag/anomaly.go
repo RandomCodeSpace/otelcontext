@@ -28,7 +28,12 @@ func (g *GraphRAG) detectAnomaliesForTenant(ctx context.Context, tenant string, 
 		baselineErrorRate := 0.02 // reasonable baseline
 		if svc.ErrorRate > baselineErrorRate*2 && svc.ErrorRate > 0.05 {
 			anomaly := AnomalyNode{
-				ID:        fmt.Sprintf("anom_%s_err_%d", svc.Name, now.UnixNano()),
+				// Stable ID per (service, type): each detection tick UPSERTS the
+				// same evolving anomaly node rather than minting a new one. With a
+				// UnixNano suffix an ongoing spike created a fresh node every 10s
+				// (and correlateWithRecent then minted O(N²) PRECEDED_BY edges),
+				// which grew the AnomalyStore to ~1.3 GB over a 15-min soak.
+				ID:        fmt.Sprintf("anom_%s_err", svc.Name),
 				Type:      AnomalyErrorSpike,
 				Severity:  classifyErrorSeverity(svc.ErrorRate),
 				Service:   svc.Name,
@@ -49,7 +54,7 @@ func (g *GraphRAG) detectAnomaliesForTenant(ctx context.Context, tenant string, 
 		// Latency degradation: p99-like check using avg * 3 as proxy
 		if svc.AvgLatency > 500 && svc.CallCount > 10 {
 			anomaly := AnomalyNode{
-				ID:        fmt.Sprintf("anom_%s_lat_%d", svc.Name, now.UnixNano()),
+				ID:        fmt.Sprintf("anom_%s_lat", svc.Name), // stable per (service,type); see error-spike note
 				Type:      AnomalyLatencySpike,
 				Severity:  classifyLatencySeverity(svc.AvgLatency),
 				Service:   svc.Name,
@@ -79,7 +84,7 @@ func (g *GraphRAG) detectAnomaliesForTenant(ctx context.Context, tenant string, 
 			deviation := (m.RollingAvg - (m.RollingMin + rangeSize/2)) / (rangeSize / 2)
 			if deviation > 3.0 || deviation < -3.0 {
 				anomaly := AnomalyNode{
-					ID:        fmt.Sprintf("anom_%s_metric_%d", m.Service, now.UnixNano()),
+					ID:        fmt.Sprintf("anom_%s_metric_%s", m.Service, m.MetricName), // stable per (service,metric)
 					Type:      AnomalyMetricZScore,
 					Severity:  SeverityWarning,
 					Service:   m.Service,
