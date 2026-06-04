@@ -17,6 +17,7 @@ type Sampler struct {
 	buckets            map[string]*tokenBucket
 	totalSeen          atomic.Int64
 	totalDropped       atomic.Int64
+	now                func() time.Time // injectable for tests; defaults to time.Now
 }
 
 // NewSampler creates a Sampler with the given parameters.
@@ -32,6 +33,7 @@ func NewSampler(rate float64, alwaysOnErrors bool, latencyThresholdMs float64) *
 		alwaysOnErrors:     alwaysOnErrors,
 		latencyThresholdMs: latencyThresholdMs,
 		buckets:            make(map[string]*tokenBucket),
+		now:                time.Now,
 	}
 }
 
@@ -67,13 +69,13 @@ func (s *Sampler) ShouldSample(serviceName string, isError bool, durationMs floa
 	s.mu.Lock()
 	b, ok := s.buckets[serviceName]
 	if !ok {
-		b = newTokenBucket(s.rate)
+		b = newTokenBucket(s.rate, s.now)
 		s.buckets[serviceName] = b
 		// Always let first trace through (new service discovery).
 		s.mu.Unlock()
 		return true
 	}
-	allow := b.allow()
+	allow := b.allow(s.now())
 	s.mu.Unlock()
 
 	if !allow {
@@ -87,35 +89,60 @@ func (s *Sampler) Stats() (int64, int64) {
 	return s.totalSeen.Load(), s.totalDropped.Load()
 }
 
-// tokenBucket is a simple token bucket for sampling decisions.
-// Refills at `rate` tokens per second, max capacity 1.0.
+// tokenBucket throttles healthy-span ingestion per service. It is a RATE
+// LIMITER, not a percentage sampler: it admits at most ~`rate` healthy spans
+// per second per service (refill `rate` tokens/s, cost 1 token/span) with a
+// startup burst of up to capacity = max(1, 1/rate) spans.
+//
+// The long-run keep FRACTION is therefore min(1, rate / offered_rate): a
+// service emitting ≤ `rate` healthy spans/s keeps all of them; above that it
+// keeps a shrinking fraction while the absolute admitted rate stays near
+// `rate`/s. So rate=0.05 means "~0.05 healthy spans/s/service" (≈ one per 20s),
+// NOT "5% of healthy spans". Errors and slow spans bypass this entirely in
+// ShouldSample, so there is no data loss for the signals that matter; the
+// absolute cap is what bounds the SQLite write rate under load spikes. If a
+// true proportional keep-fraction is ever wanted, switch to probabilistic
+// (hash-mod / rand) sampling — that is a separate design decision.
+//
+// (The previous implementation capped tokens at 1.0 but charged 1.0/rate per
+// request; for any rate < 1.0 the charge exceeded the cap, so no healthy span
+// could ever be admitted — the SQLite default rate of 0.05 dropped ~100%.)
 type tokenBucket struct {
-	rate     float64 // tokens per second
-	tokens   float64 // current tokens (0.0–1.0)
-	lastTick time.Time
+	rate     float64   // refill tokens/sec == max sustained admitted healthy spans/sec
+	capacity float64   // max accumulated tokens (burst ceiling)
+	tokens   float64   // current token count
+	lastTick time.Time // wall-clock of last refill
 }
 
-func newTokenBucket(rate float64) *tokenBucket {
+func newTokenBucket(rate float64, now func() time.Time) *tokenBucket {
+	// capacity = 1/rate tokens: one "admission interval" of burst so a freshly
+	// seen service is not throttled immediately. Floored at 1.0 so a span can
+	// always eventually be admitted.
+	capacity := 1.0 / rate
+	if capacity < 1.0 {
+		capacity = 1.0
+	}
 	return &tokenBucket{
 		rate:     rate,
-		tokens:   rate, // start with one full refill worth
-		lastTick: time.Now(),
+		capacity: capacity,
+		tokens:   capacity, // start full so new services are not immediately throttled
+		lastTick: now(),
 	}
 }
 
-// allow returns true and consumes a token if one is available.
-func (b *tokenBucket) allow() bool {
-	now := time.Now()
+// allow refills the bucket for elapsed time and admits the request if
+// at least 1 token is available, consuming exactly 1 on admission.
+func (b *tokenBucket) allow(now time.Time) bool {
 	elapsed := now.Sub(b.lastTick).Seconds()
 	b.lastTick = now
 
 	b.tokens += elapsed * b.rate
-	if b.tokens > 1.0 {
-		b.tokens = 1.0
+	if b.tokens > b.capacity {
+		b.tokens = b.capacity
 	}
 
-	if b.tokens >= 1.0/b.rate {
-		b.tokens -= 1.0 / b.rate
+	if b.tokens >= 1.0 {
+		b.tokens -= 1.0
 		return true
 	}
 	return false

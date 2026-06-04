@@ -38,10 +38,16 @@ describe('ServiceSidePanel', () => {
 
   it('renders KPI values', () => {
     renderPanel();
-    expect(screen.getByText('670')).toBeInTheDocument();
-    expect(screen.getByText('8.4%')).toBeInTheDocument();
-    expect(screen.getByText('142ms')).toBeInTheDocument();
-    expect(screen.getByText('890ms')).toBeInTheDocument();
+    // The design-system <Stat> renders the numeric value and unit in separate
+    // <span> nodes inside `.rcs-stat-value`, so e.g. '8.4%' / '142ms' never
+    // appear as a single text node.  Assert on the combined textContent of the
+    // stat-value container instead.
+    const statValues = document.querySelectorAll('.rcs-stat-value');
+    const texts = Array.from(statValues).map((el) => el.textContent ?? '');
+    expect(texts).toContain('670');       // RPS — no unit
+    expect(texts.some((t) => t === '8.40%')).toBe(true);   // error rate
+    expect(texts.some((t) => t === '142ms')).toBe(true);   // avg latency
+    expect(texts.some((t) => t === '890ms')).toBe(true);   // p99
   });
 
   it('renders upstream service name', () => {

@@ -15,7 +15,7 @@ export default function App() {
   // WebSocket retained as the live/offline source for the header indicator;
   // log batches it pushes are intentionally discarded.
   const ws = useWebSocket(() => undefined)
-  const wsConnected = !!ws.current
+  const wsConnected = ws.status === 'connected'
 
   return (
     <AppShell

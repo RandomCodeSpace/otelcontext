@@ -15,19 +15,7 @@ import (
 
 // handleGetLogs handles GET /api/logs with advanced filtering
 func (s *Server) handleGetLogs(w http.ResponseWriter, r *http.Request) {
-	limit := 50
-	offset := 0
-
-	if l := r.URL.Query().Get("limit"); l != "" {
-		if v, err := strconv.Atoi(l); err == nil {
-			limit = v
-		}
-	}
-	if o := r.URL.Query().Get("offset"); o != "" {
-		if v, err := strconv.Atoi(o); err == nil {
-			offset = v
-		}
-	}
+	limit, offset := parsePaging(r, pagingDefaultLimit)
 
 	filter := storage.LogFilter{
 		ServiceName: r.URL.Query().Get("service_name"),

@@ -4,11 +4,14 @@ import { ThemeProvider, ToastRegion } from '@ossrandom/design-system'
 import '@ossrandom/design-system/styles.css'
 import './styles/global.css'
 import App from './App'
+import { ErrorBoundary } from './components/ErrorBoundary'
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
     <ThemeProvider mode="dark">
-      <App />
+      <ErrorBoundary>
+        <App />
+      </ErrorBoundary>
       <ToastRegion />
     </ThemeProvider>
   </StrictMode>,

@@ -8,7 +8,6 @@ import (
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 )
 
-
 // TenantHeader is the canonical HTTP header carrying the tenant ID on
 // read-side (query) requests. Ingest paths resolve tenant separately via gRPC
 // metadata / OTLP resource attributes and do not go through this middleware.
@@ -32,6 +31,14 @@ func TenantMiddleware(cfg *config.Config) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if !tenantScopedPath(r.URL.Path) {
+				next.ServeHTTP(w, r)
+				return
+			}
+			// If an upstream layer (e.g. TenantKeyAuth.Middleware) has already
+			// pinned a tenant onto the context, do not overwrite it — that would
+			// allow a client to escape their key-bound tenant by supplying a
+			// different X-Tenant-ID header.
+			if storage.HasTenantContext(r.Context()) {
 				next.ServeHTTP(w, r)
 				return
 			}

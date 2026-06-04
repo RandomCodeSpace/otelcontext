@@ -332,7 +332,9 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		s.callsServiced.Add(1)
-		s.cache.Set(tenant, params.Name, params.Arguments, toolResult)
+		if !toolResult.IsError {
+			s.cache.Set(tenant, params.Name, params.Arguments, toolResult)
+		}
 		result = toolResult
 
 	case "ping":
