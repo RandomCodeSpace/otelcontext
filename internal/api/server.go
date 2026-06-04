@@ -2,6 +2,7 @@ package api
 
 import (
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/RandomCodeSpace/otelcontext/internal/cache"
@@ -105,6 +106,47 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/ws", s.hub.HandleWebSocket)
 	mux.HandleFunc("/ws/health", s.metrics.HealthWSHandler())
 	mux.HandleFunc("/ws/events", s.eventHub.HandleWebSocket)
+}
+
+const (
+	pagingDefaultLimit = 50
+	pagingMaxLimit     = 1000
+)
+
+// parsePaging reads "limit" and "offset" from the request query string and
+// applies safety clamping so GORM never sees a negative or unbounded Limit.
+//
+//   - limit: floored at 1, capped at pagingMaxLimit (1000). When absent the
+//     caller-supplied defaultLimit is used (also clamped).
+//   - offset: floored at 0. When absent defaults to 0.
+func parsePaging(r *http.Request, defaultLimit int) (limit, offset int) {
+	limit = defaultLimit
+	if limit < 1 {
+		limit = 1
+	}
+	if limit > pagingMaxLimit {
+		limit = pagingMaxLimit
+	}
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if v, err := strconv.Atoi(l); err == nil {
+			limit = v
+		}
+	}
+	if limit < 1 {
+		limit = 1
+	}
+	if limit > pagingMaxLimit {
+		limit = pagingMaxLimit
+	}
+	if o := r.URL.Query().Get("offset"); o != "" {
+		if v, err := strconv.Atoi(o); err == nil {
+			offset = v
+		}
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	return limit, offset
 }
 
 // parseTimeRange parses start and end times from request query parameters

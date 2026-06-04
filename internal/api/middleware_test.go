@@ -133,6 +133,41 @@ func TestTenantMiddleware_MissingHeaderUsesDefault(t *testing.T) {
 	}
 }
 
+// TestTenantMiddleware_DoesNotOverwritePinnedTenant verifies that when
+// TenantKeyAuth.Middleware has already pinned a tenant onto the context (the
+// per-tenant API-key path), the subsequent TenantMiddleware pass-through does
+// NOT overwrite it with the client-supplied X-Tenant-ID header.
+//
+// This is the regression test for the middleware-ordering bypass:
+//
+//	TenantKeyAuth.Middleware(auth "alpha-key" → pins "alpha")
+//	  → TenantMiddleware(reads X-Tenant-ID: "beta" → must NOT overwrite)
+//	    → handler (must see "alpha")
+func TestTenantMiddleware_DoesNotOverwritePinnedTenant(t *testing.T) {
+	// Build per-tenant key auth: key "alpha-key" → tenant "alpha".
+	auth := NewTenantKeyAuth(map[string]string{"alpha-key": "alpha"})
+
+	cfg := &config.Config{DefaultTenant: "default"}
+	tc := &tenantCapture{}
+
+	// Compose: TenantKeyAuth wraps TenantMiddleware wraps handler.
+	h := auth.Middleware("/mcp", TenantMiddleware(cfg)(tc.handler()))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/logs", nil)
+	req.Header.Set("Authorization", "Bearer alpha-key")
+	req.Header.Set(TenantHeader, "beta") // attacker's cross-tenant attempt
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d (body=%q)", rec.Code, rec.Body.String())
+	}
+	if tc.got != "alpha" {
+		t.Errorf("TenantMiddleware overwrote pinned tenant: got %q, want %q", tc.got, "alpha")
+	}
+}
+
 // Non-/api/* paths must pass through without tenant resolution — and so should
 // report the default (no ctx value).
 func TestTenantMiddleware_NonAPIPath_Passthrough(t *testing.T) {

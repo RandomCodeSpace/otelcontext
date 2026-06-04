@@ -55,6 +55,45 @@ func TestHandleGetLogs_NoSearchSkipsCap(t *testing.T) {
 	}
 }
 
+// TestParsePaging_Clamp verifies that parsePaging enforces bounds on limit and
+// offset, preventing GORM from receiving a negative Limit (treated as unlimited)
+// or a negative offset.
+func TestParsePaging_Clamp(t *testing.T) {
+	cases := []struct {
+		query        string
+		defaultLimit int
+		wantLimit    int
+		wantOffset   int
+	}{
+		// Over-limit capped at 1000.
+		{"limit=9999&offset=0", 50, 1000, 0},
+		// Negative limit floored at 1.
+		{"limit=-5&offset=0", 50, 1, 0},
+		// Negative offset floored at 0.
+		{"limit=10&offset=-99", 50, 10, 0},
+		// Both negative.
+		{"limit=-1&offset=-1", 50, 1, 0},
+		// Default limit also clamped.
+		{"", 9999, 1000, 0},
+		// Valid values pass through unchanged.
+		{"limit=100&offset=200", 50, 100, 200},
+		// Exact cap boundary.
+		{"limit=1000&offset=0", 50, 1000, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.query, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/api/logs?"+tc.query, nil)
+			gotLimit, gotOffset := parsePaging(req, tc.defaultLimit)
+			if gotLimit != tc.wantLimit {
+				t.Errorf("limit: got %d, want %d", gotLimit, tc.wantLimit)
+			}
+			if gotOffset != tc.wantOffset {
+				t.Errorf("offset: got %d, want %d", gotOffset, tc.wantOffset)
+			}
+		})
+	}
+}
+
 // newAPITestRepoWithoutFTS builds a fresh in-memory repo with FTS5 disabled.
 // Used by cap tests since they only care about handler behavior, not the
 // search backend.
