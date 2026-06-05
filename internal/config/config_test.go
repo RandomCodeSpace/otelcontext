@@ -11,20 +11,20 @@ import (
 // baseValid returns a Config that passes Validate() — test functions mutate one field at a time.
 func baseValid() *Config {
 	return &Config{
-		HTTPPort:             "8080",
-		GRPCPort:             "4317",
-		DBDriver:             "sqlite",
-		HotRetentionDays:     7,
-		MetricMaxCardinality: 10000,
-		SamplingRate:         1.0,
-		APIRateLimitRPS:      100,
-		DBMaxOpenConns:       50,
-		DBMaxIdleConns:       10,
-		CompressionLevel:     "default",
+		HTTPPort:                 "8080",
+		GRPCPort:                 "4317",
+		DBDriver:                 "sqlite",
+		HotRetentionDays:         7,
+		MetricMaxCardinality:     10000,
+		SamplingRate:             1.0,
+		APIRateLimitRPS:          100,
+		DBMaxOpenConns:           50,
+		DBMaxIdleConns:           10,
+		CompressionLevel:         "default",
 		GRPCMaxRecvMB:            16,
 		GRPCMaxConcurrentStreams: 1000,
-		RetentionBatchSize:    50000,
-		RetentionBatchSleepMs: 1,
+		RetentionBatchSize:       50000,
+		RetentionBatchSleepMs:    1,
 	}
 }
 

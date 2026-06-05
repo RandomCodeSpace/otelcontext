@@ -345,36 +345,34 @@ func Load(customPath string) (*Config, error) {
 // "Explicit operator override" is detected via os.LookupEnv (presence)
 // rather than value comparison so that, e.g., DB_MAX_OPEN_CONNS=50 set by
 // hand is still honoured even though it equals the Postgres default.
+// sqliteOverrides is the table of (env-var, apply) pairs that
+// applyDriverDefaults walks when DB_DRIVER=sqlite. Add a row here to
+// introduce a new SQLite-only default; the apply closure is the only place
+// that names the Config field, so the surrounding lookup/skip logic stays
+// in one spot.
+var sqliteOverrides = []struct {
+	envKey string
+	apply  func(*Config)
+}{
+	{"DB_MAX_OPEN_CONNS", func(c *Config) { c.DBMaxOpenConns = 1 }},
+	{"DB_MAX_IDLE_CONNS", func(c *Config) { c.DBMaxIdleConns = 1 }},
+	{"INGEST_PIPELINE_WORKERS", func(c *Config) { c.IngestPipelineWorkers = 2 }},
+	{"INGEST_PIPELINE_QUEUE_SIZE", func(c *Config) { c.IngestPipelineQueueSize = 10000 }},
+	{"METRIC_MAX_CARDINALITY", func(c *Config) { c.MetricMaxCardinality = 3000 }},
+	{"STORE_MIN_SEVERITY", func(c *Config) { c.StoreMinSeverity = "WARN" }},
+	{"SAMPLING_RATE", func(c *Config) { c.SamplingRate = 0.05 }},
+	{"GRPC_MAX_CONCURRENT_STREAMS", func(c *Config) { c.GRPCMaxConcurrentStreams = 240 }},
+	{"LOG_FTS_ENABLED", func(c *Config) { c.LogFTSEnabled = true }},
+}
+
 func applyDriverDefaults(cfg *Config) {
 	if !strings.EqualFold(cfg.DBDriver, "sqlite") {
 		return
 	}
-	if _, ok := os.LookupEnv("DB_MAX_OPEN_CONNS"); !ok {
-		cfg.DBMaxOpenConns = 1
-	}
-	if _, ok := os.LookupEnv("DB_MAX_IDLE_CONNS"); !ok {
-		cfg.DBMaxIdleConns = 1
-	}
-	if _, ok := os.LookupEnv("INGEST_PIPELINE_WORKERS"); !ok {
-		cfg.IngestPipelineWorkers = 2
-	}
-	if _, ok := os.LookupEnv("INGEST_PIPELINE_QUEUE_SIZE"); !ok {
-		cfg.IngestPipelineQueueSize = 10000
-	}
-	if _, ok := os.LookupEnv("METRIC_MAX_CARDINALITY"); !ok {
-		cfg.MetricMaxCardinality = 3000
-	}
-	if _, ok := os.LookupEnv("STORE_MIN_SEVERITY"); !ok {
-		cfg.StoreMinSeverity = "WARN"
-	}
-	if _, ok := os.LookupEnv("SAMPLING_RATE"); !ok {
-		cfg.SamplingRate = 0.05
-	}
-	if _, ok := os.LookupEnv("GRPC_MAX_CONCURRENT_STREAMS"); !ok {
-		cfg.GRPCMaxConcurrentStreams = 240
-	}
-	if _, ok := os.LookupEnv("LOG_FTS_ENABLED"); !ok {
-		cfg.LogFTSEnabled = true
+	for _, ov := range sqliteOverrides {
+		if _, ok := os.LookupEnv(ov.envKey); !ok {
+			ov.apply(cfg)
+		}
 	}
 }
 

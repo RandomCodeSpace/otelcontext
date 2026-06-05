@@ -55,11 +55,13 @@ import (
 // Returns the real tag when installed via `go install`, "local" otherwise.
 var Version = detectVersion()
 
-// detectVersion reads the module version from build info, falling back to
-// "local" for ad-hoc `go build` invocations that don't stamp a version.
+// detectVersion reads runtime/debug.BuildInfo to return the module version
+// that go install or go build stamped into the binary. Falls back to "local"
+// for go run, raw go build, or any path that does not produce a stamped
+// build (e.g. `(devel)` from module-aware development builds).
 func detectVersion() string {
-	if bi, ok := debug.ReadBuildInfo(); ok {
-		if v := bi.Main.Version; v != "" && v != "(devel)" {
+	if info, ok := debug.ReadBuildInfo(); ok {
+		if v := info.Main.Version; v != "" && v != "(devel)" {
 			return v
 		}
 	}
@@ -150,8 +152,9 @@ func main() {
 		fatal("DB/Env validation", err)
 	}
 	if strings.EqualFold(cfg.DBDriver, "sqlite") {
-		slog.Warn("SQLite driver in use — suitable for dev/small deployments only. " +
-			"Expected cap: ~5 services, ~1k events/sec sustained.")
+		slog.Warn("SQLite driver in use. Auto-tuned defaults survive ~50-120 services " +
+			"on a 4 GB host with 7-day retention. Switch to Postgres beyond that band, " +
+			"or for sustained >50 writes/sec. See README 'Production sizing'.")
 	}
 
 	// Initialize structured logger

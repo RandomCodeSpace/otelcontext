@@ -195,15 +195,18 @@ func (s *Server) Handler() http.Handler {
 	return corsMiddleware("*", http.HandlerFunc(s.ServeHTTP))
 }
 
-// corsMiddleware wraps next with permissive CORS headers and answers preflight
-// OPTIONS requests. Replaces the former central-ops httputil.CORSMiddleware so
-// the project carries no private-module dependency.
-func corsMiddleware(allowOrigin string, next http.Handler) http.Handler {
+// corsMiddleware wraps next with permissive CORS headers so MCP clients
+// running in a browser (or any cross-origin caller) can hit /mcp. Allows
+// only the verbs and request headers the MCP transport actually uses;
+// preflight short-circuits with 204. Inlined here to avoid pulling a
+// private helper module just for one ~10-line middleware.
+func corsMiddleware(origin string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()
-		h.Set("Access-Control-Allow-Origin", allowOrigin)
-		h.Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		h.Set("Access-Control-Allow-Headers", "*")
+		h.Set("Access-Control-Allow-Origin", origin)
+		h.Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		h.Set("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept, "+mcpTenantHeader+", Mcp-Session-Id")
+		h.Set("Access-Control-Expose-Headers", "Mcp-Session-Id")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return

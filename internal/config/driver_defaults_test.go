@@ -38,13 +38,14 @@ func clearSQLiteEnv(t *testing.T) {
 	}
 }
 
-// TestApplyDriverDefaults_SQLite_FlipsAllWhenNoEnv proves the post-Load()
-// override fires when the driver is SQLite and the operator did not set
-// any of the overridable env vars.
-func TestApplyDriverDefaults_SQLite_FlipsAllWhenNoEnv(t *testing.T) {
-	clearSQLiteEnv(t)
-	cfg := &Config{
-		DBDriver:                 "sqlite",
+// postgresDefaultsConfig returns a Config whose tunable fields hold the
+// Postgres / non-SQLite defaults. Shared by the SQLite-flips-all test (proves
+// the override fires) and the Postgres-no-change test (proves the override
+// does not fire). Keeping the literal in one place stops the two tests from
+// drifting and prevents a copy-paste duplication flag.
+func postgresDefaultsConfig(driver string) *Config {
+	return &Config{
+		DBDriver:                 driver,
 		DBMaxOpenConns:           50,    // Postgres default
 		DBMaxIdleConns:           10,    // Postgres default
 		IngestPipelineWorkers:    8,     // Postgres default
@@ -55,6 +56,14 @@ func TestApplyDriverDefaults_SQLite_FlipsAllWhenNoEnv(t *testing.T) {
 		GRPCMaxConcurrentStreams: 1000,  // Postgres default
 		LogFTSEnabled:            false, // FTS5 opt-in default
 	}
+}
+
+// TestApplyDriverDefaults_SQLite_FlipsAllWhenNoEnv proves the post-Load()
+// override fires when the driver is SQLite and the operator did not set
+// any of the overridable env vars.
+func TestApplyDriverDefaults_SQLite_FlipsAllWhenNoEnv(t *testing.T) {
+	clearSQLiteEnv(t)
+	cfg := postgresDefaultsConfig("sqlite")
 	applyDriverDefaults(cfg)
 
 	cases := []struct {
@@ -113,18 +122,7 @@ func TestApplyDriverDefaults_Postgres_NoChange(t *testing.T) {
 	clearSQLiteEnv(t)
 	for _, drv := range []string{"postgres", "postgresql", "Postgres", "POSTGRES"} {
 		t.Run(drv, func(t *testing.T) {
-			cfg := &Config{
-				DBDriver:                 drv,
-				DBMaxOpenConns:           50,
-				DBMaxIdleConns:           10,
-				IngestPipelineWorkers:    8,
-				IngestPipelineQueueSize:  50000,
-				MetricMaxCardinality:     10000,
-				StoreMinSeverity:         "",
-				SamplingRate:             1.0,
-				GRPCMaxConcurrentStreams: 1000,
-				LogFTSEnabled:            false,
-			}
+			cfg := postgresDefaultsConfig(drv)
 			before := *cfg
 			applyDriverDefaults(cfg)
 			if *cfg != before {
