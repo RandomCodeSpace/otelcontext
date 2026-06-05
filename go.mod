@@ -2,8 +2,6 @@ module github.com/RandomCodeSpace/otelcontext
 
 go 1.25.9
 
-require github.com/RandomCodeSpace/central-ops v0.1.0
-
 require (
 	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.21.1
 	github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.13.1

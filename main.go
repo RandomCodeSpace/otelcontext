@@ -14,8 +14,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/RandomCodeSpace/central-ops/pkg/version"
-
 	"github.com/RandomCodeSpace/otelcontext/internal/ai"
 	"github.com/RandomCodeSpace/otelcontext/internal/api"
 	"github.com/RandomCodeSpace/otelcontext/internal/config"
@@ -55,7 +53,18 @@ import (
 
 // Version is detected from build info at startup.
 // Returns the real tag when installed via `go install`, "local" otherwise.
-var Version = version.Detect()
+var Version = detectVersion()
+
+// detectVersion reads the module version from build info, falling back to
+// "local" for ad-hoc `go build` invocations that don't stamp a version.
+func detectVersion() string {
+	if bi, ok := debug.ReadBuildInfo(); ok {
+		if v := bi.Main.Version; v != "" && v != "(devel)" {
+			return v
+		}
+	}
+	return "local"
+}
 
 // cleanupStack is an ordered LIFO list of cleanup closures registered during
 // startup. fatal() walks it before os.Exit so DBs, DLQs, and tracer providers

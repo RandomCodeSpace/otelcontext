@@ -11,7 +11,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/RandomCodeSpace/central-ops/pkg/httputil"
 	"github.com/RandomCodeSpace/otelcontext/internal/graph"
 	"github.com/RandomCodeSpace/otelcontext/internal/graphrag"
 	"github.com/RandomCodeSpace/otelcontext/internal/httpconst"
@@ -193,7 +192,24 @@ func (s *Server) SetGraphRAG(g *graphrag.GraphRAG) {
 // Handler returns an http.Handler for the MCP server with CORS applied.
 // Works correctly when mounted with http.StripPrefix.
 func (s *Server) Handler() http.Handler {
-	return httputil.CORSMiddleware("*", http.HandlerFunc(s.ServeHTTP))
+	return corsMiddleware("*", http.HandlerFunc(s.ServeHTTP))
+}
+
+// corsMiddleware wraps next with permissive CORS headers and answers preflight
+// OPTIONS requests. Replaces the former central-ops httputil.CORSMiddleware so
+// the project carries no private-module dependency.
+func corsMiddleware(allowOrigin string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("Access-Control-Allow-Origin", allowOrigin)
+		h.Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		h.Set("Access-Control-Allow-Headers", "*")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // ServeHTTP dispatches by HTTP method — no path routing needed.
