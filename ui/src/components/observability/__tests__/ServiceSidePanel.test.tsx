@@ -38,10 +38,14 @@ describe('ServiceSidePanel', () => {
 
   it('renders KPI values', () => {
     renderPanel();
-    expect(screen.getByText('670')).toBeInTheDocument();
-    expect(screen.getByText('8.4%')).toBeInTheDocument();
-    expect(screen.getByText('142ms')).toBeInTheDocument();
-    expect(screen.getByText('890ms')).toBeInTheDocument();
+    // DS <Stat> renders value and unit in separate spans, and the value uses
+    // toFixed(2) — so assert the value spans (and units) individually.
+    expect(screen.getByText('670')).toBeInTheDocument();   // req rate (no unit)
+    expect(screen.getByText('8.40')).toBeInTheDocument();  // error rate value
+    expect(screen.getByText('142')).toBeInTheDocument();   // avg latency value
+    expect(screen.getByText('890')).toBeInTheDocument();   // p99 value
+    expect(screen.getAllByText('ms').length).toBeGreaterThanOrEqual(2);
+    expect(screen.getByText('%')).toBeInTheDocument();
   });
 
   it('renders upstream service name', () => {

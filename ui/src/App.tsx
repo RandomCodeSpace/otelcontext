@@ -1,35 +1,46 @@
-import { useState } from 'react'
-import { AppShell } from '@ossrandom/design-system'
+import { lazy, Suspense, useState } from 'react'
+import { AppShell, Spin } from '@ossrandom/design-system'
 import TopNav, { type OtelView } from './components/nav/TopNav'
-import ServicesView from './components/observability/ServicesView'
-import { useSystemGraph } from './hooks/useSystemGraph'
-import { useDashboard } from './hooks/useDashboard'
+import DashboardView from './components/dashboard/DashboardView'
 import { useWebSocket } from './hooks/useWebSocket'
+import type { Theme } from './hooks/useTheme'
 
-export default function App() {
-  const [view, setView] = useState<OtelView>('services')
+// Dashboard is the default view and loads eagerly. The Service Map pulls in
+// cytoscape (~434 KB) and the MCP console is a large secondary surface — both
+// are code-split so they don't weigh down the initial dashboard-first load.
+const ServicesView = lazy(() => import('./components/observability/ServicesView'))
+const MCPConsoleView = lazy(() => import('./components/mcp/MCPConsoleView'))
 
-  const graph = useSystemGraph()
-  const dash = useDashboard()
+interface AppProps {
+  theme: Theme
+  onToggleTheme: () => void
+}
 
-  // WebSocket retained as the live/offline source for the header indicator;
-  // log batches it pushes are intentionally discarded.
+export default function App({ theme, onToggleTheme }: Readonly<AppProps>) {
+  const [view, setView] = useState<OtelView>('dashboard')
+
+  // WebSocket retained purely as the live/offline source for the header badge;
+  // the pushed log batches are intentionally discarded.
   const ws = useWebSocket(() => undefined)
-  const wsConnected = !!ws.current
+  const wsConnected = ws.status === 'connected'
 
   return (
     <AppShell
       header={
-        <TopNav view={view} onNavigate={setView} wsConnected={wsConnected} />
+        <TopNav
+          view={view}
+          onNavigate={setView}
+          wsConnected={wsConnected}
+          theme={theme}
+          onToggleTheme={onToggleTheme}
+        />
       }
     >
-      <ServicesView
-        graph={graph.graph}
-        loading={graph.loading}
-        error={graph.error}
-        dashboard={dash.dashboard}
-        stats={dash.stats}
-      />
+      <Suspense fallback={<Spin label="Loading…" />}>
+        {view === 'dashboard' && <DashboardView onNavigate={setView} />}
+        {view === 'services' && <ServicesView />}
+        {view === 'mcp' && <MCPConsoleView />}
+      </Suspense>
     </AppShell>
   )
 }
