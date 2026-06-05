@@ -246,11 +246,32 @@ function FieldControl({ field, value, services, onChange }: FieldControlProps) {
       break;
     case 'duration':
       control = (
-        <Input
-          value={value}
-          placeholder="15m"
-          onChange={(v) => onChange(v)}
-        />
+        <div>
+          <Input
+            value={value}
+            placeholder="15m"
+            onChange={(v) => onChange(v)}
+          />
+          <div style={presetRow}>
+            <ButtonGroup size="sm">
+              {DATE_PRESETS.map((p) => (
+                <Button
+                  key={p.label}
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => onChange(p.label)}
+                >
+                  {p.label}
+                </Button>
+              ))}
+            </ButtonGroup>
+            {value && (
+              <Button variant="ghost" size="sm" onClick={() => onChange('')}>
+                Clear
+              </Button>
+            )}
+          </div>
+        </div>
       );
       break;
     case 'number':

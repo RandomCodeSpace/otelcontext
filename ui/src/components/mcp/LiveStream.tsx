@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { Terminal, Switch, Tooltip, Space } from '@ossrandom/design-system';
 import type { TerminalLine } from '@ossrandom/design-system';
+import { formatStreamEvent } from './mcpTypes';
 
 interface LiveStreamProps {
   /** When an API key is set the toggle is disabled — EventSource can't send
@@ -31,12 +32,20 @@ export default function LiveStream({ apiKey }: LiveStreamProps) {
     const push = (line: TerminalLine) =>
       setLines((prev) => [...prev, line].slice(-MAX_LINES));
 
+    const show = (data: string) => {
+      const { type, text } = formatStreamEvent(data);
+      push({ type, text, timestamp: new Date() });
+    };
+
     const es = new EventSource('/mcp');
     esRef.current = es;
     push({ type: 'info', text: 'opening /mcp SSE stream…', timestamp: new Date() });
     es.onopen = () => push({ type: 'info', text: 'stream open — waiting for events', timestamp: new Date() });
-    es.onmessage = (ev) =>
-      push({ type: 'stdout', text: ev.data || '(empty event)', timestamp: new Date() });
+    // Default (unnamed) events — the 5s graph snapshots arrive as `event: message`.
+    es.onmessage = (ev) => show(ev.data);
+    // The initial `event: endpoint` handshake is a named event EventSource won't
+    // route to onmessage, so listen for it explicitly.
+    es.addEventListener('endpoint', (ev) => show((ev as MessageEvent).data));
     es.onerror = () =>
       push({ type: 'warn', text: 'stream error / reconnecting (keep-alive every 25s)', timestamp: new Date() });
 

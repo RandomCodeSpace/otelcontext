@@ -187,3 +187,77 @@ export function parseToolResult(result: McpToolResult): ParsedResult {
     rootCause: payload !== undefined ? findRootCause(payload) : null,
   };
 }
+
+// --- /mcp SSE stream formatting --------------------------------------------
+
+/** Terminal line tone for a formatted stream event (subset of TerminalLine). */
+export type StreamLineType = 'info' | 'stdout' | 'warn';
+
+export interface StreamLine {
+  type: StreamLineType;
+  text: string;
+}
+
+/** Mirror of internal/graph.Snapshot (only the fields we summarise). */
+interface GraphSnapshot {
+  Nodes?: Record<string, { Status?: string } | null>;
+  Edges?: unknown[];
+}
+
+function parseSnapshot(data: unknown): GraphSnapshot | null {
+  if (typeof data === 'string') {
+    try {
+      return JSON.parse(data) as GraphSnapshot;
+    } catch {
+      return null;
+    }
+  }
+  if (data && typeof data === 'object') return data as GraphSnapshot;
+  return null;
+}
+
+/**
+ * Turns one raw SSE `data:` payload from the `/mcp` GET stream into a concise
+ * terminal line. The backend emits JSON-RPC notification envelopes:
+ *   • notifications/initialized — the handshake (endpoint event).
+ *   • notifications/resources/updated — a service-graph snapshot every ~5s,
+ *     with the snapshot JSON stringified in params.data.
+ * Unrecognised events fall back to the method name, then the raw text, so the
+ * viewer never shows the unreadable raw envelope.
+ */
+export function formatStreamEvent(raw: string): StreamLine {
+  if (!raw) return { type: 'stdout', text: '(empty event)' };
+
+  let env: { method?: string; params?: { data?: unknown } };
+  try {
+    env = JSON.parse(raw) as typeof env;
+  } catch {
+    return { type: 'stdout', text: raw };
+  }
+
+  const method = env.method;
+
+  if (method === 'notifications/initialized') {
+    return { type: 'info', text: 'handshake · stream initialized' };
+  }
+
+  if (method === 'notifications/resources/updated') {
+    const snap = parseSnapshot(env.params?.data);
+    const nodes = snap?.Nodes ? Object.values(snap.Nodes) : [];
+    let healthy = 0;
+    let degraded = 0;
+    let critical = 0;
+    for (const n of nodes) {
+      const st = (n?.Status ?? '').toLowerCase();
+      if (st === 'healthy') healthy++;
+      else if (st === 'degraded') degraded++;
+      else if (st === 'critical' || st === 'failing') critical++;
+    }
+    const edges = Array.isArray(snap?.Edges) ? snap.Edges.length : 0;
+    const text = `graph · ${nodes.length} svc · ${edges} edges · healthy ${healthy} / degraded ${degraded} / critical ${critical}`;
+    return { type: critical > 0 ? 'warn' : 'stdout', text };
+  }
+
+  if (method) return { type: 'stdout', text: method };
+  return { type: 'stdout', text: raw };
+}

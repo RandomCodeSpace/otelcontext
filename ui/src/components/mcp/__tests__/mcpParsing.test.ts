@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   extractToolText,
   findRootCause,
+  formatStreamEvent,
   parseToolResult,
 } from '../mcpTypes';
 import {
@@ -108,6 +109,49 @@ describe('toArguments', () => {
     });
     const args = toArguments(fields, { limit: '50', query: '', service: 'cart' });
     expect(args).toEqual({ limit: 50, service: 'cart' });
+  });
+});
+
+describe('formatStreamEvent', () => {
+  it('summarises a graph snapshot notification (stringified params.data)', () => {
+    const snap = JSON.stringify({
+      Nodes: {
+        a: { Status: 'healthy' },
+        b: { Status: 'degraded' },
+        c: { Status: 'critical' },
+        d: { Status: 'healthy' },
+      },
+      Edges: [{}, {}],
+    });
+    const raw = JSON.stringify({
+      jsonrpc: '2.0',
+      method: 'notifications/resources/updated',
+      params: { uri: 'OtelContext://system/graph', data: snap },
+    });
+    const line = formatStreamEvent(raw);
+    expect(line.text).toBe('graph · 4 svc · 2 edges · healthy 2 / degraded 1 / critical 1');
+    expect(line.type).toBe('warn'); // has a critical node
+  });
+
+  it('uses stdout tone when no critical nodes', () => {
+    const raw = JSON.stringify({
+      method: 'notifications/resources/updated',
+      params: { data: JSON.stringify({ Nodes: { a: { Status: 'healthy' } }, Edges: [] }) },
+    });
+    const line = formatStreamEvent(raw);
+    expect(line.type).toBe('stdout');
+    expect(line.text).toContain('1 svc');
+  });
+
+  it('renders the handshake event', () => {
+    const raw = JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized', params: {} });
+    expect(formatStreamEvent(raw)).toEqual({ type: 'info', text: 'handshake · stream initialized' });
+  });
+
+  it('falls back to the method name, then raw text, then empty', () => {
+    expect(formatStreamEvent(JSON.stringify({ method: 'notifications/ping' })).text).toBe('notifications/ping');
+    expect(formatStreamEvent('not json').text).toBe('not json');
+    expect(formatStreamEvent('').text).toBe('(empty event)');
   });
 });
 
