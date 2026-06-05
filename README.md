@@ -22,13 +22,22 @@ For teams who want traces, logs, and metrics in one place without standing up a 
 ## Quick start
 
 ```bash
-# 1. Build
-go build -o otelcontext .
+# 1. Build (Go binary + embedded React UI)
+make build                 # builds the UI, then `go build` with it embedded
+
+# ...or install a released, UI-complete binary directly:
+#   go install github.com/RandomCodeSpace/otelcontext@latest
 
 # 2. Run with an API key (dev-friendly — SQLite, plaintext HTTP)
 export API_KEY="$(openssl rand -hex 32)"
 ./otelcontext
 ```
+
+> The built UI is **not** committed — the repo is source-only. A plain
+> `go build .` produces a working API/binary but serves no web UI at `/`.
+> Use `make build` (or a release tag, which embeds the built UI) for the
+> full experience. Maintainers cut releases with `make release VERSION=vX.Y.Z`
+> — see [`scripts/release.sh`](scripts/release.sh).
 
 The server listens on:
 - OTLP gRPC: `:4317`

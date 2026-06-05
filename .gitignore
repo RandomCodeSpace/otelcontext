@@ -86,8 +86,13 @@ web_modules/
 out
 .nuxt
 dist
-!internal/ui/dist
-!internal/ui/dist/**
+# Built UI is NOT committed — it is generated at release time by
+# scripts/release.sh and embedded into the tagged commit. Only the .gitkeep
+# placeholder is tracked so `//go:embed all:dist` still compiles on a
+# source-only checkout.
+!internal/ui/dist/
+internal/ui/dist/*
+!internal/ui/dist/.gitkeep
 .cache/
 .vuepress/dist
 .temp

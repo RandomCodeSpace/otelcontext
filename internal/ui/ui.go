@@ -40,7 +40,13 @@ func (s spaFS) Open(name string) (fs.File, error) {
 	return s.FS.Open("index.html")
 }
 
-//go:embed static/* dist
+// The built UI is generated at release time (scripts/release.sh) and is not
+// committed; only internal/ui/dist/.gitkeep is tracked. The `all:` prefix
+// embeds that dotfile so a source-only checkout still compiles. A plain
+// `go build` therefore serves no SPA at "/" until the UI is built — release
+// tags carry the real dist so `go install <module>@<tag>` is UI-complete.
+//
+//go:embed static/* all:dist
 var content embed.FS
 
 type Server struct {
