@@ -101,7 +101,7 @@ type DashboardStats struct {
 	AvgLatencyMs       float64        `json:"avg_latency_ms"`
 	ErrorRate          float64        `json:"error_rate"`
 	ActiveServices     int64          `json:"active_services"`
-	P99Latency         int64          `json:"p99_latency"`
+	P99LatencyMs       float64        `json:"p99_latency_ms"`
 	TopFailingServices []ServiceError `json:"top_failing_services"`
 }
 
@@ -330,7 +330,9 @@ func DashboardStatsFromModel(s *storage.DashboardStats) DashboardStats {
 		AvgLatencyMs:   s.AvgLatencyMs,
 		ErrorRate:      s.ErrorRate,
 		ActiveServices: s.ActiveServices,
-		P99Latency:     s.P99Latency,
+		// storage.P99Latency is microseconds (storage tests assert µs); convert
+		// to milliseconds here so the API matches AvgLatencyMs and the field name.
+		P99LatencyMs: float64(s.P99Latency) / 1000.0,
 	}
 	if len(s.TopFailingServices) > 0 {
 		out.TopFailingServices = make([]ServiceError, len(s.TopFailingServices))

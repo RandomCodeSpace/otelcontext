@@ -1,1 +1,0 @@
-var e={};throw Error(`Could not resolve "d3-force" imported by "@ossrandom/design-system". Is it installed?`);export{e as default};

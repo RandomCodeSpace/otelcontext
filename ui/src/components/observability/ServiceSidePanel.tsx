@@ -45,7 +45,7 @@ const ServiceSidePanel: React.FC<ServiceSidePanelProps> = ({
       >
         <Grid columns={2} gap="sm">
           <Grid.Col span={1}>
-            <Stat label="RPS" value={Math.round(node.metrics.request_rate_rps)} />
+            <Stat label="Req rate (≈)" value={Math.round(node.metrics.request_rate_rps)} />
           </Grid.Col>
           <Grid.Col span={1}>
             <Stat
@@ -58,7 +58,7 @@ const ServiceSidePanel: React.FC<ServiceSidePanelProps> = ({
             <Stat label="Avg Latency" value={node.metrics.avg_latency_ms} unit="ms" />
           </Grid.Col>
           <Grid.Col span={1}>
-            <Stat label="P99" value={node.metrics.p99_latency_ms} unit="ms" />
+            <Stat label="P99 (est.)" value={node.metrics.p99_latency_ms} unit="ms" />
           </Grid.Col>
         </Grid>
       </Card>

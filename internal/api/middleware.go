@@ -30,6 +30,16 @@ func (rw *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	return rw.ResponseWriter.(http.Hijacker).Hijack()
 }
 
+// Flush implements http.Flusher so SSE streams (the MCP GET endpoint) can push
+// events through the middleware. Embedding the http.ResponseWriter interface
+// drops Flush from the method set, so without this the MCP SSE handler's
+// w.(http.Flusher) assertion fails and it returns "SSE not supported".
+func (rw *responseWriter) Flush() {
+	if f, ok := rw.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
 // MetricsMiddleware records OtelContext_http_requests_total and OtelContext_http_request_duration_seconds
 // for every HTTP request.
 func MetricsMiddleware(metrics *telemetry.Metrics, next http.Handler) http.Handler {
