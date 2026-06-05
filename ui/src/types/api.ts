@@ -151,7 +151,7 @@ export interface DashboardStats {
   avg_latency_ms: number
   error_rate: number
   active_services: number
-  p99_latency: number
+  p99_latency_ms: number
   top_failing_services: ServiceError[]
 }
 

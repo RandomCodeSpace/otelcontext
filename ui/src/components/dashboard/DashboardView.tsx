@@ -253,7 +253,7 @@ export default function DashboardView({
               <Divider direction="vertical" />
               <Stat
                 label="p99 latency"
-                value={Math.round(dashboard?.p99_latency ?? 0)}
+                value={Math.round(dashboard?.p99_latency_ms ?? 0)}
                 unit="ms"
               />
             </Space>
