@@ -9,12 +9,32 @@ commit on `main` is the canonical version identifier (`git rev-parse HEAD`).
 Per-tag pre-release notes are published on
 [GitHub Releases](https://github.com/RandomCodeSpace/otelcontext/releases).
 This file's `Unreleased` section tracks what has landed on `main` since the
-last published pre-release tag (`v0.0.11-beta.15`).
+last published pre-release tag (`v0.2.0-beta.6`).
 
 ## [Unreleased]
 
+## [v0.2.0-beta.6] — 2026-06-05
+
+This is the first release cut with the **source-only + build-on-tag** flow: the
+built UI is embedded into the tagged commit (not committed to `main`), so
+`go install github.com/RandomCodeSpace/otelcontext@v0.2.0-beta.6` yields a
+UI-complete binary. (Supersedes the premature `v0.2.0-beta.5` tag, which had
+committed the built UI to `main`.)
+
 ### Added
 
+- **Frontend rebuild** ([#98]) — a new default **Dashboard** (system-health
+  gauge, traffic/errors, top failing services, recent anomalies, platform
+  health); a **scalable service map** (cytoscape / cose-bilkent) that keeps
+  every node on screen from 1→200 services, sizes nodes by edge degree, and
+  reveals a node's edges + stats on hover/click; and an **MCP Trial console**
+  (list-detail over the 7-tool surface with dynamic tool forms, result views,
+  history, and a live `/mcp` SSE stream).
+- **Source-only `main` + build-on-tag release flow** ([#99]) —
+  `scripts/release.sh` / `make release VERSION=…` build the UI and embed it
+  into a detached release commit that the tag points to, so
+  `go install …@<tag>` is UI-complete while `main` carries no build artifacts
+  (`internal/ui/dist` is gitignored except `.gitkeep`; `//go:embed all:dist`).
 - **SQLite survival tuning for 120-service production load** ([#91]):
   - Fail-closed PRAGMA stanza in `internal/storage/factory.go` —
     `journal_mode=WAL`, `synchronous=NORMAL`, 256 MB page cache, 1 GB
@@ -55,6 +75,11 @@ last published pre-release tag (`v0.0.11-beta.15`).
 
 ### Changed
 
+- **UI**: removed the Logs and Traces views; the Dashboard is the new default
+  landing view. ([#98])
+- **`internal/ui/dist` is no longer committed** ([#99]). The built UI is
+  generated at release time, not stored on `main` — a plain `go build .` now
+  serves no SPA at `/`; use `make build` or install a release tag.
 - **MCP surface reduced from 21 tools to 7 triage-essential tools** ([#91]).
   Kept: `get_anomaly_timeline`, `get_service_map`, `get_service_health`,
   `root_cause_analysis`, `impact_analysis`, `trace_graph`, `search_logs`.
@@ -91,6 +116,19 @@ last published pre-release tag (`v0.0.11-beta.15`).
 
 ### Fixed
 
+- **MCP SSE returned HTTP 500** ([#98]). `GET /mcp` failed with
+  `SSE not supported` because the metrics middleware's `responseWriter`
+  captured the status code and forwarded `Hijack` (for WebSocket) but dropped
+  `Flush`, so the SSE handler's `w.(http.Flusher)` assertion failed. Forwarding
+  `Flush` restores the `200 text/event-stream` stream and the UI live stream.
+- **Dashboard p99 latency shown 1000× too large** ([#98]). `p99_latency` was
+  microseconds rendered under an "ms" label (e.g. 4,430,763); converted µs→ms
+  at the API view boundary and renamed the field to `p99_latency_ms` to match
+  `avg_latency_ms`.
+- **MCP console** ([#98]): format the `/mcp` SSE stream into concise lines
+  (`graph · N svc · M edges · healthy/degraded/critical`) instead of raw
+  JSON-RPC envelopes, and add `15m`/`1h`/`24h` quick presets to the
+  `time_range` field (it was a bare input while the datetime fields had them).
 - **OOM at ~120 services on SQLite under continuous load** ([#91]). At
   default config the binary did not survive an hour: ingest pipeline
   queue saturation under SQLite WAL contention pinned 0.5–5 GB of
@@ -110,6 +148,8 @@ last published pre-release tag (`v0.0.11-beta.15`).
 
 ### Security
 
+- Go stdlib `go.mod` directive `1.25.10` → `1.25.11` ([#98]) — clears two
+  stdlib advisories flagged by OSV-Scanner (GO-2026-5037, GO-2026-5039).
 - **OSV-Scanner advisory clean-up** ([#91]):
   - `golang.org/x/crypto` v0.50.0 → v0.52.0 (12 advisories: GO-2026-5005..5023, 5033).
   - `golang.org/x/net` v0.53.0 → v0.55.0 (6 advisories: GO-2026-5025..5030).
@@ -125,7 +165,8 @@ last published pre-release tag (`v0.0.11-beta.15`).
 - bestpractices.dev project [12646](https://www.bestpractices.dev/projects/12646)
   declared at `level: passing` via canonical autofill schema. ([#47])
 
-[Unreleased]: https://github.com/RandomCodeSpace/otelcontext/compare/v0.0.11-beta.15...HEAD
+[Unreleased]: https://github.com/RandomCodeSpace/otelcontext/compare/v0.2.0-beta.6...HEAD
+[v0.2.0-beta.6]: https://github.com/RandomCodeSpace/otelcontext/compare/v0.0.11-beta.15...v0.2.0-beta.6
 [#24]: https://github.com/RandomCodeSpace/otelcontext/pull/24
 [#25]: https://github.com/RandomCodeSpace/otelcontext/pull/25
 [#26]: https://github.com/RandomCodeSpace/otelcontext/pull/26
@@ -138,3 +179,5 @@ last published pre-release tag (`v0.0.11-beta.15`).
 [#34]: https://github.com/RandomCodeSpace/otelcontext/pull/34
 [#47]: https://github.com/RandomCodeSpace/otelcontext/pull/47
 [#91]: https://github.com/RandomCodeSpace/otelcontext/pull/91
+[#98]: https://github.com/RandomCodeSpace/otelcontext/pull/98
+[#99]: https://github.com/RandomCodeSpace/otelcontext/pull/99
