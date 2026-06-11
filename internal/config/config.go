@@ -368,6 +368,11 @@ var sqliteOverrides = []struct {
 	{"SAMPLING_RATE", func(c *Config) { c.SamplingRate = 0.05 }},
 	{"GRPC_MAX_CONCURRENT_STREAMS", func(c *Config) { c.GRPCMaxConcurrentStreams = 240 }},
 	{"LOG_FTS_ENABLED", func(c *Config) { c.LogFTSEnabled = true }},
+	// Each queued event embeds a storage.Span/Log by value (~0.5–2 KB); the
+	// 100k Postgres default is ~100 MB+ of standing buffer. On SQLite the
+	// single writer starves the workers anyway — drop sooner (metered via
+	// otelcontext_graphrag_events_dropped_total) instead of buffering RAM.
+	{"GRAPHRAG_EVENT_QUEUE_SIZE", func(c *Config) { c.GraphRAGEventQueueSize = 10000 }},
 }
 
 func applyDriverDefaults(cfg *Config) {
