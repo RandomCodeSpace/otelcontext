@@ -182,10 +182,10 @@ func main() {
 	// detected cgroup/host budget). See applyMemoryLimit in memlimit.go.
 	applyMemoryLimit(75)
 
+	// Profiling is an observability aid — a busy port must not abort startup.
 	pprofSrv, _, err := startPprofServer(cfg.PprofAddr, logger)
 	if err != nil {
-		slog.Error("Failed to start pprof server", "error", err, "addr", cfg.PprofAddr)
-		os.Exit(1)
+		slog.Warn("pprof server disabled", "error", err, "addr", cfg.PprofAddr)
 	}
 
 	// 1. Initialize Internal Telemetry (first — everything registers metrics against this)

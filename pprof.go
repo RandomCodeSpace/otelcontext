@@ -5,7 +5,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	_ "net/http/pprof" // registers profiling handlers on http.DefaultServeMux
+	_ "net/http/pprof" //nolint:gosec // G108: served only via a dedicated loopback listener (PPROF_ADDR), never the public :8080 mux
 	"time"
 )
 
