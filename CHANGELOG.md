@@ -13,6 +13,76 @@ last published pre-release tag (`v0.2.0-beta.6`).
 
 ## [Unreleased]
 
+### Fixed — production OOM restarts (memory-survival series)
+
+- **AnomalyStore memory blowup** (merged from `fix/sqlite-survival-hardening`): stable
+  per-(service,type) anomaly IDs replace one-node-per-10s-tick; the O(N²)
+  PRECEDED_BY edge mesh that heap profiling attributed 84% of live heap to is
+  gone (AnomalyStore 272 MB → 2.6 MB in soak).
+- **GOMEMLIMIT safety net**: startup sets a soft limit (env honored, else 75%
+  of the cgroup/host budget via new `internal/membudget`).
+- **Byte-bounded ingest queue**: `INGEST_PIPELINE_MAX_BYTES` (512 MB; 128 MB on
+  SQLite) — the item-count queue could hold GBs; at the cap even error/slow
+  batches get 429/`RESOURCE_EXHAUSTED` (reason `bytes_full`).
+- **GraphRAG bounds**: per-tenant span cap (`GRAPHRAG_MAX_SPANS_PER_TENANT`,
+  500k), SQLite trace TTL 1h→30m (`GRAPHRAG_TRACE_TTL`), idle-tenant store
+  eviction (`GRAPHRAG_TENANT_IDLE_TTL`, 24h; default tenant immune),
+  SignalStore metric nodes bounded (2000/tenant + 24h TTL), anomaly
+  correlation walk capped at 1000.
+- **TSDB ring buffers**: keys are now tenant-scoped (`tenant|service|metric`
+  — fixes a cross-tenant data-isolation breach) and ring creation is capped at
+  `METRIC_MAX_CARDINALITY` (previously bypassed the cardinality check).
+- **SQLite maintenance**: the automatic daily full `VACUUM` (10–60 min
+  exclusive lock → 429 storm → queue/RAM spiral) is replaced by
+  `PRAGMA optimize` + `incremental_vacuum(10000)`; restore via
+  `RETENTION_FULL_VACUUM=true` or `POST /api/admin/vacuum`. New DB files are
+  created `auto_vacuum=INCREMENTAL`.
+- **Budget-scaled SQLite PRAGMAs**: page cache = budget/32 ∈ [64 MB, 256 MB],
+  mmap = budget/8 ∈ [256 MB, 1 GB] (4 GB host → 128 MB + 512 MB); overrides
+  `SQLITE_CACHE_SIZE_KB` / `SQLITE_MMAP_SIZE_BYTES`; fail-closed stanza kept.
+- Cherry-picked security/correctness quick-wins: cross-tenant read escape via
+  `X-Tenant-ID` closed, token-bucket sampler math fixed (rate < 1.0 dropped
+  ~100% of healthy spans — SQLite's 0.05 default persisted almost nothing),
+  negative limit/offset clamps on `/api/logs` + `/api/traces`, MCP error
+  results no longer cached and `trace_graph` response capped.
+
+### Added — observability
+
+- `PPROF_ADDR` (default `127.0.0.1:6060`): `net/http/pprof` on a dedicated
+  loopback listener.
+- Store census gauges: `otelcontext_graphrag_store_entities{entity}`,
+  `otelcontext_graphrag_store_edges{store}`, `otelcontext_tsdb_ring_series_active`,
+  `otelcontext_drain_templates_active`, `otelcontext_ingest_pipeline_queue_bytes`,
+  `otelcontext_graphrag_tenants_evicted_total`, `otelcontext_tsdb_ring_series_rejected_total`.
+
+### Changed — performance
+
+- `GetServiceMapMetrics`: node stats aggregate in SQL and the edge pass scans
+  a narrow projection — the per-row zstd decompression of span attributes is
+  gone (benchmark: 22 ms/5 MB vs 37 ms/15 MB on 5k spans; scales with row
+  count). Also fixes node `error_count` being permanently 0. The
+  `/api/metrics/service-map` response is cached 30s per tenant+window.
+- GraphRAG DB rebuild is incremental via per-tenant high-water-mark (was a
+  full 1h-window re-read every 60s); the 10s anomaly scan skips tenants with
+  no new ingest events.
+- HTTP serving: UI assets ship brotli/gzip precompressed with
+  `Cache-Control: immutable` + content hashing; `index.html` gets `no-cache`
+  + ETag; SPA fallback for client-side routes; GET `/api/*` responses are
+  gzipped; `/api/system/graph`, `/api/metrics/dashboard`, `/api/stats` honor
+  `If-None-Match` → 304 with a shared 10s render cache.
+
+### Changed — frontend foundation (rewrite phases C1–C2)
+
+- New data layer: TanStack Query (visibility-aware polling — hidden tabs stop
+  hitting SQLite), single WebSocket manager with jittered backoff and a
+  bounded 5k log ring buffer, `apiFetch` with AbortSignal, percent-formatting
+  bugs fixed centrally.
+- New responsive shell: System Pulse bar (health/err/p99/DB size, 3-state
+  live indicator), bottom tab bar (<768px) / icon rail / labeled rail
+  (≥1440px), Connect popover, token CSS (`tokens.css`) with dark/light themes,
+  reduced-motion + contrast support. Routing via wouter; deep links served by
+  the SPA fallback. CI-able bundle budget gate (`npm run check-budgets`).
+
 ## [v0.2.0-beta.6] — 2026-06-05
 
 This is the first release cut with the **source-only + build-on-tag** flow: the
