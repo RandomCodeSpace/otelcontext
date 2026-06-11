@@ -70,8 +70,23 @@ func (s *Server) handleGetLatencyHeatmap(w http.ResponseWriter, r *http.Request)
 	_ = json.NewEncoder(w).Encode(points)
 }
 
-// handleGetDashboardStats handles GET /api/metrics/dashboard
+// handleGetDashboardStats handles GET /api/metrics/dashboard.
+// The rendered JSON is cached for 10s per (tenant, query) with an ETag —
+// same pattern as handleGetSystemGraph — so steady-state dashboard polling
+// becomes a hash compare instead of a SQLite aggregate + JSON encode. The
+// key includes the raw query string so explicit start/end/service_name
+// windows never share an entry; oversized queries skip the cache (see
+// maxCacheKeyQueryLen).
 func (s *Server) handleGetDashboardStats(w http.ResponseWriter, r *http.Request) {
+	var cacheKey string
+	if len(r.URL.RawQuery) <= maxCacheKeyQueryLen {
+		cacheKey = "dashboard_stats:" + storage.TenantFromContext(r.Context()) + "?" + r.URL.RawQuery
+		if cached, ok := s.cache.Get(cacheKey); ok {
+			cached.(*cachedJSON).write(w, r, "HIT")
+			return
+		}
+	}
+
 	// Default to last 30 minutes if not specified
 	end := time.Now()
 	start := end.Add(-30 * time.Minute)
@@ -96,8 +111,15 @@ func (s *Server) handleGetDashboardStats(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	w.Header().Set(httpconst.HeaderContentType, httpconst.ContentTypeJSON)
-	_ = json.NewEncoder(w).Encode(views.DashboardStatsFromModel(stats))
+	cj, err := newCachedJSON(views.DashboardStatsFromModel(stats))
+	if err != nil {
+		http.Error(w, "failed to encode dashboard stats", http.StatusInternalServerError)
+		return
+	}
+	if cacheKey != "" {
+		s.cache.Set(cacheKey, cj, hotPollCacheTTL)
+	}
+	cj.write(w, r, "MISS")
 }
 
 // handleGetServiceMapMetrics handles GET /api/metrics/service-map.
