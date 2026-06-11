@@ -75,6 +75,7 @@ func TestProcessSpan_CapDropRecorded(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.MaxSpansPerTenant = 2
 	g := New(nil, nil, nil, cfg)
+	g.SetMetrics(sharedTestMetrics()) // exercise the Prometheus drop path too
 	t.Cleanup(g.Stop)
 
 	now := time.Now()
