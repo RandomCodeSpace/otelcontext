@@ -3,6 +3,7 @@ package graphrag
 import (
 	"math"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -16,15 +17,37 @@ type tenantStores struct {
 	traces    *TraceStore
 	signals   *SignalStore
 	anomalies *AnomalyStore
+
+	// lastAccess is the unix-nano time of the most recent ingest event or
+	// query routed through storesForTenant. Drives idle-tenant eviction in
+	// refreshLoop; background maintenance uses tenantStoresNoTouch so a 60s
+	// bookkeeping pass cannot keep a dormant tenant alive.
+	lastAccess atomic.Int64
+
+	// lastEventAt is the unix-nano time of the most recent span/log/metric
+	// processed for this tenant. detectAnomalies skips tenants whose value
+	// predates the previous scan tick — their stats cannot have changed.
+	lastEventAt atomic.Int64
+
+	// lastRebuildMax is the high-water-mark (unix nanos) of span start_time
+	// merged by rebuildFromDBForTenant. Subsequent rebuilds only re-read
+	// rows newer than HWM minus a small overlap instead of the full
+	// trailing window. Zero on a fresh slice (first build / post-eviction)
+	// forces a full-window rebuild.
+	lastRebuildMax atomic.Int64
 }
 
-func newTenantStores(traceTTL time.Duration) *tenantStores {
-	return &tenantStores{
+func newTenantStores(traceTTL time.Duration, maxSpans int) *tenantStores {
+	ts := &tenantStores{
 		service:   newServiceStore(),
-		traces:    newTraceStore(traceTTL),
+		traces:    newTraceStore(traceTTL, maxSpans),
 		signals:   newSignalStore(),
 		anomalies: newAnomalyStore(),
 	}
+	// Creation counts as access — a slice re-created by the DB rebuild gets
+	// a full idle window rather than being evicted on the next tick.
+	ts.lastAccess.Store(time.Now().UnixNano())
+	return ts
 }
 
 // ServiceStore holds permanent service topology data.
@@ -50,14 +73,19 @@ type TraceStore struct {
 	Spans  map[string]*SpanNode  // key: span_id
 	Edges  map[string]*Edge      // key: type|from|to
 	TTL    time.Duration
+	// MaxSpans hard-caps the Spans map: at the cap, NEW span IDs are
+	// skipped (UpsertSpan returns false) while updates to resident IDs
+	// still apply. <=0 disables the cap.
+	MaxSpans int
 }
 
-func newTraceStore(ttl time.Duration) *TraceStore {
+func newTraceStore(ttl time.Duration, maxSpans int) *TraceStore {
 	return &TraceStore{
-		Traces: make(map[string]*TraceNode),
-		Spans:  make(map[string]*SpanNode),
-		Edges:  make(map[string]*Edge),
-		TTL:    ttl,
+		Traces:   make(map[string]*TraceNode),
+		Spans:    make(map[string]*SpanNode),
+		Edges:    make(map[string]*Edge),
+		TTL:      ttl,
+		MaxSpans: maxSpans,
 	}
 }
 
@@ -270,10 +298,19 @@ func (ts *TraceStore) UpsertTrace(traceID, rootService, status string, durationM
 	}
 }
 
-func (ts *TraceStore) UpsertSpan(span SpanNode) {
+// UpsertSpan inserts or updates a span node and its CONTAINS/CHILD_OF edges.
+// Returns false when the span is NEW and MaxSpans is already reached — the
+// span is skipped entirely (the graph is best-effort; the DB is the source
+// of truth, same doctrine as the event-channel overflow in builder.go).
+func (ts *TraceStore) UpsertSpan(span SpanNode) bool {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
 
+	if ts.MaxSpans > 0 && len(ts.Spans) >= ts.MaxSpans {
+		if _, resident := ts.Spans[span.ID]; !resident {
+			return false
+		}
+	}
 	ts.Spans[span.ID] = &span
 
 	// CONTAINS edge: trace → span
@@ -299,6 +336,7 @@ func (ts *TraceStore) UpsertSpan(span SpanNode) {
 			}
 		}
 	}
+	return true
 }
 
 func (ts *TraceStore) GetSpan(spanID string) (*SpanNode, bool) {

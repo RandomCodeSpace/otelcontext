@@ -13,7 +13,7 @@ import (
 // 15-min soak). Under the fix, node and edge counts stay bounded regardless of
 // how many ticks fire.
 func TestAnomalyDedupBoundsStore(t *testing.T) {
-	stores := newTenantStores(time.Hour)
+	stores := newTenantStores(time.Hour, 0)
 	base := time.Unix(1_700_000_000, 0)
 
 	const ticks = 100

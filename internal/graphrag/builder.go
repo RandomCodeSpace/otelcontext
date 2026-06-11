@@ -44,6 +44,13 @@ const (
 	defaultRefreshEvery  = 60 * time.Second
 	defaultSnapshotEvery = 15 * time.Minute
 	defaultAnomalyEvery  = 10 * time.Second
+	// defaultMaxSpansPerTenant caps the in-memory TraceStore per tenant
+	// (~850 B/span ⇒ ~425 MB worst case). Overridable via
+	// GRAPHRAG_MAX_SPANS_PER_TENANT.
+	defaultMaxSpansPerTenant = 500000
+	// defaultTenantIdleTTL evicts a tenant slice after this much time with
+	// no ingest event or query. Overridable via GRAPHRAG_TENANT_IDLE_TTL.
+	defaultTenantIdleTTL = 24 * time.Hour
 )
 
 // spanEvent is sent through the ingestion channel.
@@ -99,11 +106,13 @@ type GraphRAG struct {
 	stopCh  chan struct{}
 
 	// Configuration
-	traceTTL      time.Duration
-	refreshEvery  time.Duration
-	snapshotEvery time.Duration
-	anomalyEvery  time.Duration
-	workerCount   int // 0 = defaultWorkerCount (set by New from Config)
+	traceTTL          time.Duration
+	refreshEvery      time.Duration
+	snapshotEvery     time.Duration
+	anomalyEvery      time.Duration
+	workerCount       int           // 0 = defaultWorkerCount (set by New from Config)
+	maxSpansPerTenant int           // per-tenant TraceStore span cap; <=0 = unbounded
+	tenantIdleTTL     time.Duration // idle window before tenant eviction; <=0 disables
 
 	// Event drop counters. Atomic so OnSpanIngested/OnLogIngested/
 	// OnMetricIngested can record overflows without taking any lock —
@@ -111,6 +120,11 @@ type GraphRAG struct {
 	droppedSpans   atomic.Int64
 	droppedLogs    atomic.Int64
 	droppedMetrics atomic.Int64
+	// droppedSpanCap counts spans skipped because the tenant's TraceStore
+	// hit MaxSpans (signal "span_capacity" on the Prometheus counter).
+	droppedSpanCap atomic.Int64
+	// tenantsEvicted counts tenant slices removed by evictIdleTenants.
+	tenantsEvicted atomic.Int64
 
 	// metrics is an optional Prometheus hook for exporting event drops.
 	// Assigned via SetMetrics; nil-safe at call sites.
@@ -145,6 +159,15 @@ func (g *GraphRAG) DroppedLogsCount() int64 { return g.droppedLogs.Load() }
 // because the ingestion channel was full.
 func (g *GraphRAG) DroppedMetricsCount() int64 { return g.droppedMetrics.Load() }
 
+// SpanCapacityDropsCount reports the number of spans skipped because the
+// tenant's TraceStore was at its MaxSpans cap. Atomic, safe from any
+// goroutine; exported for tests and readiness probes.
+func (g *GraphRAG) SpanCapacityDropsCount() int64 { return g.droppedSpanCap.Load() }
+
+// TenantsEvictedCount reports the number of tenant store slices evicted
+// for exceeding the idle TTL since startup.
+func (g *GraphRAG) TenantsEvictedCount() int64 { return g.tenantsEvicted.Load() }
+
 // InvestigationInsertCount reports cooldown-allowed PersistInvestigation
 // calls. Semantics: this counter increments when the cooldown check
 // passes, BEFORE the DB write — so a subsequent DB failure still
@@ -175,6 +198,8 @@ func (g *GraphRAG) recordEventDrop(signal string) {
 		g.droppedLogs.Add(1)
 	case "metric":
 		g.droppedMetrics.Add(1)
+	case "span_capacity":
+		g.droppedSpanCap.Add(1)
 	}
 	if g.metrics != nil && g.metrics.GraphRAGEventsDroppedTotal != nil {
 		g.metrics.GraphRAGEventsDroppedTotal.WithLabelValues(signal).Inc()
@@ -189,17 +214,26 @@ type Config struct {
 	AnomalyEvery  time.Duration
 	WorkerCount   int
 	ChannelSize   int
+	// MaxSpansPerTenant caps each tenant's in-memory TraceStore span map.
+	// 0 = defaultMaxSpansPerTenant; negative disables the cap.
+	MaxSpansPerTenant int
+	// TenantIdleTTL evicts a tenant's store slice after this much time
+	// without any ingest event or query. 0 = defaultTenantIdleTTL;
+	// negative disables eviction.
+	TenantIdleTTL time.Duration
 }
 
 // DefaultConfig returns sensible defaults.
 func DefaultConfig() Config {
 	return Config{
-		TraceTTL:      defaultTraceTTL,
-		RefreshEvery:  defaultRefreshEvery,
-		SnapshotEvery: defaultSnapshotEvery,
-		AnomalyEvery:  defaultAnomalyEvery,
-		WorkerCount:   defaultWorkerCount,
-		ChannelSize:   defaultChannelSize,
+		TraceTTL:          defaultTraceTTL,
+		RefreshEvery:      defaultRefreshEvery,
+		SnapshotEvery:     defaultSnapshotEvery,
+		AnomalyEvery:      defaultAnomalyEvery,
+		WorkerCount:       defaultWorkerCount,
+		ChannelSize:       defaultChannelSize,
+		MaxSpansPerTenant: defaultMaxSpansPerTenant,
+		TenantIdleTTL:     defaultTenantIdleTTL,
 	}
 }
 
@@ -227,21 +261,29 @@ func New(repo *storage.Repository, tsdbAgg *tsdb.Aggregator, ringBuf *tsdb.RingB
 	if cfg.ChannelSize == 0 {
 		cfg.ChannelSize = defaultChannelSize
 	}
+	if cfg.MaxSpansPerTenant == 0 {
+		cfg.MaxSpansPerTenant = defaultMaxSpansPerTenant
+	}
+	if cfg.TenantIdleTTL == 0 {
+		cfg.TenantIdleTTL = defaultTenantIdleTTL
+	}
 
 	g := &GraphRAG{
-		tenants:       make(map[string]*tenantStores),
-		repo:          repo,
-		tsdbAgg:       tsdbAgg,
-		ringBuf:       ringBuf,
-		drain:         NewDrain(),
-		eventCh:       make(chan event, cfg.ChannelSize),
-		stopCh:        make(chan struct{}),
-		traceTTL:      cfg.TraceTTL,
-		refreshEvery:  cfg.RefreshEvery,
-		snapshotEvery: cfg.SnapshotEvery,
-		anomalyEvery:  cfg.AnomalyEvery,
-		workerCount:   cfg.WorkerCount,
-		invCooldown:   newInvestigationCooldown(5 * time.Minute),
+		tenants:           make(map[string]*tenantStores),
+		repo:              repo,
+		tsdbAgg:           tsdbAgg,
+		ringBuf:           ringBuf,
+		drain:             NewDrain(),
+		eventCh:           make(chan event, cfg.ChannelSize),
+		stopCh:            make(chan struct{}),
+		traceTTL:          cfg.TraceTTL,
+		refreshEvery:      cfg.RefreshEvery,
+		snapshotEvery:     cfg.SnapshotEvery,
+		anomalyEvery:      cfg.AnomalyEvery,
+		workerCount:       cfg.WorkerCount,
+		maxSpansPerTenant: cfg.MaxSpansPerTenant,
+		tenantIdleTTL:     cfg.TenantIdleTTL,
+		invCooldown:       newInvestigationCooldown(5 * time.Minute),
 	}
 
 	// Bootstrap the default tenant slice so refresh/snapshot loops have a
@@ -446,7 +488,7 @@ func (g *GraphRAG) processSpan(ev *spanEvent) {
 
 	// 3. Create TraceNode + SpanNode + CONTAINS + CHILD_OF edges
 	stores.traces.UpsertTrace(span.TraceID, span.ServiceName, ev.Status, durationMs, span.StartTime)
-	stores.traces.UpsertSpan(SpanNode{
+	if !stores.traces.UpsertSpan(SpanNode{
 		ID:           span.SpanID,
 		TraceID:      span.TraceID,
 		ParentSpanID: span.ParentSpanID,
@@ -456,7 +498,11 @@ func (g *GraphRAG) processSpan(ev *spanEvent) {
 		StatusCode:   ev.Status,
 		IsError:      isError,
 		Timestamp:    span.StartTime,
-	})
+	}) {
+		// Tenant span cap reached — graph is best-effort; DB is source of
+		// truth. Service/operation/trace stats above were still updated.
+		g.recordEventDrop("span_capacity")
+	}
 
 	// 4. If parent span exists and belongs to different service, create CALLS edge
 	if span.ParentSpanID != "" {
@@ -523,8 +569,19 @@ func (g *GraphRAG) storesFor(ctx context.Context) *tenantStores {
 // storesForTenant is the tenant-string flavour of storesFor, used by event
 // handlers that have already resolved the tenant (the callback path carries
 // it on spanEvent / logEvent / metricEvent). Empty strings are coerced to
-// storage.DefaultTenantID.
+// storage.DefaultTenantID. Every call refreshes the tenant's idle-eviction
+// clock — ingest and queries both count as activity.
 func (g *GraphRAG) storesForTenant(tenant string) *tenantStores {
+	slice := g.tenantStoresNoTouch(tenant)
+	slice.lastAccess.Store(time.Now().UnixNano())
+	return slice
+}
+
+// tenantStoresNoTouch returns (lazily creating) the tenant slice WITHOUT
+// refreshing its idle-eviction clock. Background maintenance — the 60s DB
+// rebuild in particular — goes through here so bookkeeping alone cannot keep
+// a dormant tenant alive past tenantIdleTTL; only real ingest or queries do.
+func (g *GraphRAG) tenantStoresNoTouch(tenant string) *tenantStores {
 	if tenant == "" {
 		tenant = storage.DefaultTenantID
 	}
@@ -539,7 +596,7 @@ func (g *GraphRAG) storesForTenant(tenant string) *tenantStores {
 	if slice, ok = g.tenants[tenant]; ok {
 		return slice
 	}
-	slice = newTenantStores(g.traceTTL)
+	slice = newTenantStores(g.traceTTL, g.maxSpansPerTenant)
 	g.tenants[tenant] = slice
 	return slice
 }
