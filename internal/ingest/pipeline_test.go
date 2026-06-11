@@ -3,12 +3,17 @@ package ingest
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
+	"github.com/RandomCodeSpace/otelcontext/internal/telemetry"
 )
 
 // fakeWriter is a deterministic, in-memory pipelineWriter for tests.
@@ -401,6 +406,9 @@ func TestPipeline_DefaultsApplied(t *testing.T) {
 	if p.cfg.SoftThreshold != d.SoftThreshold {
 		t.Errorf("SoftThreshold default not applied: got %v want %v", p.cfg.SoftThreshold, d.SoftThreshold)
 	}
+	if p.cfg.MaxBytes != d.MaxBytes {
+		t.Errorf("MaxBytes default not applied: got %d want %d", p.cfg.MaxBytes, d.MaxBytes)
+	}
 }
 
 func TestPipeline_PerTenantCap_DropsExcessHealthy(t *testing.T) {
@@ -669,5 +677,279 @@ func TestPipeline_StoreMinSeverity_Disabled_PersistsAllLogs(t *testing.T) {
 	}
 	if got := p.Stats().StoreFiltered; got != 0 {
 		t.Errorf("Stats().StoreFiltered = %d, want 0 with gate disabled", got)
+	}
+}
+
+// ===== Byte-bounded queue (P1.2) =====
+
+// fatLogBatch builds a single-log batch whose Body is `bodyLen` bytes —
+// the byte-cap tests size their payloads through this.
+func fatLogBatch(bodyLen int) *Batch {
+	return &Batch{
+		Type:   SignalLogs,
+		Tenant: "t1",
+		Logs:   []storage.Log{{Body: strings.Repeat("x", bodyLen)}},
+	}
+}
+
+func TestBatch_ApproxBytes_Formula(t *testing.T) {
+	// Pins the per-record estimate: fixed struct overhead + the lengths of
+	// the dominant string payloads. A drive-by change to the formula must
+	// consciously update this test.
+	b := &Batch{
+		Traces: []storage.Trace{{TraceID: "abcd", ServiceName: "svc", Status: "OK", Operation: "op"}},
+		Spans: []storage.Span{{
+			OperationName:  "GET /x",
+			AttributesJSON: storage.CompressedText(`{"k":"v"}`),
+			ServiceName:    "svc",
+			Status:         "OK",
+		}},
+		Logs: []storage.Log{{
+			Body:           "hello",
+			AttributesJSON: storage.CompressedText("{}"),
+			AIInsight:      storage.CompressedText("ai"),
+			ServiceName:    "svc",
+			Severity:       "INFO",
+		}},
+	}
+	wantTrace := int64(128 + 4 + 3 + 2 + 2)   // TraceID + ServiceName + Status + Operation
+	wantSpan := int64(256 + 6 + 9 + 3 + 2)    // OperationName + AttributesJSON + ServiceName + Status
+	wantLog := int64(192 + 5 + 2 + 2 + 3 + 4) // Body + AttributesJSON + AIInsight + ServiceName + Severity
+	if got, want := b.approxBytes(), wantTrace+wantSpan+wantLog; got != want {
+		t.Fatalf("approxBytes() = %d, want %d", got, want)
+	}
+}
+
+func TestBatch_ApproxBytes_GrowsWithPayload(t *testing.T) {
+	// The estimate must scale with the variable-length payloads — Body and
+	// AttributesJSON are what actually make a batch fat.
+	small := fatLogBatch(1)
+	big := fatLogBatch(1001)
+	if diff := big.approxBytes() - small.approxBytes(); diff != 1000 {
+		t.Errorf("Body growth: approxBytes diff = %d, want 1000", diff)
+	}
+
+	s1 := &Batch{Spans: []storage.Span{{SpanID: "s"}}}
+	s2 := &Batch{Spans: []storage.Span{{SpanID: "s", AttributesJSON: storage.CompressedText(strings.Repeat("a", 500))}}}
+	if diff := s2.approxBytes() - s1.approxBytes(); diff != 500 {
+		t.Errorf("AttributesJSON growth: approxBytes diff = %d, want 500", diff)
+	}
+}
+
+func TestPipeline_MaxBytes_DefaultAndClamp(t *testing.T) {
+	// MaxBytes <= 0 falls back to the 512MB default.
+	p := NewPipeline(&fakeWriter{}, nil, PipelineConfig{Capacity: 10, Workers: 0})
+	if got := p.Stats().MaxBytes; got != 512<<20 {
+		t.Errorf("MaxBytes default: got %d, want %d", got, int64(512<<20))
+	}
+	// A sub-1MB cap would reject every gRPC batch (GRPC_MAX_RECV_MB default
+	// is 16) — clamp up to the 1MB floor instead.
+	p2 := NewPipeline(&fakeWriter{}, nil, PipelineConfig{Capacity: 10, Workers: 0, MaxBytes: 1000})
+	if got := p2.Stats().MaxBytes; got != 1<<20 {
+		t.Errorf("sub-1MB clamp: got %d, want %d", got, int64(1<<20))
+	}
+	// Exactly the floor passes through unmodified.
+	p3 := NewPipeline(&fakeWriter{}, nil, PipelineConfig{Capacity: 10, Workers: 0, MaxBytes: 1 << 20})
+	if got := p3.Stats().MaxBytes; got != 1<<20 {
+		t.Errorf("1MB floor passthrough: got %d, want %d", got, int64(1<<20))
+	}
+}
+
+func TestPipeline_ByteCap_RejectsEvenPriority(t *testing.T) {
+	// Item count is nowhere near Capacity, yet the second fat batch must be
+	// rejected on bytes — and priority gives no exemption: a 429 is
+	// recoverable by the OTLP client's retry loop, an OOM kill is not.
+	p := NewPipeline(&fakeWriter{}, nil, PipelineConfig{Capacity: 100, Workers: 0, MaxBytes: 1 << 20})
+
+	first := fatLogBatch(700 * 1024)
+	first.HasError = true
+	if err := p.Submit(first); err != nil {
+		t.Fatalf("first fat batch under the cap rejected: %v", err)
+	}
+	firstSize := first.approxBytes()
+
+	second := fatLogBatch(700 * 1024)
+	second.HasError = true
+	if err := p.Submit(second); !errors.Is(err, ErrQueueFull) {
+		t.Fatalf("over-cap priority submit returned %v, want ErrQueueFull", err)
+	}
+
+	stats := p.Stats()
+	if stats.RejectedBytes != 1 {
+		t.Errorf("RejectedBytes = %d, want 1", stats.RejectedBytes)
+	}
+	if stats.RejectedFull != 0 {
+		t.Errorf("RejectedFull = %d, want 0 (byte rejection is a separate counter)", stats.RejectedFull)
+	}
+	if stats.QueueBytes != firstSize {
+		t.Errorf("QueueBytes = %d, want %d (rejected batch must not stay reserved)", stats.QueueBytes, firstSize)
+	}
+}
+
+func TestPipeline_ByteCap_SingleOversizedBatchRejected(t *testing.T) {
+	// A lone batch bigger than the whole cap is rejected outright and
+	// leaves no residual reservation behind.
+	p := NewPipeline(&fakeWriter{}, nil, PipelineConfig{Capacity: 100, Workers: 0, MaxBytes: 1 << 20})
+	b := fatLogBatch(2 << 20)
+	b.HasError = true
+	if err := p.Submit(b); !errors.Is(err, ErrQueueFull) {
+		t.Fatalf("oversized submit returned %v, want ErrQueueFull", err)
+	}
+	if got := p.Stats().QueueBytes; got != 0 {
+		t.Errorf("QueueBytes = %d after rejection, want 0", got)
+	}
+}
+
+func TestPipeline_ByteCap_ReleasesTenantSlotOnReject(t *testing.T) {
+	// A healthy batch reserves its tenant slot before the byte check; a
+	// byte rejection must hand that slot back, or the tenant cap turns into
+	// a slow leak. With cap 1, a leaked slot would make the follow-up
+	// submission a tenant_backpressure drop.
+	p := NewPipeline(&fakeWriter{}, nil, PipelineConfig{Capacity: 10, Workers: 0, MaxBytes: 1 << 20})
+	p.SetPerTenantCap(1)
+
+	fat := fatLogBatch(2 << 20) // healthy → reserves the tenant slot first
+	if err := p.Submit(fat); !errors.Is(err, ErrQueueFull) {
+		t.Fatalf("oversized submit returned %v, want ErrQueueFull", err)
+	}
+	if err := p.Submit(healthyBatch()); err != nil {
+		t.Fatalf("follow-up submit after byte rejection: %v", err)
+	}
+	if got := p.TenantDropped(); got != 0 {
+		t.Errorf("TenantDropped = %d, want 0 (slot leaked by byte rejection)", got)
+	}
+	if got := p.Stats().Enqueued; got != 1 {
+		t.Errorf("Enqueued = %d, want 1", got)
+	}
+}
+
+func TestPipeline_ChannelFull_ReleasesBytes(t *testing.T) {
+	// The hard-capacity default branch must undo the byte reservation the
+	// same way it undoes the tenant slot.
+	p := NewPipeline(&fakeWriter{}, nil, PipelineConfig{Capacity: 1, Workers: 0})
+	first := errorBatch()
+	if err := p.Submit(first); err != nil {
+		t.Fatalf("priming submit: %v", err)
+	}
+	if err := p.Submit(errorBatch()); !errors.Is(err, ErrQueueFull) {
+		t.Fatalf("channel-full submit returned %v, want ErrQueueFull", err)
+	}
+	if got, want := p.Stats().QueueBytes, first.approxBytes(); got != want {
+		t.Errorf("QueueBytes = %d, want %d (channel-full path leaked its reservation)", got, want)
+	}
+}
+
+func TestPipeline_SoftDropViaByteFullness(t *testing.T) {
+	// Item fullness is ~0.1% but bytes are at ~93% of the cap — the soft
+	// check must fire on max(itemFullness, byteFullness) and drop the
+	// healthy batch.
+	p := NewPipeline(&fakeWriter{}, nil, PipelineConfig{Capacity: 1000, Workers: 0, SoftThreshold: 0.9, MaxBytes: 1 << 20})
+	fat := fatLogBatch(950 * 1024) // priority → bypasses the soft check itself
+	fat.HasError = true
+	if err := p.Submit(fat); err != nil {
+		t.Fatalf("priming fat priority submit: %v", err)
+	}
+
+	if err := p.Submit(healthyBatch()); err != nil {
+		t.Fatalf("soft-dropped submit returned %v, want nil (silent drop)", err)
+	}
+	stats := p.Stats()
+	if stats.DroppedHealthy != 1 {
+		t.Errorf("DroppedHealthy = %d, want 1 (byteFullness should trip the soft check)", stats.DroppedHealthy)
+	}
+	if stats.Enqueued != 1 {
+		t.Errorf("Enqueued = %d, want 1 (only the priming batch)", stats.Enqueued)
+	}
+}
+
+func TestPipeline_ByteAccounting_ReservedWhileQueued(t *testing.T) {
+	// With no workers draining, QueueBytes must equal the sum of the
+	// enqueued batches' estimates.
+	p := NewPipeline(&fakeWriter{}, nil, PipelineConfig{Capacity: 10, Workers: 0})
+	b1, b2 := healthyBatch(), fatLogBatch(4096)
+	if err := p.Submit(b1); err != nil {
+		t.Fatalf("submit 1: %v", err)
+	}
+	if err := p.Submit(b2); err != nil {
+		t.Fatalf("submit 2: %v", err)
+	}
+	if got, want := p.Stats().QueueBytes, b1.approxBytes()+b2.approxBytes(); got != want {
+		t.Errorf("QueueBytes = %d, want %d", got, want)
+	}
+}
+
+func TestPipeline_ByteAccounting_ReturnsToZeroAfterProcess(t *testing.T) {
+	// Every reservation taken at Submit must be released by process() —
+	// including the panic path, or the counter ratchets up until the cap
+	// rejects all traffic.
+	w := &fakeWriter{}
+	p := NewPipeline(w, nil, PipelineConfig{Capacity: 10, Workers: 1})
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	p.Start(ctx)
+	t.Cleanup(p.Stop)
+
+	bad := healthyBatch()
+	bad.SpanCallback = func(_ storage.Span) { panic("boom") }
+	good := healthyBatch()
+
+	if err := p.Submit(bad); err != nil {
+		t.Fatalf("submit bad: %v", err)
+	}
+	if err := p.Submit(good); err != nil {
+		t.Fatalf("submit good: %v", err)
+	}
+	if !waitFor(t, 5*time.Second, func() bool { return p.Stats().Processed >= 2 }) {
+		t.Fatalf("worker did not process both batches — Processed=%d", p.Stats().Processed)
+	}
+	if !waitFor(t, 5*time.Second, func() bool { return p.Stats().QueueBytes == 0 }) {
+		t.Fatalf("QueueBytes = %d after drain, want 0 (panic path leaked its reservation)", p.Stats().QueueBytes)
+	}
+}
+
+func TestPipeline_QueueBytesGaugeTracksReservations(t *testing.T) {
+	// The Prometheus gauge must follow the reservation lifecycle: up on
+	// enqueue, back to zero after the worker drains. Built from a bare
+	// prometheus.NewGauge (not telemetry.New()) so the default registry
+	// isn't double-registered across tests.
+	g := prometheus.NewGauge(prometheus.GaugeOpts{Name: "test_ingest_pipeline_queue_bytes"})
+	m := &telemetry.Metrics{IngestPipelineQueueBytes: g}
+	p := NewPipeline(&fakeWriter{}, m, PipelineConfig{Capacity: 10, Workers: 1})
+
+	b := healthyBatch()
+	if err := p.Submit(b); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if got, want := testutil.ToFloat64(g), float64(b.approxBytes()); got != want {
+		t.Errorf("gauge after enqueue = %v, want %v", got, want)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	p.Start(ctx)
+	t.Cleanup(p.Stop)
+	if !waitFor(t, 5*time.Second, func() bool { return testutil.ToFloat64(g) == 0 }) {
+		t.Fatalf("gauge did not return to 0 after drain: %v", testutil.ToFloat64(g))
+	}
+}
+
+func TestPipeline_ByteAccounting_ReleasedOnWriterFailure(t *testing.T) {
+	// A failed BatchCreateAll drops the batch — its reservation must be
+	// released all the same.
+	w := &fakeWriter{traceErr: errors.New("db down")}
+	p := NewPipeline(w, nil, PipelineConfig{Capacity: 4, Workers: 1})
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	p.Start(ctx)
+	t.Cleanup(p.Stop)
+
+	if err := p.Submit(healthyBatch()); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if !waitFor(t, 5*time.Second, func() bool { return p.Stats().ProcessFailures >= 1 }) {
+		t.Fatalf("writer failure never surfaced")
+	}
+	if !waitFor(t, 5*time.Second, func() bool { return p.Stats().QueueBytes == 0 }) {
+		t.Fatalf("QueueBytes = %d after failed process, want 0", p.Stats().QueueBytes)
 	}
 }

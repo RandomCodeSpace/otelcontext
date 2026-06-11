@@ -13,6 +13,7 @@ var sqliteEnvKeys = []string{
 	"DB_MAX_IDLE_CONNS",
 	"INGEST_PIPELINE_WORKERS",
 	"INGEST_PIPELINE_QUEUE_SIZE",
+	"INGEST_PIPELINE_MAX_BYTES",
 	"METRIC_MAX_CARDINALITY",
 	"STORE_MIN_SEVERITY",
 	"SAMPLING_RATE",
@@ -47,16 +48,17 @@ func clearSQLiteEnv(t *testing.T) {
 func postgresDefaultsConfig(driver string) *Config {
 	return &Config{
 		DBDriver:                 driver,
-		DBMaxOpenConns:           50,    // Postgres default
-		DBMaxIdleConns:           10,    // Postgres default
-		IngestPipelineWorkers:    8,     // Postgres default
-		IngestPipelineQueueSize:  50000, // Postgres default
-		MetricMaxCardinality:     10000, // Postgres default
-		StoreMinSeverity:         "",    // same-as-ingest default
-		SamplingRate:             1.0,   // keep-all default
-		GRPCMaxConcurrentStreams: 1000,  // Postgres default
-		GraphRAGEventQueueSize:   100000, // Postgres default
-		LogFTSEnabled:            false, // FTS5 opt-in default
+		DBMaxOpenConns:           50,        // Postgres default
+		DBMaxIdleConns:           10,        // Postgres default
+		IngestPipelineWorkers:    8,         // Postgres default
+		IngestPipelineQueueSize:  50000,     // Postgres default
+		IngestPipelineMaxBytes:   512 << 20, // Postgres default
+		MetricMaxCardinality:     10000,     // Postgres default
+		StoreMinSeverity:         "",        // same-as-ingest default
+		SamplingRate:             1.0,       // keep-all default
+		GRPCMaxConcurrentStreams: 1000,      // Postgres default
+		GraphRAGEventQueueSize:   100000,    // Postgres default
+		LogFTSEnabled:            false,     // FTS5 opt-in default
 	}
 }
 
@@ -77,6 +79,7 @@ func TestApplyDriverDefaults_SQLite_FlipsAllWhenNoEnv(t *testing.T) {
 		{"DBMaxIdleConns", cfg.DBMaxIdleConns, 1},
 		{"IngestPipelineWorkers", cfg.IngestPipelineWorkers, 2},
 		{"IngestPipelineQueueSize", cfg.IngestPipelineQueueSize, 10000},
+		{"IngestPipelineMaxBytes", cfg.IngestPipelineMaxBytes, 128 << 20},
 		{"MetricMaxCardinality", cfg.MetricMaxCardinality, 3000},
 		{"StoreMinSeverity", cfg.StoreMinSeverity, "WARN"},
 		{"SamplingRate", cfg.SamplingRate, 0.05},
