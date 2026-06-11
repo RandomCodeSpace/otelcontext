@@ -190,6 +190,20 @@ func (g *GraphRAG) rebuildAllTenantsFromDB(ctx context.Context) {
 	}
 }
 
+// incrementalSince narrows the rebuild window for a tenant that already has
+// a high-water-mark: only spans newer than HWM minus rebuildOverlap need
+// re-reading — at 120 services the full-window re-read every 60s dominated
+// DB load. A fresh slice (first build, post-eviction) has HWM 0 and keeps
+// the full trailing window.
+func incrementalSince(stores *tenantStores, since time.Time) time.Time {
+	if hwm := stores.lastRebuildMax.Load(); hwm != 0 {
+		if t := time.Unix(0, hwm).Add(-rebuildOverlap); t.After(since) {
+			return t
+		}
+	}
+	return since
+}
+
 // rebuildFromDBForTenant loads recent span data for a single tenant and
 // merges it into that tenant's slice of the graph. Catches data from before
 // callbacks started (e.g., restart recovery).
@@ -209,16 +223,7 @@ func (g *GraphRAG) rebuildFromDBForTenant(_ context.Context, tenant string, sinc
 	// clock, or dormant tenants would never reach GRAPHRAG_TENANT_IDLE_TTL.
 	stores := g.tenantStoresNoTouch(tenant)
 
-	// Incremental rebuild: after the first pass, only re-read spans newer
-	// than the tenant's high-water-mark minus a small overlap instead of the
-	// full trailing window — at 120 services the full-window re-read every
-	// 60s dominated DB load. A fresh slice (first build, post-eviction) has
-	// HWM 0 and takes the full window.
-	if hwm := stores.lastRebuildMax.Load(); hwm != 0 {
-		if t := time.Unix(0, hwm).Add(-rebuildOverlap); t.After(since) {
-			since = t
-		}
-	}
+	since = incrementalSince(stores, since)
 
 	var rows []spanRow
 	err := g.repo.DB().
