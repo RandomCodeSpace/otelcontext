@@ -395,6 +395,15 @@ func main() {
 	graphRAGCfg := graphrag.DefaultConfig()
 	graphRAGCfg.WorkerCount = cfg.GraphRAGWorkerCount
 	graphRAGCfg.ChannelSize = cfg.GraphRAGEventQueueSize
+	graphRAGCfg.MaxSpansPerTenant = cfg.GraphRAGMaxSpansPerTenant
+	// Duration knobs follow the DLQ_REPLAY_INTERVAL pattern: unparsable
+	// values fall back to the package default rather than aborting startup.
+	if ttl, err := time.ParseDuration(cfg.GraphRAGTraceTTL); err == nil && ttl > 0 {
+		graphRAGCfg.TraceTTL = ttl
+	}
+	if idle, err := time.ParseDuration(cfg.GraphRAGTenantIdleTTL); err == nil && idle > 0 {
+		graphRAGCfg.TenantIdleTTL = idle
+	}
 	graphRAG := graphrag.New(repo, tsdbAgg, ringBuf, graphRAGCfg)
 	graphRAG.SetMetrics(metrics)
 	ctxGraphRAG, cancelGraphRAG := context.WithCancel(context.Background())
@@ -402,6 +411,9 @@ func main() {
 	slog.Info("GraphRAG started (layered graph with anomaly detection)",
 		"workers", cfg.GraphRAGWorkerCount,
 		"event_queue_size", cfg.GraphRAGEventQueueSize,
+		"trace_ttl", graphRAGCfg.TraceTTL,
+		"max_spans_per_tenant", graphRAGCfg.MaxSpansPerTenant,
+		"tenant_idle_ttl", graphRAGCfg.TenantIdleTTL,
 	)
 
 	// Auto-migrate GraphRAG models (Investigation, DrainTemplateRow)

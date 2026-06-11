@@ -2,7 +2,9 @@ package graphrag
 
 import (
 	"math"
+	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -16,15 +18,37 @@ type tenantStores struct {
 	traces    *TraceStore
 	signals   *SignalStore
 	anomalies *AnomalyStore
+
+	// lastAccess is the unix-nano time of the most recent ingest event or
+	// query routed through storesForTenant. Drives idle-tenant eviction in
+	// refreshLoop; background maintenance uses tenantStoresNoTouch so a 60s
+	// bookkeeping pass cannot keep a dormant tenant alive.
+	lastAccess atomic.Int64
+
+	// lastEventAt is the unix-nano time of the most recent span/log/metric
+	// processed for this tenant. detectAnomalies skips tenants whose value
+	// predates the previous scan tick — their stats cannot have changed.
+	lastEventAt atomic.Int64
+
+	// lastRebuildMax is the high-water-mark (unix nanos) of span start_time
+	// merged by rebuildFromDBForTenant. Subsequent rebuilds only re-read
+	// rows newer than HWM minus a small overlap instead of the full
+	// trailing window. Zero on a fresh slice (first build / post-eviction)
+	// forces a full-window rebuild.
+	lastRebuildMax atomic.Int64
 }
 
-func newTenantStores(traceTTL time.Duration) *tenantStores {
-	return &tenantStores{
+func newTenantStores(traceTTL time.Duration, maxSpans int) *tenantStores {
+	ts := &tenantStores{
 		service:   newServiceStore(),
-		traces:    newTraceStore(traceTTL),
+		traces:    newTraceStore(traceTTL, maxSpans),
 		signals:   newSignalStore(),
 		anomalies: newAnomalyStore(),
 	}
+	// Creation counts as access — a slice re-created by the DB rebuild gets
+	// a full idle window rather than being evicted on the next tick.
+	ts.lastAccess.Store(time.Now().UnixNano())
+	return ts
 }
 
 // ServiceStore holds permanent service topology data.
@@ -50,14 +74,19 @@ type TraceStore struct {
 	Spans  map[string]*SpanNode  // key: span_id
 	Edges  map[string]*Edge      // key: type|from|to
 	TTL    time.Duration
+	// MaxSpans hard-caps the Spans map: at the cap, NEW span IDs are
+	// skipped (UpsertSpan returns false) while updates to resident IDs
+	// still apply. <=0 disables the cap.
+	MaxSpans int
 }
 
-func newTraceStore(ttl time.Duration) *TraceStore {
+func newTraceStore(ttl time.Duration, maxSpans int) *TraceStore {
 	return &TraceStore{
-		Traces: make(map[string]*TraceNode),
-		Spans:  make(map[string]*SpanNode),
-		Edges:  make(map[string]*Edge),
-		TTL:    ttl,
+		Traces:   make(map[string]*TraceNode),
+		Spans:    make(map[string]*SpanNode),
+		Edges:    make(map[string]*Edge),
+		TTL:      ttl,
+		MaxSpans: maxSpans,
 	}
 }
 
@@ -270,10 +299,19 @@ func (ts *TraceStore) UpsertTrace(traceID, rootService, status string, durationM
 	}
 }
 
-func (ts *TraceStore) UpsertSpan(span SpanNode) {
+// UpsertSpan inserts or updates a span node and its CONTAINS/CHILD_OF edges.
+// Returns false when the span is NEW and MaxSpans is already reached — the
+// span is skipped entirely (the graph is best-effort; the DB is the source
+// of truth, same doctrine as the event-channel overflow in builder.go).
+func (ts *TraceStore) UpsertSpan(span SpanNode) bool {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
 
+	if ts.MaxSpans > 0 && len(ts.Spans) >= ts.MaxSpans {
+		if _, resident := ts.Spans[span.ID]; !resident {
+			return false
+		}
+	}
 	ts.Spans[span.ID] = &span
 
 	// CONTAINS edge: trace → span
@@ -299,6 +337,7 @@ func (ts *TraceStore) UpsertSpan(span SpanNode) {
 			}
 		}
 	}
+	return true
 }
 
 func (ts *TraceStore) GetSpan(spanID string) (*SpanNode, bool) {
@@ -412,9 +451,14 @@ func (ss *SignalStore) UpsertLogClusterWithTemplate(id, template, severity, serv
 		lc.LastSeen = ts
 	}
 
-	// EMITTED_BY edge
+	// EMITTED_BY edge. Refresh UpdatedAt on every hit so Prune's edge sweep
+	// never severs a cluster that is still receiving logs.
 	ek := edgeKey(EdgeEmittedBy, id, service)
-	if _, exists := ss.Edges[ek]; !exists {
+	if e, exists := ss.Edges[ek]; exists {
+		if ts.After(e.UpdatedAt) {
+			e.UpdatedAt = ts
+		}
+	} else {
 		ss.Edges[ek] = &Edge{
 			Type:      EdgeEmittedBy,
 			FromID:    id,
@@ -428,13 +472,18 @@ func (ss *SignalStore) AddLoggedDuringEdge(clusterID, spanID string, ts time.Tim
 	ek := edgeKey(EdgeLoggedDuring, clusterID, spanID)
 	ss.mu.Lock()
 	defer ss.mu.Unlock()
-	if _, exists := ss.Edges[ek]; !exists {
-		ss.Edges[ek] = &Edge{
-			Type:      EdgeLoggedDuring,
-			FromID:    clusterID,
-			ToID:      spanID,
-			UpdatedAt: ts,
+	if e, exists := ss.Edges[ek]; exists {
+		// Keep the correlation alive across Prune's edge sweep.
+		if ts.After(e.UpdatedAt) {
+			e.UpdatedAt = ts
 		}
+		return
+	}
+	ss.Edges[ek] = &Edge{
+		Type:      EdgeLoggedDuring,
+		FromID:    clusterID,
+		ToID:      spanID,
+		UpdatedAt: ts,
 	}
 }
 
@@ -455,9 +504,15 @@ func (ss *SignalStore) UpsertMetric(metricName, service string, value float64, t
 			LastSeen:   ts,
 		}
 		ss.Metrics[key] = m
-
-		// MEASURED_BY edge
-		ek := edgeKey(EdgeMeasuredBy, key, service)
+	}
+	// MEASURED_BY edge — created on the first sample, UpdatedAt refreshed on
+	// every sample so Prune's edge sweep never severs a live metric.
+	ek := edgeKey(EdgeMeasuredBy, key, service)
+	if e, exists := ss.Edges[ek]; exists {
+		if ts.After(e.UpdatedAt) {
+			e.UpdatedAt = ts
+		}
+	} else {
 		ss.Edges[ek] = &Edge{
 			Type:      EdgeMeasuredBy,
 			FromID:    key,
@@ -489,6 +544,51 @@ func (ss *SignalStore) LogClustersForService(service string) []*LogClusterNode {
 		}
 	}
 	return out
+}
+
+// Prune bounds the SignalStore (modeled on TraceStore.Prune): MetricNodes
+// whose LastSeen predates cutoff are removed; if the map still exceeds
+// maxMetrics (<=0 = uncapped) the oldest-LastSeen overflow is evicted. Each
+// removed metric takes its MEASURED_BY edge with it. Finally, Edges whose
+// UpdatedAt predates cutoff are swept — the upsert paths refresh edge
+// timestamps, so live correlations survive. LogClusters are NOT pruned
+// here: they are bounded upstream by the Drain template LRU; only their
+// stale edges go. Returns the number of metrics removed.
+func (ss *SignalStore) Prune(cutoff time.Time, maxMetrics int) int {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+
+	pruned := 0
+	for id, m := range ss.Metrics {
+		if m.LastSeen.Before(cutoff) {
+			delete(ss.Metrics, id)
+			delete(ss.Edges, edgeKey(EdgeMeasuredBy, id, m.Service))
+			pruned++
+		}
+	}
+	if maxMetrics > 0 && len(ss.Metrics) > maxMetrics {
+		type metricAge struct {
+			id      string
+			service string
+			seen    time.Time
+		}
+		byAge := make([]metricAge, 0, len(ss.Metrics))
+		for id, m := range ss.Metrics {
+			byAge = append(byAge, metricAge{id, m.Service, m.LastSeen})
+		}
+		sort.Slice(byAge, func(i, j int) bool { return byAge[i].seen.Before(byAge[j].seen) })
+		for _, e := range byAge[:len(byAge)-maxMetrics] {
+			delete(ss.Metrics, e.id)
+			delete(ss.Edges, edgeKey(EdgeMeasuredBy, e.id, e.service))
+			pruned++
+		}
+	}
+	for ek, e := range ss.Edges {
+		if e.UpdatedAt.Before(cutoff) {
+			delete(ss.Edges, ek)
+		}
+	}
+	return pruned
 }
 
 func (ss *SignalStore) MetricsForService(service string) []*MetricNode {
@@ -533,12 +633,24 @@ func (as *AnomalyStore) AddPrecededByEdge(anomalyID, precedingID string, ts time
 }
 
 func (as *AnomalyStore) AnomaliesSince(since time.Time) []*AnomalyNode {
+	return as.AnomaliesSinceLimit(since, 0)
+}
+
+// AnomaliesSinceLimit is AnomaliesSince with a result cap (n <= 0 means
+// unlimited). correlateWithRecent walks this on every detection tick, so the
+// cap keeps a pathological anomaly backlog from turning each tick into an
+// O(N) scan plus O(N) edge fan-out. Selection past the cap follows map
+// iteration order — correlation is best-effort by design.
+func (as *AnomalyStore) AnomaliesSinceLimit(since time.Time, n int) []*AnomalyNode {
 	as.mu.RLock()
 	defer as.mu.RUnlock()
 	var out []*AnomalyNode
 	for _, a := range as.Anomalies {
 		if a.Timestamp.After(since) {
 			out = append(out, a)
+			if n > 0 && len(out) >= n {
+				break
+			}
 		}
 	}
 	return out

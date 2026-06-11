@@ -141,6 +141,28 @@ type Config struct {
 	// GraphRAG event channel buffer size. Defaults to 10000 if unset or <=0.
 	GraphRAGEventQueueSize int
 
+	// GraphRAGTraceTTL bounds how long spans/traces stay in the in-memory
+	// TraceStore before the refresh tick prunes them. Duration string, e.g.
+	// "1h". Defaults to "1h"; flipped to "30m" on SQLite (the in-memory span
+	// window is the largest GraphRAG heap consumer at 120 services). Anomaly
+	// and investigation paths look back <=5min, so a 30min window is safe.
+	GraphRAGTraceTTL string
+
+	// GraphRAGMaxSpansPerTenant hard-caps the in-memory TraceStore span map
+	// per tenant. At the cap, NEW spans are skipped (counted via
+	// otelcontext_graphrag_events_dropped_total{signal="span_capacity"});
+	// updates to resident spans still apply. The graph is best-effort — the
+	// DB remains the source of truth. 0 = default (500000); negative
+	// disables the cap.
+	GraphRAGMaxSpansPerTenant int
+
+	// GraphRAGTenantIdleTTL evicts a tenant's entire in-memory store slice
+	// after this much time without any ingest event or query. Duration
+	// string, default "24h". The default tenant is never evicted, and an
+	// active tenant is re-created within one refresh tick (60s) from recent
+	// DB spans — eviction is self-healing.
+	GraphRAGTenantIdleTTL string
+
 	// Async ingest pipeline (Phase 1 robustness work). Decouples OTLP Export
 	// from synchronous DB writes. When enabled, Export() returns as soon as
 	// the parsed batch is enqueued; persistence runs on a worker pool.
@@ -312,8 +334,11 @@ func Load(customPath string) (*Config, error) {
 		LogFTSEnabled: parseTruthy(getEnv("LOG_FTS_ENABLED", "")),
 
 		// GraphRAG
-		GraphRAGWorkerCount:    getEnvInt("GRAPHRAG_WORKER_COUNT", 16),
-		GraphRAGEventQueueSize: getEnvInt("GRAPHRAG_EVENT_QUEUE_SIZE", 100000),
+		GraphRAGWorkerCount:       getEnvInt("GRAPHRAG_WORKER_COUNT", 16),
+		GraphRAGEventQueueSize:    getEnvInt("GRAPHRAG_EVENT_QUEUE_SIZE", 100000),
+		GraphRAGTraceTTL:          getEnv("GRAPHRAG_TRACE_TTL", "1h"),
+		GraphRAGMaxSpansPerTenant: getEnvInt("GRAPHRAG_MAX_SPANS_PER_TENANT", 500000),
+		GraphRAGTenantIdleTTL:     getEnv("GRAPHRAG_TENANT_IDLE_TTL", "24h"),
 
 		// Async ingest pipeline
 		IngestAsyncEnabled:         getEnvBool("INGEST_ASYNC_ENABLED", true),
@@ -393,6 +418,11 @@ var sqliteOverrides = []struct {
 	// single writer starves the workers anyway — drop sooner (metered via
 	// otelcontext_graphrag_events_dropped_total) instead of buffering RAM.
 	{"GRAPHRAG_EVENT_QUEUE_SIZE", func(c *Config) { c.GraphRAGEventQueueSize = 10000 }},
+	// The TraceStore span window dominates GraphRAG heap at 120 services
+	// (~1.5 GB potential at 1h). Anomaly/investigation lookbacks are <=5min,
+	// so halving the window costs nothing they rely on; MCP trace tools fall
+	// through to the DB for older traces.
+	{"GRAPHRAG_TRACE_TTL", func(c *Config) { c.GraphRAGTraceTTL = "30m" }},
 }
 
 func applyDriverDefaults(cfg *Config) {

@@ -12,8 +12,16 @@ import (
 // tenant slice we walk the ServiceStore and SignalStore under their own
 // locks and emit anomalies into that tenant's AnomalyStore.
 func (g *GraphRAG) detectAnomalies(ctx context.Context) {
+	prevScan := g.lastAnomalyScan.Swap(time.Now().UnixNano())
 	tenants := g.snapshotTenants()
 	for tenant, stores := range tenants {
+		// Gate: a tenant with no span/log/metric processed since the
+		// previous scan cannot have changed stats — skip the whole walk.
+		// The first scan after startup (prevScan == 0) always runs so
+		// DB-rebuilt state is examined at least once.
+		if prevScan != 0 && stores.lastEventAt.Load() < prevScan {
+			continue
+		}
 		tctx := storage.WithTenantContext(ctx, tenant)
 		g.detectAnomaliesForTenant(tctx, tenant, stores)
 	}
@@ -98,11 +106,17 @@ func (g *GraphRAG) detectAnomaliesForTenant(ctx context.Context, tenant string, 
 	}
 }
 
+// maxCorrelationWalk bounds how many recent anomalies correlateWithRecent
+// considers per detection. Stable per-(service,type) IDs already keep the
+// store small in steady state; this is the backstop against a pathological
+// backlog turning every 10s tick into an O(N) scan + edge fan-out.
+const maxCorrelationWalk = 1000
+
 // correlateWithRecent links an anomaly to other anomalies within ±30s in the
 // same tenant's AnomalyStore.
 func correlateWithRecent(stores *tenantStores, anomaly AnomalyNode) {
 	window := 30 * time.Second
-	recent := stores.anomalies.AnomaliesSince(anomaly.Timestamp.Add(-window))
+	recent := stores.anomalies.AnomaliesSinceLimit(anomaly.Timestamp.Add(-window), maxCorrelationWalk)
 	for _, prev := range recent {
 		if prev.ID == anomaly.ID {
 			continue

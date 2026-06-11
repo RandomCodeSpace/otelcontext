@@ -20,6 +20,7 @@ var sqliteEnvKeys = []string{
 	"GRPC_MAX_CONCURRENT_STREAMS",
 	"LOG_FTS_ENABLED",
 	"GRAPHRAG_EVENT_QUEUE_SIZE",
+	"GRAPHRAG_TRACE_TTL",
 }
 
 // clearSQLiteEnv unsets every env var consulted by applyDriverDefaults so
@@ -59,6 +60,7 @@ func postgresDefaultsConfig(driver string) *Config {
 		GRPCMaxConcurrentStreams: 1000,      // Postgres default
 		GraphRAGEventQueueSize:   100000,    // Postgres default
 		LogFTSEnabled:            false,     // FTS5 opt-in default
+		GraphRAGTraceTTL:         "1h",      // Postgres default
 	}
 }
 
@@ -86,6 +88,7 @@ func TestApplyDriverDefaults_SQLite_FlipsAllWhenNoEnv(t *testing.T) {
 		{"GRPCMaxConcurrentStreams", cfg.GRPCMaxConcurrentStreams, 240},
 		{"LogFTSEnabled", cfg.LogFTSEnabled, true},
 		{"GraphRAGEventQueueSize", cfg.GraphRAGEventQueueSize, 10000},
+		{"GraphRAGTraceTTL", cfg.GraphRAGTraceTTL, "30m"},
 	}
 	for _, c := range cases {
 		if c.got != c.want {
