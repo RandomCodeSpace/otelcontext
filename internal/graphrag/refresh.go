@@ -15,6 +15,13 @@ const (
 	// maxMetricsPerTenant caps each tenant's SignalStore metric map; past
 	// the cap the oldest-LastSeen series are evicted first.
 	maxMetricsPerTenant = 2000
+	// rebuildRowLimit caps how many span rows a single per-tenant rebuild
+	// pass loads. Hitting it is logged — topology lags until the next tick.
+	rebuildRowLimit = 50000
+	// rebuildOverlap is re-read behind the high-water-mark on each
+	// incremental rebuild so late-arriving spans with slightly older
+	// start_time values are still merged.
+	rebuildOverlap = 5 * time.Minute
 )
 
 // refreshLoop periodically rebuilds/merges from DB and prunes stale data.
@@ -202,17 +209,32 @@ func (g *GraphRAG) rebuildFromDBForTenant(_ context.Context, tenant string, sinc
 	// clock, or dormant tenants would never reach GRAPHRAG_TENANT_IDLE_TTL.
 	stores := g.tenantStoresNoTouch(tenant)
 
+	// Incremental rebuild: after the first pass, only re-read spans newer
+	// than the tenant's high-water-mark minus a small overlap instead of the
+	// full trailing window — at 120 services the full-window re-read every
+	// 60s dominated DB load. A fresh slice (first build, post-eviction) has
+	// HWM 0 and takes the full window.
+	if hwm := stores.lastRebuildMax.Load(); hwm != 0 {
+		if t := time.Unix(0, hwm).Add(-rebuildOverlap); t.After(since) {
+			since = t
+		}
+	}
+
 	var rows []spanRow
 	err := g.repo.DB().
 		Table("spans").
 		Select("span_id, parent_span_id, service_name, operation_name, duration, trace_id, status, start_time").
 		Where("start_time > ? AND tenant_id = ?", since, tenant).
 		Order("start_time ASC").
-		Limit(50000).
+		Limit(rebuildRowLimit).
 		Find(&rows).Error
 	if err != nil {
 		slog.Error("GraphRAG: failed to rebuild from DB", "tenant", tenant, "error", err)
 		return
+	}
+	if len(rows) == rebuildRowLimit {
+		slog.Warn("GraphRAG rebuild hit the row limit — topology lags until the next tick",
+			"tenant", tenant, "limit", rebuildRowLimit)
 	}
 
 	if len(rows) == 0 {
@@ -240,6 +262,12 @@ func (g *GraphRAG) rebuildFromDBForTenant(_ context.Context, tenant string, sinc
 				stores.service.UpsertCallEdge(parentSvc, r.ServiceName, durationMs, isError, r.StartTime)
 			}
 		}
+	}
+
+	// Advance the high-water-mark to the newest start_time merged. Rows are
+	// ordered ASC, so the last row carries the max; never move backwards.
+	if hwm := rows[len(rows)-1].StartTime.UnixNano(); hwm > stores.lastRebuildMax.Load() {
+		stores.lastRebuildMax.Store(hwm)
 	}
 
 	slog.Debug("GraphRAG rebuilt from DB",
