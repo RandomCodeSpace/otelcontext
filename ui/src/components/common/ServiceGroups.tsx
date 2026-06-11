@@ -1,11 +1,11 @@
 import { useState } from 'react'
 import { ChevronDown, ChevronRight } from 'lucide-react'
-import ServiceRow from '@/components/common/ServiceRow'
+import ServiceRow from './ServiceRow'
 import { rankServices } from '@/lib/triage'
 import type { SystemNode } from '@/types/api'
-import styles from './ServiceCards.module.css'
+import styles from './ServiceGroups.module.css'
 
-interface ServiceCardsProps {
+interface ServiceGroupsProps {
   nodes: readonly SystemNode[]
   onOpen: (id: string) => void
 }
@@ -34,7 +34,7 @@ function Section({
  * xs default for /map: status-grouped service cards, worst first; quiet
  * healthy services collapsed behind a disclosure.
  */
-export default function ServiceCards({ nodes, onOpen }: Readonly<ServiceCardsProps>) {
+export default function ServiceGroups({ nodes, onOpen }: Readonly<ServiceGroupsProps>) {
   const ranked = rankServices(nodes)
   const [healthyOpen, setHealthyOpen] = useState(false)
 

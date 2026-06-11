@@ -1,7 +1,7 @@
 import { useEffect, type ComponentType, type ReactNode } from 'react'
 import * as Tooltip from '@radix-ui/react-tooltip'
 import { Link, useRoute } from 'wouter'
-import { LayoutDashboard, Network, Terminal } from 'lucide-react'
+import { Activity, LayoutDashboard, Network, Terminal } from 'lucide-react'
 import { getWsManager } from '@/lib/wsManager'
 import type { Theme } from '@/hooks/useTheme'
 import PulseBar from './PulseBar'
@@ -14,7 +14,8 @@ interface NavEntry {
 }
 
 const NAV_ITEMS: readonly NavEntry[] = [
-  { href: '/map', label: 'Service Map', Icon: Network },
+  { href: '/', label: 'Triage', Icon: Activity },
+  { href: '/map', label: 'Flow Map', Icon: Network },
   { href: '/dashboard', label: 'Dashboard', Icon: LayoutDashboard },
   { href: '/mcp', label: 'MCP Console', Icon: Terminal },
 ]

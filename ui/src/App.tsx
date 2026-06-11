@@ -10,6 +10,7 @@ import styles from './App.module.css'
 
 // All routes are code-split; the Inspector is split too and only fetched
 // once a ?service= drill-down actually happens.
+const TriageView = lazy(() => import('./components/triage/TriageView'))
 const FlowMapView = lazy(() => import('./components/map/FlowMapView'))
 const DashboardView = lazy(() => import('./components/dashboard/DashboardView'))
 const MCPConsoleView = lazy(() => import('./components/mcp/MCPConsoleView'))
@@ -37,14 +38,15 @@ export default function App({ theme, onToggleTheme }: Readonly<AppProps>) {
         <div className={styles.routes}>
           <Suspense fallback={<Spin label="Loading…" />}>
             <Switch>
+              <Route path="/" component={TriageView} />
               <Route path="/map" component={FlowMapView} />
               <Route path="/dashboard">
                 <DashboardView onNavigate={(view) => navigate(VIEW_PATHS[view])} />
               </Route>
               <Route path="/mcp" component={MCPConsoleView} />
-              {/* "/" and anything unknown → /map until the Triage home lands. */}
+              {/* Unknown paths land on the Triage home. */}
               <Route>
-                <Redirect to="/map" replace />
+                <Redirect to="/" replace />
               </Route>
             </Switch>
           </Suspense>

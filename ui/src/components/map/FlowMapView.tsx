@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu'
 import { Info, Maximize2, Search, X } from 'lucide-react'
 import FlowMap, { type FlowMapHandle } from './FlowMap'
-import ServiceCards from './ServiceCards'
+import ServiceGroups from '@/components/common/ServiceGroups'
 import { useSystemGraph } from '@/hooks/useSystemGraph'
 import { useInvestigation } from '@/hooks/useInvestigation'
 import { useMediaQuery } from '@/hooks/useMediaQuery'
@@ -159,7 +159,7 @@ export default function FlowMapView() {
       />
     )
   } else {
-    body = <ServiceCards nodes={filteredNodes} onOpen={openService} />
+    body = <ServiceGroups nodes={filteredNodes} onOpen={openService} />
   }
 
   return (

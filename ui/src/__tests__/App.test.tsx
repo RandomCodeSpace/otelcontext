@@ -72,14 +72,17 @@ function renderApp(path: string) {
 }
 
 describe('App routing', () => {
-  it('redirects / to /map', async () => {
-    const memory = renderApp('/')
-    await waitFor(() => expect(memory.history).toContain('/map'))
+  it('mounts the Triage home at /', async () => {
+    renderApp('/')
+    // Empty graph → the feed's connect empty state proves the mount.
+    expect(
+      await screen.findByRole('region', { name: /service triage feed/i }),
+    ).toBeInTheDocument()
   })
 
-  it('redirects unknown paths to /map', async () => {
+  it('redirects unknown paths to /', async () => {
     const memory = renderApp('/nonsense')
-    await waitFor(() => expect(memory.history).toContain('/map'))
+    await waitFor(() => expect(memory.history).toContain('/'))
   })
 
   it('mounts the FlowMapView at /map', async () => {

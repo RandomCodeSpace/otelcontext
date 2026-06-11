@@ -1,0 +1,12 @@
+.spark {
+  display: block;
+  flex: none;
+}
+
+.line {
+  fill: none;
+  stroke: var(--crit);
+  stroke-width: 1.5;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}

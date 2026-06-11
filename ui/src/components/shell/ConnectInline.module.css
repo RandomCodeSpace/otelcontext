@@ -1,0 +1,84 @@
+.connect {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  max-width: 480px;
+}
+
+.lead {
+  margin: 0;
+  color: var(--text-2);
+  font-size: var(--text-sm);
+}
+
+.list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: 36px;
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--stroke-1);
+  border-radius: var(--radius-2);
+}
+
+@media (pointer: coarse) {
+  .item {
+    min-height: 48px;
+  }
+}
+
+.label {
+  flex: none;
+  min-width: 80px;
+  color: var(--text-3);
+  font-size: var(--text-2xs);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.value {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-1);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.copy {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: none;
+  border-radius: var(--radius-1);
+  background: transparent;
+  color: var(--text-3);
+  cursor: pointer;
+}
+
+@media (pointer: coarse) {
+  .copy {
+    width: 44px;
+    height: 44px;
+  }
+}
+
+@media (hover: hover) {
+  .copy:hover {
+    color: var(--text-1);
+  }
+}

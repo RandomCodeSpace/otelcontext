@@ -1,35 +1,34 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback } from 'react'
+import { useQuery } from '@tanstack/react-query'
+import { apiFetch } from '../lib/apiFetch'
 import type { TrafficPoint } from '../types/api'
 
 // GET /api/metrics/traffic returns a bare JSON array of TrafficPoint over the
 // last ~30 minutes (one point per minute bucket): { timestamp, count,
-// error_count }. Mirrors the useSystemGraph / useDashboard polling pattern:
-// useCallback load + setInterval + clearInterval cleanup.
+// error_count }. TanStack Query adapter keeping the legacy return shape
+// ({ points, loading, error, reload }); the shared ['metrics-traffic'] cache
+// key lets other surfaces (Triage feed sparkline) OBSERVE traffic data
+// without adding their own polling.
 export function useTraffic(pollInterval = 30_000) {
-  const [points, setPoints] = useState<TrafficPoint[] | null>(null)
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
-  const timerRef = useRef<ReturnType<typeof setInterval>>(undefined)
+  const { data, isPending, error, refetch } = useQuery({
+    queryKey: ['metrics-traffic'],
+    queryFn: async ({ signal }) => {
+      const points = await apiFetch<TrafficPoint[]>('/api/metrics/traffic', {
+        signal,
+      })
+      return Array.isArray(points) ? points : []
+    },
+    refetchInterval: pollInterval > 0 ? pollInterval : false,
+  })
 
-  const load = useCallback(async () => {
-    try {
-      const res = await fetch('/api/metrics/traffic')
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const data = (await res.json()) as TrafficPoint[]
-      setPoints(Array.isArray(data) ? data : [])
-      setError(null)
-    } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : 'fetch failed')
-    } finally {
-      setLoading(false)
-    }
-  }, [])
+  const reload = useCallback(() => {
+    void refetch()
+  }, [refetch])
 
-  useEffect(() => {
-    load()
-    timerRef.current = setInterval(load, pollInterval)
-    return () => clearInterval(timerRef.current)
-  }, [load, pollInterval])
-
-  return { points, loading, error, reload: load }
+  return {
+    points: data ?? null,
+    loading: isPending,
+    error: error ? error.message : null,
+    reload,
+  }
 }
