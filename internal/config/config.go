@@ -64,6 +64,14 @@ type Config struct {
 	RetentionBatchSize    int
 	RetentionBatchSleepMs int
 
+	// RetentionFullVacuum restores the daily full VACUUM during SQLite
+	// maintenance. Default false: the daily pass runs
+	// PRAGMA incremental_vacuum(10000) instead, because a full VACUUM holds
+	// an exclusive lock for 10-60 minutes on multi-GB files and starves
+	// ingest into a 429 storm. On-demand full VACUUM remains available via
+	// POST /api/admin/vacuum. Ignored on non-SQLite drivers.
+	RetentionFullVacuum bool
+
 	// TSDB
 	TSDBRingBufferDuration string // e.g. "1h"
 
@@ -266,6 +274,7 @@ func Load(customPath string) (*Config, error) {
 		HotRetentionDays:      getEnvInt("HOT_RETENTION_DAYS", 7),
 		RetentionBatchSize:    getEnvInt("RETENTION_BATCH_SIZE", 50000),
 		RetentionBatchSleepMs: getEnvInt("RETENTION_BATCH_SLEEP_MS", 1),
+		RetentionFullVacuum:   getEnvBool("RETENTION_FULL_VACUUM", false),
 
 		// TSDB
 		TSDBRingBufferDuration: getEnv("TSDB_RING_BUFFER_DURATION", "1h"),

@@ -1,8 +1,13 @@
 package storage
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"gorm.io/gorm"
+
+	"github.com/RandomCodeSpace/otelcontext/internal/membudget"
 )
 
 func TestNewDatabase_UnsupportedDriver(t *testing.T) {
@@ -73,6 +78,148 @@ func TestAutoMigrateModels_SQLite_AllTablesCreated(t *testing.T) {
 		if exists != 1 {
 			t.Fatalf("table %s not created", table)
 		}
+	}
+}
+
+// clearSQLiteMemoryEnv neutralizes the two PRAGMA override env vars for the
+// duration of the test. t.Setenv("") registers the restore; an empty value
+// fails strconv parsing and is therefore ignored by sqliteMemorySizes.
+func clearSQLiteMemoryEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("SQLITE_CACHE_SIZE_KB", "")
+	t.Setenv("SQLITE_MMAP_SIZE_BYTES", "")
+}
+
+// pragmaInt64 round-trips a PRAGMA query against the live connection.
+func pragmaInt64(t *testing.T, db *gorm.DB, pragma string) int64 {
+	t.Helper()
+	var v int64
+	if err := db.Raw("PRAGMA " + pragma).Scan(&v).Error; err != nil {
+		t.Fatalf("PRAGMA %s: %v", pragma, err)
+	}
+	return v
+}
+
+func TestSQLiteMemorySizes_BudgetScaling(t *testing.T) {
+	clearSQLiteMemoryEnv(t)
+	cases := []struct {
+		name        string
+		budget      int64
+		wantCacheKB int64
+		wantMmap    int64
+	}{
+		{"detection failed -> legacy hardcoded", 0, 262144, 1073741824},
+		{"4GB host -> 128MB cache, 512MB mmap", 4 << 30, 131072, 512 << 20},
+		{"1GB host clamps to floors", 1 << 30, 65536, 268435456},
+		{"64GB host clamps to ceilings", 64 << 30, 262144, 1073741824},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cacheKB, mmapBytes := sqliteMemorySizes(tc.budget)
+			if cacheKB != tc.wantCacheKB || mmapBytes != tc.wantMmap {
+				t.Fatalf("sqliteMemorySizes(%d)=(%d,%d) want (%d,%d)",
+					tc.budget, cacheKB, mmapBytes, tc.wantCacheKB, tc.wantMmap)
+			}
+		})
+	}
+}
+
+func TestSQLiteMemorySizes_EnvOverridesWinOverBudget(t *testing.T) {
+	t.Setenv("SQLITE_CACHE_SIZE_KB", "12345")
+	t.Setenv("SQLITE_MMAP_SIZE_BYTES", "0") // 0 = disable mmap, a legitimate override
+	cacheKB, mmapBytes := sqliteMemorySizes(4 << 30)
+	if cacheKB != 12345 || mmapBytes != 0 {
+		t.Fatalf("env overrides ignored: got (%d,%d) want (12345,0)", cacheKB, mmapBytes)
+	}
+}
+
+func TestSQLiteMemorySizes_InvalidEnvIgnored(t *testing.T) {
+	t.Setenv("SQLITE_CACHE_SIZE_KB", "not-a-number")
+	t.Setenv("SQLITE_MMAP_SIZE_BYTES", "-1") // negative mmap is invalid
+	cacheKB, mmapBytes := sqliteMemorySizes(4 << 30)
+	if cacheKB != 131072 || mmapBytes != 512<<20 {
+		t.Fatalf("invalid env must fall back to budget scaling: got (%d,%d)", cacheKB, mmapBytes)
+	}
+}
+
+func TestNewDatabase_SQLitePragmas_EnvOverrideRoundTrip(t *testing.T) {
+	t.Setenv("SQLITE_CACHE_SIZE_KB", "12345")
+	t.Setenv("SQLITE_MMAP_SIZE_BYTES", "33554432")
+
+	db, err := NewDatabase("sqlite", filepath.Join(t.TempDir(), "override.db"))
+	if err != nil {
+		t.Fatalf("sqlite: %v", err)
+	}
+	defer closeDB(db)
+
+	if got := pragmaInt64(t, db, "cache_size"); got != -12345 {
+		t.Fatalf("cache_size=%d want -12345", got)
+	}
+	if got := pragmaInt64(t, db, "mmap_size"); got != 33554432 {
+		t.Fatalf("mmap_size=%d want 33554432", got)
+	}
+}
+
+func TestNewDatabase_SQLitePragmas_BudgetScaledRoundTrip(t *testing.T) {
+	clearSQLiteMemoryEnv(t)
+
+	// Whatever this host's budget resolves to, the live connection must carry
+	// the same numbers the sizing function computes — proves the wiring, not
+	// the host RAM.
+	budget, _ := membudget.Detect()
+	wantCacheKB, wantMmap := sqliteMemorySizes(budget)
+
+	db, err := NewDatabase("sqlite", filepath.Join(t.TempDir(), "scaled.db"))
+	if err != nil {
+		t.Fatalf("sqlite: %v", err)
+	}
+	defer closeDB(db)
+
+	if got := pragmaInt64(t, db, "cache_size"); got != -wantCacheKB {
+		t.Fatalf("cache_size=%d want %d", got, -wantCacheKB)
+	}
+	if got := pragmaInt64(t, db, "mmap_size"); got != wantMmap {
+		t.Fatalf("mmap_size=%d want %d", got, wantMmap)
+	}
+
+	// The rest of the hardened stanza must stay byte-identical — guard the
+	// values that round-trip numerically.
+	fixed := []struct {
+		pragma string
+		want   int64
+	}{
+		{"synchronous", 1}, // NORMAL
+		{"temp_store", 2},  // MEMORY
+		{"wal_autocheckpoint", 10000},
+		{"journal_size_limit", 67108864},
+		{"busy_timeout", 5000},
+	}
+	for _, f := range fixed {
+		if got := pragmaInt64(t, db, f.pragma); got != f.want {
+			t.Fatalf("PRAGMA %s=%d want %d (hardened stanza must not drift)", f.pragma, got, f.want)
+		}
+	}
+	var mode string
+	if err := db.Raw("PRAGMA journal_mode").Scan(&mode).Error; err != nil || !strings.EqualFold(mode, "wal") {
+		t.Fatalf("journal_mode=%q err=%v want wal", mode, err)
+	}
+}
+
+func TestNewDatabase_SQLiteAutoVacuumIncremental(t *testing.T) {
+	clearSQLiteMemoryEnv(t)
+
+	// Best-effort PRAGMA at startup: on a fresh database file it must take
+	// effect (auto_vacuum=2 = INCREMENTAL) because it runs before the first
+	// table is created. Pre-existing files keep their stored mode — that is
+	// accepted and not asserted here.
+	db, err := NewDatabase("sqlite", filepath.Join(t.TempDir(), "fresh.db"))
+	if err != nil {
+		t.Fatalf("sqlite: %v", err)
+	}
+	defer closeDB(db)
+
+	if got := pragmaInt64(t, db, "auto_vacuum"); got != 2 {
+		t.Fatalf("auto_vacuum=%d want 2 (INCREMENTAL) on a fresh database", got)
 	}
 }
 
