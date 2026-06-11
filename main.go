@@ -718,6 +718,12 @@ func main() {
 
 	var httpHandler http.Handler = mux
 
+	// Gzip GET /api/* responses (innermost wrapper — only handler output is
+	// compressed; error responses written by outer middleware like auth and
+	// rate limiting stay identity-encoded, and /ws*, /v1/*, /metrics*, and
+	// the MCP/SSE path pass through untouched).
+	httpHandler = api.GzipMiddleware(cfg.MCPPath)(httpHandler)
+
 	// Resolve tenant on /api/* read-side requests (passes through OTLP /v1,
 	// MCP, UI assets, and health probes untouched).
 	httpHandler = api.TenantMiddleware(cfg)(httpHandler)
