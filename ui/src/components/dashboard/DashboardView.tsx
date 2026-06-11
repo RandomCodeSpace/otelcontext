@@ -16,7 +16,6 @@ import {
 import type { TableColumn, TimelineItem } from '@ossrandom/design-system'
 import { RadialGauge } from '@ossrandom/design-system/charts'
 import Truncate from '../common/Truncate'
-import type { OtelView } from '../nav/TopNav'
 import type { ServiceError } from '../../types/api'
 import { fmt } from '../../lib/utils'
 import { BP } from '../../lib/breakpoints'
@@ -34,6 +33,10 @@ import {
   readyCheckToStatus,
   severityToTone,
 } from './dashTypes'
+
+// Legacy view ids, kept for the onNavigate contract. Routing itself moved
+// to wouter (App maps these to paths). Previously lived in nav/TopNav.
+export type OtelView = 'dashboard' | 'services' | 'mcp'
 
 interface DashboardViewProps {
   onNavigate: (view: OtelView) => void

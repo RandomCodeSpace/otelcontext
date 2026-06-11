@@ -79,6 +79,19 @@ describe('useSystemGraph (TanStack Query adapter)', () => {
     expect(result.current.graph).toBeNull()
     expect(result.current.error).toContain('503')
   })
+
+  it('reload() triggers a refetch', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(GRAPH, { 'X-Cache': 'MISS' }))
+    const { result } = renderHook(() => useSystemGraph(0), {
+      wrapper: makeWrapper(),
+    })
+    await waitFor(() => expect(result.current.loading).toBe(false))
+    const calls = fetchMock.mock.calls.length
+    result.current.reload()
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.length).toBeGreaterThan(calls),
+    )
+  })
 })
 
 describe('useDashboard (TanStack Query adapter)', () => {
@@ -134,5 +147,18 @@ describe('useDashboard (TanStack Query adapter)', () => {
     await waitFor(() => expect(result.current.loading).toBe(false))
     expect(result.current.dashboard).toEqual(DASH)
     expect(result.current.error).toContain('500')
+  })
+
+  it('reload() refetches both endpoints', async () => {
+    routeFetches()
+    const { result } = renderHook(() => useDashboard(0), {
+      wrapper: makeWrapper(),
+    })
+    await waitFor(() => expect(result.current.loading).toBe(false))
+    const calls = fetchMock.mock.calls.length
+    result.current.reload()
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.length).toBeGreaterThanOrEqual(calls + 2),
+    )
   })
 })

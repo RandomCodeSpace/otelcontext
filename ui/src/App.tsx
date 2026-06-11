@@ -1,15 +1,22 @@
-import { lazy, Suspense, useState } from 'react'
-import { AppShell, Spin } from '@ossrandom/design-system'
-import TopNav, { type OtelView } from './components/nav/TopNav'
-import DashboardView from './components/dashboard/DashboardView'
-import { useWebSocket } from './hooks/useWebSocket'
+import { lazy, Suspense } from 'react'
+import { Redirect, Route, Switch, useLocation } from 'wouter'
+import { Spin } from '@ossrandom/design-system'
+import Shell from './components/shell/Shell'
+import type { OtelView } from './components/dashboard/DashboardView'
 import type { Theme } from './hooks/useTheme'
 
-// Dashboard is the default view and loads eagerly. The Service Map pulls in
-// cytoscape (~434 KB) and the MCP console is a large secondary surface — both
-// are code-split so they don't weigh down the initial dashboard-first load.
+// All routes are code-split: /map pulls in cytoscape (~434 KB) and the
+// other views carry design-system surfaces the shell itself doesn't need.
 const ServicesView = lazy(() => import('./components/observability/ServicesView'))
+const DashboardView = lazy(() => import('./components/dashboard/DashboardView'))
 const MCPConsoleView = lazy(() => import('./components/mcp/MCPConsoleView'))
+
+// Legacy view ids (DashboardView's onNavigate) → router paths.
+const VIEW_PATHS: Record<OtelView, string> = {
+  dashboard: '/dashboard',
+  services: '/map',
+  mcp: '/mcp',
+}
 
 interface AppProps {
   theme: Theme
@@ -17,30 +24,23 @@ interface AppProps {
 }
 
 export default function App({ theme, onToggleTheme }: Readonly<AppProps>) {
-  const [view, setView] = useState<OtelView>('dashboard')
-
-  // WebSocket retained purely as the live/offline source for the header badge;
-  // the pushed log batches are intentionally discarded.
-  const ws = useWebSocket(() => undefined)
-  const wsConnected = ws.status === 'connected'
+  const [, navigate] = useLocation()
 
   return (
-    <AppShell
-      header={
-        <TopNav
-          view={view}
-          onNavigate={setView}
-          wsConnected={wsConnected}
-          theme={theme}
-          onToggleTheme={onToggleTheme}
-        />
-      }
-    >
+    <Shell theme={theme} onToggleTheme={onToggleTheme}>
       <Suspense fallback={<Spin label="Loading…" />}>
-        {view === 'dashboard' && <DashboardView onNavigate={setView} />}
-        {view === 'services' && <ServicesView />}
-        {view === 'mcp' && <MCPConsoleView />}
+        <Switch>
+          <Route path="/map" component={ServicesView} />
+          <Route path="/dashboard">
+            <DashboardView onNavigate={(view) => navigate(VIEW_PATHS[view])} />
+          </Route>
+          <Route path="/mcp" component={MCPConsoleView} />
+          {/* "/" and anything unknown → /map until the Triage home lands. */}
+          <Route>
+            <Redirect to="/map" replace />
+          </Route>
+        </Switch>
       </Suspense>
-    </AppShell>
+    </Shell>
   )
 }

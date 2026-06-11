@@ -22,10 +22,14 @@ export function useDashboard(pollInterval = 30_000) {
     refetchInterval,
   });
 
+  // refetch is referentially stable in TanStack v5; destructured so the
+  // dependency array doesn't have to carry the whole query result objects.
+  const { refetch: refetchDashboard } = dash;
+  const { refetch: refetchStats } = stats;
   const reload = useCallback(() => {
-    void dash.refetch();
-    void stats.refetch();
-  }, [dash.refetch, stats.refetch]);
+    void refetchDashboard();
+    void refetchStats();
+  }, [refetchDashboard, refetchStats]);
 
   return {
     dashboard: dash.data ?? null,
