@@ -12,8 +12,16 @@ import (
 // tenant slice we walk the ServiceStore and SignalStore under their own
 // locks and emit anomalies into that tenant's AnomalyStore.
 func (g *GraphRAG) detectAnomalies(ctx context.Context) {
+	prevScan := g.lastAnomalyScan.Swap(time.Now().UnixNano())
 	tenants := g.snapshotTenants()
 	for tenant, stores := range tenants {
+		// Gate: a tenant with no span/log/metric processed since the
+		// previous scan cannot have changed stats — skip the whole walk.
+		// The first scan after startup (prevScan == 0) always runs so
+		// DB-rebuilt state is examined at least once.
+		if prevScan != 0 && stores.lastEventAt.Load() < prevScan {
+			continue
+		}
 		tctx := storage.WithTenantContext(ctx, tenant)
 		g.detectAnomaliesForTenant(tctx, tenant, stores)
 	}

@@ -138,6 +138,11 @@ type GraphRAG struct {
 	// invInserts counts cooldown-allowed PersistInvestigation calls.
 	// Incremented BEFORE the DB write — see InvestigationInsertCount.
 	invInserts atomic.Int64
+
+	// lastAnomalyScan is the unix-nano start time of the previous
+	// detectAnomalies pass. Tenants whose lastEventAt predates it are
+	// skipped — no events means their stats cannot have changed.
+	lastAnomalyScan atomic.Int64
 }
 
 // SetMetrics wires the Prometheus registry so GraphRAG event drops are
@@ -477,6 +482,7 @@ func (g *GraphRAG) processSpan(ev *spanEvent) {
 	}
 
 	stores := g.storesForTenant(ev.Tenant)
+	stores.lastEventAt.Store(time.Now().UnixNano())
 
 	// 1. Upsert ServiceNode
 	stores.service.UpsertService(span.ServiceName, durationMs, isError, span.StartTime)
@@ -522,6 +528,7 @@ func (g *GraphRAG) processLog(ev *logEvent) {
 	}
 
 	stores := g.storesForTenant(ev.Tenant)
+	stores.lastEventAt.Store(time.Now().UnixNano())
 
 	// Drain-based clustering (replaces hash+TF-IDF clustering). The Drain
 	// miner is shared across tenants — its template tokens describe log shape,
@@ -545,6 +552,7 @@ func (g *GraphRAG) processMetric(ev *metricEvent) {
 		return
 	}
 	stores := g.storesForTenant(ev.Tenant)
+	stores.lastEventAt.Store(time.Now().UnixNano())
 	stores.signals.UpsertMetric(m.Name, m.ServiceName, m.Value, m.Timestamp)
 }
 
