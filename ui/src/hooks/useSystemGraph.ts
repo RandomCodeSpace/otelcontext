@@ -1,32 +1,35 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback } from 'react';
+import { useQuery } from '@tanstack/react-query';
+import { apiFetchWithResponse } from '../lib/apiFetch';
 import type { SystemGraphResponse } from '../types/api';
 
+// TanStack Query adapter. Keeps the legacy return shape
+// ({ graph, cache, loading, error, reload }) so existing consumers
+// (ServicesView, DashboardView) are untouched, while gaining request
+// dedup, AbortSignal cancellation, and hidden-tab polling pause from
+// the shared query client.
 export function useSystemGraph(pollInterval = 60_000) {
-  const [graph, setGraph] = useState<SystemGraphResponse | null>(null);
-  const [cache, setCache] = useState('');
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const timerRef = useRef<ReturnType<typeof setInterval>>(undefined);
+  const { data, isPending, error, refetch } = useQuery({
+    queryKey: ['system-graph'],
+    queryFn: async ({ signal }) => {
+      const { data: graph, response } =
+        await apiFetchWithResponse<SystemGraphResponse>('/api/system/graph', {
+          signal,
+        });
+      return { graph, cache: response.headers.get('X-Cache') ?? '' };
+    },
+    refetchInterval: pollInterval > 0 ? pollInterval : false,
+  });
 
-  const load = useCallback(async () => {
-    try {
-      const res = await fetch('/api/system/graph');
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      setCache(res.headers.get('X-Cache') ?? '');
-      setGraph((await res.json()) as SystemGraphResponse);
-      setError(null);
-    } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : 'fetch failed');
-    } finally {
-      setLoading(false);
-    }
-  }, []);
+  const reload = useCallback(() => {
+    void refetch();
+  }, [refetch]);
 
-  useEffect(() => {
-    load();
-    timerRef.current = setInterval(load, pollInterval);
-    return () => clearInterval(timerRef.current);
-  }, [load, pollInterval]);
-
-  return { graph, cache, loading, error, reload: load };
+  return {
+    graph: data?.graph ?? null,
+    cache: data?.cache ?? '',
+    loading: isPending,
+    error: error ? error.message : null,
+    reload,
+  };
 }
