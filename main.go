@@ -212,7 +212,8 @@ func main() {
 	}
 	slog.Info("💾 Storage initialized", "driver", cfg.DBDriver)
 
-	// 2a. Retention scheduler: hourly batched purge + daily VACUUM/ANALYZE.
+	// 2a. Retention scheduler: hourly batched purge + daily maintenance
+	// (VACUUM ANALYZE / OPTIMIZE / PRAGMA optimize + incremental_vacuum).
 	ctxRetention, cancelRetention := context.WithCancel(context.Background())
 	retention := storage.NewRetentionScheduler(
 		repo,
@@ -220,6 +221,7 @@ func main() {
 		cfg.RetentionBatchSize,
 		time.Duration(cfg.RetentionBatchSleepMs)*time.Millisecond,
 	)
+	retention.SetFullVacuum(cfg.RetentionFullVacuum)
 	retention.Start(ctxRetention)
 	slog.Info("🧹 Retention scheduler started", "retention_days", cfg.HotRetentionDays)
 

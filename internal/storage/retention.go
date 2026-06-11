@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -12,7 +13,8 @@ import (
 
 // RetentionScheduler periodically enforces hot-DB retention and runs DB maintenance.
 // On startup and hourly thereafter it deletes rows older than retentionDays.
-// Daily it runs driver-appropriate maintenance (VACUUM ANALYZE / OPTIMIZE / VACUUM).
+// Daily it runs driver-appropriate maintenance (VACUUM ANALYZE / OPTIMIZE /
+// PRAGMA optimize + incremental_vacuum).
 type RetentionScheduler struct {
 	repo            *Repository
 	retentionDays   int
@@ -20,6 +22,14 @@ type RetentionScheduler struct {
 	vacuumInterval  time.Duration
 	purgeBatchSize  int
 	purgeBatchSleep time.Duration
+
+	// fullVacuum restores the pre-2026-06 daily full VACUUM on SQLite
+	// (RETENTION_FULL_VACUUM=true). Off by default: VACUUM holds an exclusive
+	// lock for 10-60 minutes on multi-GB files (see handleDropFTS in
+	// internal/api/admin_handlers.go), starving ingest into a 429 storm. The
+	// default maintenance runs PRAGMA incremental_vacuum(10000) instead;
+	// on-demand full VACUUM remains available via POST /api/admin/vacuum.
+	fullVacuum bool
 
 	// started is an atomic so a fast-path Stop() before Start() is lock-free.
 	// mu serializes the Start/Stop transition itself (protects cancel + done).
@@ -61,6 +71,36 @@ func NewRetentionScheduler(repo *Repository, retentionDays, batchSize int, batch
 // SkippedRuns returns the number of purge/maintenance ticks that were dropped
 // because a previous run was still executing. Intended for tests and telemetry.
 func (r *RetentionScheduler) SkippedRuns() int64 { return r.skippedRuns.Load() }
+
+// SetFullVacuum opts the daily SQLite maintenance back into a full VACUUM
+// (wired from RETENTION_FULL_VACUUM). Call before Start; not synchronized.
+func (r *RetentionScheduler) SetFullVacuum(enabled bool) { r.fullVacuum = enabled }
+
+// sqliteVacuumStatement returns the page-reclaim statement for the daily
+// SQLite maintenance pass. Default is incremental_vacuum: it releases up to
+// 10k freelist pages per tick without the whole-file exclusive lock a full
+// VACUUM takes (it no-ops harmlessly on auto_vacuum=NONE files — fresh
+// deploys are provisioned auto_vacuum=INCREMENTAL by NewDatabase).
+func sqliteVacuumStatement(fullVacuum bool) string {
+	if fullVacuum {
+		return "VACUUM"
+	}
+	return "PRAGMA incremental_vacuum(10000)"
+}
+
+// drainQuery executes a row-returning statement and discards every row.
+// PRAGMA incremental_vacuum performs its work per step (one freed page per
+// row), so the cursor must be walked to completion for the reclaim to happen.
+func drainQuery(ctx context.Context, db *sql.DB, query string) error {
+	rows, err := db.QueryContext(ctx, query) //nolint:sqlclosecheck // closed below; no rows.Close() lint seam for drain loops
+	if err != nil {
+		return err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() { //nolint:revive // intentionally empty: stepping is the side effect
+	}
+	return rows.Err()
+}
 
 // Start launches the scheduler goroutine. It runs an initial purge immediately.
 // Idempotent and race-free: atomic CAS elects the first caller, and mu
@@ -445,11 +485,21 @@ func (r *RetentionScheduler) runMaintenance(ctx context.Context) {
 			slog.Error("retention: PRAGMA optimize failed", "error", err)
 			maintFailed = true
 		}
-		if _, err := sqlDB.ExecContext(ctx, "VACUUM"); err != nil {
-			slog.Error("retention: VACUUM failed", "error", err)
+		vacuumSQL := sqliteVacuumStatement(r.fullVacuum)
+		var vacErr error
+		if r.fullVacuum {
+			_, vacErr = sqlDB.ExecContext(ctx, vacuumSQL)
+		} else {
+			// incremental_vacuum is a row-returning pragma that frees one page
+			// per step — Exec steps it once on this driver, so it must be
+			// queried and drained to reclaim the full batch.
+			vacErr = drainQuery(ctx, sqlDB, vacuumSQL)
+		}
+		if vacErr != nil {
+			slog.Error("retention: vacuum step failed", "statement", vacuumSQL, "error", vacErr)
 			maintFailed = true
 		}
-		// SQLite VACUUM is whole-DB; record a single observation under "all".
+		// SQLite maintenance is whole-DB; record a single observation under "all".
 		observe("all", time.Since(start))
 	}
 	slog.Info("retention maintenance complete", "driver", driver)

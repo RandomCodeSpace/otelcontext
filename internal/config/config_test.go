@@ -137,6 +137,30 @@ func TestValidate_TLS_ReadableFilesOK(t *testing.T) {
 	}
 }
 
+func TestLoad_RetentionFullVacuum(t *testing.T) {
+	// Default: off — the daily SQLite maintenance must not full-VACUUM.
+	t.Setenv("RETENTION_FULL_VACUUM", "")
+	if err := os.Unsetenv("RETENTION_FULL_VACUUM"); err != nil {
+		t.Fatalf("unset: %v", err)
+	}
+	cfg, err := Load("__no_such_env_file__")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.RetentionFullVacuum {
+		t.Fatal("RetentionFullVacuum must default to false")
+	}
+
+	t.Setenv("RETENTION_FULL_VACUUM", "true")
+	cfg, err = Load("__no_such_env_file__")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.RetentionFullVacuum {
+		t.Fatal("RETENTION_FULL_VACUUM=true not loaded")
+	}
+}
+
 func TestLoad_EnvVars_TLS_APIKey_OTel_Tenant(t *testing.T) {
 	t.Setenv("TLS_CERT_FILE", "")
 	t.Setenv("TLS_KEY_FILE", "")

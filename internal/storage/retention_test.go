@@ -2,9 +2,12 @@ package storage
 
 import (
 	"context"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
+
+	"gorm.io/gorm"
 )
 
 func TestRetentionScheduler_StopBeforeStart_NoDeadlock(t *testing.T) {
@@ -96,6 +99,134 @@ func TestRetentionScheduler_MaintenanceVacuumsSQLite(t *testing.T) {
 	// If runMaintenance crashes on "cannot run inside a transaction", this test fails.
 	if mustCount(t, repo.db, &Log{}) != 1000 {
 		t.Fatal("VACUUM must not delete data")
+	}
+}
+
+// newFileTestRepo builds a Repository backed by a temp-file SQLite DB. The
+// vacuum-mode tests below assert on PRAGMA freelist_count, which needs a real
+// database file rather than :memory:.
+func newFileTestRepo(t *testing.T) *Repository {
+	t.Helper()
+	t.Setenv("LOG_FTS_ENABLED", "false")
+	db, err := NewDatabase("sqlite", filepath.Join(t.TempDir(), "retention.db"))
+	if err != nil {
+		t.Fatalf("NewDatabase: %v", err)
+	}
+	if err := AutoMigrateModels(db, "sqlite"); err != nil {
+		t.Fatalf("AutoMigrateModels: %v", err)
+	}
+	repo := &Repository{db: db, driver: "sqlite"}
+	t.Cleanup(func() { _ = repo.Close() })
+	return repo
+}
+
+func freelistCount(t *testing.T, db *gorm.DB) int64 {
+	t.Helper()
+	var n int64
+	if err := db.Raw("PRAGMA freelist_count").Scan(&n).Error; err != nil {
+		t.Fatalf("PRAGMA freelist_count: %v", err)
+	}
+	return n
+}
+
+// forceAutoVacuumNone rewrites the database file with auto_vacuum=NONE so
+// PRAGMA incremental_vacuum becomes a guaranteed no-op — the file shape every
+// pre-2026-06 deployment has. VACUUM must run on the raw *sql.DB (GORM's Exec
+// wraps statements in an implicit tx, and VACUUM refuses to run inside one).
+func forceAutoVacuumNone(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatalf("raw sql.DB: %v", err)
+	}
+	if _, err := sqlDB.Exec("PRAGMA auto_vacuum=NONE"); err != nil {
+		t.Fatalf("PRAGMA auto_vacuum=NONE: %v", err)
+	}
+	if _, err := sqlDB.Exec("VACUUM"); err != nil {
+		t.Fatalf("VACUUM (rebuild to NONE): %v", err)
+	}
+	var av int64
+	if err := db.Raw("PRAGMA auto_vacuum").Scan(&av).Error; err != nil || av != 0 {
+		t.Fatalf("auto_vacuum=%d err=%v, want 0 (NONE)", av, err)
+	}
+}
+
+// seedAndDeleteLogs fills the freelist: insert rows, then bulk-delete them so
+// the freed pages sit on the freelist awaiting a vacuum of either flavor.
+func seedAndDeleteLogs(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	seedLogs(t, db, 2000, time.Now().UTC(), "vacuum-svc")
+	if err := db.Exec("DELETE FROM logs").Error; err != nil {
+		t.Fatalf("delete logs: %v", err)
+	}
+	if freelistCount(t, db) == 0 {
+		t.Fatal("test setup broken: bulk delete left an empty freelist")
+	}
+}
+
+func TestSQLiteVacuumStatement(t *testing.T) {
+	if got := sqliteVacuumStatement(false); got != "PRAGMA incremental_vacuum(10000)" {
+		t.Fatalf("default statement = %q, want incremental_vacuum", got)
+	}
+	if got := sqliteVacuumStatement(true); got != "VACUUM" {
+		t.Fatalf("full-vacuum statement = %q, want VACUUM", got)
+	}
+}
+
+// TestRetentionScheduler_MaintenanceDefaultRunsIncrementalVacuum proves the
+// default daily maintenance actually executes incremental_vacuum: on an
+// auto_vacuum=INCREMENTAL file (what NewDatabase provisions on fresh deploys)
+// freed pages stay on the freelist until incremental_vacuum releases them, so
+// an empty freelist after runMaintenance means the statement ran.
+func TestRetentionScheduler_MaintenanceDefaultRunsIncrementalVacuum(t *testing.T) {
+	repo := newFileTestRepo(t)
+	var av int64
+	if err := repo.db.Raw("PRAGMA auto_vacuum").Scan(&av).Error; err != nil || av != 2 {
+		t.Fatalf("precondition: fresh DB should be auto_vacuum=INCREMENTAL, got %d (err=%v)", av, err)
+	}
+	seedAndDeleteLogs(t, repo.db)
+
+	r := NewRetentionScheduler(repo, 7, 10_000, 0)
+	r.runMaintenance(context.Background())
+
+	if n := freelistCount(t, repo.db); n != 0 {
+		t.Fatalf("freelist=%d after default maintenance; incremental_vacuum should have released all pages", n)
+	}
+}
+
+// TestRetentionScheduler_MaintenanceDefaultSkipsFullVacuum proves the default
+// daily maintenance no longer runs a full VACUUM: on an auto_vacuum=NONE file
+// (every pre-2026-06 deployment) incremental_vacuum is a no-op, so the
+// freelist survives — a full VACUUM would have rebuilt the file and emptied it.
+func TestRetentionScheduler_MaintenanceDefaultSkipsFullVacuum(t *testing.T) {
+	repo := newFileTestRepo(t)
+	forceAutoVacuumNone(t, repo.db)
+	seedAndDeleteLogs(t, repo.db)
+
+	r := NewRetentionScheduler(repo, 7, 10_000, 0)
+	r.runMaintenance(context.Background())
+
+	// PRAGMA optimize may allocate a few stats pages from the freelist, so
+	// assert "not fully reclaimed" rather than an exact count.
+	if n := freelistCount(t, repo.db); n == 0 {
+		t.Fatal("freelist emptied — a full VACUUM ran during default maintenance; expected incremental_vacuum no-op")
+	}
+}
+
+// TestRetentionScheduler_MaintenanceFullVacuumWhenEnabled proves the
+// RETENTION_FULL_VACUUM opt-in restores the legacy behavior on the same
+// auto_vacuum=NONE file shape where incremental_vacuum provably no-ops.
+func TestRetentionScheduler_MaintenanceFullVacuumWhenEnabled(t *testing.T) {
+	repo := newFileTestRepo(t)
+	forceAutoVacuumNone(t, repo.db)
+	seedAndDeleteLogs(t, repo.db)
+
+	r := NewRetentionScheduler(repo, 7, 10_000, 0)
+	r.SetFullVacuum(true)
+	r.runMaintenance(context.Background())
+
+	if n := freelistCount(t, repo.db); n != 0 {
+		t.Fatalf("freelist=%d; RETENTION_FULL_VACUUM=true must run a full VACUUM and empty the freelist", n)
 	}
 }
 
