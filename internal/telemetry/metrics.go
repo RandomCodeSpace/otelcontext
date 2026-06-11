@@ -107,7 +107,10 @@ type Metrics struct {
 	GraphRAGStoreEntities *prometheus.GaugeVec
 	GraphRAGStoreEdges    *prometheus.GaugeVec
 	TSDBRingSeriesActive  prometheus.Gauge
-	DrainTemplatesActive  prometheus.Gauge
+	// TSDBRingSeriesRejected — points refused a NEW ring series at the
+	// tenant-scoped series cap (existing series keep recording).
+	TSDBRingSeriesRejected prometheus.Counter
+	DrainTemplatesActive   prometheus.Gauge
 
 	// --- Async ingest pipeline (Phase 1 robustness work) ---
 	// IngestPipelineQueueDepth — current queue depth, sampled on every Submit.
@@ -345,6 +348,10 @@ func New() *Metrics {
 		TSDBRingSeriesActive: promauto.NewGauge(prometheus.GaugeOpts{
 			Name: "otelcontext_tsdb_ring_series_active",
 			Help: "Distinct metric series currently held in TSDB ring buffers.",
+		}),
+		TSDBRingSeriesRejected: promauto.NewCounter(prometheus.CounterOpts{
+			Name: "otelcontext_tsdb_ring_series_rejected_total",
+			Help: "Metric points refused a new TSDB ring series at the cardinality cap (existing series keep recording).",
 		}),
 		DrainTemplatesActive: promauto.NewGauge(prometheus.GaugeOpts{
 			Name: "otelcontext_drain_templates_active",

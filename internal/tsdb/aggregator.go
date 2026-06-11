@@ -161,8 +161,10 @@ func (a *Aggregator) Ingest(m RawMetric) {
 	key := fmt.Sprintf("%s|%s|%s|%s", m.TenantID, m.ServiceName, m.Name, string(attrJSON))
 
 	// Feed ring buffer and metric counter outside the lock (both are thread-safe).
+	// The ring enforces its own tenant-scoped series cap and counts rejections
+	// via its onSeriesRejected callback, so the bool result is not re-counted here.
 	if a.ring != nil {
-		a.ring.Record(m.Name, m.ServiceName, m.Value, m.Timestamp)
+		a.ring.Record(m.TenantID, m.Name, m.ServiceName, m.Value, m.Timestamp)
 	}
 	if a.onIngest != nil {
 		a.onIngest()
