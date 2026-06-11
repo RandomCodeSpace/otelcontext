@@ -288,6 +288,20 @@ describe('WsManager log ring buffer', () => {
     expect(manager.getLogs()).toHaveLength(3)
   })
 
+  it('tracks a monotonic appended total that survives ring eviction', () => {
+    manager = new WsManager({ logCapacity: 3 })
+    manager.start()
+    latest().simulateOpen()
+
+    expect(manager.getLogsTotal()).toBe(0)
+    latest().simulateMessage({ type: 'logs', data: [1, 2].map(logEntry) })
+    expect(manager.getLogsTotal()).toBe(2)
+    latest().simulateMessage({ type: 'logs', data: [3, 4, 5].map(logEntry) })
+    // Buffer holds only 3 entries, but the total keeps counting.
+    expect(manager.getLogs()).toHaveLength(3)
+    expect(manager.getLogsTotal()).toBe(5)
+  })
+
   it('ignores malformed and non-log frames', () => {
     manager = new WsManager()
     manager.start()

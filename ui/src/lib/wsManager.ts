@@ -70,6 +70,7 @@ export class WsManager {
   private readonly logSubs = new Set<() => void>()
 
   private readonly logBuf: LogEntry[] = []
+  private logTotal = 0
   private logVersion = 0
   private lastBumpAt = 0
   private versionTimer: ReturnType<typeof setTimeout> | null = null
@@ -129,6 +130,12 @@ export class WsManager {
    * version bumps — copy if you need a stable view across ticks.
    */
   readonly getLogs = (): readonly LogEntry[] => this.logBuf
+
+  /**
+   * Monotonic count of entries ever appended (unaffected by ring
+   * eviction). Consumers diff two readings to derive "N new" counts.
+   */
+  readonly getLogsTotal = (): number => this.logTotal
 
   // ---- connection internals --------------------------------------------------
 
@@ -299,6 +306,7 @@ export class WsManager {
 
   private appendLogs(batch: LogEntry[]): void {
     for (const entry of batch) this.logBuf.push(entry)
+    this.logTotal += batch.length
     const overflow = this.logBuf.length - this.opts.logCapacity
     if (overflow > 0) this.logBuf.splice(0, overflow)
     this.requestVersionBump()
