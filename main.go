@@ -182,6 +182,12 @@ func main() {
 	// detected cgroup/host budget). See applyMemoryLimit in memlimit.go.
 	applyMemoryLimit(75)
 
+	pprofSrv, _, err := startPprofServer(cfg.PprofAddr, logger)
+	if err != nil {
+		slog.Error("Failed to start pprof server", "error", err, "addr", cfg.PprofAddr)
+		os.Exit(1)
+	}
+
 	// 1. Initialize Internal Telemetry (first — everything registers metrics against this)
 	metrics := telemetry.New()
 	slog.Info("📊 Internal telemetry initialized")
@@ -870,6 +876,9 @@ func main() {
 	grpcServer.GracefulStop()
 	if err := srv.Shutdown(ctx); err != nil {
 		slog.Error("HTTP server forced shutdown", "error", err)
+	}
+	if pprofSrv != nil {
+		_ = pprofSrv.Close()
 	}
 
 	// 2. Stop real-time hubs and event processing

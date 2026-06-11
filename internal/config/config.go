@@ -20,6 +20,10 @@ type Config struct {
 	DLQPath           string
 	DLQReplayInterval string
 
+	// PprofAddr serves net/http/pprof on a dedicated listener (never the
+	// public mux). Loopback-only by default; empty disables profiling.
+	PprofAddr string
+
 	// Ingestion Filtering
 	IngestMinSeverity      string
 	IngestAllowedServices  string
@@ -235,6 +239,7 @@ func Load(customPath string) (*Config, error) {
 		DBDSN:             getEnv("DB_DSN", ""),
 		DLQPath:           getEnv("DLQ_PATH", "./data/dlq"),
 		DLQReplayInterval: getEnv("DLQ_REPLAY_INTERVAL", "5m"),
+		PprofAddr:         getEnv("PPROF_ADDR", "127.0.0.1:6060"),
 
 		IngestMinSeverity:      getEnv("INGEST_MIN_SEVERITY", "INFO"),
 		StoreMinSeverity:       getEnv("STORE_MIN_SEVERITY", ""),
