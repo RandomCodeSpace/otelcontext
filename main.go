@@ -356,7 +356,7 @@ func main() {
 		func() { metrics.TSDBIngestTotal.Inc() },
 		func() { metrics.TSDBBatchesDropped.Inc() },
 	)
-	ringBuf := tsdb.NewRingBuffer(120, 30*time.Second)
+	ringBuf := tsdb.NewRingBuffer(120, 30*time.Second, cfg.MetricMaxCardinality, metrics.TSDBRingSeriesRejected.Inc)
 	tsdbAgg.SetRingBuffer(ringBuf)
 	slog.Info("📈 TSDB ring buffer attached (120 slots × 30s = 1h retention)")
 

@@ -8,6 +8,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 )
 
 // WindowAgg is the pre-computed aggregate for one time window slot.
@@ -147,27 +149,48 @@ func (r *MetricRing) Windows(n int) []WindowAgg {
 	return out
 }
 
-// RingBuffer manages per-metric ring buffers, keyed by "service|metric".
+// RingBuffer manages per-metric ring buffers, keyed by "tenant|service|metric".
 type RingBuffer struct {
 	mu        sync.RWMutex
 	rings     map[string]*MetricRing
 	slots     int
 	windowDur time.Duration
+	// maxSeries caps the number of distinct ring series (0 = unlimited).
+	// Past the cap, NEW series are refused — existing series keep
+	// recording — and onSeriesRejected fires once per refused point.
+	maxSeries        int
+	onSeriesRejected func()
 }
 
 // NewRingBuffer creates a RingBuffer.
 // slots × windowDur = total retention (e.g. 120 × 30s = 1 hour).
-func NewRingBuffer(slots int, windowDur time.Duration) *RingBuffer {
+// maxSeries caps distinct tenant|service|metric series (0 = unlimited);
+// onSeriesRejected is invoked once per point refused at the cap (nil = no-op).
+func NewRingBuffer(slots int, windowDur time.Duration, maxSeries int, onSeriesRejected func()) *RingBuffer {
 	return &RingBuffer{
-		rings:     make(map[string]*MetricRing),
-		slots:     slots,
-		windowDur: windowDur,
+		rings:            make(map[string]*MetricRing),
+		slots:            slots,
+		windowDur:        windowDur,
+		maxSeries:        maxSeries,
+		onSeriesRejected: onSeriesRejected,
 	}
 }
 
-// Record records a value for the given metric+service at time t.
-func (rb *RingBuffer) Record(metricName, serviceName string, value float64, at time.Time) {
-	key := serviceName + "|" + metricName
+// ringKey builds the tenant-scoped series key. An empty tenant is coerced
+// to storage.DefaultTenantID so writes without an explicit tenant and reads
+// from single-tenant callers agree on the same series.
+func ringKey(tenantID, metricName, serviceName string) string {
+	if tenantID == "" {
+		tenantID = storage.DefaultTenantID
+	}
+	return tenantID + "|" + serviceName + "|" + metricName
+}
+
+// Record records a value for the given tenant+metric+service at time t.
+// Returns false when the point was refused because creating a NEW series
+// would exceed maxSeries; existing series always keep recording.
+func (rb *RingBuffer) Record(tenantID, metricName, serviceName string, value float64, at time.Time) bool {
+	key := ringKey(tenantID, metricName, serviceName)
 	rb.mu.RLock()
 	ring, ok := rb.rings[key]
 	rb.mu.RUnlock()
@@ -175,18 +198,27 @@ func (rb *RingBuffer) Record(metricName, serviceName string, value float64, at t
 		rb.mu.Lock()
 		ring, ok = rb.rings[key]
 		if !ok {
+			if rb.maxSeries > 0 && len(rb.rings) >= rb.maxSeries {
+				rb.mu.Unlock()
+				// Fire telemetry outside the lock — see Aggregator.Ingest
+				// for why callbacks must not run under mu.
+				if rb.onSeriesRejected != nil {
+					rb.onSeriesRejected()
+				}
+				return false
+			}
 			ring = newMetricRing(metricName, serviceName, rb.slots, rb.windowDur)
 			rb.rings[key] = ring
 		}
 		rb.mu.Unlock()
 	}
 	ring.Record(value, at)
+	return true
 }
 
-// QueryRecent returns aggregated windows for the given metric+service.
-// Pass an empty serviceName to query across all services (returns first match).
-func (rb *RingBuffer) QueryRecent(metricName, serviceName string, windowCount int) []WindowAgg {
-	key := serviceName + "|" + metricName
+// QueryRecent returns aggregated windows for the given tenant+metric+service.
+func (rb *RingBuffer) QueryRecent(tenantID, metricName, serviceName string, windowCount int) []WindowAgg {
+	key := ringKey(tenantID, metricName, serviceName)
 	rb.mu.RLock()
 	ring, ok := rb.rings[key]
 	rb.mu.RUnlock()
@@ -196,7 +228,7 @@ func (rb *RingBuffer) QueryRecent(metricName, serviceName string, windowCount in
 	return ring.Windows(windowCount)
 }
 
-// AllKeys returns all registered metric+service keys.
+// AllKeys returns all registered tenant|service|metric keys.
 func (rb *RingBuffer) AllKeys() []string {
 	rb.mu.RLock()
 	defer rb.mu.RUnlock()
@@ -207,7 +239,7 @@ func (rb *RingBuffer) AllKeys() []string {
 	return keys
 }
 
-// MetricCount returns the number of distinct metric series tracked.
+// MetricCount returns the number of distinct tenant-scoped metric series tracked.
 func (rb *RingBuffer) MetricCount() int {
 	rb.mu.RLock()
 	defer rb.mu.RUnlock()
