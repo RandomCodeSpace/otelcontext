@@ -55,6 +55,9 @@ func GzipMiddleware(mcpPath string) func(http.Handler) http.Handler {
 }
 
 // gzipEligible reports whether the request may have its response gzipped.
+// The /api/ prefix gate already excludes /ws*, /v1/*, and /metrics* — those
+// prefixes cannot co-exist with /api/ — so only the MCP path (which an
+// operator could configure under /api/) needs an explicit check.
 func gzipEligible(r *http.Request, mcpPath string) bool {
 	if r.Method != http.MethodGet {
 		return false
@@ -62,11 +65,6 @@ func gzipEligible(r *http.Request, mcpPath string) bool {
 	p := r.URL.Path
 	if !strings.HasPrefix(p, "/api/") {
 		return false
-	}
-	for _, skip := range []string{"/ws", "/v1/", "/metrics"} {
-		if strings.HasPrefix(p, skip) {
-			return false
-		}
 	}
 	if p == mcpPath || strings.HasPrefix(p, mcpPath+"/") {
 		return false

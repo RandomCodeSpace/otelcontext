@@ -175,6 +175,71 @@ func TestGzipMiddleware_FlushSupported(t *testing.T) {
 	}
 }
 
+// TestGzipMiddleware_MCPPathExcluded covers the one skip that the /api/
+// prefix gate cannot subsume: an operator nesting the MCP endpoint under
+// /api/. SSE frames must never be buffered inside a gzip stream.
+func TestGzipMiddleware_MCPPathExcluded(t *testing.T) {
+	payload := strings.Repeat("event: ping\n\n", 200)
+	h := GzipMiddleware("/api/mcp")(jsonEcho(payload))
+	for _, path := range []string{"/api/mcp", "/api/mcp/session"} {
+		rec := gzipGet(t, h, path, true)
+		if got := rec.Header().Get("Content-Encoding"); got != "" {
+			t.Errorf("%s: Content-Encoding = %q, want empty (MCP/SSE excluded)", path, got)
+		}
+	}
+	// Sibling API paths still compress.
+	rec := gzipGet(t, h, "/api/stats", true)
+	if got := rec.Header().Get("Content-Encoding"); got != "gzip" {
+		t.Errorf("/api/stats: Content-Encoding = %q, want gzip", got)
+	}
+}
+
+// TestGzipMiddleware_EmptyMCPPathDefaults covers the "" → "/mcp" fallback.
+func TestGzipMiddleware_EmptyMCPPathDefaults(t *testing.T) {
+	h := GzipMiddleware("")(jsonEcho(strings.Repeat("a", 2048)))
+	rec := gzipGet(t, h, "/api/x", true)
+	if got := rec.Header().Get("Content-Encoding"); got != "gzip" {
+		t.Errorf("Content-Encoding = %q, want gzip", got)
+	}
+}
+
+func TestGzipMiddleware_DoubleWriteHeaderIgnored(t *testing.T) {
+	h := GzipMiddleware("/mcp")(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusTeapot)
+		w.WriteHeader(http.StatusOK) // must be a no-op, like net/http
+		_, _ = w.Write([]byte("tea"))
+	}))
+	rec := gzipGet(t, h, "/api/tea", true)
+	if rec.Code != http.StatusTeapot {
+		t.Fatalf("want 418 (first WriteHeader wins), got %d", rec.Code)
+	}
+	if got := gunzip(t, rec.Body); got != "tea" {
+		t.Errorf("body = %q", got)
+	}
+}
+
+func TestGzipMiddleware_FlushBeforeWrite(t *testing.T) {
+	h := GzipMiddleware("/mcp")(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.(http.Flusher).Flush() // implicit 200 + gzip engagement
+		_, _ = w.Write([]byte("after-flush"))
+	}))
+	rec := gzipGet(t, h, "/api/early-flush", true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d", rec.Code)
+	}
+	if got := gunzip(t, rec.Body); got != "after-flush" {
+		t.Errorf("body = %q", got)
+	}
+}
+
+func TestGzipResponseWriter_Unwrap(t *testing.T) {
+	rec := httptest.NewRecorder()
+	gw := &gzipResponseWriter{ResponseWriter: rec}
+	if gw.Unwrap() != rec {
+		t.Errorf("Unwrap should return the wrapped writer")
+	}
+}
+
 // TestGzipMiddleware_PoolReuseConcurrent hammers the middleware from many
 // goroutines to prove the sync.Pool recycling is race-free and never
 // cross-wires response bodies.

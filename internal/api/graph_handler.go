@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"encoding/json"
 	"log/slog"
 	"math"
 	"net/http"
@@ -65,17 +64,16 @@ var OtelContextStartTime = time.Now()
 // handleGetSystemGraph handles GET /api/system/graph.
 // When the in-memory graph has been populated it returns instantly from memory.
 // Falls back to a DB query only when the graph has never been built yet.
-// Results are cached for 10s per tenant — the cache key is scoped by tenant
-// so two tenants hitting this endpoint never share a response.
+// The rendered JSON is cached for 10s per tenant — the cache key is scoped
+// by tenant so two tenants never share a response — and carries an ETag
+// hashed once per cache fill, so a polling client that echoes If-None-Match
+// gets a bodyless 304.
 func (s *Server) handleGetSystemGraph(w http.ResponseWriter, r *http.Request) {
-	const cacheTTL = 10 * time.Second
 	ctx := r.Context()
 	cacheKey := "system_graph:" + storage.TenantFromContext(ctx)
 
 	if cached, ok := s.cache.Get(cacheKey); ok {
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("X-Cache", "HIT")
-		_ = json.NewEncoder(w).Encode(cached)
+		cached.(*cachedJSON).write(w, r, "HIT")
 		return
 	}
 
@@ -89,10 +87,13 @@ func (s *Server) handleGetSystemGraph(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	s.cache.Set(cacheKey, resp, cacheTTL)
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("X-Cache", "MISS")
-	_ = json.NewEncoder(w).Encode(resp)
+	cj, err := newCachedJSON(resp)
+	if err != nil {
+		http.Error(w, "failed to encode system graph", http.StatusInternalServerError)
+		return
+	}
+	s.cache.Set(cacheKey, cj, hotPollCacheTTL)
+	cj.write(w, r, "MISS")
 }
 
 // buildGraphFromMemory converts the in-memory graph snapshot to the API response.
