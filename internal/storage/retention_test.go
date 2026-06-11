@@ -230,6 +230,39 @@ func TestRetentionScheduler_MaintenanceFullVacuumWhenEnabled(t *testing.T) {
 	}
 }
 
+func TestDrainQuery_InvalidStatementReturnsError(t *testing.T) {
+	repo := newTestRepo(t)
+	sqlDB, err := repo.db.DB()
+	if err != nil {
+		t.Fatalf("raw sql.DB: %v", err)
+	}
+	if err := drainQuery(context.Background(), sqlDB, "PRAGMA definitely_not_a_pragma("); err == nil {
+		t.Fatal("drainQuery must surface query errors")
+	}
+}
+
+// TestRetentionScheduler_MaintenanceCancelledContext drives both SQLite
+// maintenance error branches (PRAGMA optimize + vacuum step) via an
+// already-cancelled context: the scheduler must log-and-continue, release the
+// overlap guard, and stay usable for the next tick.
+func TestRetentionScheduler_MaintenanceCancelledContext(t *testing.T) {
+	repo := newFileTestRepo(t)
+	r := NewRetentionScheduler(repo, 7, 10_000, 0)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r.runMaintenance(ctx)
+
+	if r.running.Load() {
+		t.Fatal("running flag must be released after a failed maintenance pass")
+	}
+	// A subsequent healthy pass must work.
+	r.runMaintenance(context.Background())
+	if r.running.Load() {
+		t.Fatal("running flag must be released after the recovery pass")
+	}
+}
+
 func TestRetentionScheduler_NoDataNoError(t *testing.T) {
 	repo := newTestRepo(t)
 	r := NewRetentionScheduler(repo, 7, 10_000, 5*time.Millisecond)
