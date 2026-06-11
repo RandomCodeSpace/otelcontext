@@ -1,9 +1,10 @@
 import type { LogEntry } from '@/types/api'
 
 // Module-level WebSocket singleton for the /ws hub stream. Ports the
-// hardened lifecycle from hooks/useWebSocket.ts (exponential backoff,
-// 30s ping heartbeat + 35s dead-connection watchdog, visibility/online
-// recovery) out of React entirely, and adds what the rewrite needs:
+// hardened lifecycle of the former hooks/useWebSocket.ts (exponential
+// backoff, 30s ping heartbeat + 35s dead-connection watchdog,
+// visibility/online recovery) out of React entirely, replacing that hook,
+// and adds what the rewrite needs:
 //   - jittered backoff: delay += Math.random() * delay * 0.2, so a fleet
 //     of clients recovering from a restart doesn't reconnect in lockstep;
 //   - a bounded ring buffer (cap 5000) for pushed log batches — the UI
@@ -216,9 +217,9 @@ export class WsManager {
         return // close/error handlers will drive recovery
       }
       // Arm the watchdog only if none is pending: the oldest unanswered
-      // ping's deadline must hold. (The useWebSocket hook re-armed it on
-      // every ping, which let the deadline slide forever at a 30s ping /
-      // 35s timeout — dead connections were never detected.)
+      // ping's deadline must hold. (The former useWebSocket hook re-armed
+      // it on every ping, which let the deadline slide forever at a 30s
+      // ping / 35s timeout — dead connections were never detected.)
       if (this.heartbeatTimeout !== null) return
       this.heartbeatTimeout = setTimeout(() => {
         this.heartbeatTimeout = null

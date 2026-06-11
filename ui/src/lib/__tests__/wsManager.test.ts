@@ -2,8 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { LogEntry } from '@/types/api'
 import { WsManager } from '../wsManager'
 
-// Local WebSocket mock (same shape as the one in useWebSocket.test.ts —
-// kept file-local so neither suite depends on shared mutable test state).
+// Local WebSocket mock, kept file-local so no suite depends on shared
+// mutable test state.
 class MockWebSocket {
   static readonly CONNECTING = 0
   static readonly OPEN = 1

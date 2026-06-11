@@ -10,11 +10,11 @@ type State = { error: Error | null; info: ErrorInfo | null }
  * friendly recovery UI instead of a blank page. Logs the error + component
  * stack to the console with a `[ErrorBoundary]` tag for triage.
  *
- * NOTE ON TELEMETRY FORWARDING: `useWebSocket` in this codebase is currently
- * receive-only (server pushes log batches to client over `/ws`). There is no
- * client->server send API exposed from the hook, so we do NOT forward errors
- * over WebSocket here to avoid adding coupling. When a bidirectional telemetry
- * channel is introduced, wire the `componentDidCatch` branch below.
+ * NOTE ON TELEMETRY FORWARDING: the `/ws` channel (lib/wsManager) is currently
+ * receive-only (server pushes log batches to the client). There is no
+ * client->server send API exposed, so we do NOT forward errors over WebSocket
+ * here to avoid adding coupling. When a bidirectional telemetry channel is
+ * introduced, wire the `componentDidCatch` branch below.
  */
 export class ErrorBoundary extends Component<Props, State> {
   state: State = { error: null, info: null }
@@ -35,7 +35,7 @@ export class ErrorBoundary extends Component<Props, State> {
       userAgent: typeof navigator === 'undefined' ? undefined : navigator.userAgent,
       timestamp: new Date().toISOString(),
     })
-    // TODO(telemetry): forward to server when useWebSocket exposes a send()
+    // TODO(telemetry): forward to server when lib/wsManager exposes a send()
     // API, or via a dedicated POST /api/client-errors endpoint.
   }
 
