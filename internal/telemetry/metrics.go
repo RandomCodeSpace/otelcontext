@@ -113,9 +113,14 @@ type Metrics struct {
 	// IngestPipelineQueueDepth — current queue depth, sampled on every Submit.
 	// Labeled by signal so spikes can be attributed to traces vs logs.
 	IngestPipelineQueueDepth *prometheus.GaugeVec
+	// IngestPipelineQueueBytes — approximate bytes held by queued batches.
+	// Reserved at Submit, released when a worker finishes the batch; the
+	// byte cap (INGEST_PIPELINE_MAX_BYTES) rejects submissions above it.
+	IngestPipelineQueueBytes prometheus.Gauge
 	// IngestPipelineDroppedTotal — batches that did NOT reach the DB.
 	// reason="soft_backpressure" — healthy batch dropped at >=90% fullness.
 	// reason="queue_full"        — batch rejected at 100% capacity (client got 429/RESOURCE_EXHAUSTED).
+	// reason="bytes_full"        — batch rejected at the byte cap (even priority batches).
 	IngestPipelineDroppedTotal *prometheus.CounterVec
 
 	// HTTPOTLPThrottledTotal — count of HTTP 429s issued by the OTLP HTTP
@@ -355,6 +360,10 @@ func New() *Metrics {
 			Name: "otelcontext_ingest_pipeline_queue_depth",
 			Help: "Current depth of the async ingest pipeline queue, by signal type.",
 		}, []string{"signal"}),
+		IngestPipelineQueueBytes: promauto.NewGauge(prometheus.GaugeOpts{
+			Name: "otelcontext_ingest_pipeline_queue_bytes",
+			Help: "Approximate bytes held by batches in the async ingest queue.",
+		}),
 		HTTPOTLPThrottledTotal: promauto.NewCounterVec(prometheus.CounterOpts{
 			Name: "otelcontext_http_otlp_throttled_total",
 			Help: "OTLP HTTP requests rejected with 429 because the async ingest pipeline is at capacity, by signal type.",

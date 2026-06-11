@@ -143,7 +143,14 @@ type Config struct {
 	//   100% queue       — return RESOURCE_EXHAUSTED so OTLP clients back off
 	IngestAsyncEnabled      bool // default true; opt out via INGEST_ASYNC_ENABLED=false
 	IngestPipelineQueueSize int  // default 50000 batches; per-deployment tunable
-	IngestPipelineWorkers   int  // default 8 worker goroutines
+	// IngestPipelineMaxBytes caps the approximate bytes held by queued
+	// batches. The item-count queue size alone cannot bound memory — one
+	// batch may carry arbitrarily large span/log payloads. At the cap the
+	// pipeline rejects with RESOURCE_EXHAUSTED / HTTP 429 even for priority
+	// (error/slow) batches: a 429 is recoverable, an OOM kill is not.
+	// Default 512MB; SQLite default 128MB (see applyDriverDefaults).
+	IngestPipelineMaxBytes int
+	IngestPipelineWorkers  int // default 8 worker goroutines
 	// IngestPipelinePerTenantCap caps in-flight batches per tenant so a noisy
 	// tenant cannot starve siblings of fresh queue slots when fullness is
 	// below the soft-backpressure threshold. 0 (default) disables — single-
@@ -302,6 +309,7 @@ func Load(customPath string) (*Config, error) {
 		// Async ingest pipeline
 		IngestAsyncEnabled:         getEnvBool("INGEST_ASYNC_ENABLED", true),
 		IngestPipelineQueueSize:    getEnvInt("INGEST_PIPELINE_QUEUE_SIZE", 50000),
+		IngestPipelineMaxBytes:     getEnvInt("INGEST_PIPELINE_MAX_BYTES", 512<<20),
 		IngestPipelineWorkers:      getEnvInt("INGEST_PIPELINE_WORKERS", 8),
 		IngestPipelinePerTenantCap: getEnvInt("INGEST_PIPELINE_PER_TENANT_CAP", 0),
 
@@ -363,6 +371,9 @@ var sqliteOverrides = []struct {
 	{"DB_MAX_IDLE_CONNS", func(c *Config) { c.DBMaxIdleConns = 1 }},
 	{"INGEST_PIPELINE_WORKERS", func(c *Config) { c.IngestPipelineWorkers = 2 }},
 	{"INGEST_PIPELINE_QUEUE_SIZE", func(c *Config) { c.IngestPipelineQueueSize = 10000 }},
+	// The SQLite single writer drains slowly, so the ingest queue is the
+	// first structure to bloat — bound it to 128MB instead of 512MB.
+	{"INGEST_PIPELINE_MAX_BYTES", func(c *Config) { c.IngestPipelineMaxBytes = 128 << 20 }},
 	{"METRIC_MAX_CARDINALITY", func(c *Config) { c.MetricMaxCardinality = 3000 }},
 	{"STORE_MIN_SEVERITY", func(c *Config) { c.StoreMinSeverity = "WARN" }},
 	{"SAMPLING_RATE", func(c *Config) { c.SamplingRate = 0.05 }},

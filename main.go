@@ -461,6 +461,7 @@ func main() {
 		ingestPipeline = ingest.NewPipeline(repo, metrics, ingest.PipelineConfig{
 			Capacity: cfg.IngestPipelineQueueSize,
 			Workers:  cfg.IngestPipelineWorkers,
+			MaxBytes: int64(cfg.IngestPipelineMaxBytes),
 		})
 		ingestPipeline.SetPerTenantCap(cfg.IngestPipelinePerTenantCap)
 
