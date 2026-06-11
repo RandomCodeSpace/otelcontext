@@ -98,11 +98,17 @@ func (g *GraphRAG) detectAnomaliesForTenant(ctx context.Context, tenant string, 
 	}
 }
 
+// maxCorrelationWalk bounds how many recent anomalies correlateWithRecent
+// considers per detection. Stable per-(service,type) IDs already keep the
+// store small in steady state; this is the backstop against a pathological
+// backlog turning every 10s tick into an O(N) scan + edge fan-out.
+const maxCorrelationWalk = 1000
+
 // correlateWithRecent links an anomaly to other anomalies within ±30s in the
 // same tenant's AnomalyStore.
 func correlateWithRecent(stores *tenantStores, anomaly AnomalyNode) {
 	window := 30 * time.Second
-	recent := stores.anomalies.AnomaliesSince(anomaly.Timestamp.Add(-window))
+	recent := stores.anomalies.AnomaliesSinceLimit(anomaly.Timestamp.Add(-window), maxCorrelationWalk)
 	for _, prev := range recent {
 		if prev.ID == anomaly.ID {
 			continue

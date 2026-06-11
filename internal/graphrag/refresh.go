@@ -8,6 +8,15 @@ import (
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 )
 
+const (
+	// signalRetention bounds MetricNodes and signal-store edges: anything
+	// not refreshed within this window is swept on the refresh tick.
+	signalRetention = 24 * time.Hour
+	// maxMetricsPerTenant caps each tenant's SignalStore metric map; past
+	// the cap the oldest-LastSeen series are evicted first.
+	maxMetricsPerTenant = 2000
+)
+
 // refreshLoop periodically rebuilds/merges from DB and prunes stale data.
 // Work is sharded per tenant: on each tick we snapshot the coordinator's
 // tenant map, then rebuild and prune each slice under its own lock. Tenants
@@ -29,11 +38,17 @@ func (g *GraphRAG) refreshLoop(ctx context.Context) {
 		case <-ticker.C:
 			g.rebuildAllTenantsFromDB(ctx)
 			pruned := 0
+			prunedMetrics := 0
+			signalCutoff := time.Now().Add(-signalRetention)
 			for _, stores := range g.snapshotTenants() {
 				pruned += stores.traces.Prune()
+				prunedMetrics += stores.signals.Prune(signalCutoff, maxMetricsPerTenant)
 			}
 			if pruned > 0 {
 				slog.Debug("GraphRAG pruned expired traces/spans", "count", pruned)
+			}
+			if prunedMetrics > 0 {
+				slog.Debug("GraphRAG pruned stale/over-cap metrics", "count", prunedMetrics)
 			}
 			g.pruneOldAnomalies()
 			if evicted := g.evictIdleTenants(); evicted > 0 {
