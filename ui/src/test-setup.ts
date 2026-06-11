@@ -11,6 +11,21 @@ if (!Element.prototype.releasePointerCapture) {
 if (!Element.prototype.scrollIntoView) {
   Element.prototype.scrollIntoView = () => {};
 }
+// jsdom has no matchMedia; useMediaQuery needs the listener pair. Tests that
+// exercise a specific breakpoint stub window.matchMedia themselves.
+if (typeof window !== 'undefined' && typeof window.matchMedia !== 'function') {
+  window.matchMedia = (query: string): MediaQueryList =>
+    ({
+      matches: false,
+      media: query,
+      onchange: null,
+      addListener: () => {},
+      removeListener: () => {},
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      dispatchEvent: () => false,
+    }) as MediaQueryList;
+}
 if (!('ResizeObserver' in globalThis)) {
   class ResizeObserverStub {
     observe() {}
