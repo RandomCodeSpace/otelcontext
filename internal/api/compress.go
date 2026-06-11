@@ -89,8 +89,8 @@ func (w *gzipResponseWriter) WriteHeader(code int) {
 	}
 	w.wroteHeader = true
 	h := w.Header()
-	if code != http.StatusNoContent && code != http.StatusNotModified && h.Get("Content-Encoding") == "" {
-		h.Set("Content-Encoding", "gzip")
+	if code != http.StatusNoContent && code != http.StatusNotModified && h.Get(httpconst.HeaderContentEncoding) == "" {
+		h.Set(httpconst.HeaderContentEncoding, "gzip")
 		h.Del("Content-Length")
 		gz := gzipWriterPool.Get().(*gzip.Writer)
 		gz.Reset(w.ResponseWriter)

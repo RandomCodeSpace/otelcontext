@@ -186,10 +186,10 @@ func (h *spaHandler) serveIndex(w http.ResponseWriter, r *http.Request) {
 	body := h.indexPlain
 	switch {
 	case h.indexBr != nil && httpconst.AcceptsEncoding(r, "br"):
-		hdr.Set("Content-Encoding", "br")
+		hdr.Set(httpconst.HeaderContentEncoding, "br")
 		body = h.indexBr
 	case h.indexGz != nil && httpconst.AcceptsEncoding(r, "gzip"):
-		hdr.Set("Content-Encoding", "gzip")
+		hdr.Set(httpconst.HeaderContentEncoding, "gzip")
 		body = h.indexGz
 	}
 	writeBody(w, r, body, "text/html; charset=utf-8")
@@ -209,7 +209,7 @@ func (h *spaHandler) serveAsset(w http.ResponseWriter, r *http.Request, name str
 	hdr.Set("Cache-Control", "public, max-age=31536000, immutable")
 	hdr.Set("Vary", "Accept-Encoding")
 	if encoding != "" {
-		hdr.Set("Content-Encoding", encoding)
+		hdr.Set(httpconst.HeaderContentEncoding, encoding)
 	}
 	ctype := mime.TypeByExtension(path.Ext(name))
 	if ctype == "" {
