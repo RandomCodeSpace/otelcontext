@@ -1,0 +1,32 @@
+.dot {
+  display: inline-block;
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%; /* full radius reserved for status dots */
+}
+
+.ok {
+  background: var(--ok);
+}
+
+.warn {
+  background: var(--warn);
+  animation: pulse 1.2s var(--ease) infinite;
+}
+
+.crit {
+  background: var(--crit);
+}
+
+@keyframes pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .warn {
+    animation: none;
+  }
+}

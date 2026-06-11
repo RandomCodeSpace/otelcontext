@@ -1,0 +1,12 @@
+{
+  "$comment": "Gzipped size budgets enforced by scripts/check-budgets.mjs (npm run check-budgets). 'initial' = assets referenced from dist/index.html (entry script + modulepreloads + stylesheets). Fonts are raw woff2 bytes (already compressed). lazyChunkExceptions maps a chunk name prefix (before the content hash) to a higher cap: ServicesView still carries cytoscape until the C3 flow-map rewrite deletes it.",
+  "gzipKb": {
+    "initialJs": 160,
+    "initialCss": 24,
+    "fonts": 90,
+    "lazyChunkDefault": 40,
+    "lazyChunkExceptions": {
+      "ServicesView": 170
+    }
+  }
+}

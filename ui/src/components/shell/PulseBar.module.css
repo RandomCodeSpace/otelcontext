@@ -1,0 +1,128 @@
+.bar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  height: 44px;
+  padding: 0 var(--space-3);
+  border-bottom: 1px solid var(--stroke-1);
+  background: var(--bg-base);
+}
+
+.brand {
+  flex: none;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  color: var(--text-1);
+  white-space: nowrap;
+}
+
+.summary {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex: 1;
+  min-width: 0;
+  justify-content: center;
+  font-size: var(--text-xs);
+  color: var(--text-2);
+  white-space: nowrap;
+}
+
+.sysDot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+
+.ok {
+  background: var(--ok);
+}
+
+.warn {
+  background: var(--warn);
+}
+
+.crit {
+  background: var(--crit);
+}
+
+.unknown {
+  background: var(--unknown);
+}
+
+/* Full summary on md+, compact "N issues" on xs — CSS-only swap. */
+.summaryFull {
+  display: none;
+  align-items: center;
+  gap: var(--space-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.summaryCompact {
+  display: inline;
+}
+
+@media (min-width: 768px) {
+  .summaryFull {
+    display: flex;
+  }
+
+  .summaryCompact {
+    display: none;
+  }
+}
+
+.sep {
+  color: var(--text-3);
+}
+
+.warnText {
+  color: var(--warn);
+}
+
+.critText {
+  color: var(--crit);
+}
+
+.placeholder {
+  color: var(--text-3);
+}
+
+.actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex: none;
+}
+
+.iconButton {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid var(--stroke-1);
+  border-radius: var(--radius-1);
+  background: transparent;
+  color: var(--text-2);
+  cursor: pointer;
+  transition: background var(--dur-1) var(--ease), color var(--dur-1) var(--ease);
+}
+
+@media (hover: hover) {
+  .iconButton:hover {
+    background: var(--bg-raised);
+    color: var(--text-1);
+  }
+}
+
+@media (pointer: coarse) {
+  .iconButton {
+    width: 44px;
+    height: 44px;
+  }
+}

@@ -1,35 +1,41 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback } from 'react';
+import { useQuery } from '@tanstack/react-query';
+import { apiFetch } from '../lib/apiFetch';
 import type { DashboardStats, RepoStats } from '../types/api';
 
+// TanStack Query adapter. Keeps the legacy return shape
+// ({ dashboard, stats, loading, error, reload }) for existing consumers.
+// The two endpoints become independent cache entries, so any other
+// surface (e.g. the Pulse bar) polling the same keys shares one request.
 export function useDashboard(pollInterval = 30_000) {
-  const [dashboard, setDashboard] = useState<DashboardStats | null>(null);
-  const [stats, setStats] = useState<RepoStats | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const timerRef = useRef<ReturnType<typeof setInterval>>(undefined);
+  const refetchInterval = pollInterval > 0 ? pollInterval : false;
 
-  const load = useCallback(async () => {
-    try {
-      const [dRes, sRes] = await Promise.all([
-        fetch('/api/metrics/dashboard'),
-        fetch('/api/stats'),
-      ]);
-      if (!dRes.ok || !sRes.ok) throw new Error('fetch failed');
-      setDashboard((await dRes.json()) as DashboardStats);
-      setStats((await sRes.json()) as RepoStats);
-      setError(null);
-    } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : 'fetch failed');
-    } finally {
-      setLoading(false);
-    }
-  }, []);
+  const dash = useQuery({
+    queryKey: ['metrics-dashboard'],
+    queryFn: ({ signal }) =>
+      apiFetch<DashboardStats>('/api/metrics/dashboard', { signal }),
+    refetchInterval,
+  });
+  const stats = useQuery({
+    queryKey: ['stats'],
+    queryFn: ({ signal }) => apiFetch<RepoStats>('/api/stats', { signal }),
+    refetchInterval,
+  });
 
-  useEffect(() => {
-    load();
-    timerRef.current = setInterval(load, pollInterval);
-    return () => clearInterval(timerRef.current);
-  }, [load, pollInterval]);
+  // refetch is referentially stable in TanStack v5; destructured so the
+  // dependency array doesn't have to carry the whole query result objects.
+  const { refetch: refetchDashboard } = dash;
+  const { refetch: refetchStats } = stats;
+  const reload = useCallback(() => {
+    void refetchDashboard();
+    void refetchStats();
+  }, [refetchDashboard, refetchStats]);
 
-  return { dashboard, stats, loading, error, reload: load };
+  return {
+    dashboard: dash.data ?? null,
+    stats: stats.data ?? null,
+    loading: dash.isPending || stats.isPending,
+    error: dash.error?.message ?? stats.error?.message ?? null,
+    reload,
+  };
 }
