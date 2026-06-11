@@ -98,6 +98,17 @@ type Metrics struct {
 	// --- GraphRAG overflow ---
 	GraphRAGEventsDroppedTotal *prometheus.CounterVec
 
+	// --- In-memory store census (OOM-survival work) ---
+	// GraphRAGStoreEntities — live node counts per entity kind across tenants
+	// (tenants|services|operations|traces|spans|log_clusters|metrics|anomalies).
+	// GraphRAGStoreEdges — live edge counts per store (service|trace|signal|anomaly).
+	// Together with the ring/drain gauges these attribute RSS growth to a
+	// specific structure before a heap profile is needed.
+	GraphRAGStoreEntities *prometheus.GaugeVec
+	GraphRAGStoreEdges    *prometheus.GaugeVec
+	TSDBRingSeriesActive  prometheus.Gauge
+	DrainTemplatesActive  prometheus.Gauge
+
 	// --- Async ingest pipeline (Phase 1 robustness work) ---
 	// IngestPipelineQueueDepth — current queue depth, sampled on every Submit.
 	// Labeled by signal so spikes can be attributed to traces vs logs.
@@ -323,6 +334,22 @@ func New() *Metrics {
 			Name: "otelcontext_graphrag_events_dropped_total",
 			Help: "Events dropped because the GraphRAG event channel was full.",
 		}, []string{"signal"}),
+		GraphRAGStoreEntities: promauto.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "otelcontext_graphrag_store_entities",
+			Help: "Live GraphRAG node counts across tenants, by entity kind (tenants|services|operations|traces|spans|log_clusters|metrics|anomalies).",
+		}, []string{"entity"}),
+		GraphRAGStoreEdges: promauto.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "otelcontext_graphrag_store_edges",
+			Help: "Live GraphRAG edge counts across tenants, by store (service|trace|signal|anomaly).",
+		}, []string{"store"}),
+		TSDBRingSeriesActive: promauto.NewGauge(prometheus.GaugeOpts{
+			Name: "otelcontext_tsdb_ring_series_active",
+			Help: "Distinct metric series currently held in TSDB ring buffers.",
+		}),
+		DrainTemplatesActive: promauto.NewGauge(prometheus.GaugeOpts{
+			Name: "otelcontext_drain_templates_active",
+			Help: "Live Drain log templates (bounded by the 50k LRU cap).",
+		}),
 
 		IngestPipelineQueueDepth: promauto.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "otelcontext_ingest_pipeline_queue_depth",

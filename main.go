@@ -797,12 +797,34 @@ func main() {
 		defer bootWG.Done()
 		tick := time.NewTicker(1 * time.Second)
 		defer tick.Stop()
+		// Store census is len()-under-RLock per tenant — cheap, but 15s is
+		// plenty for trend attribution of RSS growth.
+		census := time.NewTicker(15 * time.Second)
+		defer census.Stop()
 		for {
 			select {
 			case <-appCtx.Done():
 				return
 			case <-tick.C:
 				metrics.GraphRAGEventBufferDepth.Set(float64(graphRAG.EventBufferDepth()))
+			case <-census.C:
+				c := graphRAG.StoreCounts()
+				ent := metrics.GraphRAGStoreEntities
+				ent.WithLabelValues("tenants").Set(float64(c.Tenants))
+				ent.WithLabelValues("services").Set(float64(c.Services))
+				ent.WithLabelValues("operations").Set(float64(c.Operations))
+				ent.WithLabelValues("traces").Set(float64(c.Traces))
+				ent.WithLabelValues("spans").Set(float64(c.Spans))
+				ent.WithLabelValues("log_clusters").Set(float64(c.LogClusters))
+				ent.WithLabelValues("metrics").Set(float64(c.Metrics))
+				ent.WithLabelValues("anomalies").Set(float64(c.Anomalies))
+				edg := metrics.GraphRAGStoreEdges
+				edg.WithLabelValues("service").Set(float64(c.ServiceEdges))
+				edg.WithLabelValues("trace").Set(float64(c.TraceEdges))
+				edg.WithLabelValues("signal").Set(float64(c.SignalEdges))
+				edg.WithLabelValues("anomaly").Set(float64(c.AnomalyEdges))
+				metrics.TSDBRingSeriesActive.Set(float64(ringBuf.MetricCount()))
+				metrics.DrainTemplatesActive.Set(float64(graphRAG.DrainTemplateCount()))
 			}
 		}
 	}()
