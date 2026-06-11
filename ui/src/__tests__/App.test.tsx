@@ -82,11 +82,25 @@ describe('App routing', () => {
     await waitFor(() => expect(memory.history).toContain('/map'))
   })
 
-  it('mounts the existing ServicesView at /map', async () => {
+  it('mounts the FlowMapView at /map', async () => {
     renderApp('/map')
     // Lazy chunk + empty graph → the view's empty state proves the mount.
     expect(
       await screen.findByText(/no services discovered yet/i),
+    ).toBeInTheDocument()
+  })
+
+  it('mounts the Service Inspector when ?service= is present', async () => {
+    renderApp('/map?service=ghost')
+    expect(
+      await screen.findByRole('button', { name: /close inspector/i }),
+    ).toBeInTheDocument()
+  })
+
+  it('renders the trail bar when ?trail= is present', async () => {
+    renderApp('/map?trail=svc:checkout')
+    expect(
+      await screen.findByRole('navigation', { name: /investigation trail/i }),
     ).toBeInTheDocument()
   })
 })

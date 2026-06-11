@@ -118,5 +118,11 @@ export function anomalyTicks(
   }
   return [...clusters.values()]
     .sort((a, b) => a.tMs - b.tMs)
-    .map(({ tMs: _tMs, ...tick }) => tick)
+    .map((c) => ({
+      x: c.x,
+      severity: c.severity,
+      service: c.service,
+      count: c.count,
+      timestamp: c.timestamp,
+    }))
 }

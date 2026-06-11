@@ -2,14 +2,18 @@ import { lazy, Suspense } from 'react'
 import { Redirect, Route, Switch, useLocation } from 'wouter'
 import { Spin } from '@ossrandom/design-system'
 import Shell from './components/shell/Shell'
+import TrailBar from './components/trail/TrailBar'
+import { useInvestigation } from './hooks/useInvestigation'
 import type { OtelView } from './components/dashboard/DashboardView'
 import type { Theme } from './hooks/useTheme'
+import styles from './App.module.css'
 
-// All routes are code-split: /map pulls in cytoscape (~434 KB) and the
-// other views carry design-system surfaces the shell itself doesn't need.
-const ServicesView = lazy(() => import('./components/observability/ServicesView'))
+// All routes are code-split; the Inspector is split too and only fetched
+// once a ?service= drill-down actually happens.
+const FlowMapView = lazy(() => import('./components/map/FlowMapView'))
 const DashboardView = lazy(() => import('./components/dashboard/DashboardView'))
 const MCPConsoleView = lazy(() => import('./components/mcp/MCPConsoleView'))
+const ServiceInspector = lazy(() => import('./components/inspector/ServiceInspector'))
 
 // Legacy view ids (DashboardView's onNavigate) → router paths.
 const VIEW_PATHS: Record<OtelView, string> = {
@@ -25,22 +29,33 @@ interface AppProps {
 
 export default function App({ theme, onToggleTheme }: Readonly<AppProps>) {
   const [, navigate] = useLocation()
+  const { service, trail, popToFrame, popOne } = useInvestigation()
 
   return (
     <Shell theme={theme} onToggleTheme={onToggleTheme}>
-      <Suspense fallback={<Spin label="Loading…" />}>
-        <Switch>
-          <Route path="/map" component={ServicesView} />
-          <Route path="/dashboard">
-            <DashboardView onNavigate={(view) => navigate(VIEW_PATHS[view])} />
-          </Route>
-          <Route path="/mcp" component={MCPConsoleView} />
-          {/* "/" and anything unknown → /map until the Triage home lands. */}
-          <Route>
-            <Redirect to="/map" replace />
-          </Route>
-        </Switch>
-      </Suspense>
+      <div className={styles.layout}>
+        <div className={styles.routes}>
+          <Suspense fallback={<Spin label="Loading…" />}>
+            <Switch>
+              <Route path="/map" component={FlowMapView} />
+              <Route path="/dashboard">
+                <DashboardView onNavigate={(view) => navigate(VIEW_PATHS[view])} />
+              </Route>
+              <Route path="/mcp" component={MCPConsoleView} />
+              {/* "/" and anything unknown → /map until the Triage home lands. */}
+              <Route>
+                <Redirect to="/map" replace />
+              </Route>
+            </Switch>
+          </Suspense>
+        </div>
+        {service !== null && (
+          <Suspense fallback={null}>
+            <ServiceInspector />
+          </Suspense>
+        )}
+      </div>
+      <TrailBar frames={trail} onPopTo={popToFrame} onPopOne={popOne} />
     </Shell>
   )
 }

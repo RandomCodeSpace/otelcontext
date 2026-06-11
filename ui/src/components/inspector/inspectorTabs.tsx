@@ -1,25 +1,18 @@
-import type { ComponentType } from 'react'
 import { ChevronRight, TriangleAlert } from 'lucide-react'
 import type { SystemEdge, SystemNode } from '@/types/api'
 import { formatCount, formatMs, formatPercent } from '@/lib/format'
 import { nodeStatus, statusToken } from '@/lib/triage'
 import styles from './ServiceInspector.module.css'
 
-// Inspector tab registry. "Why" (root_cause_analysis) and "Impact"
-// (impact_analysis) land in a later phase — they extend INSPECTOR_TABS with
-// new entries; nothing else changes.
+// Inspector tab CONTENT components. The registry that orders them lives in
+// ./registry.ts — "Why" (root_cause_analysis) and "Impact" (impact_analysis)
+// land in a later phase by adding a component here and an entry there.
 
 export interface InspectorTabContext {
   node: SystemNode
   edges: readonly SystemEdge[]
   /** Drill into another service — pushes the investigation trail. */
   openService: (id: string) => void
-}
-
-export interface InspectorTabDef {
-  id: string
-  label: string
-  Content: ComponentType<{ ctx: InspectorTabContext }>
 }
 
 function Stat({ label, value }: Readonly<{ label: string; value: string }>) {
@@ -31,7 +24,7 @@ function Stat({ label, value }: Readonly<{ label: string; value: string }>) {
   )
 }
 
-function OverviewTab({ ctx }: Readonly<{ ctx: InspectorTabContext }>) {
+export function OverviewTab({ ctx }: Readonly<{ ctx: InspectorTabContext }>) {
   const { node } = ctx
   const m = node.metrics
   const color = statusToken(nodeStatus(node.status))
@@ -102,7 +95,7 @@ function DepRow({
   )
 }
 
-function DependenciesTab({ ctx }: Readonly<{ ctx: InspectorTabContext }>) {
+export function DependenciesTab({ ctx }: Readonly<{ ctx: InspectorTabContext }>) {
   const { node, edges, openService } = ctx
   const upstream = edges.filter((e) => e.target === node.id)
   const downstream = edges.filter((e) => e.source === node.id)
@@ -135,8 +128,3 @@ function DependenciesTab({ ctx }: Readonly<{ ctx: InspectorTabContext }>) {
     </div>
   )
 }
-
-export const INSPECTOR_TABS: readonly InspectorTabDef[] = [
-  { id: 'overview', label: 'Overview', Content: OverviewTab },
-  { id: 'dependencies', label: 'Dependencies', Content: DependenciesTab },
-]

@@ -9,7 +9,7 @@ import type { SystemGraphResponse } from '../types/api';
 // dedup, AbortSignal cancellation, and hidden-tab polling pause from
 // the shared query client.
 export function useSystemGraph(pollInterval = 60_000) {
-  const { data, isPending, error, refetch } = useQuery({
+  const { data, isPending, error, refetch, dataUpdatedAt } = useQuery({
     queryKey: ['system-graph'],
     queryFn: async ({ signal }) => {
       const { data: graph, response } =
@@ -31,5 +31,7 @@ export function useSystemGraph(pollInterval = 60_000) {
     loading: isPending,
     error: error ? error.message : null,
     reload,
+    /** Epoch ms of the last successful fetch (0 = never) — freshness label. */
+    dataUpdatedAt,
   };
 }

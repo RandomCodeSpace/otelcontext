@@ -1,12 +1,13 @@
 {
-  "$comment": "Gzipped size budgets enforced by scripts/check-budgets.mjs (npm run check-budgets). 'initial' = assets referenced from dist/index.html (entry script + modulepreloads + stylesheets). Fonts are raw woff2 bytes (already compressed). lazyChunkExceptions maps a chunk name prefix (before the content hash) to a higher cap: ServicesView still carries cytoscape until the C3 flow-map rewrite deletes it.",
+  "$comment": "Gzipped size budgets enforced by scripts/check-budgets.mjs (npm run check-budgets). 'initial' = assets referenced from dist/index.html (entry script + modulepreloads + stylesheets). Fonts are raw woff2 bytes (already compressed). lazyChunkExceptions maps a chunk name prefix (before the content hash) to a per-chunk cap — the C3 flow-map rewrite deleted cytoscape, so the map route is bound to 35KB; the Triage home to 25KB per the design plan.",
   "gzipKb": {
     "initialJs": 160,
     "initialCss": 24,
     "fonts": 90,
     "lazyChunkDefault": 40,
     "lazyChunkExceptions": {
-      "ServicesView": 170
+      "FlowMapView": 35,
+      "TriageView": 25
     }
   }
 }

@@ -9,7 +9,7 @@ import { formatPercent } from '@/lib/format'
 import { nodeStatus, statusToken } from '@/lib/triage'
 import { nextSheetState, type SheetSnap } from '@/lib/sheet'
 import type { SystemNode } from '@/types/api'
-import { INSPECTOR_TABS } from './inspectorTabs'
+import { INSPECTOR_TABS } from './registry'
 import styles from './ServiceInspector.module.css'
 
 // Service Inspector — the omnipresent ?service=X panel:

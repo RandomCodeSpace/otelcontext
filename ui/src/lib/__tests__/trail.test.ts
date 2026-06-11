@@ -73,7 +73,7 @@ describe('pushFrame', () => {
   })
 
   it('caps the stack by dropping the oldest frame', () => {
-    let frames: TrailFrame[] = []
+    let frames: readonly TrailFrame[] = []
     for (let i = 0; i < MAX_TRAIL_FRAMES + 3; i++) {
       frames = pushFrame(frames, svc(`s${i}`))
     }
