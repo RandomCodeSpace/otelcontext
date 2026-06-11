@@ -36,6 +36,9 @@ func (g *GraphRAG) refreshLoop(ctx context.Context) {
 				slog.Debug("GraphRAG pruned expired traces/spans", "count", pruned)
 			}
 			g.pruneOldAnomalies()
+			if evicted := g.evictIdleTenants(); evicted > 0 {
+				slog.Info("GraphRAG evicted idle tenant stores", "count", evicted)
+			}
 			// Bound the investigation cooldown map. The 10m cutoff is 2×
 			// the cooldown window (5m) — it retains entries through the
 			// active suppression plus a grace period. This assumes the
@@ -47,6 +50,39 @@ func (g *GraphRAG) refreshLoop(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// evictIdleTenants drops tenant store slices whose lastAccess is older than
+// tenantIdleTTL (GRAPHRAG_TENANT_IDLE_TTL, default 24h). The default tenant
+// is never evicted — single-tenant installs route everything through it.
+// Eviction is self-healing: a tenant that is actually active reappears
+// within one refresh tick (rebuildAllTenantsFromDB re-discovers it from
+// recent spans) or instantly on the next ingest event / query via
+// storesForTenant. Returns the number of slices evicted.
+func (g *GraphRAG) evictIdleTenants() int {
+	if g.tenantIdleTTL <= 0 {
+		return 0
+	}
+	cutoff := time.Now().Add(-g.tenantIdleTTL).UnixNano()
+	g.tenantsMu.Lock()
+	evicted := 0
+	for tenant, st := range g.tenants {
+		if tenant == storage.DefaultTenantID {
+			continue
+		}
+		if st.lastAccess.Load() < cutoff {
+			delete(g.tenants, tenant)
+			evicted++
+		}
+	}
+	g.tenantsMu.Unlock()
+	if evicted > 0 {
+		g.tenantsEvicted.Add(int64(evicted))
+		if g.metrics != nil && g.metrics.GraphRAGTenantsEvictedTotal != nil {
+			g.metrics.GraphRAGTenantsEvictedTotal.Add(float64(evicted))
+		}
+	}
+	return evicted
 }
 
 // snapshotLoop persists Drain templates on the configured cadence so a
@@ -147,7 +183,9 @@ func (g *GraphRAG) rebuildFromDBForTenant(_ context.Context, tenant string, sinc
 		StartTime     time.Time
 	}
 
-	stores := g.storesForTenant(tenant)
+	// NoTouch: a 60s bookkeeping rebuild must not refresh the idle-eviction
+	// clock, or dormant tenants would never reach GRAPHRAG_TENANT_IDLE_TTL.
+	stores := g.tenantStoresNoTouch(tenant)
 
 	var rows []spanRow
 	err := g.repo.DB().

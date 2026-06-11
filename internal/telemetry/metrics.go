@@ -98,6 +98,12 @@ type Metrics struct {
 	// --- GraphRAG overflow ---
 	GraphRAGEventsDroppedTotal *prometheus.CounterVec
 
+	// GraphRAGTenantsEvictedTotal counts tenant store slices evicted after
+	// exceeding GRAPHRAG_TENANT_IDLE_TTL. The default tenant is never
+	// evicted; a steady non-zero rate on a single-tenant install means
+	// rogue tenant IDs are reaching ingest.
+	GraphRAGTenantsEvictedTotal prometheus.Counter
+
 	// --- In-memory store census (OOM-survival work) ---
 	// GraphRAGStoreEntities — live node counts per entity kind across tenants
 	// (tenants|services|operations|traces|spans|log_clusters|metrics|anomalies).
@@ -334,6 +340,10 @@ func New() *Metrics {
 			Name: "otelcontext_graphrag_events_dropped_total",
 			Help: "Events dropped because the GraphRAG event channel was full.",
 		}, []string{"signal"}),
+		GraphRAGTenantsEvictedTotal: promauto.NewCounter(prometheus.CounterOpts{
+			Name: "otelcontext_graphrag_tenants_evicted_total",
+			Help: "Tenant store slices evicted after exceeding the idle TTL (GRAPHRAG_TENANT_IDLE_TTL). The default tenant is never evicted.",
+		}),
 		GraphRAGStoreEntities: promauto.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "otelcontext_graphrag_store_entities",
 			Help: "Live GraphRAG node counts across tenants, by entity kind (tenants|services|operations|traces|spans|log_clusters|metrics|anomalies).",
