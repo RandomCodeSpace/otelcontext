@@ -255,72 +255,104 @@ func (r *Repository) GetTracesFiltered(ctx context.Context, start, end time.Time
 	}, nil
 }
 
-const serviceMapSpanLimit = 500_000
+// serviceMapSpanLimit caps the edge-pass span scan. A var (not const) so the
+// row-limit warning path is testable without seeding 500k rows.
+var serviceMapSpanLimit = 500_000
+
+// serviceMapNodeRow receives the per-service GROUP BY aggregate used to build
+// ServiceMapNode entries without loading span rows into Go.
+type serviceMapNodeRow struct {
+	ServiceName string
+	SpanCount   int64
+	AvgDuration float64
+	ErrorCount  int64
+}
+
+// serviceMapSpanRow is the narrow projection scanned for the edge pass. It is
+// deliberately NOT Span: AttributesJSON (CompressedText) zstd-decompresses
+// per row in Scan(), which dominated the cost of the old full-row load.
+type serviceMapSpanRow struct {
+	SpanID       string
+	ParentSpanID string
+	ServiceName  string
+	Duration     int64
+	Status       string
+	StartTime    time.Time
+}
 
 // GetServiceMapMetrics computes topology metrics from spans scoped to the
 // tenant on ctx.
+//
+// Node stats come from a single portable GROUP BY aggregate so the database
+// does the heavy lifting. Edge stats still need the parent→child resolution
+// via span_id done in Go, but over the narrow serviceMapSpanRow projection so
+// the compressed attributes column is never scanned. `duration * 1.0` keeps
+// AVG in floating point on every dialect (SQL Server truncates AVG(bigint)).
 func (r *Repository) GetServiceMapMetrics(ctx context.Context, start, end time.Time) (*ServiceMapMetrics, error) {
 	tenant := TenantFromContext(ctx)
-	var spans []Span
-	query := r.db.WithContext(ctx).Model(&Span{}).Where(sqlWhereTenantID, tenant)
 
+	nodeQuery := r.db.WithContext(ctx).Model(&Span{}).
+		Select("service_name, COUNT(*) as span_count, AVG(duration * 1.0) as avg_duration, "+
+			"SUM(CASE WHEN status = 'STATUS_CODE_ERROR' THEN 1 ELSE 0 END) as error_count").
+		Where(sqlWhereTenantID, tenant).
+		Where("service_name <> ''")
 	if !start.IsZero() && !end.IsZero() {
-		query = query.Where("start_time BETWEEN ? AND ?", start, end)
+		nodeQuery = nodeQuery.Where("start_time BETWEEN ? AND ?", start, end)
+	}
+	var nodeRows []serviceMapNodeRow
+	if err := nodeQuery.Group("service_name").Scan(&nodeRows).Error; err != nil {
+		return nil, fmt.Errorf("failed to aggregate service map nodes: %w", err)
 	}
 
-	if err := query.Limit(serviceMapSpanLimit).Find(&spans).Error; err != nil {
+	nodes := make([]ServiceMapNode, 0, len(nodeRows))
+	for _, nr := range nodeRows {
+		nodes = append(nodes, ServiceMapNode{
+			Name:        nr.ServiceName,
+			TotalTraces: nr.SpanCount,
+			ErrorCount:  nr.ErrorCount,
+			// AVG(duration) is microseconds; convert to ms and round to 2dp.
+			AvgLatencyMs: math.Round(nr.AvgDuration/1000.0*100) / 100,
+		})
+	}
+
+	edgeQuery := r.db.WithContext(ctx).Model(&Span{}).
+		Select("span_id, parent_span_id, service_name, duration, status, start_time").
+		Where(sqlWhereTenantID, tenant)
+	if !start.IsZero() && !end.IsZero() {
+		edgeQuery = edgeQuery.Where("start_time BETWEEN ? AND ?", start, end)
+	}
+	var spans []serviceMapSpanRow
+	if err := edgeQuery.Limit(serviceMapSpanLimit).Find(&spans).Error; err != nil {
 		return nil, fmt.Errorf("failed to fetch spans: %w", err)
 	}
 	if len(spans) == serviceMapSpanLimit {
-		slog.Warn("GetServiceMapMetrics: span query hit row limit, topology may be incomplete", "limit", serviceMapSpanLimit)
+		slog.Warn("GetServiceMapMetrics: edge span query hit row limit, edge topology may be incomplete", "limit", serviceMapSpanLimit)
 	}
 
-	spanMap := make(map[string]Span)
-	nodeStats := make(map[string]*ServiceMapNode)
-	edgeStats := make(map[string]*ServiceMapEdge)
-
+	// Parent resolution map (span_id → service name) is built over ALL rows,
+	// including empty service names, matching the old full-span map exactly.
+	serviceBySpanID := make(map[string]string, len(spans))
 	for _, s := range spans {
-		spanMap[s.SpanID] = s
-
-		if s.ServiceName == "" {
-			continue
-		}
-
-		if _, ok := nodeStats[s.ServiceName]; !ok {
-			nodeStats[s.ServiceName] = &ServiceMapNode{Name: s.ServiceName}
-		}
-		ns := nodeStats[s.ServiceName]
-		ns.TotalTraces++
-		ns.AvgLatencyMs += float64(s.Duration)
+		serviceBySpanID[s.SpanID] = s.ServiceName
 	}
 
-	nodes := make([]ServiceMapNode, 0)
-	for _, ns := range nodeStats {
-		if ns.TotalTraces > 0 {
-			ns.AvgLatencyMs = ns.AvgLatencyMs / float64(ns.TotalTraces) / 1000.0
-			ns.AvgLatencyMs = math.Round(ns.AvgLatencyMs*100) / 100
-		}
-		nodes = append(nodes, *ns)
-	}
-
+	edgeStats := make(map[string]*ServiceMapEdge)
 	for _, s := range spans {
 		if s.ParentSpanID == "" || s.ParentSpanID == "0000000000000000" {
 			continue
 		}
 
-		parent, ok := spanMap[s.ParentSpanID]
+		source, ok := serviceBySpanID[s.ParentSpanID]
 		if !ok {
 			continue
 		}
-
-		source := parent.ServiceName
 		target := s.ServiceName
 
 		if source == "" || target == "" || source == target {
 			continue
 		}
 
-		key := fmt.Sprintf("%s->%s", source, target)
+		key := source + "->" + target
 		if _, ok := edgeStats[key]; !ok {
 			edgeStats[key] = &ServiceMapEdge{Source: source, Target: target}
 		}
@@ -329,7 +361,7 @@ func (r *Repository) GetServiceMapMetrics(ctx context.Context, start, end time.T
 		es.AvgLatencyMs += float64(s.Duration)
 	}
 
-	edges := make([]ServiceMapEdge, 0)
+	edges := make([]ServiceMapEdge, 0, len(edgeStats))
 	for _, es := range edgeStats {
 		if es.CallCount > 0 {
 			es.AvgLatencyMs = es.AvgLatencyMs / float64(es.CallCount) / 1000.0
