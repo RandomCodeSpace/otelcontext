@@ -26,13 +26,13 @@ type RawMetric struct {
 
 // Aggregator manages in-memory tumbling windows for metrics.
 type Aggregator struct {
-	repo           *storage.Repository
-	windowSize     time.Duration
-	buckets        map[string]*storage.MetricBucket
-	mu             sync.Mutex
-	stopChan       chan struct{}
-	flushChan chan []storage.MetricBucket
-	pool      sync.Pool
+	repo       *storage.Repository
+	windowSize time.Duration
+	buckets    map[string]*storage.MetricBucket
+	mu         sync.Mutex
+	stopChan   chan struct{}
+	flushChan  chan []storage.MetricBucket
+	pool       sync.Pool
 	// droppedBatches is incremented in flush() (under no lock other than
 	// the outer mu — but the increment path runs after the unlock) and
 	// read by DroppedBatches() concurrently from telemetry scrape paths.
@@ -52,11 +52,11 @@ type Aggregator struct {
 	// to a tenant-specific overflow bucket so a noisy tenant cannot
 	// starve siblings of fresh series. seriesPerTenant counts unique
 	// (non-overflow) bucket keys per tenant and is reset by flush().
-	maxCardinality       int                    // 0 = unlimited
-	perTenantCardinality int                    // 0 = unlimited (global cap still applies)
-	cardinalityOverflow  func(tenantID string)  // labeled per overflow event for Prometheus
-	seriesPerTenant      map[string]int         //nolint:unused // touched only via mu
-	overflowKey          string                 // constant key for the global overflow bucket
+	maxCardinality       int                   // 0 = unlimited
+	perTenantCardinality int                   // 0 = unlimited (global cap still applies)
+	cardinalityOverflow  func(tenantID string) // labeled per overflow event for Prometheus
+	seriesPerTenant      map[string]int        // touched only via mu
+	overflowKey          string                // constant key for the global overflow bucket
 
 	// Ring buffer accelerator (optional)
 	ring *RingBuffer
