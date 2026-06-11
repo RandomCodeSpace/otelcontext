@@ -48,17 +48,17 @@ func clearSQLiteEnv(t *testing.T) {
 func postgresDefaultsConfig(driver string) *Config {
 	return &Config{
 		DBDriver:                 driver,
-		DBMaxOpenConns:           50,    // Postgres default
-		DBMaxIdleConns:           10,    // Postgres default
-		IngestPipelineWorkers:    8,     // Postgres default
-		IngestPipelineQueueSize:  50000, // Postgres default
-		MetricMaxCardinality:     10000, // Postgres default
-		StoreMinSeverity:         "",    // same-as-ingest default
-		SamplingRate:             1.0,   // keep-all default
-		GRPCMaxConcurrentStreams: 1000,  // Postgres default
+		DBMaxOpenConns:           50,     // Postgres default
+		DBMaxIdleConns:           10,     // Postgres default
+		IngestPipelineWorkers:    8,      // Postgres default
+		IngestPipelineQueueSize:  50000,  // Postgres default
+		MetricMaxCardinality:     10000,  // Postgres default
+		StoreMinSeverity:         "",     // same-as-ingest default
+		SamplingRate:             1.0,    // keep-all default
+		GRPCMaxConcurrentStreams: 1000,   // Postgres default
 		GraphRAGEventQueueSize:   100000, // Postgres default
-		LogFTSEnabled:            false, // FTS5 opt-in default
-		GraphRAGTraceTTL:         "1h",  // Postgres default
+		LogFTSEnabled:            false,  // FTS5 opt-in default
+		GraphRAGTraceTTL:         "1h",   // Postgres default
 	}
 }
 
