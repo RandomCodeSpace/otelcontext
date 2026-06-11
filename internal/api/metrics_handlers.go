@@ -8,6 +8,7 @@ import (
 
 	"github.com/RandomCodeSpace/otelcontext/internal/api/views"
 	"github.com/RandomCodeSpace/otelcontext/internal/httpconst"
+	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 )
 
 // handleGetTrafficMetrics handles GET /api/metrics/traffic
@@ -99,17 +100,33 @@ func (s *Server) handleGetDashboardStats(w http.ResponseWriter, r *http.Request)
 	_ = json.NewEncoder(w).Encode(views.DashboardStatsFromModel(stats))
 }
 
-// handleGetServiceMapMetrics handles GET /api/metrics/service-map
+// handleGetServiceMapMetrics handles GET /api/metrics/service-map.
+// Results are cached for 30s per (tenant, window) — the dashboard polls this
+// endpoint and the underlying span aggregation is among the most expensive
+// queries in the API surface. The key uses the raw start/end params so the
+// default rolling window (no params) shares a single entry instead of being
+// re-keyed on every request timestamp.
 func (s *Server) handleGetServiceMapMetrics(w http.ResponseWriter, r *http.Request) {
+	const cacheTTL = 30 * time.Second
+	startStr := r.URL.Query().Get("start")
+	endStr := r.URL.Query().Get("end")
+	cacheKey := "service_map:" + storage.TenantFromContext(r.Context()) + ":" + startStr + ":" + endStr
+
+	if cached, ok := s.cache.Get(cacheKey); ok {
+		w.Header().Set(httpconst.HeaderContentType, httpconst.ContentTypeJSON)
+		w.Header().Set("X-Cache", "HIT")
+		_ = json.NewEncoder(w).Encode(cached)
+		return
+	}
+
 	end := time.Now()
 	start := end.Add(-30 * time.Minute)
-
-	if startStr := r.URL.Query().Get("start"); startStr != "" {
+	if startStr != "" {
 		if t, err := time.Parse(time.RFC3339, startStr); err == nil {
 			start = t
 		}
 	}
-	if endStr := r.URL.Query().Get("end"); endStr != "" {
+	if endStr != "" {
 		if t, err := time.Parse(time.RFC3339, endStr); err == nil {
 			end = t
 		}
@@ -122,8 +139,11 @@ func (s *Server) handleGetServiceMapMetrics(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	resp := views.ServiceMapMetricsFromModel(metrics)
+	s.cache.Set(cacheKey, resp, cacheTTL)
 	w.Header().Set(httpconst.HeaderContentType, httpconst.ContentTypeJSON)
-	_ = json.NewEncoder(w).Encode(views.ServiceMapMetricsFromModel(metrics))
+	w.Header().Set("X-Cache", "MISS")
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 // handleGetMetricBuckets handles GET /api/metrics
