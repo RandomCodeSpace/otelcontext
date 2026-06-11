@@ -185,3 +185,20 @@ func TestTraceView_PreservesJSONFieldNames(t *testing.T) {
 		}
 	}
 }
+
+// TestSpanView_PreservesStatus pins the span status code on the wire — the
+// UI waterfall colors STATUS_CODE_ERROR spans --crit and the storage model
+// has carried Status since ingest day one.
+func TestSpanView_PreservesStatus(t *testing.T) {
+	sp := storage.Span{
+		ID: 7, TraceID: "tid", SpanID: "sid", OperationName: "op",
+		ServiceName: "svc", Status: "STATUS_CODE_ERROR",
+	}
+	b, err := json.Marshal(SpanFromModel(sp))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(b), `"status":"STATUS_CODE_ERROR"`) {
+		t.Errorf("Span view missing status field in %s", string(b))
+	}
+}

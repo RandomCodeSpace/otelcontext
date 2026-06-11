@@ -46,6 +46,8 @@ export interface Span {
   /** microseconds */
   duration: number
   service_name: string
+  /** OTLP status code, e.g. STATUS_CODE_ERROR */
+  status: string
   /** compressed JSON string */
   attributes_json: string
 }
@@ -174,13 +176,10 @@ export interface LogFilter {
   offset?: number
 }
 
-// Optional list-response envelope for logs (API endpoint wraps results).
+/** GET /api/logs envelope (internal/api/log_handlers.go: {data, total}). */
 export interface LogsResponse {
-  logs?: LogEntry[]
-  items?: LogEntry[]
-  total?: number
-  limit?: number
-  offset?: number
+  data: LogEntry[]
+  total: number
 }
 
 // ============================================================================
