@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { render, screen, waitFor, within } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { Router } from 'wouter'
@@ -200,21 +200,59 @@ describe('ServiceInspector', () => {
     expect(screen.getByRole('button', { name: /retry/i })).toBeInTheDocument()
   })
 
-  it('renders as a bottom-sheet dialog on xs', async () => {
-    const mql = (query: string): MediaQueryList =>
-      ({
-        matches: query === '(max-width: 767px)',
-        media: query,
-        onchange: null,
-        addListener: () => {},
-        removeListener: () => {},
-        addEventListener: () => {},
-        removeEventListener: () => {},
-        dispatchEvent: () => false,
-      }) as MediaQueryList
-    vi.stubGlobal('matchMedia', mql)
-    renderInspector()
-    expect(await screen.findByRole('dialog')).toBeInTheDocument()
-    expect(screen.getByTestId('sheet-handle')).toBeInTheDocument()
+  describe('xs bottom sheet', () => {
+    beforeEach(() => {
+      const mql = (query: string): MediaQueryList =>
+        ({
+          matches: query === '(max-width: 767px)',
+          media: query,
+          onchange: null,
+          addListener: () => {},
+          removeListener: () => {},
+          addEventListener: () => {},
+          removeEventListener: () => {},
+          dispatchEvent: () => false,
+        }) as MediaQueryList
+      vi.stubGlobal('matchMedia', mql)
+    })
+
+    it('renders as a bottom-sheet dialog with a drag handle at 50dvh', async () => {
+      renderInspector()
+      const dialog = await screen.findByRole('dialog')
+      expect(dialog).toHaveStyle({ height: '50dvh' })
+      expect(screen.getByTestId('sheet-handle')).toBeInTheDocument()
+    })
+
+    it('drag up snaps the sheet to 92dvh', async () => {
+      renderInspector()
+      const dialog = await screen.findByRole('dialog')
+      const handle = screen.getByTestId('sheet-handle')
+      // jsdom innerHeight = 768 → threshold 115px; -200px is a real drag up
+      fireEvent.pointerDown(handle, { pointerId: 1, clientY: 600 })
+      fireEvent.pointerMove(handle, { pointerId: 1, clientY: 500 })
+      fireEvent.pointerUp(handle, { pointerId: 1, clientY: 400 })
+      expect(dialog).toHaveStyle({ height: '92dvh' })
+    })
+
+    it('swipe down past the threshold dismisses the sheet', async () => {
+      renderInspector()
+      await screen.findByRole('dialog')
+      const handle = screen.getByTestId('sheet-handle')
+      fireEvent.pointerDown(handle, { pointerId: 1, clientY: 300 })
+      fireEvent.pointerMove(handle, { pointerId: 1, clientY: 450 })
+      fireEvent.pointerUp(handle, { pointerId: 1, clientY: 600 })
+      await waitFor(() =>
+        expect(screen.queryByRole('dialog')).not.toBeInTheDocument(),
+      )
+    })
+
+    it('a small drag stays at the current snap', async () => {
+      renderInspector()
+      const dialog = await screen.findByRole('dialog')
+      const handle = screen.getByTestId('sheet-handle')
+      fireEvent.pointerDown(handle, { pointerId: 1, clientY: 300 })
+      fireEvent.pointerUp(handle, { pointerId: 1, clientY: 330 })
+      expect(dialog).toHaveStyle({ height: '50dvh' })
+    })
   })
 })

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { render, screen, within } from '@testing-library/react'
+import { fireEvent, render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { Router } from 'wouter'
@@ -232,6 +232,55 @@ describe('FlowMapView — keyboard', () => {
     await user.keyboard('f')
     await user.keyboard('/')
     expect(screen.getByLabelText(/filter services/i)).toHaveFocus()
+  })
+})
+
+describe('FlowMapView — pan/zoom', () => {
+  function innerG(): SVGGElement {
+    const svg = screen.getByTestId('flow-map-svg')
+    return svg.querySelector('g') as SVGGElement
+  }
+
+  it('wheel zooms the inner <g> transform (no re-layout)', async () => {
+    renderView()
+    await findMap()
+    const svg = screen.getByTestId('flow-map-svg')
+    const before = innerG().getAttribute('transform')
+    fireEvent.wheel(svg, { deltaY: -100, clientX: 50, clientY: 50 })
+    const after = innerG().getAttribute('transform')
+    expect(after).not.toBe(before)
+    expect(after).toMatch(/scale\(1\.1/)
+  })
+
+  it('zooming out below 0.8 hides the err%% labels (semantic zoom)', async () => {
+    renderView()
+    await findMap()
+    expect(screen.getByText('4.2%')).toBeInTheDocument()
+    const svg = screen.getByTestId('flow-map-svg')
+    fireEvent.wheel(svg, { deltaY: 300, clientX: 0, clientY: 0 })
+    expect(screen.queryByText('4.2%')).not.toBeInTheDocument()
+  })
+
+  it('single-pointer drag pans', async () => {
+    renderView()
+    await findMap()
+    const svg = screen.getByTestId('flow-map-svg')
+    fireEvent.pointerDown(svg, { pointerId: 1, clientX: 10, clientY: 10 })
+    fireEvent.pointerMove(svg, { pointerId: 1, clientX: 30, clientY: 25 })
+    fireEvent.pointerUp(svg, { pointerId: 1 })
+    expect(innerG().getAttribute('transform')).toContain('translate(20 15)')
+  })
+
+  it('two-pointer pinch zooms', async () => {
+    renderView()
+    await findMap()
+    const svg = screen.getByTestId('flow-map-svg')
+    fireEvent.pointerDown(svg, { pointerId: 1, clientX: 0, clientY: 0 })
+    fireEvent.pointerDown(svg, { pointerId: 2, clientX: 100, clientY: 0 })
+    fireEvent.pointerMove(svg, { pointerId: 2, clientX: 200, clientY: 0 })
+    fireEvent.pointerUp(svg, { pointerId: 1 })
+    fireEvent.pointerUp(svg, { pointerId: 2 })
+    expect(innerG().getAttribute('transform')).toMatch(/scale\(2\)/)
   })
 })
 
