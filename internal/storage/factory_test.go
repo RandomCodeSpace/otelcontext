@@ -188,8 +188,8 @@ func TestNewDatabase_SQLitePragmas_BudgetScaledRoundTrip(t *testing.T) {
 		pragma string
 		want   int64
 	}{
-		{"synchronous", 1},          // NORMAL
-		{"temp_store", 2},           // MEMORY
+		{"synchronous", 1}, // NORMAL
+		{"temp_store", 2},  // MEMORY
 		{"wal_autocheckpoint", 10000},
 		{"journal_size_limit", 67108864},
 		{"busy_timeout", 5000},

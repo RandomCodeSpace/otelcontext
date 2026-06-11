@@ -92,7 +92,7 @@ func sqliteVacuumStatement(fullVacuum bool) string {
 // PRAGMA incremental_vacuum performs its work per step (one freed page per
 // row), so the cursor must be walked to completion for the reclaim to happen.
 func drainQuery(ctx context.Context, db *sql.DB, query string) error {
-	rows, err := db.QueryContext(ctx, query) //nolint:sqlclosecheck // closed below; no rows.Close() lint seam for drain loops
+	rows, err := db.QueryContext(ctx, query)
 	if err != nil {
 		return err
 	}
