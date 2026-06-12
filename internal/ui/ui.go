@@ -122,7 +122,12 @@ func newSPAHandler(dist fs.FS) *spaHandler {
 }
 
 func (h *spaHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	p := path.Clean(r.URL.Path)
+	// Rooted clean: forcing a leading "/" before Clean means the result can
+	// never climb above the root, whatever shape the raw path arrives in.
+	// (Reads also go through fs.FS, which rejects ".." via fs.ValidPath —
+	// this is defense in depth, and the form semgrep's
+	// filepath-clean-misuse rule expects.)
+	p := path.Clean("/" + strings.Trim(r.URL.Path, "/"))
 	switch {
 	case p == "/" || p == "/index.html":
 		h.serveIndex(w, r)

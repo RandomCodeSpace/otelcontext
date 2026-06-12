@@ -270,3 +270,31 @@ func TestRegisterRoutes_RealEmbed(t *testing.T) {
 		t.Errorf("/static/style.css: want 200, got %d", rec.Code)
 	}
 }
+
+// Regression for semgrep filepath-clean-misuse: request paths are
+// rooted-cleaned before any lookup, so traversal shapes can never escape
+// the dist tree (fs.ValidPath is the second layer of the same defense).
+func TestServeHTTP_PathTraversalRootedClean(t *testing.T) {
+	h := newSPAHandler(builtDistFS())
+
+	// Climbing above the root collapses to a rooted path: asset-shaped
+	// targets 404, extensionless ones get the SPA shell — never a file read.
+	rec := get(t, h, "/../../etc/secret.txt", nil)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("traversal path: got %d, want 404", rec.Code)
+	}
+	rec = get(t, h, "/../../etc/passwd", nil)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "index") {
+		t.Fatalf("traversal fallback: got %d %q, want SPA shell", rec.Code, rec.Body.String())
+	}
+
+	// ".." inside /assets collapses to the real target, which is served by
+	// its own handler (index: no-cache), never via the immutable asset path.
+	rec = get(t, h, "/assets/../index.html", nil)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "index") {
+		t.Fatalf("collapsed path: got %d %q, want index", rec.Code, rec.Body.String())
+	}
+	if cc := rec.Header().Get("Cache-Control"); cc != "no-cache" {
+		t.Fatalf("collapsed path served with asset caching: Cache-Control=%q", cc)
+	}
+}
