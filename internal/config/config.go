@@ -20,6 +20,10 @@ type Config struct {
 	DLQPath           string
 	DLQReplayInterval string
 
+	// PprofAddr serves net/http/pprof on a dedicated listener (never the
+	// public mux). Loopback-only by default; empty disables profiling.
+	PprofAddr string
+
 	// Ingestion Filtering
 	IngestMinSeverity      string
 	IngestAllowedServices  string
@@ -59,6 +63,14 @@ type Config struct {
 	// dedicated DB machines. 0/negative values use defaults.
 	RetentionBatchSize    int
 	RetentionBatchSleepMs int
+
+	// RetentionFullVacuum restores the daily full VACUUM during SQLite
+	// maintenance. Default false: the daily pass runs
+	// PRAGMA incremental_vacuum(10000) instead, because a full VACUUM holds
+	// an exclusive lock for 10-60 minutes on multi-GB files and starves
+	// ingest into a 429 storm. On-demand full VACUUM remains available via
+	// POST /api/admin/vacuum. Ignored on non-SQLite drivers.
+	RetentionFullVacuum bool
 
 	// TSDB
 	TSDBRingBufferDuration string // e.g. "1h"
@@ -129,6 +141,28 @@ type Config struct {
 	// GraphRAG event channel buffer size. Defaults to 10000 if unset or <=0.
 	GraphRAGEventQueueSize int
 
+	// GraphRAGTraceTTL bounds how long spans/traces stay in the in-memory
+	// TraceStore before the refresh tick prunes them. Duration string, e.g.
+	// "1h". Defaults to "1h"; flipped to "30m" on SQLite (the in-memory span
+	// window is the largest GraphRAG heap consumer at 120 services). Anomaly
+	// and investigation paths look back <=5min, so a 30min window is safe.
+	GraphRAGTraceTTL string
+
+	// GraphRAGMaxSpansPerTenant hard-caps the in-memory TraceStore span map
+	// per tenant. At the cap, NEW spans are skipped (counted via
+	// otelcontext_graphrag_events_dropped_total{signal="span_capacity"});
+	// updates to resident spans still apply. The graph is best-effort — the
+	// DB remains the source of truth. 0 = default (500000); negative
+	// disables the cap.
+	GraphRAGMaxSpansPerTenant int
+
+	// GraphRAGTenantIdleTTL evicts a tenant's entire in-memory store slice
+	// after this much time without any ingest event or query. Duration
+	// string, default "24h". The default tenant is never evicted, and an
+	// active tenant is re-created within one refresh tick (60s) from recent
+	// DB spans — eviction is self-healing.
+	GraphRAGTenantIdleTTL string
+
 	// Async ingest pipeline (Phase 1 robustness work). Decouples OTLP Export
 	// from synchronous DB writes. When enabled, Export() returns as soon as
 	// the parsed batch is enqueued; persistence runs on a worker pool.
@@ -139,7 +173,14 @@ type Config struct {
 	//   100% queue       — return RESOURCE_EXHAUSTED so OTLP clients back off
 	IngestAsyncEnabled      bool // default true; opt out via INGEST_ASYNC_ENABLED=false
 	IngestPipelineQueueSize int  // default 50000 batches; per-deployment tunable
-	IngestPipelineWorkers   int  // default 8 worker goroutines
+	// IngestPipelineMaxBytes caps the approximate bytes held by queued
+	// batches. The item-count queue size alone cannot bound memory — one
+	// batch may carry arbitrarily large span/log payloads. At the cap the
+	// pipeline rejects with RESOURCE_EXHAUSTED / HTTP 429 even for priority
+	// (error/slow) batches: a 429 is recoverable, an OOM kill is not.
+	// Default 512MB; SQLite default 128MB (see applyDriverDefaults).
+	IngestPipelineMaxBytes int
+	IngestPipelineWorkers  int // default 8 worker goroutines
 	// IngestPipelinePerTenantCap caps in-flight batches per tenant so a noisy
 	// tenant cannot starve siblings of fresh queue slots when fullness is
 	// below the soft-backpressure threshold. 0 (default) disables — single-
@@ -235,6 +276,7 @@ func Load(customPath string) (*Config, error) {
 		DBDSN:             getEnv("DB_DSN", ""),
 		DLQPath:           getEnv("DLQ_PATH", "./data/dlq"),
 		DLQReplayInterval: getEnv("DLQ_REPLAY_INTERVAL", "5m"),
+		PprofAddr:         getEnv("PPROF_ADDR", "127.0.0.1:6060"),
 
 		IngestMinSeverity:      getEnv("INGEST_MIN_SEVERITY", "INFO"),
 		StoreMinSeverity:       getEnv("STORE_MIN_SEVERITY", ""),
@@ -254,6 +296,7 @@ func Load(customPath string) (*Config, error) {
 		HotRetentionDays:      getEnvInt("HOT_RETENTION_DAYS", 7),
 		RetentionBatchSize:    getEnvInt("RETENTION_BATCH_SIZE", 50000),
 		RetentionBatchSleepMs: getEnvInt("RETENTION_BATCH_SLEEP_MS", 1),
+		RetentionFullVacuum:   getEnvBool("RETENTION_FULL_VACUUM", false),
 
 		// TSDB
 		TSDBRingBufferDuration: getEnv("TSDB_RING_BUFFER_DURATION", "1h"),
@@ -291,12 +334,16 @@ func Load(customPath string) (*Config, error) {
 		LogFTSEnabled: parseTruthy(getEnv("LOG_FTS_ENABLED", "")),
 
 		// GraphRAG
-		GraphRAGWorkerCount:    getEnvInt("GRAPHRAG_WORKER_COUNT", 16),
-		GraphRAGEventQueueSize: getEnvInt("GRAPHRAG_EVENT_QUEUE_SIZE", 100000),
+		GraphRAGWorkerCount:       getEnvInt("GRAPHRAG_WORKER_COUNT", 16),
+		GraphRAGEventQueueSize:    getEnvInt("GRAPHRAG_EVENT_QUEUE_SIZE", 100000),
+		GraphRAGTraceTTL:          getEnv("GRAPHRAG_TRACE_TTL", "1h"),
+		GraphRAGMaxSpansPerTenant: getEnvInt("GRAPHRAG_MAX_SPANS_PER_TENANT", 500000),
+		GraphRAGTenantIdleTTL:     getEnv("GRAPHRAG_TENANT_IDLE_TTL", "24h"),
 
 		// Async ingest pipeline
 		IngestAsyncEnabled:         getEnvBool("INGEST_ASYNC_ENABLED", true),
 		IngestPipelineQueueSize:    getEnvInt("INGEST_PIPELINE_QUEUE_SIZE", 50000),
+		IngestPipelineMaxBytes:     getEnvInt("INGEST_PIPELINE_MAX_BYTES", 512<<20),
 		IngestPipelineWorkers:      getEnvInt("INGEST_PIPELINE_WORKERS", 8),
 		IngestPipelinePerTenantCap: getEnvInt("INGEST_PIPELINE_PER_TENANT_CAP", 0),
 
@@ -358,11 +405,24 @@ var sqliteOverrides = []struct {
 	{"DB_MAX_IDLE_CONNS", func(c *Config) { c.DBMaxIdleConns = 1 }},
 	{"INGEST_PIPELINE_WORKERS", func(c *Config) { c.IngestPipelineWorkers = 2 }},
 	{"INGEST_PIPELINE_QUEUE_SIZE", func(c *Config) { c.IngestPipelineQueueSize = 10000 }},
+	// The SQLite single writer drains slowly, so the ingest queue is the
+	// first structure to bloat — bound it to 128MB instead of 512MB.
+	{"INGEST_PIPELINE_MAX_BYTES", func(c *Config) { c.IngestPipelineMaxBytes = 128 << 20 }},
 	{"METRIC_MAX_CARDINALITY", func(c *Config) { c.MetricMaxCardinality = 3000 }},
 	{"STORE_MIN_SEVERITY", func(c *Config) { c.StoreMinSeverity = "WARN" }},
 	{"SAMPLING_RATE", func(c *Config) { c.SamplingRate = 0.05 }},
 	{"GRPC_MAX_CONCURRENT_STREAMS", func(c *Config) { c.GRPCMaxConcurrentStreams = 240 }},
 	{"LOG_FTS_ENABLED", func(c *Config) { c.LogFTSEnabled = true }},
+	// Each queued event embeds a storage.Span/Log by value (~0.5–2 KB); the
+	// 100k Postgres default is ~100 MB+ of standing buffer. On SQLite the
+	// single writer starves the workers anyway — drop sooner (metered via
+	// otelcontext_graphrag_events_dropped_total) instead of buffering RAM.
+	{"GRAPHRAG_EVENT_QUEUE_SIZE", func(c *Config) { c.GraphRAGEventQueueSize = 10000 }},
+	// The TraceStore span window dominates GraphRAG heap at 120 services
+	// (~1.5 GB potential at 1h). Anomaly/investigation lookbacks are <=5min,
+	// so halving the window costs nothing they rely on; MCP trace tools fall
+	// through to the DB for older traces.
+	{"GRAPHRAG_TRACE_TTL", func(c *Config) { c.GraphRAGTraceTTL = "30m" }},
 }
 
 func applyDriverDefaults(cfg *Config) {
@@ -512,6 +572,12 @@ func (c *Config) Validate() error {
 	}
 	if c.GRPCMaxConcurrentStreams < 1 || c.GRPCMaxConcurrentStreams > 1_000_000 {
 		return fmt.Errorf("GRPC_MAX_CONCURRENT_STREAMS must be between 1 and 1000000, got %d", c.GRPCMaxConcurrentStreams)
+	}
+	// GraphRAG event queue: the channel buffer is allocated up front and each
+	// queued event embeds a Span/Log by value (~0.5-2 KB), so an unbounded env
+	// value is a real OOM lever. 1M buffered events is already ~1-2 GB.
+	if c.GraphRAGEventQueueSize < 1 || c.GraphRAGEventQueueSize > 1_000_000 {
+		return fmt.Errorf("GRAPHRAG_EVENT_QUEUE_SIZE must be between 1 and 1000000, got %d", c.GraphRAGEventQueueSize)
 	}
 	if c.DBMaxOpenConns < 1 {
 		return fmt.Errorf("DB_MAX_OPEN_CONNS must be >= 1, got %d", c.DBMaxOpenConns)

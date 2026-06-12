@@ -10,18 +10,34 @@ import (
 	"time"
 
 	"github.com/RandomCodeSpace/otelcontext/internal/httpconst"
+	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 )
 
-// handleGetStats handles GET /api/stats
+// handleGetStats handles GET /api/stats.
+// The rendered JSON is cached for 10s per tenant with an ETag — same
+// pattern as handleGetSystemGraph. The UI footer polls this endpoint and
+// the COUNT(*) scans behind it are not free on a multi-GB SQLite file.
 func (s *Server) handleGetStats(w http.ResponseWriter, r *http.Request) {
+	cacheKey := "db_stats:" + storage.TenantFromContext(r.Context())
+	if cached, ok := s.cache.Get(cacheKey); ok {
+		cached.(*cachedJSON).write(w, r, "HIT")
+		return
+	}
+
 	stats, err := s.repo.GetStats(r.Context())
 	if err != nil {
 		slog.Error("Failed to get DB stats", "error", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	w.Header().Set(httpconst.HeaderContentType, httpconst.ContentTypeJSON)
-	_ = json.NewEncoder(w).Encode(stats)
+
+	cj, err := newCachedJSON(stats)
+	if err != nil {
+		http.Error(w, "failed to encode DB stats", http.StatusInternalServerError)
+		return
+	}
+	s.cache.Set(cacheKey, cj, hotPollCacheTTL)
+	cj.write(w, r, "MISS")
 }
 
 // handlePurge handles DELETE /api/admin/purge

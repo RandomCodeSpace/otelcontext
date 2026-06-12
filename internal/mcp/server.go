@@ -332,7 +332,9 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		s.callsServiced.Add(1)
-		s.cache.Set(tenant, params.Name, params.Arguments, toolResult)
+		if !toolResult.IsError {
+			s.cache.Set(tenant, params.Name, params.Arguments, toolResult)
+		}
 		result = toolResult
 
 	case "ping":
@@ -468,9 +470,18 @@ func (s *Server) runWithTimeout(ctx context.Context, cancel context.CancelFunc, 
 	case o := <-done:
 		return o.res, false
 	case <-ctx.Done():
-		// Goroutine still running — slot will be released when it
-		// finishes via the deferred release().
-		return ToolCallResult{}, true
+		// The handler goroutine cancels ctx (deferred) AFTER sending its
+		// result, so a finished handler can leave BOTH channels ready and
+		// select picks randomly — a queued result must win over a spurious
+		// timeout. Only an empty done channel is a real deadline overrun
+		// (goroutine still running; the deferred release() frees the slot
+		// whenever it finishes).
+		select {
+		case o := <-done:
+			return o.res, false
+		default:
+			return ToolCallResult{}, true
+		}
 	}
 }
 

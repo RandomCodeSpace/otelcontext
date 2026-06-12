@@ -12,8 +12,16 @@ import (
 // tenant slice we walk the ServiceStore and SignalStore under their own
 // locks and emit anomalies into that tenant's AnomalyStore.
 func (g *GraphRAG) detectAnomalies(ctx context.Context) {
+	prevScan := g.lastAnomalyScan.Swap(time.Now().UnixNano())
 	tenants := g.snapshotTenants()
 	for tenant, stores := range tenants {
+		// Gate: a tenant with no span/log/metric processed since the
+		// previous scan cannot have changed stats — skip the whole walk.
+		// The first scan after startup (prevScan == 0) always runs so
+		// DB-rebuilt state is examined at least once.
+		if prevScan != 0 && stores.lastEventAt.Load() < prevScan {
+			continue
+		}
 		tctx := storage.WithTenantContext(ctx, tenant)
 		g.detectAnomaliesForTenant(tctx, tenant, stores)
 	}
@@ -28,7 +36,12 @@ func (g *GraphRAG) detectAnomaliesForTenant(ctx context.Context, tenant string, 
 		baselineErrorRate := 0.02 // reasonable baseline
 		if svc.ErrorRate > baselineErrorRate*2 && svc.ErrorRate > 0.05 {
 			anomaly := AnomalyNode{
-				ID:        fmt.Sprintf("anom_%s_err_%d", svc.Name, now.UnixNano()),
+				// Stable ID per (service, type): each detection tick UPSERTS the
+				// same evolving anomaly node rather than minting a new one. With a
+				// UnixNano suffix an ongoing spike created a fresh node every 10s
+				// (and correlateWithRecent then minted O(N²) PRECEDED_BY edges),
+				// which grew the AnomalyStore to ~1.3 GB over a 15-min soak.
+				ID:        fmt.Sprintf("anom_%s_err", svc.Name),
 				Type:      AnomalyErrorSpike,
 				Severity:  classifyErrorSeverity(svc.ErrorRate),
 				Service:   svc.Name,
@@ -49,7 +62,7 @@ func (g *GraphRAG) detectAnomaliesForTenant(ctx context.Context, tenant string, 
 		// Latency degradation: p99-like check using avg * 3 as proxy
 		if svc.AvgLatency > 500 && svc.CallCount > 10 {
 			anomaly := AnomalyNode{
-				ID:        fmt.Sprintf("anom_%s_lat_%d", svc.Name, now.UnixNano()),
+				ID:        fmt.Sprintf("anom_%s_lat", svc.Name), // stable per (service,type); see error-spike note
 				Type:      AnomalyLatencySpike,
 				Severity:  classifyLatencySeverity(svc.AvgLatency),
 				Service:   svc.Name,
@@ -79,7 +92,7 @@ func (g *GraphRAG) detectAnomaliesForTenant(ctx context.Context, tenant string, 
 			deviation := (m.RollingAvg - (m.RollingMin + rangeSize/2)) / (rangeSize / 2)
 			if deviation > 3.0 || deviation < -3.0 {
 				anomaly := AnomalyNode{
-					ID:        fmt.Sprintf("anom_%s_metric_%d", m.Service, now.UnixNano()),
+					ID:        fmt.Sprintf("anom_%s_metric_%s", m.Service, m.MetricName), // stable per (service,metric)
 					Type:      AnomalyMetricZScore,
 					Severity:  SeverityWarning,
 					Service:   m.Service,
@@ -93,11 +106,17 @@ func (g *GraphRAG) detectAnomaliesForTenant(ctx context.Context, tenant string, 
 	}
 }
 
+// maxCorrelationWalk bounds how many recent anomalies correlateWithRecent
+// considers per detection. Stable per-(service,type) IDs already keep the
+// store small in steady state; this is the backstop against a pathological
+// backlog turning every 10s tick into an O(N) scan + edge fan-out.
+const maxCorrelationWalk = 1000
+
 // correlateWithRecent links an anomaly to other anomalies within ±30s in the
 // same tenant's AnomalyStore.
 func correlateWithRecent(stores *tenantStores, anomaly AnomalyNode) {
 	window := 30 * time.Second
-	recent := stores.anomalies.AnomaliesSince(anomaly.Timestamp.Add(-window))
+	recent := stores.anomalies.AnomaliesSinceLimit(anomaly.Timestamp.Add(-window), maxCorrelationWalk)
 	for _, prev := range recent {
 		if prev.ID == anomaly.ID {
 			continue

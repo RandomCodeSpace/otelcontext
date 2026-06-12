@@ -1,0 +1,10 @@
+{
+  "$comment": "Gzipped size budgets enforced by scripts/check-budgets.mjs (npm run check-budgets). 'initial' = assets referenced from dist/index.html (entry script + modulepreloads + stylesheets). Fonts are raw woff2 bytes (already compressed). C7 measured actuals after the design-system exit: initial JS 107.6 KB, initial CSS 2.7 KB, fonts 67.8 KB, largest lazy chunk 7.9 KB - budgets are actual + ~10% headroom. lazyChunkExceptions maps a chunk-name prefix (before the content hash) to a per-chunk cap; currently empty because every lazy chunk fits the default.",
+  "gzipKb": {
+    "initialJs": 118,
+    "initialCss": 6,
+    "fonts": 75,
+    "lazyChunkDefault": 10,
+    "lazyChunkExceptions": {}
+  }
+}

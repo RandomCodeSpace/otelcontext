@@ -1,0 +1,168 @@
+/* Breakpoints per styles/tokens.css: xs <768, md 768+, xl 1440+. */
+
+.shell {
+  display: flex;
+  flex-direction: column;
+  min-height: 100dvh;
+  /* Transparent so the body's --bg-app atmosphere ramp shows through. */
+  background: transparent;
+  color: var(--text-1);
+  font-family: var(--font-sans);
+  font-size: var(--text-base);
+}
+
+.body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+.main {
+  flex: 1;
+  min-width: 0;
+  padding: var(--space-3);
+  /* xs: keep content clear of the fixed bottom tab bar */
+  padding-bottom: calc(56px + var(--space-3) + env(safe-area-inset-bottom));
+}
+
+@media (min-width: 768px) {
+  .main {
+    padding: var(--space-4);
+  }
+}
+
+/* ---- icon rail (md+) ---- */
+.rail {
+  display: none;
+}
+
+@media (min-width: 768px) {
+  .rail {
+    display: flex;
+    flex: none;
+    flex-direction: column;
+    gap: var(--space-1);
+    width: 56px;
+    padding: var(--space-2) var(--space-1);
+    border-right: 1px solid var(--stroke-1);
+  }
+}
+
+@media (min-width: 1440px) {
+  .rail {
+    width: 200px;
+    padding: var(--space-2);
+  }
+}
+
+/* ---- bottom tab bar (xs only) ---- */
+.tabbar {
+  position: fixed;
+  inset: auto 0 0 0;
+  z-index: 40;
+  display: flex;
+  height: calc(56px + env(safe-area-inset-bottom));
+  padding-bottom: env(safe-area-inset-bottom);
+  border-top: 1px solid var(--stroke-1);
+  background: var(--bg-raised);
+}
+
+@media (min-width: 768px) {
+  .tabbar {
+    display: none;
+  }
+}
+
+/* ---- nav items (shared) ---- */
+.navItem {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-1);
+  min-height: 44px; /* ≥44px touch target on every pointer type */
+  border-radius: var(--radius-2);
+  color: var(--text-3);
+  text-decoration: none;
+  font-size: var(--text-2xs);
+  transition: background var(--dur-1) var(--ease), color var(--dur-1) var(--ease);
+}
+
+@media (hover: hover) {
+  .navItem:hover {
+    background: var(--bg-raised);
+    color: var(--text-1);
+  }
+}
+
+.navItemActive {
+  background: var(--accent-muted);
+  color: var(--accent);
+}
+
+/* Tab bar items share the row equally, icon stacked over label. */
+.tabbar .navItem {
+  flex: 1;
+  flex-direction: column;
+  gap: 2px;
+}
+
+/* Center palette button — same anatomy as a tab, never route-active. */
+.tabPalette {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  min-height: 44px;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-2);
+  background: transparent;
+  color: var(--text-3);
+  font-family: inherit;
+  font-size: var(--text-2xs);
+  cursor: pointer;
+  transition: background var(--dur-1) var(--ease), color var(--dur-1) var(--ease);
+}
+
+@media (hover: hover) {
+  .tabPalette:hover {
+    background: var(--bg-raised);
+    color: var(--text-1);
+  }
+}
+
+/* Rail: icon-only until xl, where labels appear inline. */
+.rail .navLabel {
+  display: none;
+}
+
+@media (min-width: 1440px) {
+  .rail .navItem {
+    justify-content: flex-start;
+    padding: 0 var(--space-3);
+    font-size: var(--text-sm);
+  }
+
+  .rail .navLabel {
+    display: inline;
+  }
+}
+
+.tooltip {
+  z-index: 50;
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--stroke-2);
+  border-radius: var(--radius-1);
+  background: var(--bg-overlay);
+  color: var(--text-1);
+  font-size: var(--text-2xs);
+}
+
+/* Labeled rail makes tooltips redundant at xl. */
+@media (min-width: 1440px) {
+  .tooltip {
+    display: none;
+  }
+}

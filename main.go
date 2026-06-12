@@ -177,6 +177,17 @@ func main() {
 
 	slog.Info("🚀 Starting OtelContext", "version", Version, "env", cfg.Env, "log_level", level)
 
+	// Pace the GC against a soft memory ceiling so RSS stays bounded under
+	// sustained ingest (honors an explicit GOMEMLIMIT; otherwise 75% of the
+	// detected cgroup/host budget). See applyMemoryLimit in memlimit.go.
+	applyMemoryLimit(75)
+
+	// Profiling is an observability aid — a busy port must not abort startup.
+	pprofSrv, _, err := startPprofServer(cfg.PprofAddr, logger)
+	if err != nil {
+		slog.Warn("pprof server disabled", "error", err, "addr", cfg.PprofAddr)
+	}
+
 	// 1. Initialize Internal Telemetry (first — everything registers metrics against this)
 	metrics := telemetry.New()
 	slog.Info("📊 Internal telemetry initialized")
@@ -201,7 +212,8 @@ func main() {
 	}
 	slog.Info("💾 Storage initialized", "driver", cfg.DBDriver)
 
-	// 2a. Retention scheduler: hourly batched purge + daily VACUUM/ANALYZE.
+	// 2a. Retention scheduler: hourly batched purge + daily maintenance
+	// (VACUUM ANALYZE / OPTIMIZE / PRAGMA optimize + incremental_vacuum).
 	ctxRetention, cancelRetention := context.WithCancel(context.Background())
 	retention := storage.NewRetentionScheduler(
 		repo,
@@ -209,6 +221,7 @@ func main() {
 		cfg.RetentionBatchSize,
 		time.Duration(cfg.RetentionBatchSleepMs)*time.Millisecond,
 	)
+	retention.SetFullVacuum(cfg.RetentionFullVacuum)
 	retention.Start(ctxRetention)
 	slog.Info("🧹 Retention scheduler started", "retention_days", cfg.HotRetentionDays)
 
@@ -345,7 +358,7 @@ func main() {
 		func() { metrics.TSDBIngestTotal.Inc() },
 		func() { metrics.TSDBBatchesDropped.Inc() },
 	)
-	ringBuf := tsdb.NewRingBuffer(120, 30*time.Second)
+	ringBuf := tsdb.NewRingBuffer(120, 30*time.Second, cfg.MetricMaxCardinality, metrics.TSDBRingSeriesRejected.Inc)
 	tsdbAgg.SetRingBuffer(ringBuf)
 	slog.Info("📈 TSDB ring buffer attached (120 slots × 30s = 1h retention)")
 
@@ -382,6 +395,15 @@ func main() {
 	graphRAGCfg := graphrag.DefaultConfig()
 	graphRAGCfg.WorkerCount = cfg.GraphRAGWorkerCount
 	graphRAGCfg.ChannelSize = cfg.GraphRAGEventQueueSize
+	graphRAGCfg.MaxSpansPerTenant = cfg.GraphRAGMaxSpansPerTenant
+	// Duration knobs follow the DLQ_REPLAY_INTERVAL pattern: unparsable
+	// values fall back to the package default rather than aborting startup.
+	if ttl, err := time.ParseDuration(cfg.GraphRAGTraceTTL); err == nil && ttl > 0 {
+		graphRAGCfg.TraceTTL = ttl
+	}
+	if idle, err := time.ParseDuration(cfg.GraphRAGTenantIdleTTL); err == nil && idle > 0 {
+		graphRAGCfg.TenantIdleTTL = idle
+	}
 	graphRAG := graphrag.New(repo, tsdbAgg, ringBuf, graphRAGCfg)
 	graphRAG.SetMetrics(metrics)
 	ctxGraphRAG, cancelGraphRAG := context.WithCancel(context.Background())
@@ -389,6 +411,9 @@ func main() {
 	slog.Info("GraphRAG started (layered graph with anomaly detection)",
 		"workers", cfg.GraphRAGWorkerCount,
 		"event_queue_size", cfg.GraphRAGEventQueueSize,
+		"trace_ttl", graphRAGCfg.TraceTTL,
+		"max_spans_per_tenant", graphRAGCfg.MaxSpansPerTenant,
+		"tenant_idle_ttl", graphRAGCfg.TenantIdleTTL,
 	)
 
 	// Auto-migrate GraphRAG models (Investigation, DrainTemplateRow)
@@ -450,6 +475,7 @@ func main() {
 		ingestPipeline = ingest.NewPipeline(repo, metrics, ingest.PipelineConfig{
 			Capacity: cfg.IngestPipelineQueueSize,
 			Workers:  cfg.IngestPipelineWorkers,
+			MaxBytes: int64(cfg.IngestPipelineMaxBytes),
 		})
 		ingestPipeline.SetPerTenantCap(cfg.IngestPipelinePerTenantCap)
 
@@ -707,6 +733,12 @@ func main() {
 
 	var httpHandler http.Handler = mux
 
+	// Gzip GET /api/* responses (innermost wrapper — only handler output is
+	// compressed; error responses written by outer middleware like auth and
+	// rate limiting stay identity-encoded, and /ws*, /v1/*, /metrics*, and
+	// the MCP/SSE path pass through untouched).
+	httpHandler = api.GzipMiddleware(cfg.MCPPath)(httpHandler)
+
 	// Resolve tenant on /api/* read-side requests (passes through OTLP /v1,
 	// MCP, UI assets, and health probes untouched).
 	httpHandler = api.TenantMiddleware(cfg)(httpHandler)
@@ -786,12 +818,34 @@ func main() {
 		defer bootWG.Done()
 		tick := time.NewTicker(1 * time.Second)
 		defer tick.Stop()
+		// Store census is len()-under-RLock per tenant — cheap, but 15s is
+		// plenty for trend attribution of RSS growth.
+		census := time.NewTicker(15 * time.Second)
+		defer census.Stop()
 		for {
 			select {
 			case <-appCtx.Done():
 				return
 			case <-tick.C:
 				metrics.GraphRAGEventBufferDepth.Set(float64(graphRAG.EventBufferDepth()))
+			case <-census.C:
+				c := graphRAG.StoreCounts()
+				ent := metrics.GraphRAGStoreEntities
+				ent.WithLabelValues("tenants").Set(float64(c.Tenants))
+				ent.WithLabelValues("services").Set(float64(c.Services))
+				ent.WithLabelValues("operations").Set(float64(c.Operations))
+				ent.WithLabelValues("traces").Set(float64(c.Traces))
+				ent.WithLabelValues("spans").Set(float64(c.Spans))
+				ent.WithLabelValues("log_clusters").Set(float64(c.LogClusters))
+				ent.WithLabelValues("metrics").Set(float64(c.Metrics))
+				ent.WithLabelValues("anomalies").Set(float64(c.Anomalies))
+				edg := metrics.GraphRAGStoreEdges
+				edg.WithLabelValues("service").Set(float64(c.ServiceEdges))
+				edg.WithLabelValues("trace").Set(float64(c.TraceEdges))
+				edg.WithLabelValues("signal").Set(float64(c.SignalEdges))
+				edg.WithLabelValues("anomaly").Set(float64(c.AnomalyEdges))
+				metrics.TSDBRingSeriesActive.Set(float64(ringBuf.MetricCount()))
+				metrics.DrainTemplatesActive.Set(float64(graphRAG.DrainTemplateCount()))
 			}
 		}
 	}()
@@ -865,6 +919,9 @@ func main() {
 	grpcServer.GracefulStop()
 	if err := srv.Shutdown(ctx); err != nil {
 		slog.Error("HTTP server forced shutdown", "error", err)
+	}
+	if pprofSrv != nil {
+		_ = pprofSrv.Close()
 	}
 
 	// 2. Stop real-time hubs and event processing

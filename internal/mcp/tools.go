@@ -387,6 +387,12 @@ func textResult(text string) ToolCallResult {
 }
 
 func resourceResult(uri, mimeType, text string) ToolCallResult {
+	if len(text) > MaxToolResponseBytes {
+		return errorResult(fmt.Sprintf(
+			"response too large: %d bytes exceeds %d-byte cap; narrow time range or use pagination",
+			len(text), MaxToolResponseBytes,
+		))
+	}
 	return ToolCallResult{
 		Content: []ContentItem{
 			{Type: "resource", Resource: &Resource{URI: uri, MimeType: mimeType, Text: text}},

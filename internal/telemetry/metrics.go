@@ -98,13 +98,38 @@ type Metrics struct {
 	// --- GraphRAG overflow ---
 	GraphRAGEventsDroppedTotal *prometheus.CounterVec
 
+	// GraphRAGTenantsEvictedTotal counts tenant store slices evicted after
+	// exceeding GRAPHRAG_TENANT_IDLE_TTL. The default tenant is never
+	// evicted; a steady non-zero rate on a single-tenant install means
+	// rogue tenant IDs are reaching ingest.
+	GraphRAGTenantsEvictedTotal prometheus.Counter
+
+	// --- In-memory store census (OOM-survival work) ---
+	// GraphRAGStoreEntities — live node counts per entity kind across tenants
+	// (tenants|services|operations|traces|spans|log_clusters|metrics|anomalies).
+	// GraphRAGStoreEdges — live edge counts per store (service|trace|signal|anomaly).
+	// Together with the ring/drain gauges these attribute RSS growth to a
+	// specific structure before a heap profile is needed.
+	GraphRAGStoreEntities *prometheus.GaugeVec
+	GraphRAGStoreEdges    *prometheus.GaugeVec
+	TSDBRingSeriesActive  prometheus.Gauge
+	// TSDBRingSeriesRejected — points refused a NEW ring series at the
+	// tenant-scoped series cap (existing series keep recording).
+	TSDBRingSeriesRejected prometheus.Counter
+	DrainTemplatesActive   prometheus.Gauge
+
 	// --- Async ingest pipeline (Phase 1 robustness work) ---
 	// IngestPipelineQueueDepth — current queue depth, sampled on every Submit.
 	// Labeled by signal so spikes can be attributed to traces vs logs.
 	IngestPipelineQueueDepth *prometheus.GaugeVec
+	// IngestPipelineQueueBytes — approximate bytes held by queued batches.
+	// Reserved at Submit, released when a worker finishes the batch; the
+	// byte cap (INGEST_PIPELINE_MAX_BYTES) rejects submissions above it.
+	IngestPipelineQueueBytes prometheus.Gauge
 	// IngestPipelineDroppedTotal — batches that did NOT reach the DB.
 	// reason="soft_backpressure" — healthy batch dropped at >=90% fullness.
 	// reason="queue_full"        — batch rejected at 100% capacity (client got 429/RESOURCE_EXHAUSTED).
+	// reason="bytes_full"        — batch rejected at the byte cap (even priority batches).
 	IngestPipelineDroppedTotal *prometheus.CounterVec
 
 	// HTTPOTLPThrottledTotal — count of HTTP 429s issued by the OTLP HTTP
@@ -323,11 +348,39 @@ func New() *Metrics {
 			Name: "otelcontext_graphrag_events_dropped_total",
 			Help: "Events dropped because the GraphRAG event channel was full.",
 		}, []string{"signal"}),
+		GraphRAGTenantsEvictedTotal: promauto.NewCounter(prometheus.CounterOpts{
+			Name: "otelcontext_graphrag_tenants_evicted_total",
+			Help: "Tenant store slices evicted after exceeding the idle TTL (GRAPHRAG_TENANT_IDLE_TTL). The default tenant is never evicted.",
+		}),
+		GraphRAGStoreEntities: promauto.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "otelcontext_graphrag_store_entities",
+			Help: "Live GraphRAG node counts across tenants, by entity kind (tenants|services|operations|traces|spans|log_clusters|metrics|anomalies).",
+		}, []string{"entity"}),
+		GraphRAGStoreEdges: promauto.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "otelcontext_graphrag_store_edges",
+			Help: "Live GraphRAG edge counts across tenants, by store (service|trace|signal|anomaly).",
+		}, []string{"store"}),
+		TSDBRingSeriesActive: promauto.NewGauge(prometheus.GaugeOpts{
+			Name: "otelcontext_tsdb_ring_series_active",
+			Help: "Distinct metric series currently held in TSDB ring buffers.",
+		}),
+		TSDBRingSeriesRejected: promauto.NewCounter(prometheus.CounterOpts{
+			Name: "otelcontext_tsdb_ring_series_rejected_total",
+			Help: "Metric points refused a new TSDB ring series at the cardinality cap (existing series keep recording).",
+		}),
+		DrainTemplatesActive: promauto.NewGauge(prometheus.GaugeOpts{
+			Name: "otelcontext_drain_templates_active",
+			Help: "Live Drain log templates (bounded by the 50k LRU cap).",
+		}),
 
 		IngestPipelineQueueDepth: promauto.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "otelcontext_ingest_pipeline_queue_depth",
 			Help: "Current depth of the async ingest pipeline queue, by signal type.",
 		}, []string{"signal"}),
+		IngestPipelineQueueBytes: promauto.NewGauge(prometheus.GaugeOpts{
+			Name: "otelcontext_ingest_pipeline_queue_bytes",
+			Help: "Approximate bytes held by batches in the async ingest queue.",
+		}),
 		HTTPOTLPThrottledTotal: promauto.NewCounterVec(prometheus.CounterOpts{
 			Name: "otelcontext_http_otlp_throttled_total",
 			Help: "OTLP HTTP requests rejected with 429 because the async ingest pipeline is at capacity, by signal type.",

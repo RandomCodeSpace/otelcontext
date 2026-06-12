@@ -1,0 +1,109 @@
+.strip {
+  flex: none;
+}
+
+.header {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  margin-bottom: var(--space-1);
+}
+
+.title {
+  margin: 0;
+  color: var(--text-3);
+  font-size: var(--text-2xs);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.range {
+  margin-left: auto;
+  color: var(--text-3);
+  font-size: var(--text-2xs);
+}
+
+.rangeNow {
+  color: var(--text-3);
+  font-size: var(--text-2xs);
+}
+
+.axis {
+  position: relative;
+  height: 44px;
+  border: 1px solid var(--stroke-1);
+  border-radius: var(--radius-2);
+  background: var(--bg-inset);
+  /* baseline */
+  background-image: linear-gradient(var(--stroke-1), var(--stroke-1));
+  background-repeat: no-repeat;
+  background-size: 100% 1px;
+  background-position: 0 50%;
+}
+
+.tick {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 16px;
+  margin-left: -8px; /* center on the x position */
+  border: none;
+  border-radius: 2px;
+  /* visual tick is a 4px bar drawn by the background on a wider hit area */
+  background-clip: content-box;
+  padding: 6px 6px;
+  cursor: pointer;
+  opacity: 0.9;
+  transition: opacity var(--dur-1) var(--ease);
+}
+
+@media (pointer: coarse) {
+  .tick {
+    width: 24px;
+    margin-left: -12px;
+    padding: 6px 10px;
+  }
+}
+
+@media (hover: hover) {
+  .tick:hover {
+    opacity: 1;
+  }
+}
+
+.skeleton {
+  height: 44px;
+  border-radius: var(--radius-2);
+  background: var(--bg-overlay);
+}
+
+.stateText {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  height: 44px;
+  margin: 0;
+  padding: 0 var(--space-3);
+  border: 1px solid var(--stroke-1);
+  border-radius: var(--radius-2);
+  color: var(--text-3);
+  font-size: var(--text-sm);
+}
+
+.retry {
+  min-height: 28px;
+  padding: 0 var(--space-2);
+  border: 1px solid var(--stroke-2);
+  border-radius: var(--radius-1);
+  background: transparent;
+  color: var(--text-1);
+  font-size: var(--text-xs);
+  cursor: pointer;
+}
+
+@media (pointer: coarse) {
+  .retry {
+    min-height: 40px;
+  }
+}

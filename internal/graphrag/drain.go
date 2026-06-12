@@ -213,6 +213,13 @@ func NewDrain(opts ...DrainOption) *Drain {
 	return d
 }
 
+// TemplateCount reports the number of live templates under the read lock.
+func (d *Drain) TemplateCount() int {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return len(d.templates)
+}
+
 // Match preprocesses the log line, descends the prefix tree, and either
 // merges into an existing template or creates a new one. Returns the
 // resulting template. Returns nil only for empty input.

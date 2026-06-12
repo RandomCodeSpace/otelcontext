@@ -60,6 +60,34 @@ type Batch struct {
 	LogCallback  func(storage.Log)
 
 	enqueuedAt time.Time
+
+	// sizeBytes is the approxBytes() estimate computed once at Submit time
+	// and released by process() — keeping the reservation and the release
+	// reading the same number even if the slices are mutated in between.
+	sizeBytes int64
+}
+
+// approxBytes estimates the heap footprint of the batch without marshaling.
+// Per-record fixed costs approximate struct overhead (time.Time fields,
+// GORM bookkeeping, slice/string headers); variable costs are the lengths
+// of the dominant string payloads — Body and AttributesJSON are what make
+// a batch fat. AttributesJSON/AIInsight are storage.CompressedText (string
+// kind), so len() over the string cast is O(1). Whole walk is O(records).
+func (b *Batch) approxBytes() int64 {
+	var n int64
+	for i := range b.Traces {
+		t := &b.Traces[i]
+		n += 128 + int64(len(t.TraceID)+len(t.ServiceName)+len(t.Status)+len(t.Operation))
+	}
+	for i := range b.Spans {
+		s := &b.Spans[i]
+		n += 256 + int64(len(s.OperationName)+len(string(s.AttributesJSON))+len(s.ServiceName)+len(s.Status))
+	}
+	for i := range b.Logs {
+		l := &b.Logs[i]
+		n += 192 + int64(len(l.Body)+len(string(l.AttributesJSON))+len(string(l.AIInsight))+len(l.ServiceName)+len(l.Severity))
+	}
+	return n
 }
 
 // Priority reports whether the batch is protected from soft-backpressure
@@ -76,6 +104,12 @@ type PipelineConfig struct {
 	Capacity      int     // total queue depth across all signal types
 	Workers       int     // worker goroutines draining the queue
 	SoftThreshold float64 // fullness fraction above which healthy batches are dropped (0.0–1.0)
+	// MaxBytes caps the approximate bytes held by queued batches. Capacity
+	// alone cannot bound memory — a single Batch may carry arbitrarily
+	// large span/log payloads. At the cap, Submit rejects with ErrQueueFull
+	// even for priority batches: a 429 is recoverable by the client's retry
+	// loop, an OOM kill is not. <=0 falls back to the 512MB default.
+	MaxBytes int64
 }
 
 // Defensive upper bounds on operator-supplied capacity/workers. Env-var
@@ -87,6 +121,10 @@ type PipelineConfig struct {
 const (
 	maxPipelineCapacity = 1_000_000
 	maxPipelineWorkers  = 256
+	// minPipelineMaxBytes is the floor for the byte cap. A sub-1MB cap
+	// would reject every gRPC batch outright (GRPC_MAX_RECV_MB default is
+	// 16) — clamp up instead of letting a typo black-hole all ingest.
+	minPipelineMaxBytes = 1 << 20
 )
 
 // DefaultPipelineConfig returns production-sized defaults.
@@ -95,6 +133,7 @@ func DefaultPipelineConfig() PipelineConfig {
 		Capacity:      50000,
 		Workers:       8,
 		SoftThreshold: 0.9,
+		MaxBytes:      512 << 20,
 	}
 }
 
@@ -140,8 +179,15 @@ type Pipeline struct {
 	processedTotal  atomic.Int64
 	droppedHealthy  atomic.Int64
 	rejectedFull    atomic.Int64
+	rejectedBytes   atomic.Int64
 	processFailures atomic.Int64
 	tenantDropped   atomic.Int64
+
+	// inFlightBytes tracks the approxBytes() sum of every batch currently
+	// in the queue or being processed. Reserved in Submit before the
+	// channel send, released by process() (deferred, so the panic path
+	// releases too). Bounded by cfg.MaxBytes.
+	inFlightBytes atomic.Int64
 
 	// Per-tenant in-flight cap — bounds the queue slots a single tenant
 	// can consume so a noisy tenant cannot starve siblings of fresh
@@ -201,6 +247,16 @@ func NewPipeline(writer pipelineWriter, metrics *telemetry.Metrics, cfg Pipeline
 	}
 	cfg.Capacity = capacity
 	cfg.Workers = workers
+	if cfg.MaxBytes <= 0 {
+		cfg.MaxBytes = d.MaxBytes
+	}
+	if cfg.MaxBytes < minPipelineMaxBytes {
+		slog.Warn("ingest pipeline: max bytes clamped up to floor — a sub-1MB cap would reject every gRPC batch",
+			"requested", cfg.MaxBytes,
+			"min", int64(minPipelineMaxBytes),
+		)
+		cfg.MaxBytes = minPipelineMaxBytes
+	}
 	// Zero-value config falls back to defaults — the field is internal
 	// (no env-var surface) and TestPipeline_DefaultsApplied enforces this.
 	// Priority-only mode (always-soft-drop) is not a supported configuration
@@ -300,9 +356,13 @@ func (p *Pipeline) Submit(b *Batch) error {
 		return nil
 	}
 	b.enqueuedAt = time.Now()
+	b.sizeBytes = b.approxBytes()
 
-	fullness := float64(len(p.queue)) / float64(p.cfg.Capacity)
-	if fullness >= p.cfg.SoftThreshold && !b.Priority() {
+	// Soft backpressure engages on whichever dimension is more saturated:
+	// item count (many small batches) or bytes (few fat batches).
+	itemFullness := float64(len(p.queue)) / float64(p.cfg.Capacity)
+	byteFullness := float64(p.inFlightBytes.Load()) / float64(p.cfg.MaxBytes)
+	if max(itemFullness, byteFullness) >= p.cfg.SoftThreshold && !b.Priority() {
 		p.droppedHealthy.Add(1)
 		p.observeDrop(b.Type, "soft_backpressure")
 		return nil
@@ -326,12 +386,28 @@ func (p *Pipeline) Submit(b *Batch) error {
 		p.tenantMu.Unlock()
 	}
 
+	// Byte-cap reservation — after the soft and tenant checks so dropped
+	// batches never reserve, before the channel send so the cap is never
+	// overshot. Priority batches get NO exemption here: a 429 is
+	// recoverable by the OTLP client's retry loop, an OOM kill is not.
+	if newTotal := p.inFlightBytes.Add(b.sizeBytes); newTotal > p.cfg.MaxBytes {
+		p.inFlightBytes.Add(-b.sizeBytes)
+		if tenantReserved {
+			p.releaseTenantSlot(b.Tenant)
+		}
+		p.rejectedBytes.Add(1)
+		p.observeDrop(b.Type, "bytes_full")
+		return ErrQueueFull
+	}
+
 	select {
 	case p.queue <- b:
 		p.enqueuedTotal.Add(1)
 		p.observeQueueDepth(b.Type)
+		p.observeQueueBytes()
 		return nil
 	default:
+		p.inFlightBytes.Add(-b.sizeBytes)
 		if tenantReserved {
 			p.releaseTenantSlot(b.Tenant)
 		}
@@ -377,10 +453,13 @@ func (p *Pipeline) Stats() PipelineStats {
 		Processed:       p.processedTotal.Load(),
 		DroppedHealthy:  p.droppedHealthy.Load(),
 		RejectedFull:    p.rejectedFull.Load(),
+		RejectedBytes:   p.rejectedBytes.Load(),
 		ProcessFailures: p.processFailures.Load(),
 		StoreFiltered:   p.storeFiltered.Load(),
 		QueueDepth:      len(p.queue),
 		Capacity:        p.cfg.Capacity,
+		QueueBytes:      p.inFlightBytes.Load(),
+		MaxBytes:        p.cfg.MaxBytes,
 	}
 }
 
@@ -390,10 +469,13 @@ type PipelineStats struct {
 	Processed       int64
 	DroppedHealthy  int64
 	RejectedFull    int64
+	RejectedBytes   int64 // batches rejected because the byte cap was exceeded
 	ProcessFailures int64
 	StoreFiltered   int64 // logs dropped by STORE_MIN_SEVERITY at persist time
 	QueueDepth      int
 	Capacity        int
+	QueueBytes      int64 // approx bytes currently reserved by in-flight batches
+	MaxBytes        int64 // configured byte cap
 }
 
 // worker drains the queue. Exits when stopCh closes (after draining
@@ -436,6 +518,15 @@ func (p *Pipeline) process(b *Batch) {
 	if b == nil {
 		return
 	}
+	// Release the byte reservation taken at Submit time. Unconditional —
+	// every batch that reached the channel reserved sizeBytes, priority or
+	// not — and deferred so the panic path below releases too. Mirrors the
+	// reservation exactly; an asymmetry here ratchets inFlightBytes up
+	// until the cap rejects all traffic.
+	defer func() {
+		p.inFlightBytes.Add(-b.sizeBytes)
+		p.observeQueueBytes()
+	}()
 	// Release the per-tenant slot reserved at Submit time. Registered as
 	// a defer so it runs even if the batch panics. Priority batches don't
 	// reserve at submit, so they don't release here either — the conditions
@@ -505,6 +596,13 @@ func (p *Pipeline) observeQueueDepth(t SignalType) {
 		return
 	}
 	p.metrics.IngestPipelineQueueDepth.WithLabelValues(signalLabel(t)).Set(float64(len(p.queue)))
+}
+
+func (p *Pipeline) observeQueueBytes() {
+	if p.metrics == nil || p.metrics.IngestPipelineQueueBytes == nil {
+		return
+	}
+	p.metrics.IngestPipelineQueueBytes.Set(float64(p.inFlightBytes.Load()))
 }
 
 func (p *Pipeline) observeDrop(t SignalType, reason string) {

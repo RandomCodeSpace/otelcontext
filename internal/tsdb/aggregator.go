@@ -26,13 +26,13 @@ type RawMetric struct {
 
 // Aggregator manages in-memory tumbling windows for metrics.
 type Aggregator struct {
-	repo           *storage.Repository
-	windowSize     time.Duration
-	buckets        map[string]*storage.MetricBucket
-	mu             sync.Mutex
-	stopChan       chan struct{}
-	flushChan chan []storage.MetricBucket
-	pool      sync.Pool
+	repo       *storage.Repository
+	windowSize time.Duration
+	buckets    map[string]*storage.MetricBucket
+	mu         sync.Mutex
+	stopChan   chan struct{}
+	flushChan  chan []storage.MetricBucket
+	pool       sync.Pool
 	// droppedBatches is incremented in flush() (under no lock other than
 	// the outer mu — but the increment path runs after the unlock) and
 	// read by DroppedBatches() concurrently from telemetry scrape paths.
@@ -52,11 +52,11 @@ type Aggregator struct {
 	// to a tenant-specific overflow bucket so a noisy tenant cannot
 	// starve siblings of fresh series. seriesPerTenant counts unique
 	// (non-overflow) bucket keys per tenant and is reset by flush().
-	maxCardinality       int                    // 0 = unlimited
-	perTenantCardinality int                    // 0 = unlimited (global cap still applies)
-	cardinalityOverflow  func(tenantID string)  // labeled per overflow event for Prometheus
-	seriesPerTenant      map[string]int         //nolint:unused // touched only via mu
-	overflowKey          string                 // constant key for the global overflow bucket
+	maxCardinality       int                   // 0 = unlimited
+	perTenantCardinality int                   // 0 = unlimited (global cap still applies)
+	cardinalityOverflow  func(tenantID string) // labeled per overflow event for Prometheus
+	seriesPerTenant      map[string]int        // touched only via mu
+	overflowKey          string                // constant key for the global overflow bucket
 
 	// Ring buffer accelerator (optional)
 	ring *RingBuffer
@@ -161,8 +161,10 @@ func (a *Aggregator) Ingest(m RawMetric) {
 	key := fmt.Sprintf("%s|%s|%s|%s", m.TenantID, m.ServiceName, m.Name, string(attrJSON))
 
 	// Feed ring buffer and metric counter outside the lock (both are thread-safe).
+	// The ring enforces its own tenant-scoped series cap and counts rejections
+	// via its onSeriesRejected callback, so the bool result is not re-counted here.
 	if a.ring != nil {
-		a.ring.Record(m.Name, m.ServiceName, m.Value, m.Timestamp)
+		a.ring.Record(m.TenantID, m.Name, m.ServiceName, m.Value, m.Timestamp)
 	}
 	if a.onIngest != nil {
 		a.onIngest()

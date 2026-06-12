@@ -1,15 +1,22 @@
-import { lazy, Suspense, useState } from 'react'
-import { AppShell, Spin } from '@ossrandom/design-system'
-import TopNav, { type OtelView } from './components/nav/TopNav'
-import DashboardView from './components/dashboard/DashboardView'
-import { useWebSocket } from './hooks/useWebSocket'
+import { lazy, Suspense, useCallback, useState } from 'react'
+import { Redirect, Route, Switch } from 'wouter'
+import RouteFallback from './components/common/RouteFallback'
+import Shell from './components/shell/Shell'
+import TrailBar from './components/trail/TrailBar'
+import { useGlobalKeys } from './hooks/useGlobalKeys'
+import { useInvestigation } from './hooks/useInvestigation'
 import type { Theme } from './hooks/useTheme'
+import styles from './App.module.css'
 
-// Dashboard is the default view and loads eagerly. The Service Map pulls in
-// cytoscape (~434 KB) and the MCP console is a large secondary surface — both
-// are code-split so they don't weigh down the initial dashboard-first load.
-const ServicesView = lazy(() => import('./components/observability/ServicesView'))
-const MCPConsoleView = lazy(() => import('./components/mcp/MCPConsoleView'))
+// All routes are code-split; the Inspector is split too and only fetched
+// once a ?service= drill-down actually happens. The ⌘K palette + shortcut
+// sheet chunk loads on the first open request — zero cost until then.
+const TriageView = lazy(() => import('./components/triage/TriageView'))
+const FlowMapView = lazy(() => import('./components/map/FlowMapView'))
+const TracesView = lazy(() => import('./components/traces/TracesView'))
+const LogsView = lazy(() => import('./components/logs/LogsView'))
+const ServiceInspector = lazy(() => import('./components/inspector/ServiceInspector'))
+const PaletteHost = lazy(() => import('./components/palette/PaletteHost'))
 
 interface AppProps {
   theme: Theme
@@ -17,30 +24,68 @@ interface AppProps {
 }
 
 export default function App({ theme, onToggleTheme }: Readonly<AppProps>) {
-  const [view, setView] = useState<OtelView>('dashboard')
+  const { service, trail, popToFrame, popOne } = useInvestigation()
 
-  // WebSocket retained purely as the live/offline source for the header badge;
-  // the pushed log batches are intentionally discarded.
-  const ws = useWebSocket(() => undefined)
-  const wsConnected = ws.status === 'connected'
+  const [paletteOpen, setPaletteOpen] = useState(false)
+  const [shortcutsOpen, setShortcutsOpen] = useState(false)
+  // Latches true on the first open request and stays — the chunk loads
+  // once, after which open/close is instant.
+  const [overlaysWanted, setOverlaysWanted] = useState(false)
+
+  const openPalette = useCallback(() => {
+    setOverlaysWanted(true)
+    setPaletteOpen(true)
+  }, [])
+  const togglePalette = useCallback(() => {
+    setOverlaysWanted(true)
+    setPaletteOpen((open) => !open)
+  }, [])
+  const openShortcuts = useCallback(() => {
+    setOverlaysWanted(true)
+    setShortcutsOpen(true)
+  }, [])
+  useGlobalKeys({ onPalette: togglePalette, onShortcuts: openShortcuts })
 
   return (
-    <AppShell
-      header={
-        <TopNav
-          view={view}
-          onNavigate={setView}
-          wsConnected={wsConnected}
-          theme={theme}
-          onToggleTheme={onToggleTheme}
-        />
-      }
+    <Shell
+      theme={theme}
+      onToggleTheme={onToggleTheme}
+      onOpenPalette={openPalette}
     >
-      <Suspense fallback={<Spin label="Loading…" />}>
-        {view === 'dashboard' && <DashboardView onNavigate={setView} />}
-        {view === 'services' && <ServicesView />}
-        {view === 'mcp' && <MCPConsoleView />}
-      </Suspense>
-    </AppShell>
+      <div className={styles.layout}>
+        <div className={styles.routes}>
+          <Suspense fallback={<RouteFallback />}>
+            <Switch>
+              <Route path="/" component={TriageView} />
+              <Route path="/map" component={FlowMapView} />
+              <Route path="/traces" component={TracesView} />
+              <Route path="/logs" component={LogsView} />
+              {/* Unknown paths (incl. the retired /dashboard and /mcp)
+                  land on the Triage home. */}
+              <Route>
+                <Redirect to="/" replace />
+              </Route>
+            </Switch>
+          </Suspense>
+        </div>
+        {service !== null && (
+          <Suspense fallback={null}>
+            <ServiceInspector />
+          </Suspense>
+        )}
+      </div>
+      <TrailBar frames={trail} onPopTo={popToFrame} onPopOne={popOne} />
+      {overlaysWanted && (
+        <Suspense fallback={null}>
+          <PaletteHost
+            paletteOpen={paletteOpen}
+            onPaletteOpenChange={setPaletteOpen}
+            shortcutsOpen={shortcutsOpen}
+            onShortcutsOpenChange={setShortcutsOpen}
+            onToggleTheme={onToggleTheme}
+          />
+        </Suspense>
+      )}
+    </Shell>
   )
 }

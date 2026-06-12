@@ -5,25 +5,13 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"strconv"
 
 	"github.com/RandomCodeSpace/otelcontext/internal/api/views"
 )
 
 // handleGetTraces handles GET /api/traces
 func (s *Server) handleGetTraces(w http.ResponseWriter, r *http.Request) {
-	limit := 20
-	offset := 0
-	if l := r.URL.Query().Get("limit"); l != "" {
-		if v, err := strconv.Atoi(l); err == nil {
-			limit = v
-		}
-	}
-	if o := r.URL.Query().Get("offset"); o != "" {
-		if v, err := strconv.Atoi(o); err == nil {
-			offset = v
-		}
-	}
+	limit, offset := parsePaging(r, 20)
 
 	start, end, err := parseTimeRange(r)
 	if err != nil {

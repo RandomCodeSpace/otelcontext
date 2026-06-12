@@ -1,0 +1,120 @@
+.container {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  border: 1px solid var(--stroke-1);
+  border-radius: var(--radius-2);
+  background: var(--bg-inset);
+  overflow: hidden;
+}
+
+.container:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+  /* pan/pinch are ours — but ONLY on the SVG, never the page */
+  touch-action: none;
+  cursor: grab;
+}
+
+.svg:active {
+  cursor: grabbing;
+}
+
+/* ---- nodes ---- */
+.node {
+  cursor: pointer;
+  transition: opacity var(--dur-2) var(--ease);
+}
+
+.nodeRect {
+  fill: var(--bg-raised);
+  stroke: var(--stroke-2);
+  stroke-width: 1;
+  transition: stroke var(--dur-2) var(--ease);
+}
+
+@media (hover: hover) {
+  .node:hover .nodeRect {
+    stroke: var(--text-3);
+  }
+}
+
+.nodeSelected {
+  stroke: var(--accent);
+  stroke-width: 2;
+}
+
+.nodeFocused {
+  stroke: var(--accent);
+  stroke-width: 2;
+  stroke-dasharray: 4 3;
+}
+
+/* Blast-radius cone (?impact=): --crit tint over the node fill, strength
+ * by depth via inline fillOpacity (lib/impact.impactAlpha). */
+.nodeImpact {
+  fill: var(--crit);
+  pointer-events: none;
+}
+
+.nodeImpactRoot {
+  stroke: var(--crit);
+  stroke-width: 2;
+}
+
+.nodeDot {
+  fill: var(--node-color);
+}
+
+.nodeName {
+  fill: var(--text-1);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  pointer-events: none;
+}
+
+.nodeErr {
+  fill: var(--text-2);
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  text-anchor: end;
+  pointer-events: none;
+}
+
+/* ---- edges ---- */
+.edge {
+  fill: none;
+  stroke: var(--stroke-2);
+  stroke-width: var(--edge-w, 1);
+  stroke-linecap: round;
+  transition: opacity var(--dur-2) var(--ease);
+}
+
+.edgeFailing {
+  stroke: var(--crit);
+}
+
+/* Animated dashes ONLY on failing edges AND only when motion is allowed. */
+@media (prefers-reduced-motion: no-preference) {
+  .edgeFailing {
+    stroke-dasharray: 7 5;
+    animation: edge-dash 1s linear infinite;
+  }
+}
+
+@keyframes edge-dash {
+  to {
+    stroke-dashoffset: -12;
+  }
+}
+
+/* Selection: 1-hop neighborhood stays at full opacity, the rest dims. */
+.dimmed {
+  opacity: 0.35;
+}

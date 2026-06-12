@@ -46,6 +46,7 @@ type Span struct {
 	EndTime        time.Time `json:"end_time"`
 	Duration       int64     `json:"duration"`
 	ServiceName    string    `json:"service_name"`
+	Status         string    `json:"status"`
 	AttributesJSON string    `json:"attributes_json"`
 }
 
@@ -244,6 +245,7 @@ func SpanFromModel(m storage.Span) Span {
 		EndTime:        m.EndTime,
 		Duration:       m.Duration,
 		ServiceName:    m.ServiceName,
+		Status:         m.Status,
 		AttributesJSON: string(m.AttributesJSON),
 	}
 }

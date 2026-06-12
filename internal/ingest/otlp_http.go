@@ -37,9 +37,16 @@ const headerContentType = "Content-Type" //nolint:goconst // single literal; Son
 // to the request context before delegating to the gRPC Export methods.
 // Uses the shared storage.WithTenantContext helper so ingest and read paths
 // agree on the context key.
+//
+// The raw header value is run through storage.SanitizeTenantID — the same
+// sanitizer applied on the gRPC metadata path in tenantFromContext — so
+// control characters, oversized strings, and empty values are rejected
+// identically regardless of transport.
 func withTenantFromHTTP(r *http.Request) context.Context {
 	if v := r.Header.Get("X-Tenant-ID"); v != "" {
-		return storage.WithTenantContext(r.Context(), v)
+		if sanitized := storage.SanitizeTenantID(v); sanitized != "" {
+			return storage.WithTenantContext(r.Context(), sanitized)
+		}
 	}
 	return r.Context()
 }

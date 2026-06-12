@@ -8,6 +8,22 @@ import (
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 )
 
+const (
+	// signalRetention bounds MetricNodes and signal-store edges: anything
+	// not refreshed within this window is swept on the refresh tick.
+	signalRetention = 24 * time.Hour
+	// maxMetricsPerTenant caps each tenant's SignalStore metric map; past
+	// the cap the oldest-LastSeen series are evicted first.
+	maxMetricsPerTenant = 2000
+	// rebuildRowLimit caps how many span rows a single per-tenant rebuild
+	// pass loads. Hitting it is logged — topology lags until the next tick.
+	rebuildRowLimit = 50000
+	// rebuildOverlap is re-read behind the high-water-mark on each
+	// incremental rebuild so late-arriving spans with slightly older
+	// start_time values are still merged.
+	rebuildOverlap = 5 * time.Minute
+)
+
 // refreshLoop periodically rebuilds/merges from DB and prunes stale data.
 // Work is sharded per tenant: on each tick we snapshot the coordinator's
 // tenant map, then rebuild and prune each slice under its own lock. Tenants
@@ -29,13 +45,22 @@ func (g *GraphRAG) refreshLoop(ctx context.Context) {
 		case <-ticker.C:
 			g.rebuildAllTenantsFromDB(ctx)
 			pruned := 0
+			prunedMetrics := 0
+			signalCutoff := time.Now().Add(-signalRetention)
 			for _, stores := range g.snapshotTenants() {
 				pruned += stores.traces.Prune()
+				prunedMetrics += stores.signals.Prune(signalCutoff, maxMetricsPerTenant)
 			}
 			if pruned > 0 {
 				slog.Debug("GraphRAG pruned expired traces/spans", "count", pruned)
 			}
+			if prunedMetrics > 0 {
+				slog.Debug("GraphRAG pruned stale/over-cap metrics", "count", prunedMetrics)
+			}
 			g.pruneOldAnomalies()
+			if evicted := g.evictIdleTenants(); evicted > 0 {
+				slog.Info("GraphRAG evicted idle tenant stores", "count", evicted)
+			}
 			// Bound the investigation cooldown map. The 10m cutoff is 2×
 			// the cooldown window (5m) — it retains entries through the
 			// active suppression plus a grace period. This assumes the
@@ -47,6 +72,39 @@ func (g *GraphRAG) refreshLoop(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// evictIdleTenants drops tenant store slices whose lastAccess is older than
+// tenantIdleTTL (GRAPHRAG_TENANT_IDLE_TTL, default 24h). The default tenant
+// is never evicted — single-tenant installs route everything through it.
+// Eviction is self-healing: a tenant that is actually active reappears
+// within one refresh tick (rebuildAllTenantsFromDB re-discovers it from
+// recent spans) or instantly on the next ingest event / query via
+// storesForTenant. Returns the number of slices evicted.
+func (g *GraphRAG) evictIdleTenants() int {
+	if g.tenantIdleTTL <= 0 {
+		return 0
+	}
+	cutoff := time.Now().Add(-g.tenantIdleTTL).UnixNano()
+	g.tenantsMu.Lock()
+	evicted := 0
+	for tenant, st := range g.tenants {
+		if tenant == storage.DefaultTenantID {
+			continue
+		}
+		if st.lastAccess.Load() < cutoff {
+			delete(g.tenants, tenant)
+			evicted++
+		}
+	}
+	g.tenantsMu.Unlock()
+	if evicted > 0 {
+		g.tenantsEvicted.Add(int64(evicted))
+		if g.metrics != nil && g.metrics.GraphRAGTenantsEvictedTotal != nil {
+			g.metrics.GraphRAGTenantsEvictedTotal.Add(float64(evicted))
+		}
+	}
+	return evicted
 }
 
 // snapshotLoop persists Drain templates on the configured cadence so a
@@ -132,6 +190,20 @@ func (g *GraphRAG) rebuildAllTenantsFromDB(ctx context.Context) {
 	}
 }
 
+// incrementalSince narrows the rebuild window for a tenant that already has
+// a high-water-mark: only spans newer than HWM minus rebuildOverlap need
+// re-reading — at 120 services the full-window re-read every 60s dominated
+// DB load. A fresh slice (first build, post-eviction) has HWM 0 and keeps
+// the full trailing window.
+func incrementalSince(stores *tenantStores, since time.Time) time.Time {
+	if hwm := stores.lastRebuildMax.Load(); hwm != 0 {
+		if t := time.Unix(0, hwm).Add(-rebuildOverlap); t.After(since) {
+			return t
+		}
+	}
+	return since
+}
+
 // rebuildFromDBForTenant loads recent span data for a single tenant and
 // merges it into that tenant's slice of the graph. Catches data from before
 // callbacks started (e.g., restart recovery).
@@ -147,7 +219,11 @@ func (g *GraphRAG) rebuildFromDBForTenant(_ context.Context, tenant string, sinc
 		StartTime     time.Time
 	}
 
-	stores := g.storesForTenant(tenant)
+	// NoTouch: a 60s bookkeeping rebuild must not refresh the idle-eviction
+	// clock, or dormant tenants would never reach GRAPHRAG_TENANT_IDLE_TTL.
+	stores := g.tenantStoresNoTouch(tenant)
+
+	since = incrementalSince(stores, since)
 
 	var rows []spanRow
 	err := g.repo.DB().
@@ -155,11 +231,15 @@ func (g *GraphRAG) rebuildFromDBForTenant(_ context.Context, tenant string, sinc
 		Select("span_id, parent_span_id, service_name, operation_name, duration, trace_id, status, start_time").
 		Where("start_time > ? AND tenant_id = ?", since, tenant).
 		Order("start_time ASC").
-		Limit(50000).
+		Limit(rebuildRowLimit).
 		Find(&rows).Error
 	if err != nil {
 		slog.Error("GraphRAG: failed to rebuild from DB", "tenant", tenant, "error", err)
 		return
+	}
+	if len(rows) == rebuildRowLimit {
+		slog.Warn("GraphRAG rebuild hit the row limit — topology lags until the next tick",
+			"tenant", tenant, "limit", rebuildRowLimit)
 	}
 
 	if len(rows) == 0 {
@@ -187,6 +267,12 @@ func (g *GraphRAG) rebuildFromDBForTenant(_ context.Context, tenant string, sinc
 				stores.service.UpsertCallEdge(parentSvc, r.ServiceName, durationMs, isError, r.StartTime)
 			}
 		}
+	}
+
+	// Advance the high-water-mark to the newest start_time merged. Rows are
+	// ordered ASC, so the last row carries the max; never move backwards.
+	if hwm := rows[len(rows)-1].StartTime.UnixNano(); hwm > stores.lastRebuildMax.Load() {
+		stores.lastRebuildMax.Store(hwm)
 	}
 
 	slog.Debug("GraphRAG rebuilt from DB",

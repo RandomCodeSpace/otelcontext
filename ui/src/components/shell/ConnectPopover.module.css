@@ -1,0 +1,103 @@
+.trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: 28px;
+  padding: 0 var(--space-2);
+  border: 1px solid var(--stroke-1);
+  border-radius: var(--radius-1);
+  background: transparent;
+  color: var(--text-2);
+  font: inherit;
+  font-size: var(--text-xs);
+  cursor: pointer;
+  transition: background var(--dur-1) var(--ease), color var(--dur-1) var(--ease);
+}
+
+@media (hover: hover) {
+  .trigger:hover {
+    background: var(--bg-raised);
+    color: var(--text-1);
+  }
+}
+
+@media (pointer: coarse) {
+  .trigger {
+    min-height: 44px;
+    min-width: 44px;
+    justify-content: center;
+  }
+}
+
+/* xs: icon only — the label costs pulse-bar room the summary needs */
+.triggerLabel {
+  display: none;
+}
+
+@media (min-width: 768px) {
+  .triggerLabel {
+    display: inline;
+  }
+}
+
+.content {
+  z-index: 50;
+  min-width: 280px;
+  max-width: min(420px, calc(100vw - 16px));
+  padding: var(--space-1);
+  border: 1px solid var(--stroke-2);
+  border-radius: var(--radius-2);
+  background: var(--bg-overlay);
+  box-shadow: var(--shadow-sheet);
+}
+
+.item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: 32px;
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-1);
+  color: var(--text-2);
+  font-size: var(--text-xs);
+  cursor: pointer;
+  outline: none;
+}
+
+.item[data-highlighted] {
+  background: var(--accent-muted);
+  color: var(--text-1);
+}
+
+@media (pointer: coarse) {
+  .item {
+    min-height: 44px;
+  }
+}
+
+.itemLabel {
+  flex: none;
+  min-width: 72px;
+  color: var(--text-1);
+}
+
+.itemValue {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  color: var(--text-2);
+}
+
+.copyIcon {
+  flex: none;
+  color: var(--text-3);
+}
+
+.copiedIcon {
+  flex: none;
+  color: var(--ok);
+}

@@ -13,11 +13,14 @@ var sqliteEnvKeys = []string{
 	"DB_MAX_IDLE_CONNS",
 	"INGEST_PIPELINE_WORKERS",
 	"INGEST_PIPELINE_QUEUE_SIZE",
+	"INGEST_PIPELINE_MAX_BYTES",
 	"METRIC_MAX_CARDINALITY",
 	"STORE_MIN_SEVERITY",
 	"SAMPLING_RATE",
 	"GRPC_MAX_CONCURRENT_STREAMS",
 	"LOG_FTS_ENABLED",
+	"GRAPHRAG_EVENT_QUEUE_SIZE",
+	"GRAPHRAG_TRACE_TTL",
 }
 
 // clearSQLiteEnv unsets every env var consulted by applyDriverDefaults so
@@ -46,15 +49,18 @@ func clearSQLiteEnv(t *testing.T) {
 func postgresDefaultsConfig(driver string) *Config {
 	return &Config{
 		DBDriver:                 driver,
-		DBMaxOpenConns:           50,    // Postgres default
-		DBMaxIdleConns:           10,    // Postgres default
-		IngestPipelineWorkers:    8,     // Postgres default
-		IngestPipelineQueueSize:  50000, // Postgres default
-		MetricMaxCardinality:     10000, // Postgres default
-		StoreMinSeverity:         "",    // same-as-ingest default
-		SamplingRate:             1.0,   // keep-all default
-		GRPCMaxConcurrentStreams: 1000,  // Postgres default
-		LogFTSEnabled:            false, // FTS5 opt-in default
+		DBMaxOpenConns:           50,        // Postgres default
+		DBMaxIdleConns:           10,        // Postgres default
+		IngestPipelineWorkers:    8,         // Postgres default
+		IngestPipelineQueueSize:  50000,     // Postgres default
+		IngestPipelineMaxBytes:   512 << 20, // Postgres default
+		MetricMaxCardinality:     10000,     // Postgres default
+		StoreMinSeverity:         "",        // same-as-ingest default
+		SamplingRate:             1.0,       // keep-all default
+		GRPCMaxConcurrentStreams: 1000,      // Postgres default
+		GraphRAGEventQueueSize:   100000,    // Postgres default
+		LogFTSEnabled:            false,     // FTS5 opt-in default
+		GraphRAGTraceTTL:         "1h",      // Postgres default
 	}
 }
 
@@ -75,11 +81,14 @@ func TestApplyDriverDefaults_SQLite_FlipsAllWhenNoEnv(t *testing.T) {
 		{"DBMaxIdleConns", cfg.DBMaxIdleConns, 1},
 		{"IngestPipelineWorkers", cfg.IngestPipelineWorkers, 2},
 		{"IngestPipelineQueueSize", cfg.IngestPipelineQueueSize, 10000},
+		{"IngestPipelineMaxBytes", cfg.IngestPipelineMaxBytes, 128 << 20},
 		{"MetricMaxCardinality", cfg.MetricMaxCardinality, 3000},
 		{"StoreMinSeverity", cfg.StoreMinSeverity, "WARN"},
 		{"SamplingRate", cfg.SamplingRate, 0.05},
 		{"GRPCMaxConcurrentStreams", cfg.GRPCMaxConcurrentStreams, 240},
 		{"LogFTSEnabled", cfg.LogFTSEnabled, true},
+		{"GraphRAGEventQueueSize", cfg.GraphRAGEventQueueSize, 10000},
+		{"GraphRAGTraceTTL", cfg.GraphRAGTraceTTL, "30m"},
 	}
 	for _, c := range cases {
 		if c.got != c.want {

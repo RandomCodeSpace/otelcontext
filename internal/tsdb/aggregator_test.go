@@ -250,6 +250,34 @@ func TestAggregator_DefaultBehaviorUnchanged(t *testing.T) {
 	}
 }
 
+// TestAggregator_IngestFeedsRingWithTenant verifies Ingest plumbs the
+// point's TenantID into the attached ring buffer, so two tenants emitting
+// the same service+metric never merge into one ring series.
+func TestAggregator_IngestFeedsRingWithTenant(t *testing.T) {
+	a := NewAggregator(nil, time.Minute)
+	rb := NewRingBuffer(8, time.Minute, 0, nil)
+	a.SetRingBuffer(rb)
+
+	mA := newRawMetric("tenant-a", "svc", "latency", 0)
+	mA.Value = 1.0
+	a.Ingest(mA)
+	mB := newRawMetric("tenant-b", "svc", "latency", 0)
+	mB.Value = 100.0
+	a.Ingest(mB)
+
+	aggsA := rb.QueryRecent("tenant-a", "latency", "svc", 8)
+	if len(aggsA) != 1 || aggsA[0].Sum != 1.0 {
+		t.Errorf("tenant-a ring aggs=%v, want one window with Sum=1", aggsA)
+	}
+	aggsB := rb.QueryRecent("tenant-b", "latency", "svc", 8)
+	if len(aggsB) != 1 || aggsB[0].Sum != 100.0 {
+		t.Errorf("tenant-b ring aggs=%v, want one window with Sum=100", aggsB)
+	}
+	if got := rb.MetricCount(); got != 2 {
+		t.Errorf("ring MetricCount=%d, want 2 tenant-scoped series", got)
+	}
+}
+
 // TestAggregator_OverflowBucketStatsCorrect ensures that successive
 // overflow points for the same tenant accumulate into ONE overflow
 // bucket (not many) and that min/max/sum/count update correctly.

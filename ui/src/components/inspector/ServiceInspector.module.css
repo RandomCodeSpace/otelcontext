@@ -1,0 +1,525 @@
+/* Service Inspector — md: fixed overlay sheet; lg: docked 380px column;
+ * xl: 440px. The xs bottom sheet is a separate Radix dialog (below). */
+
+.panel {
+  position: fixed;
+  inset: 0 0 0 auto;
+  z-index: 45;
+  display: flex;
+  flex-direction: column;
+  width: min(420px, calc(100vw - 48px));
+  border-left: 1px solid var(--stroke-1);
+  background: var(--bg-raised);
+  box-shadow: var(--shadow-sheet);
+  overflow-y: auto;
+}
+
+@media (min-width: 1024px) {
+  .panel {
+    position: static;
+    z-index: auto;
+    flex: none;
+    width: 380px;
+    background: transparent;
+    box-shadow: none;
+  }
+}
+
+@media (min-width: 1440px) {
+  .panel {
+    width: 440px;
+  }
+}
+
+/* ---- header ---- */
+.header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border-bottom: 1px solid var(--stroke-1);
+}
+
+.statusDot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+
+.name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-base);
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.health {
+  color: var(--text-2);
+  font-size: var(--text-sm);
+}
+
+.close {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  margin: -10px -10px -10px 0;
+  border: none;
+  border-radius: var(--radius-2);
+  background: transparent;
+  color: var(--text-2);
+  cursor: pointer;
+  transition: background var(--dur-1) var(--ease), color var(--dur-1) var(--ease);
+}
+
+@media (hover: hover) {
+  .close:hover {
+    background: var(--bg-overlay);
+    color: var(--text-1);
+  }
+}
+
+/* ---- tabs ---- */
+.tabs {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.tabList {
+  display: flex;
+  flex: none;
+  gap: var(--space-1);
+  padding: var(--space-2) var(--space-3) 0;
+  border-bottom: 1px solid var(--stroke-1);
+  overflow-x: auto;
+}
+
+.tabTrigger {
+  min-height: 36px;
+  padding: 0 var(--space-2);
+  border: none;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  color: var(--text-2);
+  font-size: var(--text-sm);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color var(--dur-1) var(--ease);
+}
+
+@media (pointer: coarse) {
+  .tabTrigger {
+    min-height: 44px;
+  }
+}
+
+@media (hover: hover) {
+  .tabTrigger:hover {
+    color: var(--text-1);
+  }
+}
+
+.tabTrigger[data-state='active'] {
+  border-bottom-color: var(--accent);
+  color: var(--text-1);
+}
+
+.tabContent {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.tabBody {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  padding: var(--space-3);
+}
+
+/* ---- overview ---- */
+.statGrid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: var(--space-2);
+}
+
+.stat {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--stroke-1);
+  border-radius: var(--radius-2);
+}
+
+.statLabel {
+  color: var(--text-3);
+  font-size: var(--text-2xs);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.statValue {
+  font-family: var(--font-mono);
+  font-size: var(--text-lg);
+}
+
+.healthRow {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.healthBar {
+  flex: 1;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--bg-inset);
+  overflow: hidden;
+}
+
+.healthFill {
+  height: 100%;
+  border-radius: 2px;
+}
+
+.sectionTitle {
+  margin: 0 0 var(--space-2);
+  color: var(--text-3);
+  font-size: var(--text-2xs);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.quiet {
+  margin: 0;
+  color: var(--text-3);
+  font-size: var(--text-sm);
+}
+
+.alertList {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.alertItem {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-1);
+  background: var(--warn-bg);
+  color: var(--text-1);
+  font-size: var(--text-sm);
+}
+
+.alertIcon {
+  flex: none;
+  align-self: center;
+  color: var(--warn);
+}
+
+/* ---- dependencies ---- */
+.depList {
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.depRow {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  min-height: 36px;
+  padding: var(--space-1) var(--space-2);
+  border: none;
+  border-radius: var(--radius-1);
+  background: transparent;
+  color: var(--text-1);
+  font-size: var(--text-sm);
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--dur-1) var(--ease);
+}
+
+@media (pointer: coarse) {
+  .depRow {
+    min-height: 44px;
+  }
+}
+
+@media (hover: hover) {
+  .depRow:hover {
+    background: var(--bg-overlay);
+  }
+}
+
+.depName {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  font-family: var(--font-mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.depMeta {
+  flex: none;
+  color: var(--text-3);
+  font-size: var(--text-2xs);
+}
+
+.depChevron {
+  flex: none;
+  color: var(--text-3);
+}
+
+/* ---- MCP verb tabs (Why / Impact) ---- */
+.runButton {
+  align-self: flex-start;
+  min-height: 36px;
+  padding: 0 var(--space-4);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-2);
+  background: var(--accent-muted);
+  color: var(--accent);
+  font-size: var(--text-sm);
+  font-weight: 600;
+  cursor: pointer;
+  transition: background var(--dur-1) var(--ease);
+}
+
+@media (pointer: coarse) {
+  .runButton {
+    min-height: 44px;
+  }
+}
+
+@media (hover: hover) {
+  .runButton:hover {
+    background: var(--bg-overlay);
+  }
+}
+
+.skeletonCause {
+  min-height: 64px;
+  margin-bottom: var(--space-2);
+}
+
+.causeList {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.causeCard {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--stroke-1);
+  border-radius: var(--radius-2);
+}
+
+.causeHead {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+}
+
+.causeRank {
+  flex: none;
+  color: var(--text-3);
+  font-size: var(--text-2xs);
+}
+
+.causeService {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.causeOp {
+  color: var(--text-2);
+  font-weight: 400;
+}
+
+.causeScore {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--text-2);
+}
+
+.scoreTrack {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--bg-inset);
+  overflow: hidden;
+}
+
+.scoreFill {
+  height: 100%;
+  border-radius: 2px;
+  background: var(--accent);
+}
+
+.evidenceList {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: 0;
+  padding-left: var(--space-4);
+  color: var(--text-2);
+  font-size: var(--text-xs);
+}
+
+.evidenceItem {
+  overflow-wrap: anywhere; /* evidence lines carry trace ids */
+}
+
+.verbHeadRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.verbHeadRow .stateAction {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+/* ---- async states ---- */
+.statePanel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-4) var(--space-3);
+  color: var(--text-2);
+  font-size: var(--text-sm);
+}
+
+.statePanel p {
+  margin: 0;
+}
+
+.stateAction {
+  align-self: flex-start;
+  min-height: 32px;
+  padding: 0 var(--space-3);
+  border: 1px solid var(--stroke-2);
+  border-radius: var(--radius-2);
+  background: transparent;
+  color: var(--text-1);
+  font-size: var(--text-sm);
+  cursor: pointer;
+}
+
+@media (pointer: coarse) {
+  .stateAction {
+    min-height: 44px;
+  }
+}
+
+.mono {
+  font-family: var(--font-mono);
+}
+
+.skeleton {
+  min-height: 52px;
+  border-color: transparent;
+  border-radius: var(--radius-2);
+  background: var(--bg-overlay);
+}
+
+.skeletonRow {
+  min-height: 16px;
+}
+
+/* ---- xs bottom sheet ---- */
+.sheetOverlay {
+  position: fixed;
+  inset: 0;
+  z-index: 48;
+  background: rgb(0 0 0 / 0.5);
+}
+
+.sheet {
+  position: fixed;
+  inset: auto 0 0 0;
+  z-index: 49;
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--stroke-2);
+  border-radius: var(--radius-3) var(--radius-3) 0 0;
+  background: var(--bg-raised);
+  box-shadow: var(--shadow-sheet);
+  transition: height var(--dur-3) var(--ease);
+}
+
+.sheetHandle {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  height: 24px;
+  cursor: grab;
+  touch-action: none;
+}
+
+.sheetGrip {
+  width: 36px;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--stroke-2);
+}
+
+.sheetScroll {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+  overflow-y: auto;
+  padding-bottom: env(safe-area-inset-bottom);
+}
+
+.srOnly {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  clip-path: inset(50%);
+  overflow: hidden;
+  white-space: nowrap;
+}
