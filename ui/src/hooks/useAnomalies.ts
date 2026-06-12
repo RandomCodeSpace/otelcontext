@@ -1,28 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { callMcpTool, type McpToolResult } from '../lib/mcpClient'
+import { callMcpTool } from '../lib/mcpClient'
+import { parseAnomalies } from '../lib/mcpResults'
 import type { AnomalyNode } from '../types/api'
-
-// Parse the MCP tool result into AnomalyNode[]. The backend's
-// `get_anomaly_timeline` tool returns the anomaly slice JSON-encoded inside
-// result.content[0].text (json.MarshalIndent of []*graphrag.AnomalyNode); an
-// empty timeline marshals to the literal "null". We also tolerate a future
-// structured shape where the array lands on result.anomalies directly.
-export function parseAnomalies(result: McpToolResult | null): AnomalyNode[] {
-  if (!result) return []
-  // Structured fallback first (defensive — current server is text-only).
-  const structured = (result as { anomalies?: unknown }).anomalies
-  if (Array.isArray(structured)) return structured as AnomalyNode[]
-
-  const text = result.content?.find((c) => c.type === 'text')?.text
-  if (!text) return []
-  try {
-    const parsed = JSON.parse(text) as unknown
-    return Array.isArray(parsed) ? (parsed as AnomalyNode[]) : []
-  } catch {
-    // Non-JSON text (e.g. an "Error: ..." payload that slipped past isError).
-    return []
-  }
-}
 
 // Recent-anomaly window + cap for the dashboard panel.
 const WINDOW_MINUTES = 15
