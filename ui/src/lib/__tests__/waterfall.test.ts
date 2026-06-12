@@ -127,7 +127,7 @@ describe('buildWaterfall', () => {
       }),
     ])
     // Both spans appear exactly once.
-    expect(layout.rows.map((r) => r.span.span_id).sort()).toEqual(['x', 'y'])
+    expect(layout.rows.map((r) => r.span.span_id).sort((a, b) => a.localeCompare(b))).toEqual(['x', 'y'])
   })
 
   it('is deterministic for identical start times (span_id tiebreak)', () => {

@@ -1,11 +1,12 @@
 import type { LogEntry } from '@/types/api'
+import { cryptoRandom } from './random'
 
 // Module-level WebSocket singleton for the /ws hub stream. Ports the
 // hardened lifecycle of the former hooks/useWebSocket.ts (exponential
 // backoff, 30s ping heartbeat + 35s dead-connection watchdog,
 // visibility/online recovery) out of React entirely, replacing that hook,
 // and adds what the rewrite needs:
-//   - jittered backoff: delay += Math.random() * delay * 0.2, so a fleet
+//   - jittered backoff: delay += cryptoRandom() * delay * 0.2, so a fleet
 //     of clients recovering from a restart doesn't reconnect in lockstep;
 //   - a bounded ring buffer (cap 5000) for pushed log batches — the UI
 //     must never mirror the backend's unbounded-growth incident;
@@ -205,7 +206,7 @@ export class WsManager {
       this.opts.initialBackoffMs * 2 ** attempt,
       this.opts.maxBackoffMs,
     )
-    delay += Math.random() * delay * 0.2 // de-synchronize fleet reconnects
+    delay += cryptoRandom() * delay * 0.2 // de-synchronize fleet reconnects
     this.setState('reconnecting', attempt + 1)
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null

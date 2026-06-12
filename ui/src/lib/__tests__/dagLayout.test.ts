@@ -51,7 +51,7 @@ describe('layoutGraph — layering', () => {
       [E('x', 'y'), E('y', 'z'), E('z', 'x')],
     )
     expect(layout.nodes.size).toBe(3)
-    expect(layout.layers.flat().sort()).toEqual(['x', 'y', 'z'])
+    expect(layout.layers.flat().sort((a, b) => a.localeCompare(b))).toEqual(['x', 'y', 'z'])
   })
 
   it('drops self-loops and edges to unknown nodes', () => {

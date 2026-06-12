@@ -98,10 +98,10 @@ export default function FlowMap({
   const shapeKey = useMemo(
     () =>
       JSON.stringify({
-        ids: [...new Set(nodes.map((n) => n.id))].sort(),
+        ids: [...new Set(nodes.map((n) => n.id))].sort((a, b) => a.localeCompare(b)),
         edges: edgeRefs
           .map((e): [string, string] => [e.source, e.target])
-          .sort((a, b) => (a[0] + a[1] < b[0] + b[1] ? -1 : 1)),
+          .sort((a, b) => (a[0] + a[1]).localeCompare(b[0] + b[1])),
       }),
     [nodes, edgeRefs],
   )

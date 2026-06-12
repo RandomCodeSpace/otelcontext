@@ -20,10 +20,10 @@ export type PercentUnit = 'ratio' | 'percent' | 'auto'
 
 /** toFixed + trailing-zero trim: 73.0 → "73", 4.20 → "4.2". */
 function trimFixed(value: number, digits: number): string {
-  return value
-    .toFixed(digits)
-    .replace(/\.0+$/, '')
-    .replace(/(\.\d*?)0+$/, '$1')
+  const s = value.toFixed(digits)
+  if (!s.includes('.')) return s
+  // Two anchored single-quantifier passes -- linear, no backtracking.
+  return s.replace(/0+$/, '').replace(/\.$/, '')
 }
 
 /**

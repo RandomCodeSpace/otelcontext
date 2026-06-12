@@ -573,6 +573,12 @@ func (c *Config) Validate() error {
 	if c.GRPCMaxConcurrentStreams < 1 || c.GRPCMaxConcurrentStreams > 1_000_000 {
 		return fmt.Errorf("GRPC_MAX_CONCURRENT_STREAMS must be between 1 and 1000000, got %d", c.GRPCMaxConcurrentStreams)
 	}
+	// GraphRAG event queue: the channel buffer is allocated up front and each
+	// queued event embeds a Span/Log by value (~0.5-2 KB), so an unbounded env
+	// value is a real OOM lever. 1M buffered events is already ~1-2 GB.
+	if c.GraphRAGEventQueueSize < 1 || c.GraphRAGEventQueueSize > 1_000_000 {
+		return fmt.Errorf("GRAPHRAG_EVENT_QUEUE_SIZE must be between 1 and 1000000, got %d", c.GraphRAGEventQueueSize)
+	}
 	if c.DBMaxOpenConns < 1 {
 		return fmt.Errorf("DB_MAX_OPEN_CONNS must be >= 1, got %d", c.DBMaxOpenConns)
 	}

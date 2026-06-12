@@ -2,6 +2,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { LogEntry } from '@/types/api'
 import { WsManager } from '../wsManager'
 
+// wsManager draws jitter from lib/random (CSPRNG-backed); stub the module so
+// fake-timer advancement stays deterministic.
+const jitter = vi.hoisted(() => ({ value: 0 }))
+vi.mock('../random', () => ({ cryptoRandom: () => jitter.value }))
+
 // Local WebSocket mock, kept file-local so no suite depends on shared
 // mutable test state.
 class MockWebSocket {
@@ -110,7 +115,7 @@ describe('WsManager connection lifecycle', () => {
   })
 
   it('schedules an exponential reconnect after close (jitter floor)', () => {
-    vi.spyOn(Math, 'random').mockReturnValue(0)
+    jitter.value = 0
     manager = new WsManager()
     manager.start()
     latest().simulateOpen()
@@ -134,7 +139,7 @@ describe('WsManager connection lifecycle', () => {
   })
 
   it('adds up to 20% jitter to the backoff delay', () => {
-    vi.spyOn(Math, 'random').mockReturnValue(1)
+    jitter.value = 1
     manager = new WsManager()
     manager.start()
     latest().simulateClose()
@@ -147,7 +152,7 @@ describe('WsManager connection lifecycle', () => {
   })
 
   it('caps the backoff base at maxBackoffMs', () => {
-    vi.spyOn(Math, 'random').mockReturnValue(0)
+    jitter.value = 0
     manager = new WsManager({ initialBackoffMs: 100, maxBackoffMs: 300 })
     manager.start()
 
@@ -164,7 +169,7 @@ describe('WsManager connection lifecycle', () => {
   })
 
   it('reconnects immediately with reset attempts when the tab becomes visible', () => {
-    vi.spyOn(Math, 'random').mockReturnValue(0)
+    jitter.value = 0
     manager = new WsManager()
     manager.start()
 

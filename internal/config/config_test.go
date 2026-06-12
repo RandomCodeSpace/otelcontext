@@ -23,6 +23,7 @@ func baseValid() *Config {
 		CompressionLevel:         "default",
 		GRPCMaxRecvMB:            16,
 		GRPCMaxConcurrentStreams: 1000,
+		GraphRAGEventQueueSize:   100000,
 		RetentionBatchSize:       50000,
 		RetentionBatchSleepMs:    1,
 	}
@@ -329,5 +330,24 @@ func TestLoad_DefaultTenant_FallsBackToDefault(t *testing.T) {
 	}
 	if cfg.DefaultTenant != "default" {
 		t.Errorf("expected default tenant to be 'default', got %q", cfg.DefaultTenant)
+	}
+}
+
+// TestValidate_GraphRAGEventQueueSize_Bounds: the event channel buffer is
+// allocated up front and each event embeds a Span/Log by value, so the env
+// value must be range-checked (also breaks the CodeQL
+// go/uncontrolled-allocation-size taint path env -> make(chan, n)).
+func TestValidate_GraphRAGEventQueueSize_Bounds(t *testing.T) {
+	for _, bad := range []int{0, -1, 1_000_001} {
+		c := baseValid()
+		c.GraphRAGEventQueueSize = bad
+		if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "GRAPHRAG_EVENT_QUEUE_SIZE") {
+			t.Fatalf("size %d: expected GRAPHRAG_EVENT_QUEUE_SIZE error, got %v", bad, err)
+		}
+	}
+	c := baseValid()
+	c.GraphRAGEventQueueSize = 1_000_000
+	if err := c.Validate(); err != nil {
+		t.Fatalf("size 1000000 should validate: %v", err)
 	}
 }

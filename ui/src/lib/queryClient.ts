@@ -1,4 +1,5 @@
 import { QueryClient } from '@tanstack/react-query'
+import { cryptoRandom } from './random'
 
 // TanStack Query is the only server-state store in the UI. The defaults here
 // are deliberate backend-pressure relief for the SQLite memory incident:
@@ -14,7 +15,7 @@ const RETRY_MAX_MS = 30_000
 /** Exponential backoff with up to +20% jitter, capped at 30s. */
 export function retryDelayWithJitter(attemptIndex: number): number {
   const base = Math.min(RETRY_BASE_MS * 2 ** attemptIndex, RETRY_MAX_MS)
-  return base + Math.random() * base * 0.2
+  return base + cryptoRandom() * base * 0.2
 }
 
 /** Build the app QueryClient. Exported as a factory for test isolation. */
