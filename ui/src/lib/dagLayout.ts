@@ -46,15 +46,24 @@ export const GAP_Y = 16
 export const MIN_ZOOM = 0.2
 export const MAX_ZOOM = 2.5
 
+/**
+ * Locale-independent string compare (UTF-16 code units). The layout must be
+ * deterministic across machines, so localeCompare is deliberately NOT used.
+ */
+export function compareIds(a: string, b: string): number {
+  if (a < b) return -1
+  return a > b ? 1 : 0
+}
+
 /** Order-insensitive identity of the node/edge SET (metrics excluded). */
 export function graphSetHash(
   nodeIds: readonly string[],
   edges: readonly GraphEdgeRef[],
 ): string {
-  const ns = [...nodeIds].sort().join(',')
+  const ns = [...nodeIds].sort(compareIds).join(',')
   const es = edges
     .map((e) => `${e.source}>${e.target}`)
-    .sort()
+    .sort(compareIds)
     .join(',')
   return `${ns}|${es}`
 }
@@ -74,6 +83,34 @@ function sanitizeEdges(ids: ReadonlySet<string>, edges: readonly GraphEdgeRef[])
   return out
 }
 
+/** Iterative DFS from one root: keeps forward edges, drops back-edges. */
+function dfsKeepForwardEdges(
+  root: string,
+  out: ReadonlyMap<string, string[]>,
+  state: Map<string, 1 | 2>,
+  kept: GraphEdgeRef[],
+): void {
+  const stack: Array<{ id: string; next: number }> = [{ id: root, next: 0 }]
+  state.set(root, 1)
+  while (stack.length > 0) {
+    const frame = stack[stack.length - 1]
+    const targets = out.get(frame.id) ?? []
+    if (frame.next >= targets.length) {
+      state.set(frame.id, 2)
+      stack.pop()
+      continue
+    }
+    const target = targets[frame.next++]
+    const s = state.get(target)
+    if (s === 1) continue // back-edge → drop for layering
+    kept.push({ source: frame.id, target })
+    if (s === undefined) {
+      state.set(target, 1)
+      stack.push({ id: target, next: 0 })
+    }
+  }
+}
+
 /** Drop back-edges via iterative DFS from sorted ids — deterministic. */
 function breakCycles(sortedIds: readonly string[], edges: readonly GraphEdgeRef[]): GraphEdgeRef[] {
   const out = new Map<string, string[]>()
@@ -85,26 +122,7 @@ function breakCycles(sortedIds: readonly string[], edges: readonly GraphEdgeRef[
   const state = new Map<string, 1 | 2>() // 1 = on stack, 2 = done
   const kept: GraphEdgeRef[] = []
   for (const root of sortedIds) {
-    if (state.has(root)) continue
-    const stack: Array<{ id: string; next: number }> = [{ id: root, next: 0 }]
-    state.set(root, 1)
-    while (stack.length > 0) {
-      const frame = stack[stack.length - 1]
-      const targets = out.get(frame.id) ?? []
-      if (frame.next >= targets.length) {
-        state.set(frame.id, 2)
-        stack.pop()
-        continue
-      }
-      const target = targets[frame.next++]
-      const s = state.get(target)
-      if (s === 1) continue // back-edge → drop for layering
-      kept.push({ source: frame.id, target })
-      if (s === undefined) {
-        state.set(target, 1)
-        stack.push({ id: target, next: 0 })
-      }
-    }
+    if (!state.has(root)) dfsKeepForwardEdges(root, out, state, kept)
   }
   return kept
 }
@@ -155,7 +173,7 @@ export function layoutGraph(
   nodeIds: readonly string[],
   edges: readonly GraphEdgeRef[],
 ): Layout {
-  const sortedIds = [...new Set(nodeIds)].sort()
+  const sortedIds = [...new Set(nodeIds)].sort(compareIds)
   const idSet = new Set(sortedIds)
   const clean = sanitizeEdges(idSet, edges)
   const dag = breakCycles(sortedIds, clean)
