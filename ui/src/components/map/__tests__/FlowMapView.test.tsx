@@ -316,3 +316,50 @@ describe('FlowMapView — xs', () => {
     expect(memory.history.at(-1)).toContain('service=db')
   })
 })
+
+describe('FlowMapView — ?impact= blast-radius overlay', () => {
+  it('tints the downstream cone by depth and rings the root', async () => {
+    renderView('/map?impact=checkout')
+    const svg = within(await findMap()).getByTestId('flow-map-svg')
+    // depth 1 (payments) and depth 2 (db) get --crit tint rects…
+    const payTint = screen.getByTestId('impact-tint-payments')
+    const dbTint = screen.getByTestId('impact-tint-db')
+    expect(
+      Number(payTint.style.fillOpacity),
+    ).toBeGreaterThan(Number(dbTint.style.fillOpacity))
+    // …the root gets the ring, not a tint.
+    expect(screen.queryByTestId('impact-tint-checkout')).toBeNull()
+    const rootRect = svg.querySelector('[data-node-id="checkout"] rect')
+    expect(rootRect?.getAttribute('class')).toContain('nodeImpactRoot')
+  })
+
+  it('dims services outside the cone', async () => {
+    renderView('/map?impact=payments')
+    const svg = within(await findMap()).getByTestId('flow-map-svg')
+    expect(
+      svg.querySelector('[data-node-id="checkout"]')?.getAttribute('class'),
+    ).toContain('dimmed')
+    expect(
+      svg.querySelector('[data-node-id="db"]')?.getAttribute('class'),
+    ).not.toContain('dimmed')
+  })
+
+  it('announces the overlay and clears it via the banner button', async () => {
+    const user = userEvent.setup()
+    const memory = renderView('/map?impact=checkout')
+    await findMap()
+    const banner = screen.getByRole('status')
+    expect(banner).toHaveTextContent(/blast radius of/i)
+    expect(banner).toHaveTextContent(/2 downstream/i)
+    await user.click(
+      screen.getByRole('button', { name: /clear blast radius overlay/i }),
+    )
+    expect(memory.history.at(-1)).not.toContain('impact=')
+  })
+
+  it('forces the flow rendering on xs (cone is map-only)', async () => {
+    stubXs()
+    renderView('/map?impact=checkout')
+    expect(await findMap()).toBeInTheDocument()
+  })
+})

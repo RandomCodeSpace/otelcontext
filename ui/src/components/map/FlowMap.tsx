@@ -24,6 +24,7 @@ import {
   type WalkDir,
 } from '@/lib/dagLayout'
 import { formatPercent } from '@/lib/format'
+import { impactAlpha } from '@/lib/impact'
 import { nodeStatus, statusToken } from '@/lib/triage'
 import type { SystemEdge, SystemNode } from '@/types/api'
 import styles from './FlowMap.module.css'
@@ -44,6 +45,11 @@ interface FlowMapProps {
   edges: readonly SystemEdge[]
   /** The inspected service — accent ring + 1-hop neighborhood emphasis. */
   selectedId: string | null
+  /**
+   * Blast-radius cone (?impact=): service → BFS depth, root at 0. When set
+   * it owns the emphasis — cone nodes tint --crit by depth, the rest dims.
+   */
+  impact?: ReadonlyMap<string, number> | null
   onSelect: (id: string) => void
   onClearSelection: () => void
   onFocusFilter: () => void
@@ -70,6 +76,7 @@ export default function FlowMap({
   nodes,
   edges,
   selectedId,
+  impact = null,
   onSelect,
   onClearSelection,
   onFocusFilter,
@@ -203,6 +210,7 @@ export default function FlowMap({
 
   const neighbors = selectedId ? neighborsOf(edgeRefs, selectedId) : null
   const showErrLabels = transform.k >= SEMANTIC_ZOOM
+  const impactOn = impact !== null
 
   return (
     <div
@@ -229,8 +237,11 @@ export default function FlowMap({
             const to = layout.nodes.get(e.target)
             if (!from || !to || e.source === e.target) return null
             const failing = isEdgeFailing(e.status)
-            const dimmed =
-              neighbors !== null && e.source !== selectedId && e.target !== selectedId
+            const dimmed = impactOn
+              ? !(impact.has(e.source) && impact.has(e.target))
+              : neighbors !== null &&
+                e.source !== selectedId &&
+                e.target !== selectedId
             return (
               <path
                 key={`${e.source}>${e.target}`}
@@ -245,7 +256,10 @@ export default function FlowMap({
             if (!pos) return null
             const status = nodeStatus(n.status)
             const selected = n.id === selectedId
-            const dimmed = neighbors !== null && !selected && !neighbors.has(n.id)
+            const depth = impactOn ? impact.get(n.id) : undefined
+            const dimmed = impactOn
+              ? depth === undefined
+              : neighbors !== null && !selected && !neighbors.has(n.id)
             const focused = n.id === focusedId
             return (
               <g
@@ -258,11 +272,21 @@ export default function FlowMap({
                 onClick={() => onSelect(n.id)}
               >
                 <rect
-                  className={`${styles.nodeRect} ${selected ? styles.nodeSelected : ''} ${focused ? styles.nodeFocused : ''}`}
+                  className={`${styles.nodeRect} ${selected ? styles.nodeSelected : ''} ${focused ? styles.nodeFocused : ''} ${depth === 0 ? styles.nodeImpactRoot : ''}`}
                   width={NODE_W}
                   height={NODE_H}
                   rx={6}
                 />
+                {depth !== undefined && depth > 0 && (
+                  <rect
+                    className={styles.nodeImpact}
+                    data-testid={`impact-tint-${n.id}`}
+                    width={NODE_W}
+                    height={NODE_H}
+                    rx={6}
+                    style={{ fillOpacity: impactAlpha(depth) }}
+                  />
+                )}
                 <circle className={styles.nodeDot} cx={16} cy={NODE_H / 2} r={4} />
                 <text className={styles.nodeName} x={28} y={NODE_H / 2 + 4}>
                   {n.id.length > 16 ? `${n.id.slice(0, 15)}…` : n.id}
