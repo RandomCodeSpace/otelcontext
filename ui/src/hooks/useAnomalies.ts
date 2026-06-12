@@ -7,7 +7,7 @@ import type { AnomalyNode } from '../types/api'
 // result.content[0].text (json.MarshalIndent of []*graphrag.AnomalyNode); an
 // empty timeline marshals to the literal "null". We also tolerate a future
 // structured shape where the array lands on result.anomalies directly.
-function parseAnomalies(result: McpToolResult | null): AnomalyNode[] {
+export function parseAnomalies(result: McpToolResult | null): AnomalyNode[] {
   if (!result) return []
   // Structured fallback first (defensive — current server is text-only).
   const structured = (result as { anomalies?: unknown }).anomalies

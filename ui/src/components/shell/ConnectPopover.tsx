@@ -1,25 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu'
 import { Cable, Check, Copy } from 'lucide-react'
+import { endpoints, type Endpoint } from './connectEndpoints'
 import styles from './ConnectPopover.module.css'
-
-interface Endpoint {
-  key: string
-  label: string
-  value: string
-}
-
-// Derived from the page origin, so the copied values work wherever the
-// operator is browsing from (recomposes what TopNav/SettingsDrawer never
-// surfaced: the actual connect strings for agents and OTLP exporters).
-function endpoints(): Endpoint[] {
-  const { origin, hostname } = window.location
-  return [
-    { key: 'mcp', label: 'MCP URL', value: `${origin}/mcp` },
-    { key: 'grpc', label: 'OTLP gRPC', value: `${hostname}:4317` },
-    { key: 'http', label: 'OTLP HTTP', value: `${origin}/v1/` },
-  ]
-}
 
 /** Pulse-bar popover with copyable MCP/OTLP endpoints. */
 export default function ConnectPopover() {

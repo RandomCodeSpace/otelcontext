@@ -24,8 +24,6 @@
     "@tanstack/react-virtual": "^3.14.2",
     "clsx": "^2.1.1",
     "cmdk": "^1.1.1",
-    "cytoscape": "^3.33.2",
-    "cytoscape-cose-bilkent": "^4.1.0",
     "lucide-react": "^0.469.0",
     "react": "^19.2.5",
     "react-dom": "^19.2.5",

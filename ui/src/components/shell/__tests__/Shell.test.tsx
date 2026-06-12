@@ -67,7 +67,7 @@ describe('Shell', () => {
   it('exposes both nav variants (rail + bottom tabs) with all destinations', () => {
     renderShell()
     // Each destination appears twice: once in the rail, once in the tab bar.
-    for (const name of [/service map/i, /dashboard/i, /mcp console/i]) {
+    for (const name of [/triage/i, /flow map/i, /dashboard/i, /mcp console/i]) {
       expect(screen.getAllByRole('link', { name })).toHaveLength(2)
     }
   })
