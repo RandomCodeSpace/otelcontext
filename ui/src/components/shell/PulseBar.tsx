@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react'
-import { Moon, Sun } from 'lucide-react'
+import { Moon, SquareSlash, Sun } from 'lucide-react'
 import { useSystemGraph } from '@/hooks/useSystemGraph'
 import { useDashboard } from '@/hooks/useDashboard'
 import { formatMb, formatMs, formatPercent } from '@/lib/format'
@@ -16,6 +16,8 @@ export const DB_SIZE_WARN_MB = 2048
 interface PulseBarProps {
   theme?: Theme
   onToggleTheme?: () => void
+  /** Opens the ⌘K command palette. */
+  onOpenPalette?: () => void
   /** Injectable for tests; defaults to the singleton-backed LiveDot. */
   liveSlot?: ReactNode
 }
@@ -57,6 +59,7 @@ function Sep() {
 export default function PulseBar({
   theme = 'dark',
   onToggleTheme,
+  onOpenPalette,
   liveSlot,
 }: Readonly<PulseBarProps>) {
   const { graph } = useSystemGraph()
@@ -128,6 +131,20 @@ export default function PulseBar({
 
       <div className={styles.actions}>
         {liveSlot === undefined ? <LiveDot /> : liveSlot}
+        {onOpenPalette && (
+          <button
+            type="button"
+            className={styles.paletteButton}
+            aria-label="Open command palette"
+            aria-keyshortcuts="Meta+K Control+K"
+            onClick={onOpenPalette}
+          >
+            <SquareSlash size={14} aria-hidden="true" />
+            <kbd className={styles.paletteKbd} aria-hidden="true">
+              ⌘K
+            </kbd>
+          </button>
+        )}
         <ConnectPopover />
         {onToggleTheme && (
           <button

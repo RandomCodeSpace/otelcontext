@@ -126,3 +126,43 @@
     height: 44px;
   }
 }
+
+/* ---- ⌘K palette button ---- */
+.paletteButton {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  height: 28px;
+  padding: 0 var(--space-2);
+  border: 1px solid var(--stroke-1);
+  border-radius: var(--radius-1);
+  background: transparent;
+  color: var(--text-2);
+  cursor: pointer;
+  transition: background var(--dur-1) var(--ease), color var(--dur-1) var(--ease);
+}
+
+@media (hover: hover) {
+  .paletteButton:hover {
+    background: var(--bg-raised);
+    color: var(--text-1);
+  }
+}
+
+@media (pointer: coarse) {
+  .paletteButton {
+    height: 44px;
+  }
+}
+
+/* The xs tab bar carries its own palette button — hide this one there. */
+@media (max-width: 767px) {
+  .paletteButton {
+    display: none;
+  }
+}
+
+.paletteKbd {
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+}

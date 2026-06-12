@@ -105,6 +105,33 @@
   gap: 2px;
 }
 
+/* Center palette button — same anatomy as a tab, never route-active. */
+.tabPalette {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  min-height: 44px;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-2);
+  background: transparent;
+  color: var(--text-3);
+  font-family: inherit;
+  font-size: var(--text-2xs);
+  cursor: pointer;
+  transition: background var(--dur-1) var(--ease), color var(--dur-1) var(--ease);
+}
+
+@media (hover: hover) {
+  .tabPalette:hover {
+    background: var(--bg-raised);
+    color: var(--text-1);
+  }
+}
+
 /* Rail: icon-only until xl, where labels appear inline. */
 .rail .navLabel {
   display: none;
