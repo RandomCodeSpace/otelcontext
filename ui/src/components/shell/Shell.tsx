@@ -1,7 +1,7 @@
 import { useEffect, type ComponentType, type ReactNode } from 'react'
 import * as Tooltip from '@radix-ui/react-tooltip'
 import { Link, useRoute } from 'wouter'
-import { Activity, LayoutDashboard, ListTree, Network, ScrollText, SquareSlash, Terminal } from 'lucide-react'
+import { Activity, ListTree, Network, ScrollText, SquareSlash } from 'lucide-react'
 import { getWsManager } from '@/lib/wsManager'
 import type { Theme } from '@/hooks/useTheme'
 import PulseBar from './PulseBar'
@@ -13,13 +13,12 @@ interface NavEntry {
   Icon: ComponentType<{ size?: number | string; 'aria-hidden'?: boolean }>
 }
 
+// Exactly the four triage destinations — the xs bottom-tab-bar spec.
 const NAV_ITEMS: readonly NavEntry[] = [
   { href: '/', label: 'Triage', Icon: Activity },
   { href: '/map', label: 'Flow Map', Icon: Network },
   { href: '/traces', label: 'Traces', Icon: ListTree },
   { href: '/logs', label: 'Logs', Icon: ScrollText },
-  { href: '/dashboard', label: 'Dashboard', Icon: LayoutDashboard },
-  { href: '/mcp', label: 'MCP Console', Icon: Terminal },
 ]
 
 function NavLink({

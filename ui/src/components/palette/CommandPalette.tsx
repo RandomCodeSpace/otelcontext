@@ -108,11 +108,11 @@ export default function CommandPalette({
       } else {
         // Start the RPC now — the inspector tab observes the in-flight
         // prefetch through the shared query key (lib/triageVerbs).
-        void queryClient.prefetchQuery(
-          cmd.prefetch === 'root_cause_analysis'
-            ? rootCauseQueryOptions(cmd.service)
-            : impactQueryOptions(cmd.service),
-        )
+        if (cmd.prefetch === 'root_cause_analysis') {
+          void queryClient.prefetchQuery(rootCauseQueryOptions(cmd.service))
+        } else {
+          void queryClient.prefetchQuery(impactQueryOptions(cmd.service))
+        }
         openService(cmd.service, cmd.tab)
       }
       close()

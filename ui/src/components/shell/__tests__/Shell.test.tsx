@@ -64,21 +64,51 @@ describe('Shell', () => {
     )
   })
 
-  it('exposes both nav variants (rail + bottom tabs) with all destinations', () => {
+  it('exposes both nav variants (rail + bottom tabs) with exactly 4 destinations', () => {
     renderShell()
     // Each destination appears twice: once in the rail, once in the tab bar.
-    for (const name of [/triage/i, /flow map/i, /dashboard/i, /mcp console/i]) {
+    for (const name of [/triage/i, /flow map/i, /traces/i, /logs/i]) {
       expect(screen.getAllByRole('link', { name })).toHaveLength(2)
     }
+    // The dashboard and MCP-console destinations are retired.
+    expect(screen.getAllByRole('link')).toHaveLength(8)
   })
 
   it('marks the active route with aria-current', () => {
-    renderShell('/dashboard')
+    renderShell('/traces')
     const active = screen
       .getAllByRole('link')
       .filter((a) => a.getAttribute('aria-current') === 'page')
     expect(active).toHaveLength(2) // rail + tab bar
-    active.forEach((a) => expect(a).toHaveAttribute('href', '/dashboard'))
+    active.forEach((a) => expect(a).toHaveAttribute('href', '/traces'))
+  })
+
+  it('renders the palette buttons when onOpenPalette is wired', async () => {
+    const user = userEvent.setup()
+    const onOpenPalette = vi.fn()
+    const { hook } = memoryLocation({ path: '/map' })
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    })
+    render(
+      <QueryClientProvider client={qc}>
+        <Router hook={hook}>
+          <Shell
+            theme="dark"
+            onToggleTheme={() => {}}
+            onOpenPalette={onOpenPalette}
+          >
+            <div />
+          </Shell>
+        </Router>
+      </QueryClientProvider>,
+    )
+    const buttons = screen.getAllByRole('button', {
+      name: /open command palette/i,
+    })
+    expect(buttons).toHaveLength(2) // pulse bar (md+) + xs tab-bar center
+    await user.click(buttons[0])
+    expect(onOpenPalette).toHaveBeenCalledTimes(1)
   })
 
   it('wires the theme toggle through to the callback', async () => {

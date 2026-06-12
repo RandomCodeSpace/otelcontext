@@ -1,11 +1,10 @@
 import { lazy, Suspense, useCallback, useState } from 'react'
-import { Redirect, Route, Switch, useLocation } from 'wouter'
-import { Spin } from '@ossrandom/design-system'
+import { Redirect, Route, Switch } from 'wouter'
+import RouteFallback from './components/common/RouteFallback'
 import Shell from './components/shell/Shell'
 import TrailBar from './components/trail/TrailBar'
 import { useGlobalKeys } from './hooks/useGlobalKeys'
 import { useInvestigation } from './hooks/useInvestigation'
-import type { OtelView } from './components/dashboard/DashboardView'
 import type { Theme } from './hooks/useTheme'
 import styles from './App.module.css'
 
@@ -14,19 +13,10 @@ import styles from './App.module.css'
 // sheet chunk loads on the first open request — zero cost until then.
 const TriageView = lazy(() => import('./components/triage/TriageView'))
 const FlowMapView = lazy(() => import('./components/map/FlowMapView'))
-const DashboardView = lazy(() => import('./components/dashboard/DashboardView'))
-const MCPConsoleView = lazy(() => import('./components/mcp/MCPConsoleView'))
 const TracesView = lazy(() => import('./components/traces/TracesView'))
 const LogsView = lazy(() => import('./components/logs/LogsView'))
 const ServiceInspector = lazy(() => import('./components/inspector/ServiceInspector'))
 const PaletteHost = lazy(() => import('./components/palette/PaletteHost'))
-
-// Legacy view ids (DashboardView's onNavigate) → router paths.
-const VIEW_PATHS: Record<OtelView, string> = {
-  dashboard: '/dashboard',
-  services: '/map',
-  mcp: '/mcp',
-}
 
 interface AppProps {
   theme: Theme
@@ -34,7 +24,6 @@ interface AppProps {
 }
 
 export default function App({ theme, onToggleTheme }: Readonly<AppProps>) {
-  const [, navigate] = useLocation()
   const { service, trail, popToFrame, popOne } = useInvestigation()
 
   const [paletteOpen, setPaletteOpen] = useState(false)
@@ -65,17 +54,14 @@ export default function App({ theme, onToggleTheme }: Readonly<AppProps>) {
     >
       <div className={styles.layout}>
         <div className={styles.routes}>
-          <Suspense fallback={<Spin label="Loading…" />}>
+          <Suspense fallback={<RouteFallback />}>
             <Switch>
               <Route path="/" component={TriageView} />
               <Route path="/map" component={FlowMapView} />
               <Route path="/traces" component={TracesView} />
               <Route path="/logs" component={LogsView} />
-              <Route path="/dashboard">
-                <DashboardView onNavigate={(view) => navigate(VIEW_PATHS[view])} />
-              </Route>
-              <Route path="/mcp" component={MCPConsoleView} />
-              {/* Unknown paths land on the Triage home. */}
+              {/* Unknown paths (incl. the retired /dashboard and /mcp)
+                  land on the Triage home. */}
               <Route>
                 <Redirect to="/" replace />
               </Route>
