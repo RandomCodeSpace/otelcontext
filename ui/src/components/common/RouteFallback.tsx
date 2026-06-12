@@ -9,7 +9,7 @@ export default function RouteFallback() {
   return (
     <div className={styles.wrap} role="status" aria-live="polite">
       <span className={styles.spinner} aria-hidden="true" />
-      Loading…
+      <span>Loading…</span>
     </div>
   )
 }

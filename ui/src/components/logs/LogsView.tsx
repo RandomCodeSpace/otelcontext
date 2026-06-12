@@ -69,11 +69,9 @@ export default function LogsView() {
   } | null>(null)
   const paused = frozen !== null
 
-  const mode: Mode = contextAnchor
-    ? 'context'
-    : debouncedSearch || traceId || serviceParam
-      ? 'search'
-      : 'live'
+  let mode: Mode = 'live'
+  if (contextAnchor) mode = 'context'
+  else if (debouncedSearch || traceId || serviceParam) mode = 'search'
 
   // ---- live tail. Renders are driven by the WsManager version counter
   // (one bump per 250ms flush tick), so filtering/counting per render IS

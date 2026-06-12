@@ -4,13 +4,13 @@
 
 OtelContext is a self-hosted OTLP observability platform. Single Go binary with embedded React frontend.
 - **Backend:** Go 1.25, native `net/http` (no frameworks), GORM ORM, gRPC + HTTP for OTLP ingestion
-- **Frontend:** React 19 + TypeScript + TanStack Query + wouter + Radix primitives + hand-rolled token CSS (`ui/src/styles/tokens.css`); cytoscape (lazy) still renders the service map and `@ossrandom/design-system` remains on legacy views until the rewrite completes (phases C3–C7)
+- **Frontend:** React 19 + TypeScript + TanStack Query/Virtual + wouter + Radix primitives + cmdk palette + hand-rolled token CSS (`ui/src/styles/tokens.css`) with CSS Modules; the flow map is own deterministic SVG layout code. No UI framework: `@ossrandom/design-system`, cytoscape, uplot all removed (rewrite completed 2026-06-12, phases C1–C7)
 - **Ports:** gRPC `:4317` (OTLP), HTTP `:8080` (API + HTTP OTLP + WebSocket + UI)
 
 ## Strict Rules
 
 - NO Express.js/Gin/Echo — use native Go `net/http`
-- NO Tailwind CSS, NO Mantine — use `@ossrandom/design-system` exclusively for UI components and tokens. Raw CSS only for layout escape hatches (root height, scrollbar overrides, virtualised list containers); no auxiliary visual styling.
+- NO Tailwind CSS, NO Mantine, NO component frameworks — UI styling is the hand-rolled token sheet (`ui/src/styles/tokens.css`) + per-component CSS Modules; Radix primitives (unstyled) only for the a11y-hard parts (dialog/tabs/tooltip/dropdown). Token values only — no raw hex outside tokens.css.
 - Single-service architecture (no microservices split)
 - All internal DBs must be **embedded** (no external processes)
 - Relational DB (SQLite/MySQL/PostgreSQL/MSSQL) is the **single source of truth**
@@ -193,7 +193,7 @@ internal/
   telemetry/    # Prometheus metrics + health (19 metrics)
   tsdb/         # Time series aggregator + ring buffer (lock-free Windows())
   ui/           # Embedded React frontend
-ui/             # React frontend (Vite + @ossrandom/design-system)
+ui/             # React frontend (Vite + token CSS Modules, no UI framework)
 test/           # Microservice simulation (7 services)
 docs/           # Specifications and plans
 ```

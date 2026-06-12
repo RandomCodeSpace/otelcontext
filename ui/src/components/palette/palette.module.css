@@ -44,8 +44,10 @@
 }
 
 .input:focus-visible {
-  /* The dialog frame carries focus affordance — an inner ring would double up. */
+  /* An inner ring would double up with the dialog frame — signal focus on
+   * the input's own hairline instead. */
   outline: none;
+  border-bottom-color: var(--accent);
 }
 
 .list {

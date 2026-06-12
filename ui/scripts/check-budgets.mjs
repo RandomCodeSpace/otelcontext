@@ -59,7 +59,8 @@ const lazyChunks = readdirSync(join(distDir, 'assets')).filter(
   (f) => f.endsWith('.js') && !initialSet.has(f),
 );
 for (const chunk of lazyChunks) {
-  const name = chunk.replace(/-[^-]+\.js$/, ''); // strip content hash
+  // Strip the 8-char Vite content hash (base64url — it may contain '-').
+  const name = chunk.replace(/-[\w-]{8}\.js$/, '');
   const cap = budgets.lazyChunkExceptions[name] ?? budgets.lazyChunkDefault;
   check(`lazy ${chunk}`, gzipKb(join(distDir, 'assets', chunk)), cap);
 }

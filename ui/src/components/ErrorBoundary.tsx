@@ -25,7 +25,6 @@ export class ErrorBoundary extends Component<Props, State> {
 
   componentDidCatch(error: Error, info: ErrorInfo): void {
     this.setState({ info })
-    // eslint-disable-next-line no-console
     console.error('[ErrorBoundary] Uncaught error in React tree', {
       message: error.message,
       name: error.name,
@@ -53,9 +52,10 @@ export class ErrorBoundary extends Component<Props, State> {
     const { error, info } = this.state
     if (!error) return this.props.children
 
-    // Inline styles ONLY — if the design system stylesheet failed to load and is
-    // the root cause, the fallback must still render correctly. DS CSS vars are
-    // used as primary with hex fallbacks.
+    // Inline styles ONLY — if the app stylesheet failed to load and is the
+    // root cause, the fallback must still render. Our tokens (styles/
+    // tokens.css) are primary; the hex fallbacks are those tokens' dark
+    // values, used only when the stylesheet itself is missing.
     const monoStack =
       'var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace)'
     return (
@@ -69,8 +69,8 @@ export class ErrorBoundary extends Component<Props, State> {
           alignItems: 'center',
           justifyContent: 'center',
           padding: '24px',
-          background: 'var(--bg-0, #0a0a0a)',
-          color: 'var(--fg-1, #fff)',
+          background: 'var(--bg-base, #0b0d10)',
+          color: 'var(--text-1, #e8ecf2)',
           fontFamily:
             'var(--font-sans, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif)',
           zIndex: 9999,
@@ -81,11 +81,11 @@ export class ErrorBoundary extends Component<Props, State> {
           style={{
             width: '100%',
             maxWidth: '640px',
-            background: 'var(--bg-1, #111)',
-            border: '1px solid var(--border-1, #27272a)',
-            borderRadius: 'var(--radius-lg, 12px)',
+            background: 'var(--bg-raised, #12151b)',
+            border: '1px solid var(--stroke-1, #1e232d)',
+            borderRadius: 'var(--radius-3, 10px)',
             padding: '32px',
-            boxShadow: 'var(--shadow-lg, 0 10px 40px rgba(0, 0, 0, 0.5))',
+            boxShadow: 'var(--shadow-sheet, 0 8px 32px rgb(0 0 0 / 0.45))',
           }}
         >
           <div
@@ -94,7 +94,7 @@ export class ErrorBoundary extends Component<Props, State> {
               fontWeight: 700,
               letterSpacing: '0.14em',
               textTransform: 'uppercase',
-              color: 'var(--brand-red-500, #ef4444)',
+              color: 'var(--crit, #f87171)',
               marginBottom: '12px',
             }}
           >
@@ -105,7 +105,7 @@ export class ErrorBoundary extends Component<Props, State> {
               fontSize: '24px',
               fontWeight: 700,
               margin: '0 0 12px 0',
-              color: 'var(--fg-1, #fff)',
+              color: 'var(--text-1, #e8ecf2)',
             }}
           >
             Something went wrong
@@ -114,7 +114,7 @@ export class ErrorBoundary extends Component<Props, State> {
             style={{
               fontSize: '14px',
               lineHeight: 1.6,
-              color: 'var(--fg-2, #d4d4d8)',
+              color: 'var(--text-2, #9aa3b2)',
               margin: '0 0 20px 0',
             }}
           >
@@ -125,18 +125,18 @@ export class ErrorBoundary extends Component<Props, State> {
 
           <div
             style={{
-              background: 'var(--bg-3, #050505)',
-              border: '1px solid var(--border-1, #27272a)',
-              borderRadius: 'var(--radius-md, 8px)',
+              background: 'var(--bg-inset, #07090c)',
+              border: '1px solid var(--stroke-1, #1e232d)',
+              borderRadius: 'var(--radius-2, 6px)',
               padding: '12px 14px',
               marginBottom: '20px',
               fontFamily: monoStack,
               fontSize: '13px',
-              color: 'var(--fg-2, #d4d4d8)',
+              color: 'var(--text-2, #9aa3b2)',
               wordBreak: 'break-word',
             }}
           >
-            <span style={{ color: 'var(--brand-red-500, #ef4444)' }}>
+            <span style={{ color: 'var(--crit, #f87171)' }}>
               {error.name || 'Error'}
             </span>
             : {error.message || '(no message)'}
@@ -147,7 +147,7 @@ export class ErrorBoundary extends Component<Props, State> {
               style={{
                 marginBottom: '24px',
                 fontSize: '12px',
-                color: 'var(--fg-3, #71717a)',
+                color: 'var(--text-3, #646d7c)',
               }}
             >
               <summary
@@ -155,7 +155,7 @@ export class ErrorBoundary extends Component<Props, State> {
                   cursor: 'pointer',
                   userSelect: 'none',
                   padding: '4px 0',
-                  color: 'var(--fg-2, #d4d4d8)',
+                  color: 'var(--text-2, #9aa3b2)',
                 }}
               >
                 Component stack
@@ -164,13 +164,13 @@ export class ErrorBoundary extends Component<Props, State> {
                 style={{
                   marginTop: '8px',
                   padding: '12px',
-                  background: 'var(--bg-3, #050505)',
-                  border: '1px solid var(--border-1, #27272a)',
-                  borderRadius: 'var(--radius-md, 8px)',
+                  background: 'var(--bg-inset, #07090c)',
+                  border: '1px solid var(--stroke-1, #1e232d)',
+                  borderRadius: 'var(--radius-2, 6px)',
                   fontFamily: monoStack,
                   fontSize: '11px',
                   lineHeight: 1.5,
-                  color: 'var(--fg-2, #d4d4d8)',
+                  color: 'var(--text-2, #9aa3b2)',
                   whiteSpace: 'pre-wrap',
                   wordBreak: 'break-word',
                   maxHeight: '240px',
@@ -188,15 +188,15 @@ export class ErrorBoundary extends Component<Props, State> {
               onClick={this.reset}
               style={{
                 appearance: 'none',
-                border: '1px solid var(--accent-fg, #ef4444)',
-                background: 'var(--accent-fg, #ef4444)',
-                color: 'var(--accent-on, #fff)',
+                border: '1px solid var(--crit, #f87171)',
+                background: 'transparent',
+                color: 'var(--crit, #f87171)',
                 padding: '10px 18px',
-                borderRadius: 'var(--radius-md, 8px)',
+                borderRadius: 'var(--radius-2, 6px)',
                 fontSize: '14px',
                 fontWeight: 600,
                 cursor: 'pointer',
-                transition: 'background 120ms ease',
+                transition: 'background var(--dur-2, 140ms) var(--ease, ease)',
               }}
             >
               Try again
@@ -206,15 +206,15 @@ export class ErrorBoundary extends Component<Props, State> {
               onClick={this.reload}
               style={{
                 appearance: 'none',
-                border: '1px solid var(--border-2, #3f3f46)',
+                border: '1px solid var(--stroke-2, #2a3140)',
                 background: 'transparent',
-                color: 'var(--fg-1, #fff)',
+                color: 'var(--text-1, #e8ecf2)',
                 padding: '10px 18px',
-                borderRadius: 'var(--radius-md, 8px)',
+                borderRadius: 'var(--radius-2, 6px)',
                 fontSize: '14px',
                 fontWeight: 500,
                 cursor: 'pointer',
-                transition: 'border-color 120ms ease',
+                transition: 'border-color var(--dur-2, 140ms) var(--ease, ease)',
               }}
             >
               Reload page
