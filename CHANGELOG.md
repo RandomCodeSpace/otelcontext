@@ -71,6 +71,27 @@ last published pre-release tag (`v0.2.0-beta.6`).
   gzipped; `/api/system/graph`, `/api/metrics/dashboard`, `/api/stats` honor
   `If-None-Match` → 304 with a shared 10s render cache.
 
+### Changed — frontend rewrite complete (phases C3–C7)
+
+- New Triage home at `/`: anomaly strip (MCP `get_anomaly_timeline`) + ranked
+  worst-first service feed. The cytoscape physics graph is replaced by a
+  deterministic layered SVG flow map (own ~300-line layout; −500 KB raw of
+  graph-lib payload; map route now ~5 KB gz), keyboard-walkable, with a
+  blast-radius overlay (`/map?impact=svc`).
+- Service Inspector (docked panel / bottom sheet) with Overview, Dependencies,
+  **Why** (`root_cause_analysis`) and **Impact** (`impact_analysis`) tabs —
+  the MCP triage verbs as human-clickable actions. Investigation Trail:
+  URL-encoded drill-down breadcrumbs (`?trail=`), shareable and reload-safe.
+- `/traces` (virtualized table + real time-positioned SVG waterfall) and
+  `/logs` (live tail over the bounded WS ring buffer, virtualized,
+  severity pills, context/trace cross-links).
+- ⌘K command palette (navigate / services / triage actions / utilities),
+  `g m/t/l/h` chords, `?` shortcut sheet.
+- `@ossrandom/design-system`, the legacy Dashboard and the MCP Console are
+  removed (uplot/clsx/fontsource deps too); nav is exactly
+  Triage / Flow Map / Traces / Logs. Bundle budgets tightened to actuals+10%:
+  initial JS ≤118 KB gz, initial CSS ≤6 KB gz, every lazy chunk ≤10 KB gz.
+
 ### Changed — frontend foundation (rewrite phases C1–C2)
 
 - New data layer: TanStack Query (visibility-aware polling — hidden tabs stop
