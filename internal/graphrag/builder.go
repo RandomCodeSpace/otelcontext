@@ -38,8 +38,13 @@ func guardWorker(name string) {
 }
 
 const (
-	defaultWorkerCount   = 16
-	defaultChannelSize   = 100000
+	defaultWorkerCount = 16
+	defaultChannelSize = 100000
+	// maxChannelSize bounds the event channel buffer at the allocation
+	// site: each queued event embeds a Span/Log by value (~0.5-2 KB), so
+	// 1M buffered events is already ~1-2 GB. Mirrors the config-boundary
+	// range check on GRAPHRAG_EVENT_QUEUE_SIZE (config.Validate).
+	maxChannelSize       = 1_000_000
 	defaultTraceTTL      = 1 * time.Hour
 	defaultRefreshEvery  = 60 * time.Second
 	defaultSnapshotEvery = 15 * time.Minute
@@ -263,7 +268,7 @@ func New(repo *storage.Repository, tsdbAgg *tsdb.Aggregator, ringBuf *tsdb.RingB
 	if cfg.WorkerCount == 0 {
 		cfg.WorkerCount = defaultWorkerCount
 	}
-	if cfg.ChannelSize == 0 {
+	if cfg.ChannelSize <= 0 || cfg.ChannelSize > maxChannelSize {
 		cfg.ChannelSize = defaultChannelSize
 	}
 	if cfg.MaxSpansPerTenant == 0 {
