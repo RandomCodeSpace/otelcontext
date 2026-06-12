@@ -21,6 +21,7 @@ func (s *Server) handleGetLogs(w http.ResponseWriter, r *http.Request) {
 		ServiceName: r.URL.Query().Get("service_name"),
 		Severity:    r.URL.Query().Get("severity"),
 		Search:      r.URL.Query().Get("search"),
+		TraceID:     r.URL.Query().Get("trace_id"),
 		Limit:       limit,
 		Offset:      offset,
 	}
