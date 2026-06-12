@@ -22,8 +22,12 @@ export type PercentUnit = 'ratio' | 'percent' | 'auto'
 function trimFixed(value: number, digits: number): string {
   const s = value.toFixed(digits)
   if (!s.includes('.')) return s
-  // Two anchored single-quantifier passes -- linear, no backtracking.
-  return s.replace(/0+$/, '').replace(/\.$/, '')
+  // Index walk instead of regex: even /0+$/ backtracks polynomially when
+  // the engine retries it from every position (sonar S5852).
+  let end = s.length
+  while (s[end - 1] === '0') end--
+  if (s[end - 1] === '.') end--
+  return s.slice(0, end)
 }
 
 /**
