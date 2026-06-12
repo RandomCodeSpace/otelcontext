@@ -1,7 +1,106 @@
 /*
- * Browser-reset only. Tokens and theming live in styles/tokens.css;
+ * Browser-level base. Tokens and theming live in styles/tokens.css;
  * everything visual is component CSS Modules on top of those tokens.
+ * This file owns only what must apply before any component renders:
+ * surface continuity (overscroll, browser chrome), typography rendering,
+ * form-control inheritance, and the iOS input-zoom guard.
  */
-*, *::before, *::after { box-sizing: border-box; }
-body { margin: 0; }
-#root { min-height: 100vh; }
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  height: 100%;
+}
+
+body {
+  min-height: 100%;
+  margin: 0;
+  /* The app shell paints --bg-base too, but body must match so mobile
+   * rubber-band overscroll and in-between paint frames never flash white. */
+  background: var(--bg-app, var(--bg-base));
+  background-attachment: fixed;
+  color: var(--text-1);
+  font-family: var(--font-sans);
+  font-size: var(--text-base);
+  /* Inter at 12–13.5px sits better slightly tightened. */
+  letter-spacing: -0.006em;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  /* Kill the grey/blue flash on touch — components signal press states. */
+  -webkit-tap-highlight-color: transparent;
+  overscroll-behavior-y: none;
+}
+
+#root {
+  min-height: 100vh;
+  min-height: 100dvh;
+}
+
+/* Form controls inherit the product type instead of UA defaults. */
+input,
+textarea,
+select,
+button {
+  font: inherit;
+  letter-spacing: inherit;
+  color: inherit;
+}
+
+/* iOS Safari auto-zooms any focused control whose font-size is below 16px.
+ * The product scale tops out at 13.5px, so on coarse pointers every text
+ * control is pinned to 16px. !important is deliberate: this guard must beat
+ * any per-component font-size, present or future — a zooming viewport is
+ * always worse than a slightly larger field. */
+@media (pointer: coarse) {
+  input,
+  textarea,
+  select {
+    font-size: max(16px, 1em) !important;
+  }
+}
+
+/* Text fields get a contained focus treatment — the global 2px offset ring
+ * (tokens.css) reads clunky inside dense toolbars. */
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 0;
+  box-shadow: 0 0 0 3px var(--accent-muted);
+}
+
+::selection {
+  background: var(--accent-muted);
+  color: var(--text-1);
+}
+
+/* Token-colored scrollbars — UA-default chrome on a near-black surface is
+ * the single loudest "unfinished" signal. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--stroke-2) transparent;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-thumb {
+  border: 3px solid transparent;
+  border-radius: 8px;
+  background-color: var(--stroke-2);
+  background-clip: content-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background-color: var(--text-3);
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}

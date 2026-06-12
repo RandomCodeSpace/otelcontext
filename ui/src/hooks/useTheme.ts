@@ -44,6 +44,11 @@ export function useTheme() {
 
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme)
+    // Keep mobile browser chrome (address bar / status bar) on-surface —
+    // values mirror --bg-base in tokens.css for each theme.
+    document
+      .querySelector('meta[name="theme-color"]')
+      ?.setAttribute('content', theme === 'dark' ? '#0b0d10' : '#f7f8fa')
   }, [theme])
 
   const toggle = useCallback(() => {

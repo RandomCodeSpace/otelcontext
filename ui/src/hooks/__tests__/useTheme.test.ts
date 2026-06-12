@@ -107,3 +107,25 @@ describe('useTheme', () => {
     setItem.mockRestore()
   })
 })
+
+describe('theme-color meta sync', () => {
+  it('keeps the browser chrome color in sync with the active theme', () => {
+    const meta = document.createElement('meta')
+    meta.setAttribute('name', 'theme-color')
+    document.head.appendChild(meta)
+    try {
+      mockMatchMedia(false)
+      const { result } = renderHook(() => useTheme())
+      expect(meta.getAttribute('content')).toBe('#0b0d10')
+      act(() => result.current.toggle())
+      expect(meta.getAttribute('content')).toBe('#f7f8fa')
+    } finally {
+      meta.remove()
+    }
+  })
+
+  it('tolerates a missing theme-color meta tag', () => {
+    mockMatchMedia(false)
+    expect(() => renderHook(() => useTheme())).not.toThrow()
+  })
+})

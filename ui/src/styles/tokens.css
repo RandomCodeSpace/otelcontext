@@ -72,8 +72,13 @@
   --dur-1: 80ms;
   --dur-2: 140ms;
   --dur-3: 240ms;
-  /* single elevation level — sheets/overlays only */
+  /* two elevation levels — popovers/menus, and sheets/overlays */
+  --shadow-pop: 0 4px 16px rgb(0 0 0 / 0.35);
   --shadow-sheet: 0 8px 32px rgb(0 0 0 / 0.45);
+  /* App atmosphere: a barely-perceptible luminance ramp from the top of the
+   * viewport (~3% lighter) into --bg-base. Texture, not decoration — it
+   * keeps the large dark field from reading flat. Painted by body only. */
+  --bg-app: radial-gradient(1100px 700px at 50% -12%, #11151d 0%, var(--bg-base) 62%);
   color-scheme: dark;
 }
 
@@ -96,7 +101,9 @@
   --ok-bg: #0e9f6e14;
   --warn-bg: #b4530914;
   --crit-bg: #dc262614;
+  --shadow-pop: 0 4px 16px rgb(23 27 35 / 0.1);
   --shadow-sheet: 0 8px 32px rgb(23 27 35 / 0.16);
+  --bg-app: radial-gradient(1100px 700px at 50% -12%, #fdfdfe 0%, var(--bg-base) 62%);
   color-scheme: light;
 }
 
