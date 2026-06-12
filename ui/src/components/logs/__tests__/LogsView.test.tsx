@@ -317,6 +317,23 @@ describe('LogsView — server search mode', () => {
     await waitFor(() => expect(loc.history.at(-1)).toBe('/logs'))
   })
 
+  it('enters a service-scoped search from the ?service= deep link (palette verb)', async () => {
+    const user = userEvent.setup()
+    fetchMock.mockResolvedValue(
+      jsonResponse({ data: [log({ body: 'svc-scoped' })], total: 1 }),
+    )
+    const { loc } = renderLogs('/logs?service=checkout')
+    await waitFor(() =>
+      expect(screen.getByText('svc-scoped')).toBeInTheDocument(),
+    )
+    const calledPath = String(fetchMock.mock.calls[0]?.[0])
+    expect(calledPath).toContain('service_name=checkout')
+    expect(screen.getByText(/checkout · 1 matches/i)).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: /back to live/i }))
+    await waitFor(() => expect(loc.history.at(-1)).toBe('/logs'))
+  })
+
   it('pages older results with Load older', async () => {
     const user = userEvent.setup()
     const first = Array.from({ length: 100 }, (_, i) =>

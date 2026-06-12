@@ -85,6 +85,16 @@ describe('App routing', () => {
     await waitFor(() => expect(memory.history).toContain('/'))
   })
 
+  it('redirects the retired /dashboard route to the Triage home', async () => {
+    const memory = renderApp('/dashboard')
+    await waitFor(() => expect(memory.history).toContain('/'))
+  })
+
+  it('redirects the retired /mcp route to the Triage home', async () => {
+    const memory = renderApp('/mcp')
+    await waitFor(() => expect(memory.history).toContain('/'))
+  })
+
   it('mounts the FlowMapView at /map', async () => {
     renderApp('/map')
     // Lazy chunk + empty graph → the view's empty state proves the mount.

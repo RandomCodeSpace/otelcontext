@@ -149,6 +149,27 @@ describe('ServiceInspector', () => {
     expect(screen.getByText('p99 above 200ms')).toBeInTheDocument()
   })
 
+  it('?tab= deep-links a registry tab (palette verbs)', async () => {
+    renderInspector('/map?service=payments&tab=why')
+    await screen.findByRole('tab', { name: /why/i })
+    expect(screen.getByRole('tab', { name: /why/i })).toHaveAttribute(
+      'aria-selected',
+      'true',
+    )
+    expect(
+      screen.getByRole('button', { name: /run root-cause analysis/i }),
+    ).toBeInTheDocument()
+  })
+
+  it('an invalid ?tab= falls back to Overview', async () => {
+    renderInspector('/map?service=payments&tab=nope')
+    await screen.findByText('42/s')
+    expect(screen.getByRole('tab', { name: /overview/i })).toHaveAttribute(
+      'aria-selected',
+      'true',
+    )
+  })
+
   it('dependencies tab lists upstream/downstream; row click pushes the trail', async () => {
     const user = userEvent.setup()
     const memory = renderInspector()

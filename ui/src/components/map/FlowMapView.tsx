@@ -1,12 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu'
 import { Info, Maximize2, Search, X } from 'lucide-react'
+import { useLocation, useSearch } from 'wouter'
 import FlowMap, { type FlowMapHandle } from './FlowMap'
 import ServiceGroups from '@/components/common/ServiceGroups'
 import { useSystemGraph } from '@/hooks/useSystemGraph'
 import { useInvestigation } from '@/hooks/useInvestigation'
 import { useMediaQuery } from '@/hooks/useMediaQuery'
+import { downstreamDepths } from '@/lib/impact'
 import { nodeStatus, type ServiceStatus } from '@/lib/triage'
+import { buildHref, readParam } from '@/lib/urlState'
 import type { SystemNode } from '@/types/api'
 import styles from './FlowMapView.module.css'
 
@@ -89,6 +92,8 @@ function SkeletonMap() {
 export default function FlowMapView() {
   const { graph, loading, error, reload, dataUpdatedAt } = useSystemGraph()
   const { service, openService, closeInspector } = useInvestigation()
+  const search = useSearch()
+  const [, navigate] = useLocation()
   const isXs = useMediaQuery('(max-width: 767px)')
   const [query, setQuery] = useState('')
   const [status, setStatus] = useState<StatusFilter>('all')
@@ -105,8 +110,24 @@ export default function FlowMapView() {
     [nodes, q, status],
   )
 
+  // ?impact= blast-radius overlay (Inspector "Show on map" / shared links):
+  // BFS the downstream cone client-side over the already-loaded edge set.
+  const impactService = readParam(search, 'impact')
+  const impactDepths = useMemo(() => {
+    if (!impactService || edges.length === 0) return null
+    return downstreamDepths(
+      edges.map((e) => ({ source: e.source, target: e.target })),
+      impactService,
+    )
+  }, [impactService, edges])
+  const clearImpact = useCallback(() => {
+    navigate(buildHref('/map', search, { impact: null }), { replace: true })
+  }, [navigate, search])
+
   const focusFilter = useCallback(() => filterRef.current?.focus(), [])
-  const showMap = !isXs || xsFlow
+  // The cone is a map-only affordance — entering impact mode on xs jumps
+  // straight to the flow rendering instead of the card list.
+  const showMap = !isXs || xsFlow || impactDepths !== null
 
   let body
   if (loading) {
@@ -153,6 +174,7 @@ export default function FlowMapView() {
         nodes={filteredNodes}
         edges={edges}
         selectedId={service}
+        impact={impactDepths}
         onSelect={openService}
         onClearSelection={closeInspector}
         onFocusFilter={focusFilter}
@@ -241,6 +263,25 @@ export default function FlowMapView() {
           <LegendPopover />
         </div>
       </div>
+      {impactService && (
+        <div className={styles.impactBanner} role="status">
+          <span className={styles.impactText}>
+            Blast radius of{' '}
+            <code className={styles.impactService}>{impactService}</code>
+            {impactDepths !== null && (
+              <> — {impactDepths.size - 1} downstream</>
+            )}
+          </span>
+          <button
+            type="button"
+            className={styles.toolButton}
+            aria-label="Clear blast radius overlay"
+            onClick={clearImpact}
+          >
+            <X size={13} aria-hidden="true" />
+          </button>
+        </div>
+      )}
       {body}
     </div>
   )

@@ -1,7 +1,7 @@
 import { useQuery } from '@tanstack/react-query'
 import { callMcpTool } from '@/lib/mcpClient'
+import { parseAnomalies } from '@/lib/mcpResults'
 import { ANOMALY_WINDOW_MS } from '@/lib/triage'
-import { parseAnomalies } from './useAnomalies'
 import type { AnomalyNode } from '@/types/api'
 
 export interface AnomalyTimeline {

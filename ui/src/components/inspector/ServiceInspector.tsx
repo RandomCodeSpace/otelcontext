@@ -2,14 +2,16 @@ import { useCallback, useRef, useState, type ReactNode } from 'react'
 import * as Dialog from '@radix-ui/react-dialog'
 import * as Tabs from '@radix-ui/react-tabs'
 import { X } from 'lucide-react'
+import { useLocation, useSearch } from 'wouter'
 import { useInvestigation } from '@/hooks/useInvestigation'
 import { useSystemGraph } from '@/hooks/useSystemGraph'
 import { useMediaQuery } from '@/hooks/useMediaQuery'
 import { formatPercent } from '@/lib/format'
 import { nodeStatus, statusToken } from '@/lib/triage'
 import { nextSheetState, type SheetSnap } from '@/lib/sheet'
+import { buildHref, readParam } from '@/lib/urlState'
 import type { SystemNode } from '@/types/api'
-import { INSPECTOR_TABS } from './registry'
+import { INSPECTOR_TABS, isInspectorTabId } from './registry'
 import styles from './ServiceInspector.module.css'
 
 // Service Inspector — the omnipresent ?service=X panel:
@@ -64,9 +66,35 @@ function InspectorBody({
   service,
   onClose,
 }: Readonly<{ service: string; onClose: () => void }>) {
-  const { openService } = useInvestigation()
+  const { openService, openTrace } = useInvestigation()
   const { graph, loading, error, reload } = useSystemGraph()
   const node = graph?.nodes.find((n) => n.id === service) ?? null
+
+  const search = useSearch()
+  const [, navigate] = useLocation()
+  // ?tab= targets a registry tab (palette verbs / shared links). The param
+  // seeds local state; manual tab flips stay local — re-seeded whenever the
+  // param or the inspected service changes (adjust-during-render pattern,
+  // not an effect: https://react.dev/learn/you-might-not-need-an-effect).
+  const tabParam = readParam(search, 'tab')
+  const seedTab = isInspectorTabId(tabParam) ? tabParam : INSPECTOR_TABS[0].id
+  const [tab, setTab] = useState(seedTab)
+  const [seedKey, setSeedKey] = useState({ tabParam, service })
+  if (seedKey.tabParam !== tabParam || seedKey.service !== service) {
+    setSeedKey({ tabParam, service })
+    setTab(seedTab)
+  }
+
+  const showImpactOnMap = useCallback(
+    (svc: string) => {
+      // Cone overlay lives on /map; drop inspector params so the map is
+      // unobstructed. History push — Back returns to the inspector.
+      navigate(
+        buildHref('/map', search, { impact: svc, service: null, tab: null }),
+      )
+    },
+    [navigate, search],
+  )
 
   if (loading) {
     return (
@@ -105,11 +133,17 @@ function InspectorBody({
     )
   }
 
-  const ctx = { node, edges: graph?.edges ?? [], openService }
+  const ctx = {
+    node,
+    edges: graph?.edges ?? [],
+    openService,
+    openTrace,
+    showImpactOnMap,
+  }
   return (
     <>
       <Header node={node} service={service} onClose={onClose} />
-      <Tabs.Root defaultValue={INSPECTOR_TABS[0].id} className={styles.tabs}>
+      <Tabs.Root value={tab} onValueChange={setTab} className={styles.tabs}>
         <Tabs.List className={styles.tabList} aria-label="Inspector sections">
           {INSPECTOR_TABS.map((tab) => (
             <Tabs.Trigger key={tab.id} value={tab.id} className={styles.tabTrigger}>

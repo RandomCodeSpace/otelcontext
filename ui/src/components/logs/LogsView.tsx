@@ -23,12 +23,14 @@ type Mode = 'live' | 'search' | 'context'
 function searchPath(
   q: string,
   traceId: string,
+  service: string,
   severity: PillSeverity | null,
   offset: number,
 ): string {
   const params = new URLSearchParams()
   if (q) params.set('search', q)
   if (traceId) params.set('trace_id', traceId)
+  if (service) params.set('service_name', service)
   if (severity) params.set('severity', severity)
   params.set('limit', String(PAGE_SIZE))
   params.set('offset', String(offset))
@@ -45,10 +47,15 @@ export default function LogsView() {
   const ws = getWsManager()
   const [, navigate] = useLocation()
   const urlParams = useSearch()
-  const traceId = useMemo(
-    () => new URLSearchParams(urlParams).get('trace') ?? '',
-    [urlParams],
-  )
+  // Deep-link params: ?trace= correlates a trace's logs, ?service= scopes a
+  // server-side search to one service (the palette's "Search logs…" verb).
+  const { traceId, serviceParam } = useMemo(() => {
+    const params = new URLSearchParams(urlParams)
+    return {
+      traceId: params.get('trace') ?? '',
+      serviceParam: params.get('service') ?? '',
+    }
+  }, [urlParams])
 
   const [severity, setSeverity] = useState<PillSeverity | null>(null)
   const [searchText, setSearchText] = useState('')
@@ -62,11 +69,9 @@ export default function LogsView() {
   } | null>(null)
   const paused = frozen !== null
 
-  const mode: Mode = contextAnchor
-    ? 'context'
-    : debouncedSearch || traceId
-      ? 'search'
-      : 'live'
+  let mode: Mode = 'live'
+  if (contextAnchor) mode = 'context'
+  else if (debouncedSearch || traceId || serviceParam) mode = 'search'
 
   // ---- live tail. Renders are driven by the WsManager version counter
   // (one bump per 250ms flush tick), so filtering/counting per render IS
@@ -87,10 +92,10 @@ export default function LogsView() {
 
   // ---- search mode (server-backed, offset paging)
   const searchQuery = useInfiniteQuery({
-    queryKey: ['logs', 'search', debouncedSearch, traceId, severity],
+    queryKey: ['logs', 'search', debouncedSearch, traceId, serviceParam, severity],
     queryFn: ({ pageParam, signal }) =>
       apiFetch<LogsResponse>(
-        searchPath(debouncedSearch, traceId, severity, pageParam),
+        searchPath(debouncedSearch, traceId, serviceParam, severity, pageParam),
         { signal },
       ),
     initialPageParam: 0,
@@ -126,8 +131,8 @@ export default function LogsView() {
   const backToLive = () => {
     setContextAnchor(null)
     setSearchText('')
-    if (traceId) {
-      // Drop the ?trace= deep-link param without adding a history entry.
+    if (traceId || serviceParam) {
+      // Drop the deep-link params without adding a history entry.
       navigate('/logs', { replace: true })
     }
   }
@@ -200,7 +205,7 @@ export default function LogsView() {
           {mode === 'search' &&
             (traceId
               ? `trace ${traceId.slice(0, 12)}…`
-              : `${searchQuery.data?.pages[0]?.total ?? '…'} matches`)}
+              : `${serviceParam ? `${serviceParam} · ` : ''}${searchQuery.data?.pages[0]?.total ?? '…'} matches`)}
           {mode === 'context' && 'surrounding ±1min'}
         </span>
       </div>

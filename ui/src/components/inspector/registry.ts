@@ -4,10 +4,11 @@ import {
   OverviewTab,
   type InspectorTabContext,
 } from './inspectorTabs'
+import { WhyTab } from './WhyTab'
+import { ImpactTab } from './ImpactTab'
 
-// The Inspector tab registry — the extension seam for later phases:
-// "Why" (MCP root_cause_analysis) and "Impact" (MCP impact_analysis) ship
-// by adding their content component to inspectorTabs.tsx and one entry here.
+// The Inspector tab registry. Adding a tab = one content component plus one
+// entry here; ids double as the ?tab= deep-link values the palette uses.
 
 export interface InspectorTabDef {
   id: string
@@ -17,5 +18,12 @@ export interface InspectorTabDef {
 
 export const INSPECTOR_TABS: readonly InspectorTabDef[] = [
   { id: 'overview', label: 'Overview', Content: OverviewTab },
+  { id: 'why', label: 'Why', Content: WhyTab },
+  { id: 'impact', label: 'Impact', Content: ImpactTab },
   { id: 'dependencies', label: 'Dependencies', Content: DependenciesTab },
 ]
+
+/** Validate a ?tab= param against the registry. */
+export function isInspectorTabId(value: string | null): value is string {
+  return value !== null && INSPECTOR_TABS.some((tab) => tab.id === value)
+}

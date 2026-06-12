@@ -1,7 +1,7 @@
 // Minimal JSON-RPC 2.0 transport for the OtelContext MCP endpoint (POST /mcp).
-// Shared by the MCP Trial console (hooks/useMcpTools, useMcpCall) and the
-// dashboard's anomaly panel (hooks/useAnomalies). Transport only — result
-// parsing (content[0].text JSON, root_cause extraction) is the caller's job.
+// Shared by the triage-verb queries (lib/triageVerbs) and the anomaly
+// timeline (hooks/useAnomalyTimeline). Transport only — result parsing
+// (content[0].text JSON) lives in lib/mcpResults.
 
 export interface McpToolResult {
   content?: { type: string; text?: string }[]
@@ -54,23 +54,6 @@ export async function mcpRpc<T = unknown>(
     throw new McpError(json.error.code ?? -1, json.error.message ?? 'MCP error')
   }
   return json.result as T
-}
-
-export interface McpToolSchema {
-  type?: string
-  properties?: Record<string, { type?: string; description?: string }>
-  required?: string[]
-}
-
-export interface McpTool {
-  name: string
-  description?: string
-  inputSchema?: McpToolSchema
-}
-
-export async function listMcpTools(opts?: McpCallOptions): Promise<McpTool[]> {
-  const result = await mcpRpc<{ tools?: McpTool[] }>('tools/list', {}, opts)
-  return result.tools ?? []
 }
 
 export async function callMcpTool(

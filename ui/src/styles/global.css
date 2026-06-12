@@ -1,5 +1,6 @@
 /*
- * Browser-reset only. Everything else is owned by @ossrandom/design-system.
+ * Browser-reset only. Tokens and theming live in styles/tokens.css;
+ * everything visual is component CSS Modules on top of those tokens.
  */
 *, *::before, *::after { box-sizing: border-box; }
 body { margin: 0; }

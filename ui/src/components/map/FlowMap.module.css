@@ -56,6 +56,18 @@
   stroke-dasharray: 4 3;
 }
 
+/* Blast-radius cone (?impact=): --crit tint over the node fill, strength
+ * by depth via inline fillOpacity (lib/impact.impactAlpha). */
+.nodeImpact {
+  fill: var(--crit);
+  pointer-events: none;
+}
+
+.nodeImpactRoot {
+  stroke: var(--crit);
+  stroke-width: 2;
+}
+
 .nodeDot {
   fill: var(--node-color);
 }
