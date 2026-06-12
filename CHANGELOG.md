@@ -9,9 +9,13 @@ commit on `main` is the canonical version identifier (`git rev-parse HEAD`).
 Per-tag pre-release notes are published on
 [GitHub Releases](https://github.com/RandomCodeSpace/otelcontext/releases).
 This file's `Unreleased` section tracks what has landed on `main` since the
-last published pre-release tag (`v0.2.0-beta.6`).
+last published pre-release tag (`v0.3.0-beta.1`).
 
 ## [Unreleased]
+
+_Nothing yet._
+
+## [v0.3.0-beta.1] — 2026-06-12
 
 ### Fixed — production OOM restarts (memory-survival series)
 
@@ -256,7 +260,8 @@ committed the built UI to `main`.)
 - bestpractices.dev project [12646](https://www.bestpractices.dev/projects/12646)
   declared at `level: passing` via canonical autofill schema. ([#47])
 
-[Unreleased]: https://github.com/RandomCodeSpace/otelcontext/compare/v0.2.0-beta.6...HEAD
+[Unreleased]: https://github.com/RandomCodeSpace/otelcontext/compare/v0.3.0-beta.1...HEAD
+[v0.3.0-beta.1]: https://github.com/RandomCodeSpace/otelcontext/compare/v0.2.0-beta.6...v0.3.0-beta.1
 [v0.2.0-beta.6]: https://github.com/RandomCodeSpace/otelcontext/compare/v0.0.11-beta.15...v0.2.0-beta.6
 [#24]: https://github.com/RandomCodeSpace/otelcontext/pull/24
 [#25]: https://github.com/RandomCodeSpace/otelcontext/pull/25
