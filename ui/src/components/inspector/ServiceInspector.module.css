@@ -293,6 +293,131 @@
   color: var(--text-3);
 }
 
+/* ---- MCP verb tabs (Why / Impact) ---- */
+.runButton {
+  align-self: flex-start;
+  min-height: 36px;
+  padding: 0 var(--space-4);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-2);
+  background: var(--accent-muted);
+  color: var(--accent);
+  font-size: var(--text-sm);
+  font-weight: 600;
+  cursor: pointer;
+  transition: background var(--dur-1) var(--ease);
+}
+
+@media (pointer: coarse) {
+  .runButton {
+    min-height: 44px;
+  }
+}
+
+@media (hover: hover) {
+  .runButton:hover {
+    background: var(--bg-overlay);
+  }
+}
+
+.skeletonCause {
+  min-height: 64px;
+  margin-bottom: var(--space-2);
+}
+
+.causeList {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.causeCard {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--stroke-1);
+  border-radius: var(--radius-2);
+}
+
+.causeHead {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+}
+
+.causeRank {
+  flex: none;
+  color: var(--text-3);
+  font-size: var(--text-2xs);
+}
+
+.causeService {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.causeOp {
+  color: var(--text-2);
+  font-weight: 400;
+}
+
+.causeScore {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--text-2);
+}
+
+.scoreTrack {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--bg-inset);
+  overflow: hidden;
+}
+
+.scoreFill {
+  height: 100%;
+  border-radius: 2px;
+  background: var(--accent);
+}
+
+.evidenceList {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: 0;
+  padding-left: var(--space-4);
+  color: var(--text-2);
+  font-size: var(--text-xs);
+}
+
+.evidenceItem {
+  overflow-wrap: anywhere; /* evidence lines carry trace ids */
+}
+
+.verbHeadRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.verbHeadRow .stateAction {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
 /* ---- async states ---- */
 .statePanel {
   display: flex;

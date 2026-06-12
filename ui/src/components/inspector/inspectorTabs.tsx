@@ -4,15 +4,19 @@ import { formatCount, formatMs, formatPercent } from '@/lib/format'
 import { nodeStatus, statusToken } from '@/lib/triage'
 import styles from './ServiceInspector.module.css'
 
-// Inspector tab CONTENT components. The registry that orders them lives in
-// ./registry.ts — "Why" (root_cause_analysis) and "Impact" (impact_analysis)
-// land in a later phase by adding a component here and an entry there.
+// Inspector tab CONTENT components (Overview, Dependencies). The registry
+// that orders them lives in ./registry.ts; the MCP verb tabs ("Why",
+// "Impact") live in WhyTab.tsx / ImpactTab.tsx.
 
 export interface InspectorTabContext {
   node: SystemNode
   edges: readonly SystemEdge[]
   /** Drill into another service — pushes the investigation trail. */
   openService: (id: string) => void
+  /** Drill into a trace — pushes the trail and navigates to /traces. */
+  openTrace: (id: string) => void
+  /** Hand a blast radius to the flow map's ?impact= cone overlay. */
+  showImpactOnMap: (service: string) => void
 }
 
 function Stat({ label, value }: Readonly<{ label: string; value: string }>) {

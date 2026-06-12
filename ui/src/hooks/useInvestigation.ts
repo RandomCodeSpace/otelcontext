@@ -22,8 +22,14 @@ export interface Investigation {
   service: string | null
   /** The breadcrumb stack, oldest first. */
   trail: readonly TrailFrame[]
-  /** Drill into a service: pushes the trail and opens the Inspector. */
-  openService: (id: string) => void
+  /**
+   * Drill into a service: pushes the trail and opens the Inspector.
+   * `tab` targets a specific inspector tab (palette verbs); omitting it
+   * clears any stale ?tab so plain drill-downs land on Overview.
+   */
+  openService: (id: string, tab?: string) => void
+  /** Drill into a trace: pushes the trail and navigates to /traces. */
+  openTrace: (id: string) => void
   /** Close the Inspector. The trail is history — it stays. */
   closeInspector: () => void
   /** Chip tap: pop back to frame `index` and activate it. */
@@ -47,11 +53,31 @@ export function useInvestigation(): Investigation {
   )
 
   const openService = useCallback(
-    (id: string) => {
+    (id: string, tab?: string) => {
       const next = pushFrame(trail, { kind: 'svc', id })
-      apply({ service: id, trail: serializeTrail(next) || null })
+      apply({
+        service: id,
+        trail: serializeTrail(next) || null,
+        tab: tab ?? null,
+      })
     },
     [apply, trail],
+  )
+
+  const openTrace = useCallback(
+    (id: string) => {
+      const next = pushFrame(trail, { kind: 'trace', id })
+      // Cross-route navigation — history push so Back returns here. The
+      // trail carries the investigation context; route-local filters from
+      // the previous page deliberately do not follow.
+      navigate(
+        buildHref('/traces', '', {
+          trace: id,
+          trail: serializeTrail(next) || null,
+        }),
+      )
+    },
+    [navigate, trail],
   )
 
   const closeInspector = useCallback(() => {
@@ -80,5 +106,13 @@ export function useInvestigation(): Investigation {
     activate(trail.slice(0, -1))
   }, [activate, trail])
 
-  return { service, trail, openService, closeInspector, popToFrame, popOne }
+  return {
+    service,
+    trail,
+    openService,
+    openTrace,
+    closeInspector,
+    popToFrame,
+    popOne,
+  }
 }

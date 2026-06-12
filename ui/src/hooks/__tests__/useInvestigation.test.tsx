@@ -95,10 +95,40 @@ describe('useInvestigation', () => {
   })
 
   it('preserves the current route path and unrelated params', () => {
-    const { memory, rendered } = setup('/map?tab=deps')
+    const { memory, rendered } = setup('/map?status=critical')
     act(() => rendered.result.current.openService('checkout'))
     expect(memory.history.at(-1)).toMatch(/^\/map\?/)
-    expect(memory.history.at(-1)).toContain('tab=deps')
+    expect(memory.history.at(-1)).toContain('status=critical')
+  })
+
+  it('openService clears a stale ?tab so drill-downs land on Overview', () => {
+    const { memory, rendered } = setup('/map?service=a&tab=why&trail=svc:a')
+    act(() => rendered.result.current.openService('b'))
+    expect(memory.history.at(-1)).not.toContain('tab=')
+  })
+
+  it('openService with a tab targets that inspector tab', () => {
+    const { memory, rendered } = setup('/map')
+    act(() => rendered.result.current.openService('checkout', 'why'))
+    expect(memory.history.at(-1)).toContain('tab=why')
+    expect(rendered.result.current.service).toBe('checkout')
+  })
+
+  it('openTrace pushes a trace frame and navigates to /traces', () => {
+    const { memory, rendered } = setup('/map?service=a&trail=svc:a')
+    act(() => rendered.result.current.openTrace('t1'))
+    const dest = memory.history.at(-1)!
+    expect(dest).toMatch(/^\/traces\?/)
+    expect(dest).toContain('trace=t1')
+    expect(dest).toContain('trail=svc%3Aa%2Ctrace%3At1')
+    expect(dest).not.toContain('service=')
+  })
+
+  it('openTrace pushes history (Back returns to the inspector)', () => {
+    const { memory, rendered } = setup('/map?service=a')
+    const before = memory.history.length
+    act(() => rendered.result.current.openTrace('t1'))
+    expect(memory.history.length).toBe(before + 1)
   })
 
   it('uses replace navigation (no history spam)', () => {
