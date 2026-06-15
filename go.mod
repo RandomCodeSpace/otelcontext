@@ -3,7 +3,7 @@ module github.com/RandomCodeSpace/otelcontext
 go 1.25.11
 
 require (
-	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.21.1
+	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.22.0
 	github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.13.1
 	github.com/coder/websocket v1.8.14
 	github.com/glebarez/go-sqlite v1.22.0
