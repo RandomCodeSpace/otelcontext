@@ -42,15 +42,15 @@ describe('useGlobalKeys', () => {
     expect(onShortcuts).toHaveBeenCalledTimes(1)
   })
 
-  it('g t navigates to /traces; g while typing does not', () => {
-    const { memory, getByLabelText } = setup('/map')
+  it('g m navigates to /map; g while typing does not', () => {
+    const { memory, getByLabelText } = setup('/')
     fireEvent.keyDown(getByLabelText('field'), { key: 'g' })
-    fireEvent.keyDown(getByLabelText('field'), { key: 't' })
-    expect(memory.history.at(-1)).toBe('/map')
+    fireEvent.keyDown(getByLabelText('field'), { key: 'm' })
+    expect(memory.history.at(-1)).toBe('/')
 
     fireEvent.keyDown(window, { key: 'g' })
-    fireEvent.keyDown(window, { key: 't' })
-    expect(memory.history.at(-1)).toBe('/traces')
+    fireEvent.keyDown(window, { key: 'm' })
+    expect(memory.history.at(-1)).toBe('/map')
   })
 
   it('the listener unbinds on unmount', () => {

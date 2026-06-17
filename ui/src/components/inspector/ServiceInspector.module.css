@@ -20,8 +20,26 @@
     z-index: auto;
     flex: none;
     width: 380px;
-    background: transparent;
-    box-shadow: none;
+    background: var(--bg-raised);
+    /* Docked = the single inspected entity anchored to the canvas selection.
+     * Hairline left border + a raised 2px inset --accent rail reads as
+     * "this column belongs to the lit node" at the same intensity as the
+     * canvas node ring and the rail row; separation by hairline + edge,
+     * never a drop shadow. */
+    border-left: 1px solid var(--stroke-1);
+    box-shadow: inset 2px 0 0 var(--accent);
+  }
+
+  /* Header wash — a faint --accent-muted gradient under the title band echoes
+   * the canvas focus-distortion (the lit node's accent ring) so the docked
+   * column reads as the selection's surface, not a generic panel. Fades to
+   * transparent before the dense content, keeping name/numeral AA intact. */
+  .header {
+    background: linear-gradient(
+      to bottom,
+      var(--accent-muted),
+      transparent
+    );
   }
 }
 
@@ -52,16 +70,21 @@
   min-width: 0;
   overflow: hidden;
   margin: 0;
-  font-family: var(--font-mono);
+  font-family: var(--font-sans);
   font-size: var(--text-base);
   font-weight: 600;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
+/* Header health reading — mono numeral, status-tinted, the authoritative
+ * value for the inspected service. */
 .health {
-  color: var(--text-2);
+  flex: none;
+  font-family: var(--font-mono);
   font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-2);
 }
 
 .close {
@@ -154,6 +177,8 @@
   gap: var(--space-2);
 }
 
+/* Instrument readout cell: legend cap stacked above a mono numeral. The
+ * <Metric> group lays out as a column so the reading reads top-to-bottom. */
 .stat {
   display: flex;
   flex-direction: column;
@@ -163,7 +188,25 @@
   border-radius: var(--radius-2);
 }
 
+/* The <Metric> group: legend cap on its own line, numeral + unit beneath. */
+.stat > [role='group'] {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.stat :global(.num) {
+  font-size: var(--text-lg);
+  color: var(--text-1);
+}
+
+/* Err reading carries status saturation when non-zero. */
+.statCrit :global(.num) {
+  color: var(--crit);
+}
+
 .statLabel {
+  font-family: var(--font-mono);
   color: var(--text-3);
   font-size: var(--text-2xs);
   text-transform: uppercase;
@@ -196,6 +239,7 @@
 
 .sectionTitle {
   margin: 0 0 var(--space-2);
+  font-family: var(--font-mono);
   color: var(--text-3);
   font-size: var(--text-2xs);
   font-weight: 600;
@@ -277,13 +321,16 @@
   flex: 1;
   min-width: 0;
   overflow: hidden;
-  font-family: var(--font-mono);
+  font-family: var(--font-sans);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
+/* Dependency meta is a measured reading (calls / err / trace id) → mono. */
 .depMeta {
   flex: none;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
   color: var(--text-3);
   font-size: var(--text-2xs);
 }
@@ -291,6 +338,18 @@
 .depChevron {
   flex: none;
   color: var(--text-3);
+}
+
+/* Read-only error-chain span row (Why tab) — depRow layout, no interactivity. */
+.chainSpan {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  min-height: 36px;
+  padding: var(--space-1) var(--space-2);
+  color: var(--text-1);
+  font-size: var(--text-sm);
 }
 
 /* ---- MCP verb tabs (Why / Impact) ---- */
@@ -351,6 +410,8 @@
 
 .causeRank {
   flex: none;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
   color: var(--text-3);
   font-size: var(--text-2xs);
 }
@@ -359,7 +420,7 @@
   flex: 1;
   min-width: 0;
   overflow: hidden;
-  font-family: var(--font-mono);
+  font-family: var(--font-sans);
   font-size: var(--text-sm);
   font-weight: 600;
   text-overflow: ellipsis;
@@ -470,7 +531,7 @@
   position: fixed;
   inset: 0;
   z-index: 48;
-  background: rgb(0 0 0 / 0.5);
+  background: var(--scrim);
 }
 
 .sheet {
@@ -481,7 +542,9 @@
   flex-direction: column;
   border-top: 1px solid var(--stroke-2);
   border-radius: var(--radius-3) var(--radius-3) 0 0;
-  background: var(--bg-raised);
+  /* Floating bottom sheet → overlay surface + drop shadow (the one place a
+   * shadow is for elevation, not separation). */
+  background: var(--bg-overlay);
   box-shadow: var(--shadow-sheet);
   transition: height var(--dur-3) var(--ease);
 }

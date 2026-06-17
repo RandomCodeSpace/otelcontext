@@ -136,3 +136,7 @@ data/
 /bin/
 /loadsim
 /otelcontext
+# 1b agent plan (scratch)
+ui/PLAN-1b.md
+# preview-only Vite config (not a shipped artifact)
+ui/vite.preview.config.ts

@@ -16,7 +16,7 @@ export interface GlobalKeyHandlers {
 
 /**
  * Window-level keyboard dispatch: palette toggle, shortcut sheet and the
- * 'g m/t/l/h' go-to chords. The rules live in lib/chords (pure, tested);
+ * 'g h/m' go-to chords. The rules live in lib/chords (pure, tested);
  * this hook only wires DOM events and wouter navigation.
  */
 export function useGlobalKeys({ onPalette, onShortcuts }: GlobalKeyHandlers) {

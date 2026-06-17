@@ -7,13 +7,10 @@
   overflow-y: auto;
 }
 
+/* The .legend utility (global.css) owns the mono-caps voice; the module only
+ * positions the section label above its rows. */
 .sectionTitle {
   margin: 0 0 var(--space-1);
-  color: var(--text-3);
-  font-size: var(--text-2xs);
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
 }
 
 .list {

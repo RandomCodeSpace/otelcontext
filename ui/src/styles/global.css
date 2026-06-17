@@ -104,3 +104,32 @@ select:focus-visible {
 ::-webkit-scrollbar-track {
   background: transparent;
 }
+
+/* Instrument Deck: faint dotted instrument grid on the app surface. Pure CSS,
+   zero DOM. Suppressed under prefers-contrast for a flat high-contrast field. */
+.graticule {
+  background-image: radial-gradient(var(--bg-graticule) 1px, transparent 1px);
+  background-size: 16px 16px;
+}
+@media (prefers-contrast: more) {
+  .graticule {
+    background-image: none;
+  }
+}
+
+/* Indicator voice: every MEASURED quantity renders mono + tabular-nums in a
+   fixed-width slot so live values tick without reflow. */
+.num {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum' 1;
+}
+
+/* Instrument legend: uppercase mono caps for units/axis/section labels. */
+.legend {
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}

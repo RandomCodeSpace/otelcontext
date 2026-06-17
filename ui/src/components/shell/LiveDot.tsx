@@ -37,11 +37,12 @@ export default function LiveDot({ manager }: Readonly<LiveDotProps>) {
   }
 
   return (
-    <span
-      role="status"
-      aria-label={label}
-      title={label}
-      className={`${styles.dot} ${styles[tone]}`}
-    />
+    <span role="status" title={label} className={styles.live}>
+      {/* Real text content is what a live region announces — aria-label
+          mutations on an unchanged empty node are not announced. The colored
+          dot is decorative and hidden from AT. */}
+      <span className={styles.srOnly}>{label}</span>
+      <span aria-hidden="true" className={`${styles.dot} ${styles[tone]}`} />
+    </span>
   )
 }

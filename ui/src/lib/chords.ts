@@ -1,6 +1,6 @@
 // Global keyboard dispatch — a pure state machine so every rule is unit-
 // testable without a DOM: ⌘/Ctrl+K palette (works while typing — the only
-// global that does), '?' shortcut sheet, and the 'g m/t/l/h' go-to chords.
+// global that does), '?' shortcut sheet, and the 'g h/m' go-to chords.
 // '/' is deliberately absent: page-local filter handlers own it.
 
 export type GlobalKeyAction =
@@ -19,12 +19,11 @@ export const INITIAL_CHORD_STATE: ChordState = { pendingG: null }
 /** A second leniency beyond typical chord typing speed. */
 export const CHORD_TIMEOUT_MS = 1200
 
-/** The g-chord destinations: g h home, g m map, g t traces, g l logs. */
+/** The g-chord destinations: g h home, g m map. (Traces/logs are MCP-tool
+ *  surfaces for AI agents now — the human UI has no screen to jump to.) */
 export const GO_TARGETS: Readonly<Record<string, string>> = {
   h: '/',
   m: '/map',
-  t: '/traces',
-  l: '/logs',
 }
 
 export interface KeyStroke {

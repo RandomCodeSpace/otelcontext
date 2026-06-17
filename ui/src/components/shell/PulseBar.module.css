@@ -75,6 +75,16 @@
   }
 }
 
+/* Instrument-Deck indicator voice for each strip reading: mono + tabular so
+   live values (health %, err, p99, DB) tick in fixed-width slots without
+   reflow. The descriptor word ("healthy", "degraded") rides along in mono —
+   acceptable for a dense instrument strip. */
+.reading {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum' 1;
+}
+
 .sep {
   color: var(--text-3);
 }
@@ -152,13 +162,6 @@
 @media (pointer: coarse) {
   .paletteButton {
     height: 44px;
-  }
-}
-
-/* The xs tab bar carries its own palette button — hide this one there. */
-@media (max-width: 767px) {
-  .paletteButton {
-    display: none;
   }
 }
 

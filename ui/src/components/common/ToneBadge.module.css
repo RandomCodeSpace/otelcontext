@@ -26,6 +26,6 @@
 }
 
 .unknown {
-  color: var(--text-2);
-  background: var(--bg-overlay);
+  color: var(--unknown);
+  background: var(--unknown-bg);
 }

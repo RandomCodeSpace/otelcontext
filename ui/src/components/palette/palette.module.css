@@ -4,7 +4,7 @@
   position: fixed;
   inset: 0;
   z-index: 58;
-  background: rgb(0 0 0 / 0.5);
+  background: var(--scrim);
 }
 
 .content {
@@ -44,10 +44,12 @@
 }
 
 .input:focus-visible {
-  /* An inner ring would double up with the dialog frame — signal focus on
-   * the input's own hairline instead. */
+  /* Accent the input's own hairline AND carry the same contained focus glow
+   * global.css gives every text field, so the modal's primary input reads as
+   * unambiguously focused (a lone 1px edge color shift is too weak a signal). */
   outline: none;
   border-bottom-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-muted);
 }
 
 .list {
@@ -70,13 +72,15 @@
   font-size: var(--text-sm);
 }
 
+/* Section labels are instrument legends: mono uppercase caps (the .legend
+ * voice) so the chrome reads as one instrument surface. */
 .group [cmdk-group-heading] {
   padding: var(--space-2) var(--space-2) var(--space-1);
   color: var(--text-3);
+  font-family: var(--font-mono);
   font-size: var(--text-2xs);
-  font-weight: 600;
-  text-transform: uppercase;
   letter-spacing: 0.06em;
+  text-transform: uppercase;
 }
 
 .item {
@@ -189,10 +193,10 @@
 .sheetGroupTitle {
   margin: var(--space-3) 0 var(--space-2);
   color: var(--text-3);
+  font-family: var(--font-mono);
   font-size: var(--text-2xs);
-  font-weight: 600;
-  text-transform: uppercase;
   letter-spacing: 0.06em;
+  text-transform: uppercase;
 }
 
 .shortcutList {

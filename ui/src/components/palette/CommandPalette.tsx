@@ -1,17 +1,7 @@
 import { useCallback, useState } from 'react'
 import * as Dialog from '@radix-ui/react-dialog'
 import { Command } from 'cmdk'
-import {
-  Activity,
-  Copy,
-  ListTree,
-  Network,
-  Radar,
-  ScrollText,
-  SearchCode,
-  SunMoon,
-  Waypoints,
-} from 'lucide-react'
+import { Copy, Orbit, Radar, SunMoon, Waypoints } from 'lucide-react'
 import { useLocation } from 'wouter'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useInvestigation } from '@/hooks/useInvestigation'
@@ -37,16 +27,12 @@ import styles from './palette.module.css'
 // the first open.
 
 const NAV_COMMANDS = [
-  { href: '/', label: 'Triage', Icon: Activity },
-  { href: '/map', label: 'Flow Map', Icon: Network },
-  { href: '/traces', label: 'Traces', Icon: ListTree },
-  { href: '/logs', label: 'Logs', Icon: ScrollText },
+  { href: '/', label: 'Service Map', Icon: Orbit },
 ] as const
 
 const ACTION_ICONS: Record<PaletteActionId, typeof Radar> = {
   'root-cause': Radar,
   impact: Waypoints,
-  'search-logs': SearchCode,
 }
 
 interface CommandPaletteProps {
@@ -103,21 +89,17 @@ export default function CommandPalette({
   const runOnService = useCallback(
     (action: PaletteActionId, service: string) => {
       const cmd = serviceCommand(action, service)
-      if (cmd.kind === 'navigate') {
-        navigate(cmd.href)
+      // Start the RPC now — the inspector tab observes the in-flight
+      // prefetch through the shared query key (lib/triageVerbs).
+      if (cmd.prefetch === 'root_cause_analysis') {
+        void queryClient.prefetchQuery(rootCauseQueryOptions(cmd.service))
       } else {
-        // Start the RPC now — the inspector tab observes the in-flight
-        // prefetch through the shared query key (lib/triageVerbs).
-        if (cmd.prefetch === 'root_cause_analysis') {
-          void queryClient.prefetchQuery(rootCauseQueryOptions(cmd.service))
-        } else {
-          void queryClient.prefetchQuery(impactQueryOptions(cmd.service))
-        }
-        openService(cmd.service, cmd.tab)
+        void queryClient.prefetchQuery(impactQueryOptions(cmd.service))
       }
+      openService(cmd.service, cmd.tab)
       close()
     },
-    [navigate, queryClient, openService, close],
+    [queryClient, openService, close],
   )
 
   const copyMcpUrl = useCallback(() => {

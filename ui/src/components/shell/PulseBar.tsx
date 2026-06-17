@@ -7,6 +7,7 @@ import type { RepoStats, SystemSummary } from '@/types/api'
 import type { Theme } from '@/hooks/useTheme'
 import LiveDot from './LiveDot'
 import ConnectPopover from './ConnectPopover'
+import { UptimeOdometer } from './UptimeOdometer'
 import styles from './PulseBar.module.css'
 
 // Operator honesty about the SQLite growth incident: tint the DB segment
@@ -81,11 +82,13 @@ export default function PulseBar({
               aria-hidden="true"
             />
             <span className={styles.summaryFull}>
-              <span>{formatPercent(summary.overall_health_score)} healthy</span>
+              <span className={styles.reading}>
+                {formatPercent(summary.overall_health_score)} healthy
+              </span>
               {summary.degraded > 0 && (
                 <>
                   <Sep />
-                  <span className={styles.warnText}>
+                  <span className={`${styles.reading} ${styles.warnText}`}>
                     {summary.degraded} degraded
                   </span>
                 </>
@@ -93,7 +96,7 @@ export default function PulseBar({
               {summary.critical > 0 && (
                 <>
                   <Sep />
-                  <span className={styles.critText}>
+                  <span className={`${styles.reading} ${styles.critText}`}>
                     {summary.critical} critical
                   </span>
                 </>
@@ -102,18 +105,24 @@ export default function PulseBar({
                 <>
                   <Sep />
                   {/* error_rate from /api/metrics/dashboard is already ×100 */}
-                  <span>
+                  <span className={styles.reading}>
                     err {formatPercent(dashboard.error_rate, 1, 'percent')}
                   </span>
                   <Sep />
-                  <span>p99 {formatMs(dashboard.p99_latency_ms)}</span>
+                  <span className={styles.reading}>
+                    p99 {formatMs(dashboard.p99_latency_ms)}
+                  </span>
                 </>
               )}
+              <Sep />
+              <UptimeOdometer uptimeSeconds={summary.uptime_seconds} />
               {dbMb !== null && (
                 <>
                   <Sep />
                   <span
-                    className={dbMb >= DB_SIZE_WARN_MB ? styles.warnText : undefined}
+                    className={`${styles.reading} ${
+                      dbMb >= DB_SIZE_WARN_MB ? styles.warnText : ''
+                    }`}
                   >
                     DB {formatMb(dbMb)}
                   </span>

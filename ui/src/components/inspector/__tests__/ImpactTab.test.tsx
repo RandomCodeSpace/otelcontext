@@ -39,7 +39,6 @@ function renderTab(overrides: Partial<InspectorTabContext> = {}) {
     node,
     edges: [],
     openService: vi.fn(),
-    openTrace: vi.fn(),
     showImpactOnMap: vi.fn(),
     ...overrides,
   }

@@ -210,18 +210,28 @@ export function edgeWidth(callCount: number): number {
   return Math.min(5, Math.max(1, w))
 }
 
-/** Transform that fits the content bbox into the viewport (never upscales). */
+/**
+ * Transform that fits the content bbox into the viewport (never upscales).
+ * `minScale` floors the zoom: on a very narrow viewport (a phone) the contain
+ * scale can shrink a small field to illegible dust, so callers pass a floor to
+ * keep nodes readable — the content then overflows the constrained axis and is
+ * reached by pan/pinch. The result stays centered, so floored overflow spills
+ * symmetrically. Floor is ignored for content that genuinely needs to zoom out
+ * past it (callers gate the floor on a small node count).
+ */
 export function fitTransform(
   content: { width: number; height: number },
   viewport: { width: number; height: number },
   padding = 24,
+  minScale = 0,
 ): Transform {
   if (content.width <= 0 || content.height <= 0) return { x: padding, y: padding, k: 1 }
-  const k = Math.min(
+  let k = Math.min(
     1,
     (viewport.width - padding * 2) / content.width,
     (viewport.height - padding * 2) / content.height,
   )
+  if (minScale > 0) k = Math.max(k, minScale)
   return {
     k,
     x: (viewport.width - content.width * k) / 2,

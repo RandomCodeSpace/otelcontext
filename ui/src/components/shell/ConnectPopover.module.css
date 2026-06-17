@@ -75,21 +75,31 @@
   }
 }
 
+/* Endpoint name is an instrument legend: mono uppercase caps. */
 .itemLabel {
   flex: none;
   min-width: 72px;
-  color: var(--text-1);
+  color: var(--text-3);
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
 }
 
+/* The connect string is a code well — inset surface, mono, hairline. */
 .itemValue {
   flex: 1;
   min-width: 0;
   overflow: hidden;
+  padding: 2px var(--space-2);
+  border: 1px solid var(--stroke-1);
+  border-radius: var(--radius-1);
+  background: var(--bg-inset);
   text-overflow: ellipsis;
   white-space: nowrap;
   font-family: var(--font-mono);
   font-size: var(--text-2xs);
-  color: var(--text-2);
+  color: var(--text-1);
 }
 
 .copyIcon {

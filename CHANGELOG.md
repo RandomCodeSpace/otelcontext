@@ -13,10 +13,16 @@ last published pre-release tag (`v0.3.0-beta.1`).
 
 ## [Unreleased]
 
-_Nothing yet._
+### Changed — map-centric "Service Map" UI redesign
+
+- The home is now a single live **Service Map**: a sunflower/phyllotaxis radial
+  layout (most-critical at center) that scales 7→120+ services, with system
+  vitals in the header, a recent-anomaly strip (15m/30m/1h counts + service
+  chips), and the Inspector docked on selection.
+- Logs and Traces are no longer human screens — they are served by the MCP
+  `search_logs`/`trace_graph` tools; the nav collapses to Service Map + ⌘K.
 
 ## [v0.3.0-beta.1] — 2026-06-12
-
 ### Fixed — production OOM restarts (memory-survival series)
 
 - **AnomalyStore memory blowup** (merged from `fix/sqlite-survival-hardening`): stable

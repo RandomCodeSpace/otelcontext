@@ -7,6 +7,7 @@ import { useInvestigation } from '@/hooks/useInvestigation'
 import { useSystemGraph } from '@/hooks/useSystemGraph'
 import { useMediaQuery } from '@/hooks/useMediaQuery'
 import { formatPercent } from '@/lib/format'
+import { Metric } from '@/components/common/Metric'
 import { nodeStatus, statusToken } from '@/lib/triage'
 import { nextSheetState, type SheetSnap } from '@/lib/sheet'
 import { buildHref, readParam } from '@/lib/urlState'
@@ -34,7 +35,9 @@ function Header({
       />
       <h2 className={styles.name}>{service}</h2>
       {node && (
-        <span className={styles.health}>{formatPercent(node.health_score)}</span>
+        <span className={styles.health} style={{ color: statusToken(status) }}>
+          <Metric value={formatPercent(node.health_score)} />
+        </span>
       )}
       <button
         type="button"
@@ -66,7 +69,7 @@ function InspectorBody({
   service,
   onClose,
 }: Readonly<{ service: string; onClose: () => void }>) {
-  const { openService, openTrace } = useInvestigation()
+  const { openService } = useInvestigation()
   const { graph, loading, error, reload } = useSystemGraph()
   const node = graph?.nodes.find((n) => n.id === service) ?? null
 
@@ -137,7 +140,6 @@ function InspectorBody({
     node,
     edges: graph?.edges ?? [],
     openService,
-    openTrace,
     showImpactOnMap,
   }
   return (

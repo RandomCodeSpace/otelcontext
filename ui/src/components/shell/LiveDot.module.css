@@ -1,9 +1,27 @@
+.live {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+}
+
 .dot {
   display: inline-block;
   flex: none;
   width: 8px;
   height: 8px;
   border-radius: 50%; /* full radius reserved for status dots */
+}
+
+.srOnly {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  clip-path: inset(50%);
+  overflow: hidden;
+  white-space: nowrap;
 }
 
 .ok {

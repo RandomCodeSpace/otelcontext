@@ -3,7 +3,13 @@
 .shell {
   display: flex;
   flex-direction: column;
-  min-height: 100dvh;
+  /* Hard viewport box — NOT min-height. With min-height the shell grows past the
+   * viewport when a panel is tall (e.g. a 120-row rail), the page scrolls "below
+   * the footer", and the canvas inherits a giant height so fit() centers the
+   * field off-screen. height + overflow:hidden pins the frame; panels scroll
+   * internally (.sideRail/.tabContent own their overflow). */
+  height: 100dvh;
+  overflow: hidden;
   /* Transparent so the body's --bg-app atmosphere ramp shows through. */
   background: transparent;
   color: var(--text-1);
@@ -19,10 +25,14 @@
 
 .main {
   flex: 1;
+  /* min-height:0 lets .main shrink to the viewport and contain its overflow
+   * instead of being stretched tall by route content (the fit() blowout). */
+  min-height: 0;
   min-width: 0;
+  overflow: hidden;
   padding: var(--space-3);
-  /* xs: keep content clear of the fixed bottom tab bar */
-  padding-bottom: calc(56px + var(--space-3) + env(safe-area-inset-bottom));
+  /* No bottom tab bar anymore — just clear the phone home indicator. */
+  padding-bottom: calc(var(--space-3) + env(safe-area-inset-bottom));
 }
 
 @media (min-width: 768px) {

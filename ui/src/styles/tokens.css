@@ -42,6 +42,9 @@
   --text-3: #646d7c; /*  4.6:1 on base */
   --accent: #5ca8ff; /* the ONLY interactive hue */
   --accent-muted: #5ca8ff26;
+  --accent-edge: #5ca8ff26; /* accent ~15% — focus ring + active-route hairline ONLY */
+  --bg-graticule: #5ca8ff0a; /* dotted instrument grid, ~4% accent */
+  --gauge-track: var(--stroke-2); /* gauge/dial hairline track — inherits prefers-contrast */
   --ok: #34d399;
   --warn: #fbbf24;
   --crit: #f87171;
@@ -49,6 +52,8 @@
   --ok-bg: #34d39914;
   --warn-bg: #fbbf2414;
   --crit-bg: #f8717114;
+  --unknown-bg: #6b728014; /* neutral status wash — 8% --unknown, parity with ok/warn/crit-bg */
+  --scrim: rgb(0 0 0 / 0.5); /* neutral black dialog scrim — shared by palette + inspector overlays */
   --font-sans: 'InterVariable', system-ui, sans-serif;
   --font-mono: 'JetBrains Mono', ui-monospace, monospace;
   --text-2xs: 11px;
@@ -94,6 +99,9 @@
   --text-3: #687284;
   --accent: #1d6fe0; /* darkened for ≥4.5:1 on white */
   --accent-muted: #1d6fe01f;
+  --accent-edge: #1d6fe029;
+  --bg-graticule: #1d6fe00d;
+  --gauge-track: var(--stroke-2);
   --ok: #0e9f6e; /* status hues darkened for ≥4.5:1 */
   --warn: #b45309;
   --crit: #dc2626;
@@ -101,6 +109,8 @@
   --ok-bg: #0e9f6e14;
   --warn-bg: #b4530914;
   --crit-bg: #dc262614;
+  --unknown-bg: #6b728014; /* neutral status wash — 8% --unknown, parity with ok/warn/crit-bg */
+  --scrim: rgb(0 0 0 / 0.5); /* neutral black dialog scrim — shared by palette + inspector overlays */
   --shadow-pop: 0 4px 16px rgb(23 27 35 / 0.1);
   --shadow-sheet: 0 8px 32px rgb(23 27 35 / 0.16);
   --bg-app: radial-gradient(1100px 700px at 50% -12%, #fdfdfe 0%, var(--bg-base) 62%);
