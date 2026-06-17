@@ -15,6 +15,8 @@
 
 .svg {
   display: block;
+  position: relative;
+  z-index: 1;
   width: 100%;
   height: 100%;
   /* pan/pinch are ours — but ONLY on the SVG, never the page */
@@ -29,14 +31,36 @@
 /* ---- nodes ---- */
 .node {
   cursor: pointer;
-  transition: opacity var(--dur-2) var(--ease);
+  /* Placement is a CSS transform (style.transform) so it can interpolate:
+   * living physics travels nodes between polls, and the status-tier gravity
+   * offset eases on a tier flip. transform-box/origin make the local SVG
+   * coordinate frame the basis so translate() reads in user units. */
+  transform-box: fill-box;
+  transform-origin: 0 0;
+  transition:
+    transform var(--dur-3) var(--ease),
+    opacity var(--dur-2) var(--ease);
 }
 
 .nodeRect {
-  fill: var(--bg-raised);
-  stroke: var(--stroke-2);
-  stroke-width: 1;
-  transition: stroke var(--dur-2) var(--ease);
+  /* Status-tinted raised surface + a status-weighted border so a node reads as
+   * a solid chip in BOTH themes (on light, a flat white --bg-raised on the
+   * --bg-inset canvas with a --stroke-2 hairline was all but invisible).
+   * --node-color is the
+   * status hue (var(--crit)/--warn/--ok/--unknown); mixing a sliver into the
+   * fill and a strong share into the stroke keeps saturation rationed to status
+   * while making the box legible against the canvas. */
+  fill: color-mix(in srgb, var(--node-color) 12%, var(--bg-raised));
+  stroke: color-mix(in srgb, var(--node-color) 60%, var(--stroke-2));
+  stroke-width: 1.5;
+  /* Scale lifts in the rect's OWN local box (fill-box), so the selection
+   * lift composes cleanly with the <g>'s inline layout translate instead of
+   * fighting it. GPU transform only — no filter/shadow. */
+  transform-box: fill-box;
+  transform-origin: center;
+  transition:
+    stroke var(--dur-2) var(--ease),
+    transform var(--dur-3) var(--ease);
 }
 
 @media (hover: hover) {
@@ -50,10 +74,80 @@
   stroke-width: 2;
 }
 
+/* Select → focus-distortion: the inspected node lifts (1.0→1.015) as the field
+ * dims around it — the constellation's hero interaction, matched to the
+ * ServiceRow fallback. Travel is keyed off --dur-3, so the global reduced-motion
+ * block (zeros --dur-*) collapses the travel while this static end-state (and
+ * the accent ring above) is preserved. */
+.node[data-selected] .nodeRect {
+  transform: scale(1.015);
+}
+
 .nodeFocused {
   stroke: var(--accent);
   stroke-width: 2;
   stroke-dasharray: 4 3;
+}
+
+/* Anomaly prominence — failing services dominate the field. A fuller --crit
+ * fill + a heavier border makes a critical chip read at a glance, in both
+ * themes. Only FILL + WIDTH are set (not stroke COLOR), so the accent
+ * selection/focus ring still wins when a critical node is inspected. */
+.node[data-status='critical'] .nodeRect {
+  fill: color-mix(in srgb, var(--node-color) 24%, var(--bg-raised));
+  stroke-width: 2;
+}
+
+.node[data-status='degraded'] .nodeRect {
+  fill: color-mix(in srgb, var(--node-color) 16%, var(--bg-raised));
+}
+
+/* The pulse beacon: a --crit halo the size of the chip that flashes then
+ * expands+fades outward — a glance answers "what's failing now". Behind the
+ * chip; pure opacity/scale (no SVG filter/blur). Static end-state is invisible
+ * (opacity 0), so reduced motion simply shows the stronger crit chip above. */
+.nodePulse {
+  fill: none;
+  stroke: var(--crit);
+  stroke-width: 2;
+  opacity: 0;
+  pointer-events: none;
+  transform-box: fill-box;
+  transform-origin: center;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .node[data-status='critical'] .nodePulse {
+    animation: node-pulse 1.8s var(--ease) infinite;
+  }
+
+  /* Pause with the rest of the ambient motion when the tab is backgrounded. */
+  .container[data-visible='false'] .nodePulse {
+    animation-play-state: paused;
+  }
+}
+
+/* Battery: no per-node pulse on coarse pointers (phones). The static crit chip
+ * carries the signal there. */
+@media (pointer: coarse) {
+  .nodePulse {
+    animation: none;
+  }
+}
+
+@keyframes node-pulse {
+  0% {
+    opacity: 0.55;
+    transform: scale(1);
+  }
+  70% {
+    opacity: 0;
+    transform: scale(1.25);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(1.25);
+  }
 }
 
 /* Blast-radius cone (?impact=): --crit tint over the node fill, strength
@@ -70,6 +164,29 @@
 
 .nodeDot {
   fill: var(--node-color);
+  /* Status tone interpolates between polls on a tier change. */
+  transition: fill var(--dur-2) var(--ease);
+}
+
+/* Galaxy marker: in a large, zoomed-out field each un-surfaced service renders
+ * as a solid status-colored dot instead of a chip, so ~120 services read as a
+ * dense even disc rather than a smear of overlapping labels. Centered on the
+ * node, so edges connect at the same point as the chip. A hairline keeps the
+ * dot crisp on both themes; the selection/focus/impact stroke classes (shared
+ * with the chip) override it when the node is emphasized. */
+.nodeMarker {
+  fill: var(--node-color);
+  stroke: color-mix(in srgb, var(--node-color) 55%, var(--stroke-2));
+  stroke-width: 1;
+  transition:
+    fill var(--dur-2) var(--ease),
+    stroke var(--dur-2) var(--ease);
+}
+
+@media (hover: hover) {
+  .node:hover .nodeMarker {
+    stroke: var(--text-3);
+  }
 }
 
 .nodeName {
@@ -100,11 +217,31 @@
   stroke: var(--crit);
 }
 
-/* Animated dashes ONLY on failing edges AND only when motion is allowed. */
+/* Animated dashes ONLY on failing edges AND only when motion is allowed. The
+ * march flows toward the path end (source→target); core-ward edges reverse it
+ * so failure always reads as draining inward to the core. Paused when the tab
+ * is hidden (visibilitychange-gated via data-visible on .container). */
 @media (prefers-reduced-motion: no-preference) {
   .edgeFailing {
     stroke-dasharray: 7 5;
     animation: edge-dash 1s linear infinite;
+  }
+
+  .edgeFailing[data-coreward='reverse'] {
+    animation-direction: reverse;
+  }
+
+  .container[data-visible='false'] .edgeFailing {
+    animation-play-state: paused;
+  }
+}
+
+/* Ambient motion is a desktop affordance only: on coarse pointers (phones,
+ * the pinch-zoom surface) the marching dashes are battery cost with no hover
+ * context, so the failing edge renders as a static --crit stroke. */
+@media (pointer: coarse) {
+  .edgeFailing {
+    animation: none;
   }
 }
 
@@ -117,4 +254,79 @@
 /* Selection: 1-hop neighborhood stays at full opacity, the rest dims. */
 .dimmed {
   opacity: 0.35;
+}
+
+/* ---- radial dial backdrop ---- */
+.dial {
+  pointer-events: none;
+}
+
+/* Concentric ring guides — the instrument graticule, in dial form. Faint
+ * hairlines so numerals/nodes stay the focus. */
+.ring {
+  fill: none;
+  stroke: var(--stroke-1);
+  stroke-width: 1;
+  transition: stroke-opacity var(--dur-3) var(--ease);
+}
+
+/* ---- cinematic depth (ringDepth-gated) ---- */
+/* Inner rings read bright, outer rings recede — a cheap parallax-of-opacity
+ * depth cue. No SVG filters/blur. --ring-depth is 0 (inner) .. 1 (outer). */
+.depth .ring {
+  stroke-opacity: calc(1 - 0.7 * var(--ring-depth, 0));
+}
+
+/* ONE shared radial-gradient behind the pinned core. position:absolute HTML
+ * sibling of the <svg>; pointer-events:none so it never eats clicks. Static
+ * end-state, so reduced-motion is a no-op here. */
+.depth::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: radial-gradient(
+    closest-side at 50% 50%,
+    var(--accent-edge) 0%,
+    transparent 70%
+  );
+  z-index: 0;
+}
+
+/* Health core: numerals are the source of truth, centered on the dial. */
+.coreLabel {
+  fill: var(--text-1);
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--text-lg);
+  text-anchor: middle;
+}
+
+.coreUnit {
+  fill: var(--text-3);
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  letter-spacing: 0.06em;
+  text-anchor: middle;
+}
+
+/* Health Core overlay: an absolutely-centered HTML sibling of the <svg>,
+ * PINNED at viewport center while the field pans/zooms behind it. The host
+ * provides the actual gauge/odometer content; this just centers it and lifts
+ * it above the glow. Children opt back into pointer events as needed. */
+.core {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  z-index: 1;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+}
+
+.core > * {
+  pointer-events: auto;
 }

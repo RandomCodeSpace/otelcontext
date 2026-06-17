@@ -145,4 +145,11 @@ describe('PulseBar', () => {
     const db = await screen.findByText(/DB 4GB/)
     expect(db.className).toContain('warn')
   })
+
+  it('shows process uptime in the strip, derived from uptime_seconds', async () => {
+    routeFetches({ summary: { uptime_seconds: 532297 } }) // 6d 03:51:37
+    renderPulseBar()
+    const up = await screen.findByRole('group', { name: /process uptime/i })
+    expect(up.textContent).toMatch(/6d 03:51:37/)
+  })
 })

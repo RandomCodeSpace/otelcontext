@@ -114,23 +114,6 @@ describe('useInvestigation', () => {
     expect(rendered.result.current.service).toBe('checkout')
   })
 
-  it('openTrace pushes a trace frame and navigates to /traces', () => {
-    const { memory, rendered } = setup('/map?service=a&trail=svc:a')
-    act(() => rendered.result.current.openTrace('t1'))
-    const dest = memory.history.at(-1)!
-    expect(dest).toMatch(/^\/traces\?/)
-    expect(dest).toContain('trace=t1')
-    expect(dest).toContain('trail=svc%3Aa%2Ctrace%3At1')
-    expect(dest).not.toContain('service=')
-  })
-
-  it('openTrace pushes history (Back returns to the inspector)', () => {
-    const { memory, rendered } = setup('/map?service=a')
-    const before = memory.history.length
-    act(() => rendered.result.current.openTrace('t1'))
-    expect(memory.history.length).toBe(before + 1)
-  })
-
   it('uses replace navigation (no history spam)', () => {
     const { memory, rendered } = setup('/map')
     act(() => rendered.result.current.openService('a'))

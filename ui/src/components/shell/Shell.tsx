@@ -1,7 +1,7 @@
-import { useEffect, type ComponentType, type ReactNode } from 'react'
+import { type ComponentType, type ReactNode, useEffect } from 'react'
 import * as Tooltip from '@radix-ui/react-tooltip'
 import { Link, useRoute } from 'wouter'
-import { Activity, ListTree, Network, ScrollText, SquareSlash } from 'lucide-react'
+import { Orbit } from 'lucide-react'
 import { getWsManager } from '@/lib/wsManager'
 import type { Theme } from '@/hooks/useTheme'
 import PulseBar from './PulseBar'
@@ -13,12 +13,12 @@ interface NavEntry {
   Icon: ComponentType<{ size?: number | string; 'aria-hidden'?: boolean }>
 }
 
-// Exactly the four triage destinations — the xs bottom-tab-bar spec.
+// The Constellation map is the single human destination — the flow map folded
+// into it, and logs/traces are served to AI agents via the MCP tools
+// (search_logs, trace_graph), not as dedicated human screens. The ⌘K palette
+// (pulse-bar + tab-bar buttons) carries everything else.
 const NAV_ITEMS: readonly NavEntry[] = [
-  { href: '/', label: 'Triage', Icon: Activity },
-  { href: '/map', label: 'Flow Map', Icon: Network },
-  { href: '/traces', label: 'Traces', Icon: ListTree },
-  { href: '/logs', label: 'Logs', Icon: ScrollText },
+  { href: '/', label: 'Service Map', Icon: Orbit },
 ]
 
 function NavLink({
@@ -82,12 +82,13 @@ export default function Shell({
     getWsManager().start()
   }, [])
 
-  // The palette button sits mid-bar on xs — thumb-reach center slot.
-  const mid = Math.ceil(NAV_ITEMS.length / 2)
+  // The home route is the Constellation canvas — it owns its own Health Core,
+  // so the Shell no longer hangs a vitals hero on `/`. Every route keeps the
+  // always-on slim strip (PulseBar) at the top.
 
   return (
     <Tooltip.Provider delayDuration={300}>
-      <div className={styles.shell}>
+      <div className={`${styles.shell} graticule`}>
         <PulseBar
           theme={theme}
           onToggleTheme={onToggleTheme}
@@ -101,25 +102,6 @@ export default function Shell({
           </nav>
           <main className={styles.main}>{children}</main>
         </div>
-        <nav className={styles.tabbar} aria-label="Primary">
-          {NAV_ITEMS.slice(0, mid).map((entry) => (
-            <NavLink key={entry.href} entry={entry} variant="tab" />
-          ))}
-          {onOpenPalette && (
-            <button
-              type="button"
-              className={styles.tabPalette}
-              aria-label="Open command palette"
-              onClick={onOpenPalette}
-            >
-              <SquareSlash size={18} aria-hidden />
-              <span className={styles.navLabel}>Search</span>
-            </button>
-          )}
-          {NAV_ITEMS.slice(mid).map((entry) => (
-            <NavLink key={entry.href} entry={entry} variant="tab" />
-          ))}
-        </nav>
       </div>
     </Tooltip.Provider>
   )

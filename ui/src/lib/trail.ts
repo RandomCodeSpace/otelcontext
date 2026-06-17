@@ -3,8 +3,9 @@
 // serialization and stack ops. URL wiring lives in hooks/useInvestigation;
 // rendering in components/trail/TrailBar.
 //
-// Frame kinds are extensible (trace frames round-trip today; their activation
-// lands with the /traces route in a later phase).
+// Frame kinds are extensible. Trace frames still round-trip through a shared
+// ?trail= URL (so old links don't break), but the human UI has no trace
+// screen to activate them on — trace drill-down is an AI-agent MCP surface.
 
 export type TrailKind = 'svc' | 'trace'
 

@@ -1,0 +1,245 @@
+/* ConstellationHome — the living radial map as the product home. The canvas is
+   the dominant surface; a slim worst-first rail rides alongside on md+. xs folds
+   to the dense card list (the canvas is behind a Flow toggle). Cinematic CSS
+   lives here in the route chunk — never in global.css. */
+
+.view {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  height: 100%;
+  min-height: 0;
+}
+
+.stage {
+  display: flex;
+  flex: 1;
+  gap: var(--space-3);
+  min-height: 0;
+}
+
+/* The canvas owns the field. position:relative anchors the fit + xs-toggle
+   affordances over it. */
+.canvas {
+  position: relative;
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* Fit affordance — a translucent chrome button pinned to the canvas corner so
+   the persistent graticule reads through (no opaque toolbar). */
+.fit {
+  position: absolute;
+  top: var(--space-2);
+  right: var(--space-2);
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border: 1px solid var(--stroke-1);
+  border-radius: var(--radius-2);
+  background: color-mix(in srgb, var(--bg-raised) 70%, transparent);
+  color: var(--text-2);
+  cursor: pointer;
+  transition: color var(--dur-1) var(--ease);
+}
+
+@media (pointer: coarse) {
+  .fit {
+    width: 44px;
+    height: 44px;
+  }
+}
+
+@media (hover: hover) {
+  .fit:hover {
+    color: var(--text-1);
+  }
+}
+
+/* ---- the worst-first side rail (md+) ---- */
+.sideRail {
+  display: flex;
+  flex: none;
+  flex-direction: column;
+  gap: var(--space-2);
+  width: 300px;
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: var(--space-1);
+}
+
+.railTitle {
+  margin: 0 0 var(--space-1);
+}
+
+/* ---- xs card-list head (List/Flow toggle) ---- */
+.rail {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-height: 0;
+  overflow-y: auto;
+}
+
+/* xs vitals header — the compact HealthCore docked above the card list. It is
+   already width-bounded internally; center it and hold it at its natural height
+   so the rail's flex column never stretches the instrument. */
+.xsVitals {
+  display: flex;
+  flex: none;
+  justify-content: center;
+  padding-bottom: var(--space-2);
+  border-bottom: 1px solid var(--stroke-1);
+}
+
+.railHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.viewToggle {
+  min-height: 32px;
+  padding: 0 var(--space-3);
+  border: 1px solid var(--stroke-1);
+  border-radius: var(--radius-2);
+  background: color-mix(in srgb, var(--bg-raised) 70%, transparent);
+  color: var(--text-2);
+  font-size: var(--text-xs);
+  cursor: pointer;
+  transition: color var(--dur-1) var(--ease);
+}
+
+@media (pointer: coarse) {
+  .viewToggle {
+    min-height: 44px;
+  }
+}
+
+@media (hover: hover) {
+  .viewToggle:hover {
+    color: var(--text-1);
+  }
+}
+
+.viewToggleActive {
+  position: absolute;
+  top: var(--space-2);
+  left: var(--space-2);
+  z-index: 2;
+}
+
+/* ---- blast-radius banner (?impact=) ---- */
+.impactBanner {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-2) var(--space-1) var(--space-3);
+  border: 1px solid var(--crit);
+  border-radius: var(--radius-2);
+  background: var(--crit-bg);
+  color: var(--text-1);
+  font-size: var(--text-sm);
+}
+
+.impactText {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.impactService {
+  font-family: var(--font-mono);
+}
+
+.bannerButton {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border: 1px solid var(--stroke-1);
+  border-radius: var(--radius-2);
+  background: transparent;
+  color: var(--text-2);
+  cursor: pointer;
+}
+
+@media (pointer: coarse) {
+  .bannerButton {
+    width: 44px;
+    height: 44px;
+  }
+}
+
+/* ---- async states ---- */
+.statePanel {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: var(--space-3);
+  align-items: flex-start;
+  justify-content: center;
+  padding: var(--space-5);
+  border: 1px solid var(--stroke-1);
+  border-radius: var(--radius-2);
+  color: var(--text-2);
+  font-size: var(--text-sm);
+}
+
+.statePanel p {
+  margin: 0;
+}
+
+.stateAction {
+  min-height: 32px;
+  padding: 0 var(--space-3);
+  border: 1px solid var(--stroke-2);
+  border-radius: var(--radius-2);
+  background: transparent;
+  color: var(--text-1);
+  font-size: var(--text-sm);
+  cursor: pointer;
+}
+
+@media (pointer: coarse) {
+  .stateAction {
+    min-height: 44px;
+  }
+}
+
+/* Skeleton mirrors the canvas: a centered grid of node-sized blocks. */
+.skeleton {
+  display: grid;
+  flex: 1;
+  grid-template-columns: repeat(3, 168px);
+  gap: var(--space-5);
+  align-content: center;
+  justify-content: center;
+  border: 1px solid var(--stroke-1);
+  border-radius: var(--radius-2);
+  background: var(--bg-inset);
+}
+
+.skeletonNode {
+  height: 40px;
+  border-radius: var(--radius-2);
+  background: var(--bg-overlay);
+}
+
+/* xs: the rail becomes the whole stage; no side rail. */
+@media (max-width: 767px) {
+  .sideRail {
+    display: none;
+  }
+}

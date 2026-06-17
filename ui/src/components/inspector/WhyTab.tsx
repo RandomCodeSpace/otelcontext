@@ -1,5 +1,4 @@
 import { useMemo } from 'react'
-import { ChevronRight } from 'lucide-react'
 import { useTriageTool } from '@/hooks/useTriageTool'
 import { rootCauseQueryOptions } from '@/lib/triageVerbs'
 import type { RankedCause, SpanNode } from '@/types/api'
@@ -9,30 +8,21 @@ import styles from './ServiceInspector.module.css'
 
 // "Why" tab — MCP root_cause_analysis as a human verb. Ranked probable
 // causes with a relative score bar, evidence bullets, and the error-chain
-// spans deep-linking into /traces (pushing the investigation trail).
+// spans listed as read-only context. (Full trace drill-down is an AI-agent
+// surface via the trace_graph MCP tool — the human UI no longer ships a
+// dedicated traces screen, so the spans are non-interactive here.)
 
 function shortId(id: string): string {
   return id.length > 12 ? `${id.slice(0, 12)}…` : id
 }
 
-function ChainSpanRow({
-  span,
-  openTrace,
-}: Readonly<{ span: SpanNode; openTrace: (id: string) => void }>) {
+function ChainSpanRow({ span }: Readonly<{ span: SpanNode }>) {
   return (
-    <li>
-      <button
-        type="button"
-        className={styles.depRow}
-        onClick={() => openTrace(span.trace_id)}
-        aria-label={`Open trace ${span.trace_id}: ${span.service} · ${span.operation}`}
-      >
-        <span className={styles.depName}>
-          {span.service} · {span.operation}
-        </span>
-        <span className={styles.depMeta}>trace {shortId(span.trace_id)}</span>
-        <ChevronRight size={13} className={styles.depChevron} aria-hidden="true" />
-      </button>
+    <li className={styles.chainSpan}>
+      <span className={styles.depName}>
+        {span.service} · {span.operation}
+      </span>
+      <span className={styles.depMeta}>trace {shortId(span.trace_id)}</span>
     </li>
   )
 }
@@ -41,12 +31,10 @@ function CauseCard({
   cause,
   rank,
   maxScore,
-  openTrace,
 }: Readonly<{
   cause: RankedCause
   rank: number
   maxScore: number
-  openTrace: (id: string) => void
 }>) {
   const frac = maxScore > 0 ? Math.max(0, cause.score) / maxScore : 0
   return (
@@ -81,7 +69,7 @@ function CauseCard({
           <h4 className={styles.sectionTitle}>Error chain</h4>
           <ul className={styles.depList}>
             {cause.error_chain.map((span) => (
-              <ChainSpanRow key={span.id} span={span} openTrace={openTrace} />
+              <ChainSpanRow key={span.id} span={span} />
             ))}
           </ul>
         </>
@@ -125,7 +113,6 @@ export function WhyTab({ ctx }: Readonly<{ ctx: InspectorTabContext }>) {
                 cause={cause}
                 rank={i + 1}
                 maxScore={maxScore}
-                openTrace={ctx.openTrace}
               />
             ))}
           </ol>

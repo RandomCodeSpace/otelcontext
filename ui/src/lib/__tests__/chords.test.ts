@@ -53,11 +53,9 @@ describe('keyAction — palette and shortcuts', () => {
 })
 
 describe('keyAction — g go-to chords', () => {
-  it('g then m/t/l/h navigates within the timeout', () => {
+  it('g then h/m navigates within the timeout', () => {
     const cases: Array<[string, string]> = [
       ['m', '/map'],
-      ['t', '/traces'],
-      ['l', '/logs'],
       ['h', '/'],
     ]
     for (const [key, href] of cases) {

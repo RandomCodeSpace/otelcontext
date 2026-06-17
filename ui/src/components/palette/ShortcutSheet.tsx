@@ -13,7 +13,7 @@ const GROUPS: ReadonlyArray<{
     title: 'Global',
     keys: [
       ['⌘K / Ctrl+K', 'Command palette'],
-      ['g h · g m · g t · g l', 'Go to Triage / Map / Traces / Logs'],
+      ['g h · g m', 'Go to Triage / Map'],
       ['/', 'Focus the page filter'],
       ['⌫', 'Pop the investigation trail'],
       ['?', 'This sheet'],

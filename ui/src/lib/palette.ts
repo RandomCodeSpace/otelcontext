@@ -3,18 +3,17 @@
 // selection produces. The cmdk rendering shell lives in
 // components/palette/CommandPalette.tsx.
 
-export type PaletteActionId = 'root-cause' | 'impact' | 'search-logs'
+export type PaletteActionId = 'root-cause' | 'impact'
 
 export interface PaletteActionDef {
   id: PaletteActionId
   label: string
 }
 
-/** The triage verbs, in triage-loop order: why → blast radius → evidence. */
+/** The triage verbs, in triage-loop order: why → blast radius. */
 export const PALETTE_ACTIONS: readonly PaletteActionDef[] = [
   { id: 'root-cause', label: 'Root cause analysis…' },
   { id: 'impact', label: 'Blast radius…' },
-  { id: 'search-logs', label: 'Search logs…' },
 ]
 
 export type PalettePage =
@@ -35,7 +34,6 @@ export function escapeBehavior(page: PalettePage): 'back' | 'close' {
 const PICK_PLACEHOLDERS: Record<PaletteActionId, string> = {
   'root-cause': 'Root cause of which service?',
   impact: 'Blast radius of which service?',
-  'search-logs': 'Search logs of which service?',
 }
 
 export function pagePlaceholder(page: PalettePage): string {
@@ -44,15 +42,13 @@ export function pagePlaceholder(page: PalettePage): string {
     : PICK_PLACEHOLDERS[page.action]
 }
 
-/** What executing an action against a chosen service means. */
-export type PaletteCommand =
-  | {
-      kind: 'inspect'
-      service: string
-      tab: 'why' | 'impact'
-      prefetch: 'root_cause_analysis' | 'impact_analysis'
-    }
-  | { kind: 'navigate'; href: string }
+/** What executing an action against a chosen service means: open the
+ *  inspector on the matching verb tab and prefetch its MCP RPC. */
+export interface PaletteCommand {
+  service: string
+  tab: 'why' | 'impact'
+  prefetch: 'root_cause_analysis' | 'impact_analysis'
+}
 
 export function serviceCommand(
   action: PaletteActionId,
@@ -60,23 +56,8 @@ export function serviceCommand(
 ): PaletteCommand {
   switch (action) {
     case 'root-cause':
-      return {
-        kind: 'inspect',
-        service,
-        tab: 'why',
-        prefetch: 'root_cause_analysis',
-      }
+      return { service, tab: 'why', prefetch: 'root_cause_analysis' }
     case 'impact':
-      return {
-        kind: 'inspect',
-        service,
-        tab: 'impact',
-        prefetch: 'impact_analysis',
-      }
-    case 'search-logs':
-      return {
-        kind: 'navigate',
-        href: `/logs?service=${encodeURIComponent(service)}`,
-      }
+      return { service, tab: 'impact', prefetch: 'impact_analysis' }
   }
 }

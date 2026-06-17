@@ -1,6 +1,7 @@
 import { ChevronRight, TriangleAlert } from 'lucide-react'
 import type { SystemEdge, SystemNode } from '@/types/api'
 import { formatCount, formatMs, formatPercent } from '@/lib/format'
+import { Metric } from '@/components/common/Metric'
 import { nodeStatus, statusToken } from '@/lib/triage'
 import styles from './ServiceInspector.module.css'
 
@@ -13,17 +14,20 @@ export interface InspectorTabContext {
   edges: readonly SystemEdge[]
   /** Drill into another service — pushes the investigation trail. */
   openService: (id: string) => void
-  /** Drill into a trace — pushes the trail and navigates to /traces. */
-  openTrace: (id: string) => void
   /** Hand a blast radius to the flow map's ?impact= cone overlay. */
   showImpactOnMap: (service: string) => void
 }
 
-function Stat({ label, value }: Readonly<{ label: string; value: string }>) {
+// One instrument readout: uppercase legend cap above a mono numeral. `crit`
+// tints the numeral with status saturation (used for a non-zero error rate).
+function Stat({
+  label,
+  value,
+  crit = false,
+}: Readonly<{ label: string; value: string; crit?: boolean }>) {
   return (
-    <div className={styles.stat}>
-      <span className={styles.statLabel}>{label}</span>
-      <span className={styles.statValue}>{value}</span>
+    <div className={`${styles.stat}${crit ? ` ${styles.statCrit}` : ''}`}>
+      <Metric label={label} value={value} />
     </div>
   )
 }
@@ -36,13 +40,13 @@ export function OverviewTab({ ctx }: Readonly<{ ctx: InspectorTabContext }>) {
     <div className={styles.tabBody}>
       <div className={styles.statGrid}>
         <Stat label="RPS" value={`${formatCount(m.request_rate_rps)}/s`} />
-        <Stat label="Err" value={formatPercent(m.error_rate)} />
-        <Stat label="Avg" value={formatMs(m.avg_latency_ms)} />
-        <Stat label="p99" value={formatMs(m.p99_latency_ms)} />
+        <Stat label="ERR" value={formatPercent(m.error_rate)} crit={m.error_rate > 0} />
+        <Stat label="AVG" value={formatMs(m.avg_latency_ms)} />
+        <Stat label="P99" value={formatMs(m.p99_latency_ms)} />
       </div>
 
       <div className={styles.healthRow}>
-        <span className={styles.statLabel}>Health</span>
+        <span className={styles.statLabel}>HEALTH</span>
         <div
           className={styles.healthBar}
           role="meter"
@@ -59,7 +63,9 @@ export function OverviewTab({ ctx }: Readonly<{ ctx: InspectorTabContext }>) {
             }}
           />
         </div>
-        <span className={styles.statValue}>{formatPercent(node.health_score)}</span>
+        <span className={styles.statValue} style={{ color }}>
+          {formatPercent(node.health_score)}
+        </span>
       </div>
 
       <section aria-label="Alerts">

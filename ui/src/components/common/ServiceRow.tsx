@@ -1,4 +1,4 @@
-import { formatMs, formatPercent } from '@/lib/format'
+import { formatCount, formatMs, formatPercent } from '@/lib/format'
 import { nodeStatus, statusToken } from '@/lib/triage'
 import type { SystemNode } from '@/types/api'
 import styles from './ServiceRow.module.css'
@@ -7,22 +7,46 @@ interface ServiceRowProps {
   node: SystemNode
   /** Row tap — drill into the service (pushes the investigation trail). */
   onOpen: (id: string) => void
+  /**
+   * The id of the single inspected service, if any. When this row is the
+   * selected one it gets the focus-distortion (scale + accent ring); the
+   * non-selected rows dim. Optional so the xs flow-map fallback (no
+   * inspector) keeps the plain list.
+   */
+  selectedId?: string | null
 }
 
 /**
- * One service row: status dot, mono name, inline 60px health bar, err%/p99
- * (tabular), alert-count badge. Shared by the Triage feed and the flow map's
- * xs card list so "how a service looks" has one source of truth.
+ * One service row: status dot, name, inline health bar, then the mono
+ * indicator columns (rps / err% / p99) — every measured quantity in the
+ * indicator voice. Shared by the Triage feed and the flow map's xs card list
+ * so "how a service looks" has one source of truth.
+ *
+ * Focus-distortion: when a service is inspected, the selected row lifts
+ * (scale 1.015) with an --accent-edge ring and the rest dim. This is a pure
+ * CSS transition applied after the URL state commits (no JS animation loop),
+ * so INP stays low; reduced-motion keeps the end-state (ring + dim), drops
+ * only the travel.
  */
-export default function ServiceRow({ node, onOpen }: Readonly<ServiceRowProps>) {
+export default function ServiceRow({ node, onOpen, selectedId }: Readonly<ServiceRowProps>) {
   const color = statusToken(nodeStatus(node.status))
+  const hasSelection = selectedId != null && selectedId !== ''
+  const selected = hasSelection && selectedId === node.id
+  const dimmed = hasSelection && !selected
   return (
-    <button type="button" className={styles.row} onClick={() => onOpen(node.id)}>
+    <button
+      type="button"
+      className={styles.row}
+      data-selected={selected || undefined}
+      data-dimmed={dimmed || undefined}
+      aria-current={selected ? 'true' : undefined}
+      onClick={() => onOpen(node.id)}
+    >
       <span className={styles.dot} style={{ background: color }} aria-hidden="true" />
       <span className={styles.name}>{node.id}</span>
       {node.alerts.length > 0 && (
         <span className={styles.badge} aria-label={`${node.alerts.length} alerts`}>
-          {node.alerts.length}
+          <span className="num">{node.alerts.length}</span>
         </span>
       )}
       <span
@@ -42,8 +66,15 @@ export default function ServiceRow({ node, onOpen }: Readonly<ServiceRowProps>) 
         />
       </span>
       <span className={styles.metrics}>
-        <span className={styles.metric}>{formatPercent(node.metrics.error_rate)}</span>
-        <span className={styles.metric}>{formatMs(node.metrics.p99_latency_ms)}</span>
+        <span className={styles.metric} role="group" aria-label={`rps ${node.metrics.request_rate_rps}`}>
+          <span className="num">{formatCount(node.metrics.request_rate_rps)}</span>
+        </span>
+        <span className={styles.metric} role="group" aria-label={`error rate ${formatPercent(node.metrics.error_rate)}`}>
+          <span className="num">{formatPercent(node.metrics.error_rate)}</span>
+        </span>
+        <span className={styles.metric} role="group" aria-label={`p99 ${formatMs(node.metrics.p99_latency_ms)}`}>
+          <span className="num">{formatMs(node.metrics.p99_latency_ms)}</span>
+        </span>
       </span>
     </button>
   )

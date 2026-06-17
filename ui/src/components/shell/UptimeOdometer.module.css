@@ -1,0 +1,28 @@
+.odometer {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--space-2);
+}
+
+.value {
+  /* Fixed-width slot so the ticking seconds never reflow the strip. */
+  color: var(--text-1);
+  font-size: var(--text-sm);
+}
+
+/* Restart flash: a brief accent wash that re-bases the odometer reading.
+ * Keyed off --dur-3 so the reduced-motion block (which zeros the token)
+ * collapses it to an instant, no-op transition. transform/opacity only. */
+.flash {
+  animation: restart-flash var(--dur-3) var(--ease);
+}
+
+@keyframes restart-flash {
+  0% {
+    opacity: 0.35;
+    color: var(--accent);
+  }
+  100% {
+    opacity: 1;
+  }
+}

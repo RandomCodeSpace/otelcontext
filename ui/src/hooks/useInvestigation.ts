@@ -28,8 +28,6 @@ export interface Investigation {
    * clears any stale ?tab so plain drill-downs land on Overview.
    */
   openService: (id: string, tab?: string) => void
-  /** Drill into a trace: pushes the trail and navigates to /traces. */
-  openTrace: (id: string) => void
   /** Close the Inspector. The trail is history — it stays. */
   closeInspector: () => void
   /** Chip tap: pop back to frame `index` and activate it. */
@@ -64,22 +62,6 @@ export function useInvestigation(): Investigation {
     [apply, trail],
   )
 
-  const openTrace = useCallback(
-    (id: string) => {
-      const next = pushFrame(trail, { kind: 'trace', id })
-      // Cross-route navigation — history push so Back returns here. The
-      // trail carries the investigation context; route-local filters from
-      // the previous page deliberately do not follow.
-      navigate(
-        buildHref('/traces', '', {
-          trace: id,
-          trail: serializeTrail(next) || null,
-        }),
-      )
-    },
-    [navigate, trail],
-  )
-
   const closeInspector = useCallback(() => {
     apply({ service: null })
   }, [apply])
@@ -87,8 +69,9 @@ export function useInvestigation(): Investigation {
   const activate = useCallback(
     (frames: readonly TrailFrame[]) => {
       apply({
-        // svc frames re-open the Inspector; other kinds (trace) only truncate
-        // for now — their activation lands with the /traces route.
+        // svc frames re-open the Inspector; trace frames (which can still
+        // arrive in a shared ?trail= URL) only truncate — the human UI has
+        // no trace screen to activate them on.
         service: topService(frames),
         trail: serializeTrail(frames) || null,
       })
@@ -110,7 +93,6 @@ export function useInvestigation(): Investigation {
     service,
     trail,
     openService,
-    openTrace,
     closeInspector,
     popToFrame,
     popOne,

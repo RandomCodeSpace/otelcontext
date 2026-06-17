@@ -39,7 +39,6 @@ function renderTab(overrides: Partial<InspectorTabContext> = {}) {
     node,
     edges: [],
     openService: vi.fn(),
-    openTrace: vi.fn(),
     showImpactOnMap: vi.fn(),
     ...overrides,
   }
@@ -114,15 +113,22 @@ describe('WhyTab', () => {
     expect(screen.getByText(/anomaly: error spike/)).toBeInTheDocument()
   })
 
-  it('error-chain spans deep-link via openTrace', async () => {
+  it('renders error-chain spans as read-only text (no trace drill-down)', async () => {
     const user = userEvent.setup()
     fetchMock.mockResolvedValueOnce(rpc(JSON.stringify(CAUSES)))
-    const ctx = renderTab()
+    renderTab()
     await user.click(
       screen.getByRole('button', { name: /run root-cause analysis/i }),
     )
-    await user.click(await screen.findByRole('button', { name: /open trace t1/i }))
-    expect(ctx.openTrace).toHaveBeenCalledWith('t1')
+    // The error-chain span is listed for context…
+    expect(
+      await screen.findByText(/db · SELECT spans/),
+    ).toBeInTheDocument()
+    // …but it is not an interactive trace link — the human UI has no
+    // traces screen; trace_graph is the AI-agent MCP surface.
+    expect(
+      screen.queryByRole('button', { name: /open trace/i }),
+    ).toBeNull()
   })
 
   it('designed empty state when no causes are found', async () => {

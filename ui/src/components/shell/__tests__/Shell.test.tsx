@@ -26,7 +26,7 @@ const fetchMock = vi.fn<typeof fetch>(() =>
   Promise.resolve(new Response('{}', { status: 200 })),
 )
 
-function renderShell(path = '/map', onToggleTheme = vi.fn()) {
+function renderShell(path = '/', onToggleTheme = vi.fn()) {
   const { hook } = memoryLocation({ path })
   const qc = new QueryClient({
     defaultOptions: { queries: { retry: false } },
@@ -58,29 +58,28 @@ describe('Shell', () => {
   it('renders the pulse banner, navigation and main content', () => {
     renderShell()
     expect(screen.getByRole('banner')).toBeInTheDocument()
-    expect(screen.getAllByRole('navigation').length).toBeGreaterThanOrEqual(2)
+    expect(screen.getAllByRole('navigation').length).toBeGreaterThanOrEqual(1)
     expect(screen.getByRole('main')).toContainElement(
       screen.getByTestId('page-content'),
     )
   })
 
-  it('exposes both nav variants (rail + bottom tabs) with exactly 4 destinations', () => {
+  it('renders the single Service Map destination in the rail', () => {
     renderShell()
-    // Each destination appears twice: once in the rail, once in the tab bar.
-    for (const name of [/triage/i, /flow map/i, /traces/i, /logs/i]) {
-      expect(screen.getAllByRole('link', { name })).toHaveLength(2)
-    }
-    // The dashboard and MCP-console destinations are retired.
-    expect(screen.getAllByRole('link')).toHaveLength(8)
+    // The Service Map is the only human destination — logs/traces are MCP-tool
+    // surfaces, the flow map folded into home, and the bottom tab bar was
+    // removed (Search lives in the top pulse bar). One nav link, in the rail.
+    expect(screen.getAllByRole('link', { name: /service map/i })).toHaveLength(1)
+    expect(screen.getAllByRole('link')).toHaveLength(1)
   })
 
   it('marks the active route with aria-current', () => {
-    renderShell('/traces')
+    renderShell('/')
     const active = screen
       .getAllByRole('link')
       .filter((a) => a.getAttribute('aria-current') === 'page')
-    expect(active).toHaveLength(2) // rail + tab bar
-    active.forEach((a) => expect(a).toHaveAttribute('href', '/traces'))
+    expect(active).toHaveLength(1) // the single rail nav link
+    active.forEach((a) => expect(a).toHaveAttribute('href', '/'))
   })
 
   it('renders the palette buttons when onOpenPalette is wired', async () => {
@@ -106,7 +105,7 @@ describe('Shell', () => {
     const buttons = screen.getAllByRole('button', {
       name: /open command palette/i,
     })
-    expect(buttons).toHaveLength(2) // pulse bar (md+) + xs tab-bar center
+    expect(buttons).toHaveLength(1) // the pulse-bar ⌘K (bottom tab bar removed)
     await user.click(buttons[0])
     expect(onOpenPalette).toHaveBeenCalledTimes(1)
   })

@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { render, screen, waitFor } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { Router } from 'wouter'
 import { memoryLocation } from 'wouter/memory-location'
@@ -72,11 +73,12 @@ function renderApp(path: string) {
 }
 
 describe('App routing', () => {
-  it('mounts the Triage home at /', async () => {
+  it('mounts the Constellation home at /', async () => {
     renderApp('/')
-    // Empty graph → the feed's connect empty state proves the mount.
+    // Empty graph → the home's anomaly tape + connect empty state prove the
+    // ConstellationHome lazy chunk mounted.
     expect(
-      await screen.findByRole('region', { name: /service triage feed/i }),
+      await screen.findByRole('region', { name: /recent anomalies/i }),
     ).toBeInTheDocument()
   })
 
@@ -85,35 +87,77 @@ describe('App routing', () => {
     await waitFor(() => expect(memory.history).toContain('/'))
   })
 
-  it('redirects the retired /dashboard route to the Triage home', async () => {
+  it('redirects the retired /dashboard route to the home', async () => {
     const memory = renderApp('/dashboard')
     await waitFor(() => expect(memory.history).toContain('/'))
   })
 
-  it('redirects the retired /mcp route to the Triage home', async () => {
+  it('redirects the retired /mcp route to the home', async () => {
     const memory = renderApp('/mcp')
     await waitFor(() => expect(memory.history).toContain('/'))
   })
 
-  it('mounts the FlowMapView at /map', async () => {
-    renderApp('/map')
-    // Lazy chunk + empty graph → the view's empty state proves the mount.
+  it('redirects the removed /traces screen to the home', async () => {
+    const memory = renderApp('/traces')
+    await waitFor(() => expect(memory.history).toContain('/'))
+  })
+
+  it('redirects the removed /logs screen to the home', async () => {
+    const memory = renderApp('/logs')
+    await waitFor(() => expect(memory.history).toContain('/'))
+  })
+
+  it('folds /map into the home canvas', async () => {
+    const memory = renderApp('/map')
+    await waitFor(() => expect(memory.history.at(-1)).toBe('/'))
+  })
+
+  it('preserves ?service= when folding /map into the home', async () => {
+    const memory = renderApp('/map?service=ghost')
+    // The redirect rebuilds the query so the deep link survives the fold.
+    await waitFor(() => expect(memory.history.at(-1)).toContain('service=ghost'))
+    // …and the Inspector docks for that service.
     expect(
-      await screen.findByText(/no services discovered yet/i),
+      await screen.findByRole('button', { name: /close inspector/i }),
     ).toBeInTheDocument()
   })
 
+  it('preserves ?impact= when folding /map into the home', async () => {
+    const memory = renderApp('/map?impact=ghost')
+    await waitFor(() => expect(memory.history.at(-1)).toContain('impact=ghost'))
+  })
+
   it('mounts the Service Inspector when ?service= is present', async () => {
-    renderApp('/map?service=ghost')
+    renderApp('/?service=ghost')
     expect(
       await screen.findByRole('button', { name: /close inspector/i }),
     ).toBeInTheDocument()
   })
 
   it('renders the trail bar when ?trail= is present', async () => {
-    renderApp('/map?trail=svc:checkout')
+    renderApp('/?trail=svc:checkout')
     expect(
       await screen.findByRole('navigation', { name: /investigation trail/i }),
+    ).toBeInTheDocument()
+  })
+
+  it('opens the command palette on the global ⌘K shortcut', async () => {
+    const user = userEvent.setup()
+    renderApp('/')
+    await screen.findByRole('region', { name: /recent anomalies/i })
+    await user.keyboard('{Meta>}k{/Meta}')
+    expect(
+      await screen.findByRole('dialog', { name: /command palette/i }),
+    ).toBeInTheDocument()
+  })
+
+  it('opens the shortcut sheet on "?"', async () => {
+    const user = userEvent.setup()
+    renderApp('/')
+    await screen.findByRole('region', { name: /recent anomalies/i })
+    await user.keyboard('?')
+    expect(
+      await screen.findByRole('dialog', { name: /keyboard shortcuts/i }),
     ).toBeInTheDocument()
   })
 })

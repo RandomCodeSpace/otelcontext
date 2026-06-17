@@ -5,14 +5,25 @@
   width: 100%;
   min-height: 44px;
   padding: var(--space-1) var(--space-2);
-  border: none;
+  /* Hairline separation, not a card. The 1px transparent ring slot keeps the
+   * box from jumping when the selected ring appears. */
+  border: 1px solid transparent;
+  border-bottom-color: var(--stroke-1);
   border-radius: var(--radius-2);
   background: transparent;
   color: var(--text-1);
   font-size: var(--text-sm);
   text-align: left;
   cursor: pointer;
-  transition: background var(--dur-1) var(--ease);
+  /* Focus-distortion travel: transform + opacity only (GPU). Keyed off
+   * --dur-2 so the reduced-motion block (zeros --dur-*) collapses the travel
+   * while the end-state (ring + dim) is preserved. */
+  transition:
+    background var(--dur-1) var(--ease),
+    transform var(--dur-2) var(--ease),
+    opacity var(--dur-2) var(--ease),
+    border-color var(--dur-2) var(--ease);
+  transform-origin: left center;
 }
 
 @media (pointer: coarse) {
@@ -27,6 +38,20 @@
   }
 }
 
+/* Signature focus-distortion: the single inspected row lifts and gets the full
+ * --accent ring — matching the canvas node and docked inspector so one selected
+ * service reads at the same intensity across all three surfaces. */
+.row[data-selected] {
+  background: var(--bg-raised);
+  border-color: var(--accent);
+  transform: scale(1.015);
+}
+
+/* Non-selected rows recede while one is inspected. */
+.row[data-dimmed] {
+  opacity: 0.55;
+}
+
 .dot {
   flex: none;
   width: 8px;
@@ -38,7 +63,7 @@
   flex: 1;
   min-width: 0;
   overflow: hidden;
-  font-family: var(--font-mono);
+  /* Service name is a NAME — Inter, not the indicator voice. */
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -60,7 +85,7 @@
   width: 60px;
   height: 4px;
   border-radius: 2px;
-  background: var(--bg-inset);
+  background: var(--gauge-track);
   overflow: hidden;
 }
 
@@ -73,15 +98,14 @@
 .metrics {
   flex: none;
   display: flex;
-  gap: var(--space-2);
+  gap: var(--space-3);
   justify-content: flex-end;
-  min-width: 110px;
-  font-family: var(--font-mono);
   font-size: var(--text-xs);
   color: var(--text-2);
 }
 
 .metric {
-  min-width: 48px;
+  display: inline-block;
+  min-width: 44px;
   text-align: right;
 }

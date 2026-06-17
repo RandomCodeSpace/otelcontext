@@ -63,9 +63,9 @@ describe('CommandPalette', () => {
 
   it('navigate commands route and close the palette', async () => {
     const user = userEvent.setup()
-    const { memory, onPaletteOpenChange } = setup()
-    await user.click(await screen.findByText('Traces'))
-    expect(memory.history.at(-1)).toBe('/traces')
+    const { memory, onPaletteOpenChange } = setup({ path: '/map' })
+    await user.click(await screen.findByText('Service Map'))
+    expect(memory.history.at(-1)).toBe('/')
     expect(onPaletteOpenChange).toHaveBeenCalledWith(false)
   })
 
@@ -112,14 +112,6 @@ describe('CommandPalette', () => {
         qc.getQueryState(['mcp', 'impact_analysis', 'payments']),
       ).toBeDefined(),
     )
-  })
-
-  it('search-logs action deep-links the /logs service search', async () => {
-    const user = userEvent.setup()
-    const { memory } = setup()
-    await user.click(await screen.findByText('Search logs…'))
-    await user.click(await screen.findByText('checkout'))
-    expect(memory.history.at(-1)).toBe('/logs?service=checkout')
   })
 
   it('Escape on the picker page backs out instead of closing', async () => {

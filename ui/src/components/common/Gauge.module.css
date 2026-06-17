@@ -1,0 +1,59 @@
+.gauge {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  aspect-ratio: 1 / 1;
+}
+
+.dial {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.track,
+.fill {
+  fill: none;
+  stroke-width: 6;
+  stroke-linecap: round;
+}
+
+.track {
+  stroke: var(--gauge-track);
+}
+
+.fill {
+  /* Animate the reveal with the shared duration/easing; under
+     prefers-reduced-motion --dur-2 is zeroed at tokens.css:123, so the arc
+     snaps to its value with no transition. transform/opacity-free property,
+     but this is a one-shot value change (no looping), so it is safe to ease. */
+  transition: stroke-dashoffset var(--dur-2) var(--ease);
+}
+
+.ok {
+  stroke: var(--ok);
+}
+
+.warn {
+  stroke: var(--warn);
+}
+
+.crit {
+  stroke: var(--crit);
+}
+
+.accent {
+  stroke: var(--accent);
+}
+
+.readout {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+}

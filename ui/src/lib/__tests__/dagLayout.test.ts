@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   GAP_X,
   NODE_W,
+  compareIds,
   edgePath,
   edgeWidth,
   fitTransform,
@@ -154,6 +155,20 @@ describe('fitTransform / zoomAt', () => {
     expect(Number.isFinite(t.x)).toBe(true)
   })
 
+  it('floors the scale at minScale (small field on a narrow viewport)', () => {
+    // Contain-fit would shrink to ~0.18 on a phone-width viewport; the floor
+    // keeps it legible and the content then overflows, staying centered.
+    const t = fitTransform({ width: 1100, height: 1100 }, { width: 360, height: 640 }, 24, 0.5)
+    expect(t.k).toBe(0.5)
+    // Centered overflow: the field spills symmetrically (negative offset).
+    expect(t.x).toBeCloseTo((360 - 1100 * 0.5) / 2, 5)
+  })
+
+  it('minScale never upscales past the contain fit when content already fits', () => {
+    const t = fitTransform({ width: 100, height: 100 }, { width: 1000, height: 800 }, 24, 0.5)
+    expect(t.k).toBe(1)
+  })
+
   it('zoomAt keeps the anchor point stationary', () => {
     const t = { x: 20, y: 30, k: 1 }
     const t2 = zoomAt(t, 100, 100, 1.5)
@@ -217,5 +232,19 @@ describe('edgePath / neighborsOf', () => {
   it('collects 1-hop neighbors in both directions', () => {
     const edges = [E('a', 'b'), E('c', 'a'), E('b', 'd')]
     expect(neighborsOf(edges, 'a')).toEqual(new Set(['b', 'c']))
+  })
+})
+
+describe('compareIds (locale-independent, codepoint order)', () => {
+  it('orders by UTF-16 code unit, not locale', () => {
+    // Under many locales localeCompare puts 'a' before 'Z'; codepoint order is 'Z'(90) < 'a'(97).
+    expect(compareIds('Z', 'a')).toBeLessThan(0)
+    expect(['a', 'Z', 'B'].slice().sort(compareIds)).toEqual(['B', 'Z', 'a'])
+  })
+
+  it('is a total order with stable equality', () => {
+    expect(compareIds('svc-1', 'svc-1')).toBe(0)
+    expect(compareIds('svc-1', 'svc-2')).toBeLessThan(0)
+    expect(compareIds('svc-2', 'svc-1')).toBeGreaterThan(0)
   })
 })

@@ -8,21 +8,30 @@ import styles from './ServiceGroups.module.css'
 interface ServiceGroupsProps {
   nodes: readonly SystemNode[]
   onOpen: (id: string) => void
+  /** Id of the inspected service — drives row focus-distortion. Optional so
+   * the xs flow-map fallback (no inspector) renders a plain list. */
+  selectedId?: string | null
 }
 
 function Section({
   title,
   nodes,
   onOpen,
-}: Readonly<{ title: string; nodes: SystemNode[]; onOpen: (id: string) => void }>) {
+  selectedId,
+}: Readonly<{
+  title: string
+  nodes: SystemNode[]
+  onOpen: (id: string) => void
+  selectedId?: string | null
+}>) {
   if (nodes.length === 0) return null
   return (
     <section aria-label={title}>
-      <h3 className={styles.sectionTitle}>{title}</h3>
+      <h3 className={`legend ${styles.sectionTitle}`}>{title}</h3>
       <ul className={styles.list}>
         {nodes.map((n) => (
           <li key={n.id}>
-            <ServiceRow node={n} onOpen={onOpen} />
+            <ServiceRow node={n} onOpen={onOpen} selectedId={selectedId} />
           </li>
         ))}
       </ul>
@@ -31,18 +40,19 @@ function Section({
 }
 
 /**
- * xs default for /map: status-grouped service cards, worst first; quiet
- * healthy services collapsed behind a disclosure.
+ * Status-grouped service list, worst first; quiet healthy services collapsed
+ * behind a disclosure. Hairline-separated rows (not cards). Doubles as the xs
+ * default for /map.
  */
-export default function ServiceGroups({ nodes, onOpen }: Readonly<ServiceGroupsProps>) {
+export default function ServiceGroups({ nodes, onOpen, selectedId }: Readonly<ServiceGroupsProps>) {
   const ranked = rankServices(nodes)
   const [healthyOpen, setHealthyOpen] = useState(false)
 
   return (
     <div className={styles.cards}>
-      <Section title="Critical" nodes={ranked.critical} onOpen={onOpen} />
-      <Section title="Degraded" nodes={ranked.degraded} onOpen={onOpen} />
-      <Section title="Alerts" nodes={ranked.alerted} onOpen={onOpen} />
+      <Section title="Critical" nodes={ranked.critical} onOpen={onOpen} selectedId={selectedId} />
+      <Section title="Degraded" nodes={ranked.degraded} onOpen={onOpen} selectedId={selectedId} />
+      <Section title="Alerts" nodes={ranked.alerted} onOpen={onOpen} selectedId={selectedId} />
       {ranked.healthy.length > 0 && (
         <section aria-label="Healthy">
           <button
@@ -56,14 +66,14 @@ export default function ServiceGroups({ nodes, onOpen }: Readonly<ServiceGroupsP
             ) : (
               <ChevronRight size={13} aria-hidden="true" />
             )}
-            {ranked.healthy.length} healthy service
+            <span className="num">{ranked.healthy.length}</span> healthy service
             {ranked.healthy.length === 1 ? '' : 's'}
           </button>
           {healthyOpen && (
             <ul className={styles.list}>
               {ranked.healthy.map((n) => (
                 <li key={n.id}>
-                  <ServiceRow node={n} onOpen={onOpen} />
+                  <ServiceRow node={n} onOpen={onOpen} selectedId={selectedId} />
                 </li>
               ))}
             </ul>

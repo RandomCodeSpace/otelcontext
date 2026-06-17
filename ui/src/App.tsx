@@ -1,5 +1,5 @@
 import { lazy, Suspense, useCallback, useState } from 'react'
-import { Redirect, Route, Switch } from 'wouter'
+import { Redirect, Route, Switch, useSearch } from 'wouter'
 import RouteFallback from './components/common/RouteFallback'
 import Shell from './components/shell/Shell'
 import TrailBar from './components/trail/TrailBar'
@@ -11,16 +11,24 @@ import styles from './App.module.css'
 // All routes are code-split; the Inspector is split too and only fetched
 // once a ?service= drill-down actually happens. The ⌘K palette + shortcut
 // sheet chunk loads on the first open request — zero cost until then.
-const TriageView = lazy(() => import('./components/triage/TriageView'))
-const FlowMapView = lazy(() => import('./components/map/FlowMapView'))
-const TracesView = lazy(() => import('./components/traces/TracesView'))
-const LogsView = lazy(() => import('./components/logs/LogsView'))
+const ConstellationHome = lazy(() => import('./components/triage/ConstellationHome'))
 const ServiceInspector = lazy(() => import('./components/inspector/ServiceInspector'))
 const PaletteHost = lazy(() => import('./components/palette/PaletteHost'))
 
 interface AppProps {
   theme: Theme
   onToggleTheme: () => void
+}
+
+/**
+ * /map folds into the home canvas (the map IS home). wouter's <Redirect to>
+ * drops the query string, so rebuild the target from useSearch() — this keeps
+ * deep links like /map?service=x and /map?impact=x alive across the fold.
+ */
+function MapRedirect() {
+  const search = useSearch()
+  const to = search ? `/?${search}` : '/'
+  return <Redirect to={to} replace />
 }
 
 export default function App({ theme, onToggleTheme }: Readonly<AppProps>) {
@@ -56,12 +64,13 @@ export default function App({ theme, onToggleTheme }: Readonly<AppProps>) {
         <div className={styles.routes}>
           <Suspense fallback={<RouteFallback />}>
             <Switch>
-              <Route path="/" component={TriageView} />
-              <Route path="/map" component={FlowMapView} />
-              <Route path="/traces" component={TracesView} />
-              <Route path="/logs" component={LogsView} />
-              {/* Unknown paths (incl. the retired /dashboard and /mcp)
-                  land on the Triage home. */}
+              <Route path="/" component={ConstellationHome} />
+              {/* The map is the home canvas now — fold /map into / while
+                  preserving ?service= / ?impact= deep links. */}
+              <Route path="/map" component={MapRedirect} />
+              {/* Unknown paths (incl. the retired /dashboard, /mcp,
+                  /traces and /logs) land on the Constellation home —
+                  logs and traces are MCP-tool surfaces for agents now. */}
               <Route>
                 <Redirect to="/" replace />
               </Route>

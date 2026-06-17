@@ -1,0 +1,181 @@
+/* HealthCore — the fused vitals instrument. Default (deck) layout matches the
+   former VitalsDeck core; the compact variant sizes it for the canvas center. */
+
+.core {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-4);
+}
+
+.hero {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-2);
+  /* Fixed slot so loading→loaded swaps never shift the layout. */
+  width: 180px;
+  max-width: 60vw;
+}
+
+/* The central gauge dominates; satellites are the readings around it. */
+.hero :global(.num) {
+  font-size: var(--text-2xl);
+  color: var(--text-1);
+}
+
+.satellites {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: var(--space-3);
+  width: 100%;
+  max-width: 420px;
+}
+
+.satellites :global(.num) {
+  font-size: var(--text-lg);
+  color: var(--text-1);
+}
+
+.numericOnly {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-1);
+  aspect-ratio: 1 / 1;
+}
+
+.srOnly {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  clip-path: inset(50%);
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+/* md+ deck: hero and satellites read as one wide cluster. */
+@media (min-width: 768px) {
+  .core {
+    flex-direction: row;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: var(--space-5);
+  }
+
+  .hero {
+    width: 200px;
+  }
+
+  .satellites {
+    width: auto;
+    flex: 1;
+    min-width: 280px;
+    max-width: 480px;
+  }
+}
+
+/* ---- compact (canvas center) ----
+   Pinned at the map center; sized so the instrument reads without crowding the
+   inner rings. Stays a vertical stack at every width (the field is the layout,
+   not this). Numerals stay authoritative; gauges shrink. */
+.compact {
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--stroke-1);
+  border-radius: var(--radius-3);
+  /* Near-opaque so the core sits ON the field while staying legible: a
+     saturated red node or the accent-edge glow panning behind it cannot pull a
+     legend under AA, and there is no per-frame backdrop blur to re-sample while
+     the SVG <g> pans/zooms (a compositor-expensive op on 4×-throttled mobile —
+     exactly the coarse pointers where pinch-zoom happens). 94% keeps a hair of
+     the graticule reading through without the contrast/perf cost of a blur. */
+  background: color-mix(in srgb, var(--bg-raised) 94%, transparent);
+}
+
+/* Lift the instrument legends off the AA floor for the compact variant: the
+   global .legend is --text-3 (~4.6:1 on the solid base), which the translucent
+   surface over moving high-chroma content can erode below 4.5:1. --text-2 is
+   7.1:1, so the headroom holds even with a critical-tier node parked behind. */
+.compact :global(.legend) {
+  color: var(--text-2);
+}
+
+.compact .hero {
+  width: 100px;
+}
+
+.compact .hero :global(.num) {
+  font-size: var(--text-lg);
+}
+
+.compact .satellites {
+  grid-template-columns: repeat(3, 1fr);
+  gap: var(--space-2);
+  width: 100%;
+  max-width: 168px;
+}
+
+/* Stack each satellite's legend OVER its numeral. Inline (the default Metric
+   voice) the two run together — "ERR" + "69.7%" — and at the compact gauge
+   size they overflow the dial and collide with the neighbouring readout. A
+   centered column keeps each reading inside its own gauge at every width. */
+.compact .satellites :global([role='group']) {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  line-height: 1.15;
+}
+
+.compact .satellites :global(.num) {
+  font-size: var(--text-xs);
+}
+
+@media (min-width: 768px) {
+  .compact {
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+
+  .compact .hero {
+    width: 100px;
+  }
+
+  .compact .satellites {
+    width: 100%;
+    min-width: 0;
+    max-width: 168px;
+  }
+}
+
+/* xs: the compact core doubles as the bottom-left corner stat card over the
+   map — shrink it so it stays peripheral and never eats the lower field. */
+@media (max-width: 767px) {
+  .compact {
+    gap: var(--space-1);
+    padding: var(--space-2);
+  }
+
+  .compact .hero {
+    width: 80px;
+  }
+
+  .compact .hero :global(.num) {
+    font-size: var(--text-base);
+  }
+
+  .compact .satellites {
+    max-width: 148px;
+    gap: var(--space-1);
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  /* No ambient motion here — the instrument is steady; transitions live on the
+     gauges/odometer themselves. */
+}

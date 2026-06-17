@@ -1,0 +1,15 @@
+# Gitleaks configuration.
+#
+# Extends gitleaks' built-in ruleset (so real secrets are still caught) but
+# excludes the embedded UI build artifacts under internal/ui/dist/. Those are
+# minified, gitignored bundle files — committed only in pre-"source-only-main"
+# history (#99) — whose hashed/minified contents trip the generic-api-key
+# heuristic. They are build output, never source, and never carry real secrets.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Embedded UI build artifacts are build output, not secret-bearing source."
+paths = [
+  '''internal/ui/dist/.*''',
+]
