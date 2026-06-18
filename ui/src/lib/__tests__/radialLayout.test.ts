@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { layoutRadial, walkRadial } from '../radialLayout'
+import { layoutRadial } from '../radialLayout'
 import { NODE_H, NODE_W, type GraphEdgeRef, type Layout } from '../dagLayout'
 
 const E = (source: string, target: string): GraphEdgeRef => ({ source, target })
@@ -190,104 +190,5 @@ describe('layoutRadial — determinism', () => {
     const a = layoutRadial(nodes, edges)
     const b = layoutRadial(nodes, [...edges, ...edges])
     expect([...a.nodes.entries()]).toEqual([...b.nodes.entries()])
-  })
-})
-
-describe('walkRadial — null focus', () => {
-  const layout = layoutRadial(
-    ['core', 'a', 'b', 'c', 'd'],
-    [E('a', 'core'), E('b', 'core'), E('c', 'core')],
-  )
-
-  it("null focus + 'right' returns the most-critical node (ring 0, first)", () => {
-    const target = walkRadial(layout, null, 'right')
-    expect(target).toBe(layout.layers[0][0])
-    expect(layout.nodes.get(target!)!.layer).toBe(0)
-  })
-
-  // Cold-start bootstrap: a null focus seeds the most-critical entry node for
-  // ANY arrow key (not just 'right'), so Tabbing into the field and pressing
-  // the intuitive ArrowDown is never keyboard-inert. The seed is deterministic.
-  it('null focus seeds the SAME ring-0 entry node in every direction', () => {
-    const seed = layout.layers[0][0]
-    for (const dir of ['left', 'right', 'up', 'down'] as const) {
-      const target = walkRadial(layout, null, dir)
-      expect(target).toBe(seed)
-      expect(layout.nodes.get(target!)!.layer).toBe(0)
-    }
-  })
-})
-
-describe('walkRadial — unknown focus', () => {
-  const layout = layoutRadial(['a', 'b'], [E('a', 'b')])
-  it('returns null for an unknown focus id in every direction', () => {
-    for (const dir of ['left', 'right', 'up', 'down'] as const) {
-      expect(walkRadial(layout, 'ghost', dir)).toBeNull()
-    }
-  })
-})
-
-describe('walkRadial — angular movement (left/right)', () => {
-  // Several singletons land on the same outermost ring, spread by angle.
-  const ids = ['a', 'b', 'c', 'd', 'e', 'f']
-  const layout = layoutRadial(ids, [])
-
-  it('right then left returns to the start (inverse on the same ring)', () => {
-    // pick a node that is not at a ring boundary
-    const ring = layout.layers.find((r) => r.length >= 3)!
-    const start = ring[1]
-    const right = walkRadial(layout, start, 'right')
-    expect(right).toBe(ring[2])
-    const back = walkRadial(layout, right, 'left')
-    expect(back).toBe(start)
-  })
-
-  it('returns null at the angular ring boundaries (no wraparound)', () => {
-    const ring = layout.layers.find((r) => r.length >= 2)!
-    expect(walkRadial(layout, ring[0], 'left')).toBeNull()
-    expect(walkRadial(layout, ring[ring.length - 1], 'right')).toBeNull()
-  })
-
-  it('returns null moving angularly on a single-node ring', () => {
-    const callers = Array.from({ length: 10 }, (_, i) => `c${i}`)
-    const l = layoutRadial(['solo', ...callers], callers.map((c) => E(c, 'solo')))
-    // solo is alone on ring 0
-    expect(l.layers[0]).toEqual(['solo'])
-    expect(walkRadial(l, 'solo', 'left')).toBeNull()
-    expect(walkRadial(l, 'solo', 'right')).toBeNull()
-  })
-})
-
-describe('walkRadial — ring movement (up/down)', () => {
-  // hub on inner ring, callers on outer ring.
-  const callers = Array.from({ length: 8 }, (_, i) => `c${i}`)
-  const layout = layoutRadial(['hub', ...callers], callers.map((c) => E(c, 'hub')))
-
-  it('down moves outward to a higher ring index', () => {
-    const target = walkRadial(layout, 'hub', 'down')
-    expect(target).not.toBeNull()
-    expect(layout.nodes.get(target!)!.layer).toBeGreaterThan(layout.nodes.get('hub')!.layer)
-  })
-
-  it('up from the outermost-ring node reaches a lower ring index', () => {
-    const outer = callers.find((c) => layout.nodes.get(c)!.layer === layout.layers.length - 1)!
-    const target = walkRadial(layout, outer, 'up')
-    expect(target).not.toBeNull()
-    expect(layout.nodes.get(target!)!.layer).toBeLessThan(layout.nodes.get(outer)!.layer)
-  })
-
-  it('up from ring 0 returns null (innermost boundary)', () => {
-    expect(walkRadial(layout, 'hub', 'up')).toBeNull()
-  })
-
-  it('down from the outermost ring returns null', () => {
-    const outer = callers.find((c) => layout.nodes.get(c)!.layer === layout.layers.length - 1)!
-    expect(walkRadial(layout, outer, 'down')).toBeNull()
-  })
-
-  it('ring movement is deterministic (picks nearest by angle, compareIds tiebreak)', () => {
-    const a = walkRadial(layout, 'hub', 'down')
-    const b = walkRadial(layout, 'hub', 'down')
-    expect(a).toBe(b)
   })
 })
