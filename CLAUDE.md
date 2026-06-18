@@ -292,6 +292,14 @@ All actions are SHA-pinned per Scorecard `Pinned-Dependencies`. Top-level `permi
 - **Baseline:** to be measured after first push to `main`. Track via the Scorecard dashboard linked from the README badge.
 - **Stretch target:** ≥ 8.0/10. Best-effort — Scorecard does **not** gate merge per the board ruling. The `passing` Best Practices badge is the only hard supply-chain gate.
 
+### Release artifacts & signing (`.github/workflows/release.yml` + `.goreleaser.yaml`)
+
+Triggered by a `v*` tag push (the tag is cut by `scripts/release.sh`). GoReleaser OSS v2 builds cross-platform binaries (linux/darwin × amd64/arm64, `CGO_ENABLED=0` for the pure-Go SQLite driver, `-trimpath -s -w`), emits `tar.gz` archives (incl. LICENSE.md + README.md), a sha256 `checksums.txt`, and per-archive SBOMs via syft. **cosign keyless** (Sigstore OIDC; the release job grants `id-token: write`) signs the checksums file, attaching `checksums.txt.sig` + `checksums.txt.pem` to the release. This is what makes Scorecard's **Packaging** (a publishing workflow is detected) and **Signed-Releases** checks score.
+
+Division of labour: `scripts/release.sh` builds the UI + pushes the tag (and, with `--release`, creates the GitHub release shell with notes but **no artifacts**); `release.yml` then runs GoReleaser with `release.mode: append`, which adds the signed artifacts to that same release without racing on "release already exists". All third-party actions are SHA-pinned per Scorecard `Pinned-Dependencies` (pins reused from `security.yml`/`scorecard.yml` where they overlap). $0/OSS-only: GoReleaser OSS, cosign (Apache-2.0), syft (Apache-2.0) — no Pro-only config keys.
+
+> Caveat: Packaging/Signed-Releases only **score** after the next `v*` tag-push actually runs `release.yml` and produces a signed release.
+
 ### Vulnerability reporting
 
 See [`SECURITY.md`](SECURITY.md). Preferred channel: GitHub Security Advisories at `https://github.com/RandomCodeSpace/otelcontext/security/advisories/new`. Email fallback: `ak.nitrr13@gmail.com` with subject prefix `[otelcontext security]`.

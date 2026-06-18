@@ -1,0 +1,92 @@
+name: Release (artifacts + signing)
+# Builds release artifacts and signs them when a `v*` tag is pushed.
+#
+# The tag itself is cut by scripts/release.sh: it builds the React UI, makes a
+# DETACHED commit embedding internal/ui/dist, tags it, and pushes ONLY the tag
+# (main stays source-only). This workflow runs on that tag push and owns
+# release ARTIFACTS + SIGNING — GoReleaser builds the cross-platform binaries,
+# emits checksums + SBOMs, and cosign keyless-signs the checksums file so a
+# .sig + .pem pair attaches to the release. That satisfies Scorecard's
+# Packaging (a publishing workflow is detected) and Signed-Releases checks.
+#
+# release.sh embeds internal/ui/dist into the detached tagged commit, but this
+# workflow rebuilds the UI (npm ci && npm run build) BEFORE invoking goreleaser
+# anyway: `go build` only recompiles Go (never runs vite), so rebuilding here
+# guarantees the embedded dist is present and current regardless of how the tag
+# was produced.
+#
+# All third-party actions are SHA-pinned per Scorecard Pinned-Dependencies;
+# pins are reused verbatim from security.yml / scorecard.yml where they overlap.
+on:
+  push:
+    tags:
+      - 'v*'
+
+# Workflow-level default: minimum needed for actions/checkout. The release job
+# escalates to contents: write (create/append the GitHub release + upload
+# assets) and id-token: write (cosign keyless OIDC).
+permissions:
+  contents: read
+
+jobs:
+  goreleaser:
+    name: GoReleaser (build · sbom · sign)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - name: Harden runner egress
+        # step-security/harden-runner v2.19.0
+        uses: step-security/harden-runner@8d3c67de8e2fe68ef647c8db1e6a09f647780f40
+        with:
+          egress-policy: audit
+
+      - name: Checkout tag
+        # actions/checkout v4.2.2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          # Full history so goreleaser's changelog/version detection works.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        # actions/setup-go v6.2.0
+        uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up Node
+        # actions/setup-node v6.4.0
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: '24'
+
+      - name: Build UI (embedded into the binary)
+        # The Go binary embeds internal/ui/dist via //go:embed; build it before
+        # goreleaser compiles. `npm run build` emits into internal/ui/dist.
+        run: |
+          cd ui
+          npm ci
+          npm run build
+          test -f ../internal/ui/dist/index.html
+
+      - name: Install cosign
+        # sigstore/cosign-installer v3.9.2 — provides `cosign` for the keyless
+        # signing step in .goreleaser.yaml (signs: cmd: cosign).
+        uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159
+
+      - name: Run GoReleaser
+        # goreleaser/goreleaser-action v6.2.1
+        uses: goreleaser/goreleaser-action@90a3faa9d0182683851fbfa97ca1a2cb983bfca3
+        with:
+          version: '~> v2'
+          args: release --clean
+        env:
+          # Pure-Go SQLite driver → cgo off (matches .goreleaser.yaml builds.env).
+          CGO_ENABLED: '0'
+          # Default token: goreleaser uses it to create/append the release.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # cosign keyless reads the OIDC token from these (set by id-token: write).
+          COSIGN_EXPERIMENTAL: '1'

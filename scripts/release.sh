@@ -15,9 +15,23 @@
 # the release commit is reachable solely through the tag, so no build artifact
 # ever lands on the branch.
 #
+# Division of labour with .github/workflows/release.yml
+# -----------------------------------------------------
+# Pushing the tag (below) triggers release.yml, which owns release ARTIFACTS +
+# SIGNING: GoReleaser builds the cross-platform binaries, emits checksums +
+# SBOMs, and cosign keyless-signs the checksums file (.sig + .pem). This script
+# only builds the UI and pushes the tag; it does NOT upload any binaries.
+#
+# `--release` here creates the GitHub release shell EARLY (title + install
+# notes, NO artifacts) so humans see notes immediately. GoReleaser is configured
+# with `release.mode: append` (.goreleaser.yaml), so when its run finishes it
+# ADDS its signed artifacts to this same release rather than failing on
+# "release already exists" — no race. Omit `--release` and GoReleaser creates
+# the release itself from scratch.
+#
 # Usage:
-#   scripts/release.sh vX.Y.Z[-pre]            # build + push tag
-#   scripts/release.sh vX.Y.Z[-pre] --release  # also create a GitHub pre-release
+#   scripts/release.sh vX.Y.Z[-pre]            # build + push tag (release.yml does the rest)
+#   scripts/release.sh vX.Y.Z[-pre] --release  # also create the GitHub release shell (notes only)
 #
 set -euo pipefail
 
@@ -69,7 +83,10 @@ echo "✓ pushed tag $VER -> $(git rev-parse --short "$VER")"
 
 # (the EXIT trap now restores main to the source-only state)
 
-# --- Optional GitHub pre-release --------------------------------------------
+# --- Optional GitHub pre-release (shell only; release.yml appends artifacts) -
+# Creates the release with title + notes and NO artifacts. The tag push above
+# triggers .github/workflows/release.yml, whose GoReleaser run (release.mode:
+# append) attaches the signed binaries, checksums, and SBOMs to this release.
 if [ "$MAKE_RELEASE" = "--release" ]; then
   prev="$(git describe --tags --abbrev=0 "${VER}^" 2>/dev/null || true)"
   range="${prev:+${prev}..}${VER}"
