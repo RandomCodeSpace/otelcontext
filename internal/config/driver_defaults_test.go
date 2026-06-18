@@ -15,7 +15,6 @@ var sqliteEnvKeys = []string{
 	"INGEST_PIPELINE_QUEUE_SIZE",
 	"INGEST_PIPELINE_MAX_BYTES",
 	"METRIC_MAX_CARDINALITY",
-	"STORE_MIN_SEVERITY",
 	"SAMPLING_RATE",
 	"GRPC_MAX_CONCURRENT_STREAMS",
 	"LOG_FTS_ENABLED",
@@ -55,7 +54,7 @@ func postgresDefaultsConfig(driver string) *Config {
 		IngestPipelineQueueSize:  50000,     // Postgres default
 		IngestPipelineMaxBytes:   512 << 20, // Postgres default
 		MetricMaxCardinality:     10000,     // Postgres default
-		StoreMinSeverity:         "",        // same-as-ingest default
+		StoreMinSeverity:         "WARN",    // global default (all drivers), not driver-flipped
 		SamplingRate:             1.0,       // keep-all default
 		GRPCMaxConcurrentStreams: 1000,      // Postgres default
 		GraphRAGEventQueueSize:   100000,    // Postgres default
@@ -83,7 +82,6 @@ func TestApplyDriverDefaults_SQLite_FlipsAllWhenNoEnv(t *testing.T) {
 		{"IngestPipelineQueueSize", cfg.IngestPipelineQueueSize, 10000},
 		{"IngestPipelineMaxBytes", cfg.IngestPipelineMaxBytes, 128 << 20},
 		{"MetricMaxCardinality", cfg.MetricMaxCardinality, 3000},
-		{"StoreMinSeverity", cfg.StoreMinSeverity, "WARN"},
 		{"SamplingRate", cfg.SamplingRate, 0.05},
 		{"GRPCMaxConcurrentStreams", cfg.GRPCMaxConcurrentStreams, 240},
 		{"LogFTSEnabled", cfg.LogFTSEnabled, true},

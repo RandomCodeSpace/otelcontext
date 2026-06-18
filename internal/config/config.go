@@ -30,11 +30,13 @@ type Config struct {
 	IngestExcludedServices string
 
 	// Storage Filtering. Logs that pass IngestMinSeverity (so they reach the
-	// receiver and feed in-memory consumers like vectordb / GraphRAG) but
-	// fall below StoreMinSeverity are skipped during the DB persist pass —
-	// only the row-write is dropped, not the in-memory enrichment. Empty
-	// (default) means StoreMinSeverity == IngestMinSeverity, i.e. no
-	// behavior change vs. the single-threshold semantics.
+	// receiver and feed in-memory consumers like GraphRAG / Drain) but fall
+	// below StoreMinSeverity are skipped during the DB persist pass — only the
+	// row-write is dropped, not the in-memory enrichment. Defaults to "WARN"
+	// (all drivers): INFO/DEBUG still inform anomaly detection + clustering but
+	// don't grow the DB. Empty falls back to IngestMinSeverity (no second-tier
+	// gate); a value <= IngestMinSeverity is a no-op since the receiver already
+	// drops below that.
 	StoreMinSeverity string
 
 	// DB Connection Pool
@@ -279,7 +281,7 @@ func Load(customPath string) (*Config, error) {
 		PprofAddr:         getEnv("PPROF_ADDR", "127.0.0.1:6060"),
 
 		IngestMinSeverity:      getEnv("INGEST_MIN_SEVERITY", "INFO"),
-		StoreMinSeverity:       getEnv("STORE_MIN_SEVERITY", ""),
+		StoreMinSeverity:       getEnv("STORE_MIN_SEVERITY", "WARN"),
 		IngestAllowedServices:  getEnv("INGEST_ALLOWED_SERVICES", ""),
 		IngestExcludedServices: getEnv("INGEST_EXCLUDED_SERVICES", ""),
 
@@ -409,7 +411,6 @@ var sqliteOverrides = []struct {
 	// first structure to bloat — bound it to 128MB instead of 512MB.
 	{"INGEST_PIPELINE_MAX_BYTES", func(c *Config) { c.IngestPipelineMaxBytes = 128 << 20 }},
 	{"METRIC_MAX_CARDINALITY", func(c *Config) { c.MetricMaxCardinality = 3000 }},
-	{"STORE_MIN_SEVERITY", func(c *Config) { c.StoreMinSeverity = "WARN" }},
 	{"SAMPLING_RATE", func(c *Config) { c.SamplingRate = 0.05 }},
 	{"GRPC_MAX_CONCURRENT_STREAMS", func(c *Config) { c.GRPCMaxConcurrentStreams = 240 }},
 	{"LOG_FTS_ENABLED", func(c *Config) { c.LogFTSEnabled = true }},
