@@ -21,6 +21,15 @@ on:
   push:
     tags:
       - 'v*'
+  # Manual re-release: run the CURRENT (default-branch) workflow against an
+  # already-pushed tag. GoReleaser's `release: mode: append` adds artifacts to
+  # the existing release WITHOUT mutating the immutable tag — used to recover a
+  # release whose original tag-push run failed.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to (re)build + sign (e.g. v0.3.1)'
+        required: true
 
 # Workflow-level default: minimum needed for actions/checkout. The release job
 # escalates to contents: write (create/append the GitHub release + upload
@@ -46,7 +55,10 @@ jobs:
         # actions/checkout v4.2.2
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          # Full history so goreleaser's changelog/version detection works.
+          # On workflow_dispatch, build the supplied existing tag; on a tag
+          # push, the pushed ref. Full history so goreleaser version detection
+          # works.
+          ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -76,6 +88,13 @@ jobs:
         # sigstore/cosign-installer v3.9.2 — provides `cosign` for the keyless
         # signing step in .goreleaser.yaml (signs: cmd: cosign).
         uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159
+
+      - name: Install syft
+        # anchore/sbom-action v0.24.0 (download-syft sub-action) — puts `syft`
+        # on PATH for the goreleaser `sboms:` step, which shells out to syft per
+        # archive. Without this goreleaser fails: `exec: "syft": not found`.
+        # Pin reused from security.yml.
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610
 
       - name: Run GoReleaser
         # goreleaser/goreleaser-action v6.2.1
