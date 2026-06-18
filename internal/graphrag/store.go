@@ -19,6 +19,12 @@ type tenantStores struct {
 	signals   *SignalStore
 	anomalies *AnomalyStore
 
+	// topology records cross-service CALLS edges from EVERY received span,
+	// pre-sample (see topology_observer.go). Bounded and tenant-isolated by
+	// living on this slice; guarantees the service map shows flow direction
+	// even when sampling starves the sampled edge path.
+	topology *topologyObserver
+
 	// lastAccess is the unix-nano time of the most recent ingest event or
 	// query routed through storesForTenant. Drives idle-tenant eviction in
 	// refreshLoop; background maintenance uses tenantStoresNoTouch so a 60s
@@ -44,6 +50,7 @@ func newTenantStores(traceTTL time.Duration, maxSpans int) *tenantStores {
 		traces:    newTraceStore(traceTTL, maxSpans),
 		signals:   newSignalStore(),
 		anomalies: newAnomalyStore(),
+		topology:  newTopologyObserver(),
 	}
 	// Creation counts as access — a slice re-created by the DB rebuild gets
 	// a full idle window rather than being evicted on the next tick.
@@ -220,6 +227,56 @@ func (s *ServiceStore) UpsertCallEdge(source, target string, durationMs float64,
 	e.ErrorRate = float64(e.ErrorCount) / float64(e.CallCount)
 	e.Weight = float64(e.CallCount)
 	e.UpdatedAt = ts
+}
+
+// EnsureService guarantees a ServiceNode for name EXISTS without touching its
+// aggregates. Absent → created with zeroed call/error stats (FirstSeen/LastSeen
+// = ts); present → no-op. The pre-sample topology observer uses this so the
+// service map has a row to hang flow-direction edges on even when sampling
+// dropped every span for the service; the sampled path (UpsertService) and the
+// 60s DB rebuild remain the sole source of call/error/latency aggregates.
+// Returns true if a new node was created.
+func (s *ServiceStore) EnsureService(name string, ts time.Time) bool {
+	if name == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.Services[name]; ok {
+		return false
+	}
+	s.Services[name] = &ServiceNode{
+		ID:        name,
+		Name:      name,
+		FirstSeen: ts,
+		LastSeen:  ts,
+	}
+	return true
+}
+
+// EnsureCallEdge guarantees a CALLS edge source→target EXISTS without touching
+// its aggregates. If the edge is absent it is created with zeroed
+// CallCount/latency/error stats (UpdatedAt = ts); if it already exists this is a
+// no-op. The pre-sample topology observer uses this so the service map shows
+// flow direction even when sampling dropped every span that would have formed
+// the edge — while the sampled path (UpsertCallEdge) remains the sole source of
+// CallCount/latency/error-rate aggregates. Returns true if a new edge was created.
+func (s *ServiceStore) EnsureCallEdge(source, target string, ts time.Time) bool {
+	ek := edgeKey(EdgeCalls, source, target)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.Edges[ek]; ok {
+		return false
+	}
+	s.Edges[ek] = &Edge{
+		Type:      EdgeCalls,
+		FromID:    source,
+		ToID:      target,
+		UpdatedAt: ts,
+	}
+	return true
 }
 
 func (s *ServiceStore) GetService(name string) (*ServiceNode, bool) {
