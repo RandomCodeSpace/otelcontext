@@ -35,7 +35,7 @@ jobs:
     steps:
       - name: Harden runner egress
         # step-security/harden-runner v2.19.0
-        uses: step-security/harden-runner@8d3c67de8e2fe68ef647c8db1e6a09f647780f40
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411
         with:
           egress-policy: audit
 
@@ -64,6 +64,6 @@ jobs:
 
       - name: Upload SARIF to GitHub code-scanning
         # github/codeql-action/upload-sarif v3.35.2
-        uses: github/codeql-action/upload-sarif@95e58e9a2cdfd71adc6e0353d5c52f41a045d225
+        uses: github/codeql-action/upload-sarif@8aad20d150bbac5944a9f9d289da16a4b0d87c1e
         with:
           sarif_file: results.sarif
