@@ -169,7 +169,7 @@ function FlowMapInner({
   // radial layout). Metric-only polls reuse these via the data memo below.
   const shapeKey = useMemo(() => {
     const ids = nodes.map((n) => n.id).sort(compareIds)
-    const es = edgeRefs.map((e) => `${e.source}->${e.target}`).sort()
+    const es = edgeRefs.map((e) => `${e.source}->${e.target}`).sort((a, b) => a.localeCompare(b))
     return JSON.stringify({ ids, es })
   }, [nodes, edgeRefs])
   const positions = useMemo(() => {
