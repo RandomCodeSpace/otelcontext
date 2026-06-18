@@ -14,6 +14,7 @@ import {
   BaseEdge,
   Controls,
   Handle,
+  MarkerType,
   MiniMap,
   Position,
   ReactFlow,
@@ -32,22 +33,25 @@ import {
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
 import { NODE_H, NODE_W, compareIds, edgeWidth, neighborsOf, type GraphEdgeRef } from '@/lib/dagLayout'
-import { layoutDagre } from '@/lib/dagreLayout'
+import { layoutRadial } from '@/lib/radialLayout'
 import { formatPercent } from '@/lib/format'
 import { nodeStatus, statusToken } from '@/lib/triage'
 import type { SystemEdge, SystemNode } from '@/types/api'
 import styles from './FlowMap.module.css'
 
 // React Flow service map. React Flow owns pan / zoom / fit, the grid, the
-// minimap and the zoom controls; we feed it a dagre layout (dagreLayout.ts —
-// crossing-minimised, left→right) for node positions AND edge ROUTING
-// waypoints, so links thread between ranks instead of disappearing under node
-// boxes at ~120 services. Two readability levers for scale: edges are drawn
-// through the dagre waypoints (routed, capped-thin), and nodes drop to status
-// DOTS below a zoom threshold (level-of-detail) so the 168px chips stop
-// occluding the field when zoomed out. dagre seeds the positions; nodes stay
-// DRAGGABLE for manual nudges — a drag survives metric polls, and a fresh
-// layout (topology change) re-seeds.
+// minimap and the zoom controls; we feed it a deterministic phyllotaxis
+// ("sunflower") layout (radialLayout.ts) for node positions — the most-critical
+// service near the centre, the rest on a golden-angle spiral that fills the disc
+// EVENLY from 7 to 120+ services. Unlike a layered DAG, a sunflower never
+// collapses sparse/disconnected graphs into a single column, so the map stays a
+// readable disc at scale instead of a 8000px-tall line. Two readability levers:
+// edges carry a direction ARROWHEAD (markerEnd) so flow is legible statically —
+// at any zoom and under reduced motion — and nodes drop to status DOTS below a
+// zoom threshold (level-of-detail) so the 168px chips stop occluding the field
+// when zoomed out. The layout seeds the positions; nodes stay DRAGGABLE for
+// manual nudges — a drag survives metric polls, and a fresh layout (topology
+// change) re-seeds.
 
 export type LayoutMode = 'radial' | 'dag'
 
@@ -59,7 +63,7 @@ export interface FlowMapHandle {
 interface FlowMapProps {
   nodes: readonly SystemNode[]
   edges: readonly SystemEdge[]
-  /** Layout paradigm. Only the layered dagre layout is used today; kept for API stability. */
+  /** Layout paradigm. The sunflower (phyllotaxis) layout is used today; kept for API stability. */
   mode?: LayoutMode
   /** The inspected service — accent ring + 1-hop neighborhood emphasis. */
   selectedId: string | null
@@ -116,6 +120,7 @@ function ServiceMapNode({ data }: NodeProps<ServiceNode>) {
     const cls = [
       styles.dotNode,
       emphasis === 'dim' && styles.dimmed,
+      (emphasis === 'neighbor' || (impactDepth !== null && impactDepth > 0)) && styles.dotNeighbor,
       (emphasis === 'selected' || impactDepth === 0) && styles.dotSelected,
     ]
       .filter(Boolean)
@@ -129,7 +134,9 @@ function ServiceMapNode({ data }: NodeProps<ServiceNode>) {
   const cls = [
     styles.chip,
     emphasis === 'selected' && styles.selected,
+    emphasis === 'neighbor' && styles.neighbor,
     emphasis === 'dim' && styles.dimmed,
+    impactDepth !== null && impactDepth > 0 && styles.inCone,
     impactDepth === 0 && styles.impactRoot,
   ]
     .filter(Boolean)
@@ -146,32 +153,6 @@ function ServiceMapNode({ data }: NodeProps<ServiceNode>) {
 }
 
 const NODE_TYPES: NodeTypes = { service: ServiceMapNode }
-
-/** Unit vector (guards zero length). */
-function unit(dx: number, dy: number): { x: number; y: number } {
-  const m = Math.hypot(dx, dy) || 1
-  return { x: dx / m, y: dy / m }
-}
-
-/** SVG path through the dagre waypoints with lightly rounded corners — the
- *  routed "circuit" look, radius clamped so it never overshoots a short leg. */
-function routedPath(pts: { x: number; y: number }[], radius = 7): string {
-  if (pts.length < 2) return ''
-  if (pts.length === 2) return `M${pts[0].x},${pts[0].y} L${pts[1].x},${pts[1].y}`
-  let d = `M${pts[0].x},${pts[0].y}`
-  for (let i = 1; i < pts.length - 1; i++) {
-    const p0 = pts[i - 1]
-    const p1 = pts[i]
-    const p2 = pts[i + 1]
-    const r = Math.min(radius, Math.hypot(p1.x - p0.x, p1.y - p0.y) / 2, Math.hypot(p2.x - p1.x, p2.y - p1.y) / 2)
-    const u1 = unit(p1.x - p0.x, p1.y - p0.y)
-    const u2 = unit(p2.x - p1.x, p2.y - p1.y)
-    d += ` L${p1.x - u1.x * r},${p1.y - u1.y * r} Q${p1.x},${p1.y} ${p1.x + u2.x * r},${p1.y + u2.y * r}`
-  }
-  const last = pts.at(-1)!
-  d += ` L${last.x},${last.y}`
-  return d
-}
 
 /** Centre of an internal node in flow coords (measured dims, NODE_* fallback). */
 function nodeCenter(n: InternalNode): { x: number; y: number } {
@@ -195,31 +176,28 @@ function borderToward(n: InternalNode, toward: { x: number; y: number }): { x: n
   return { x: c.x + ex / scale, y: c.y + ey / scale }
 }
 
-/** Edge drawn along dagre's routing waypoints (carried in data.points) so it
- *  threads between ranks at chip zoom. Two cases fall back to a centre-to-centre
- *  line instead: (1) LOD/dot zoom — chips collapse to a centred dot and the
- *  routed path ends ~84px away at the box border, so it would read as
- *  disconnected; (2) the cheap fallback layout, which has no waypoints. Either
- *  way the link visibly joins the two nodes. Colour/thickness ride the forwarded
- *  style; the flow animation is React Flow's native `animated` flag. */
-function RoutedEdge({ source, target, data, style }: EdgeProps) {
+/** Straight edge between two nodes carrying a direction ARROWHEAD. The
+ *  phyllotaxis layout has no routing waypoints, so edges are chords across the
+ *  disc. At chip zoom each endpoint pins to the node BORDER facing the other
+ *  node, so the arrowhead lands on the chip edge and follows a dragged node. At
+ *  LOD/dot zoom the chips collapse to a centred dot — the 168×40 wrapper border
+ *  would leave the line ~75px short of the dot — so we connect centre-to-centre
+ *  instead. Colour/thickness ride the forwarded style; markerEnd is the
+ *  forwarded arrowhead; the flow animation is React Flow's native `animated`
+ *  flag (a secondary cue — the arrowhead is the load-bearing one). */
+function RoutedEdge({ source, target, style, markerEnd }: EdgeProps) {
   const compact = useStore((s) => s.transform[2] < LOD_ZOOM)
   const s = useInternalNode(source)
   const t = useInternalNode(target)
   if (!s || !t) return null
-  const pts = (data?.points as { x: number; y: number }[] | undefined) ?? []
-  // Routed (chip zoom, with waypoints): keep dagre's middle routing, but pin the
-  // endpoints to each node's BORDER toward the adjacent waypoint — so links meet
-  // the chip edge (not its centre) and still follow a dragged node.
-  if (!compact && pts.length >= 2) {
-    const a = borderToward(s, pts[1] ?? nodeCenter(t))
-    const b = borderToward(t, pts.at(-2) ?? nodeCenter(s))
-    return <BaseEdge path={routedPath([a, ...pts.slice(1, -1), b])} style={style} />
+  if (compact) {
+    const a = nodeCenter(s)
+    const b = nodeCenter(t)
+    return <BaseEdge path={`M${a.x},${a.y} L${b.x},${b.y}`} style={style} markerEnd={markerEnd} />
   }
-  // LOD dot zoom, or the fallback layout with no waypoints: plain centre line.
-  const a = nodeCenter(s)
-  const b = nodeCenter(t)
-  return <BaseEdge path={`M${a.x},${a.y} L${b.x},${b.y}`} style={style} />
+  const a = borderToward(s, nodeCenter(t))
+  const b = borderToward(t, nodeCenter(s))
+  return <BaseEdge path={`M${a.x},${a.y} L${b.x},${b.y}`} style={style} markerEnd={markerEnd} />
 }
 
 const EDGE_TYPES: EdgeTypes = { routed: RoutedEdge }
@@ -258,20 +236,19 @@ function FlowMapInner({
     [edges],
   )
 
-  // Layout: recomputed ONLY when the node/edge SET changes (deterministic
-  // dagre). Carries both node positions and edge routing waypoints.
+  // Layout: recomputed ONLY when the node/edge SET changes — the phyllotaxis
+  // layout is deterministic for a given node/edge set.
   const shapeKey = useMemo(() => {
     const ids = nodes.map((n) => n.id).sort(compareIds)
     const es = edgeRefs.map((e) => `${e.source}->${e.target}`).sort((a, b) => a.localeCompare(b))
     return JSON.stringify({ ids, es })
   }, [nodes, edgeRefs])
-  // dagre layout, computed synchronously. It's deterministic and instant at
-  // normal scale; the previous Web Worker added cross-browser fragility for a
-  // benefit (avoiding a ~0.5–1.2s freeze only at ~120 services) that doesn't
-  // apply here, so it was removed for this simpler, robust path.
+  // Phyllotaxis ("sunflower") layout, computed synchronously — deterministic and
+  // instant. Edges feed criticality ranking (the most-called service lands at
+  // the disc centre); positions are stable for a given node/edge set.
   const layout = useMemo(() => {
     const { ids } = JSON.parse(shapeKey) as { ids: string[] }
-    return layoutDagre(ids, edgeRefs)
+    return layoutRadial(ids, edgeRefs)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [shapeKey])
 
@@ -331,32 +308,46 @@ function FlowMapInner({
     return () => cancelAnimationFrame(raf)
   }, [layout, fitView])
 
-  // Routed animated edges. Waypoints come from the dagre layout; token colour
-  // rides the inline style (CSS custom props resolve in the style property,
-  // unlike SVG presentation attributes); width is capped so high call-counts
-  // stay a hairline. Failing edges carry --crit + an `edgeFailing` class hook.
-  const rfEdges: Edge[] = useMemo(
-    () =>
-      edges.map((e) => {
-        const failing = isEdgeFailing(e.status)
-        const key = `${e.source}->${e.target}`
-        return {
-          id: key,
-          source: e.source,
-          target: e.target,
-          type: 'routed',
-          animated: true,
-          className: failing ? 'edgeFailing' : undefined,
-          data: { points: layout.edges.get(key) ?? [] },
-          style: {
-            stroke: failing ? 'var(--crit)' : 'var(--text-3)',
-            strokeWidth: Math.min(2.25, edgeWidth(e.call_count)),
-            opacity: failing ? 1 : 0.7,
-          } as CSSProperties,
-        }
-      }),
-    [edges, layout],
-  )
+  // Selection-aware animated edges. With a node selected (or a blast-radius
+  // cone) the ACTIVE path — 1-hop edges of the selection, or cone edges whose
+  // BOTH endpoints are in the cone — is drawn in the accent hue, thicker, fully
+  // opaque and animated; every off-path edge recedes to a dim hairline and stops
+  // animating, so the path reads as a clear through-line. A failing edge keeps
+  // its --crit hue. With nothing selected it's the neutral resting style. Token
+  // colour rides the inline style (CSS custom props resolve there, unlike SVG
+  // presentation attributes); width is capped so high call-counts stay a
+  // hairline. Every edge carries a direction arrowhead (markerEnd) coloured to
+  // match its stroke, so flow direction is legible statically — at any zoom and
+  // under reduced motion. Failing edges keep the `edgeFailing` class hook.
+  const rfEdges: Edge[] = useMemo(() => {
+    const focusing = selectedId !== null || impact != null
+    return edges.map((e) => {
+      const failing = isEdgeFailing(e.status)
+      const key = `${e.source}->${e.target}`
+      const active = impact
+        ? impact.has(e.source) && impact.has(e.target)
+        : selectedId !== null && (e.source === selectedId || e.target === selectedId)
+      const dimmed = focusing && !active
+      const stroke = failing ? 'var(--crit)' : active ? 'var(--accent)' : 'var(--text-3)'
+      const width = active
+        ? Math.min(3.5, edgeWidth(e.call_count) * 1.6)
+        : Math.min(2.25, edgeWidth(e.call_count))
+      return {
+        id: key,
+        source: e.source,
+        target: e.target,
+        type: 'routed',
+        animated: !dimmed,
+        className: failing ? 'edgeFailing' : undefined,
+        markerEnd: { type: MarkerType.ArrowClosed, width: 16, height: 16, color: stroke },
+        style: {
+          stroke,
+          strokeWidth: dimmed ? 1 : width,
+          opacity: dimmed ? 0.14 : failing || active ? 1 : 0.7,
+        } as CSSProperties,
+      }
+    })
+  }, [edges, selectedId, impact])
 
   const onNodeClick = useCallback((_: unknown, n: Node) => onSelect(n.id), [onSelect])
 

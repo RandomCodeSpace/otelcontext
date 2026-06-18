@@ -53,9 +53,12 @@
  * reduced motion (dur 0) preserves the static accent end-state. */
 .selected {
   border-color: var(--accent);
-  box-shadow: 0 0 0 1px var(--accent);
-  transform: scale(1.015);
+  box-shadow:
+    0 0 0 2px var(--accent),
+    0 0 0 6px var(--accent-muted);
+  transform: scale(1.03);
   transform-origin: center;
+  z-index: 2;
 }
 
 /* Field-wide focus-distortion: non-neighbour fade. */
@@ -66,13 +69,28 @@
 /* Blast-radius root (?impact=): same accent emphasis as the inspected node. */
 .impactRoot {
   border-color: var(--accent);
-  box-shadow: 0 0 0 1px var(--accent);
+  box-shadow:
+    0 0 0 2px var(--accent),
+    0 0 0 6px var(--accent-muted);
+  z-index: 2;
+}
+
+/* 1-hop neighbour of the selected node, and intermediate blast-radius cone
+ * members: lift above the dimmed field with an accent outline at full opacity so
+ * the active neighbourhood / cone reads as a connected group, not stragglers. */
+.neighbor,
+.inCone {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent-edge);
+  opacity: 1;
+  z-index: 1;
 }
 
 /* ---- level-of-detail: a status dot replaces the chip when zoomed out (dense
- * 120-service view), so the 168px boxes stop occluding the routed edges. The
- * dot is centred in the node box (dagre's edge waypoints still meet the box
- * border) and carries the status hue. ---- */
+ * 120-service view), so the 168px boxes stop occluding the edges. In dot mode
+ * edges connect centre-to-centre so they meet the dot rather than ending at the
+ * wrapper-box border; the dot is centred in the node box and carries the status
+ * hue. ---- */
 .dotNode {
   display: flex;
   align-items: center;
@@ -95,6 +113,14 @@
   box-shadow:
     0 0 0 2px var(--bg-inset),
     0 0 0 4px var(--accent);
+}
+
+/* Neighbour / in-cone dot: a thinner accent ring — present but subordinate to
+ * the selected/root dot's wider ring. */
+.dotNeighbor::before {
+  box-shadow:
+    0 0 0 2px var(--bg-inset),
+    0 0 0 3px var(--accent);
 }
 
 /* Connection anchor, kept INVISIBLE. React Flow needs a source/target handle
