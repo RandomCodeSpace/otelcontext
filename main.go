@@ -571,6 +571,12 @@ func main() {
 		graphRAG.OnSpanIngested(span)
 	})
 
+	// Observe cross-service call topology pre-sample so the service map keeps
+	// flow direction even when sampling drops the spans forming each edge.
+	traceServer.SetTopologyObserver(func(tenant, traceID, spanID, parentSpanID, service string) {
+		graphRAG.ObserveSpanTopology(tenant, traceID, spanID, parentSpanID, service)
+	})
+
 	metricsServer.SetMetricCallback(func(m tsdb.RawMetric) {
 		eventHub.BroadcastMetric(realtime.MetricEntry{
 			Name:        m.Name,

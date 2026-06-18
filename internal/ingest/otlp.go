@@ -102,10 +102,15 @@ func tenantFromResource(attrs []*commonpb.KeyValue) string {
 }
 
 type TraceServer struct {
-	repo                *storage.Repository
-	metrics             *telemetry.Metrics
-	logCallback         func(storage.Log)
-	spanCallback        func(storage.Span) // called for each span after persistence
+	repo         *storage.Repository
+	metrics      *telemetry.Metrics
+	logCallback  func(storage.Log)
+	spanCallback func(storage.Span) // called for each span after persistence
+	// topologyObserver, when set, is invoked for EVERY received span BEFORE the
+	// sampler's keep/drop decision so cross-service call topology survives
+	// sampling (see graphrag.GraphRAG.ObserveSpanTopology). Args:
+	// tenant, traceID, spanID, parentSpanID, service. nil = disabled.
+	topologyObserver    func(tenant, traceID, spanID, parentSpanID, service string)
 	minSeverity         int
 	allowedServices     map[string]bool
 	excludedServices    map[string]bool
@@ -168,6 +173,14 @@ func (s *TraceServer) SetSpanCallback(cb func(storage.Span)) {
 // SetSampler enables adaptive trace sampling. Pass nil to disable.
 func (s *TraceServer) SetSampler(sm *Sampler) {
 	s.sampler = sm
+}
+
+// SetTopologyObserver wires a pre-sample hook invoked for every received span
+// before the sampler runs, so the in-memory service map keeps cross-service
+// flow direction even when sampling drops the spans that would have formed the
+// edge. Pass nil to disable. Wired in main.go to graphrag.ObserveSpanTopology.
+func (s *TraceServer) SetTopologyObserver(cb func(tenant, traceID, spanID, parentSpanID, service string)) {
+	s.topologyObserver = cb
 }
 
 // SetPipeline enables the async ingest pipeline. When set, Export()
@@ -336,6 +349,22 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 					if span.Status != nil {
 						statusStr = span.Status.Code.String()
 					}
+
+					// Observe cross-service call topology for EVERY span BEFORE
+					// the sampler can drop it. The sampled path below still owns
+					// edge aggregates; this only guarantees the edge exists so the
+					// service map keeps flow direction at low sample rates. Cheap
+					// and strictly bounded (per-tenant LRU + per-pair dedup).
+					if s.topologyObserver != nil {
+						s.topologyObserver(
+							tenantID,
+							fmt.Sprintf("%x", span.TraceId),
+							fmt.Sprintf("%x", span.SpanId),
+							fmt.Sprintf("%x", span.ParentSpanId),
+							serviceName,
+						)
+					}
+
 					if s.sampler != nil {
 						isError := statusStr == "STATUS_CODE_ERROR"
 						durationMs := float64(duration) / 1000.0
