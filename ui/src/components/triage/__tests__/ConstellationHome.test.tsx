@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { render, screen, within } from '@testing-library/react'
+import { fireEvent, render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { Router } from 'wouter'
@@ -142,17 +142,16 @@ async function findMap() {
 }
 
 describe('ConstellationHome — canvas + core', () => {
-  it('renders the radial canvas as the hero with health demoted to a corner card', async () => {
+  it('renders the canvas as the hero with health demoted to a corner card', async () => {
     renderHome()
     const map = await findMap()
-    // The map is the hero: nodes fill the field, the center is free.
-    expect(within(map).getByText('db')).toBeInTheDocument()
+    // The map is the hero: nodes fill the field, the center is free. (React Flow
+    // mounts node DOM after it measures the pane, so the node text is async.)
+    expect(await within(map).findByText('db')).toBeInTheDocument()
     // No pinned center overlay and no on-page health card — vitals live in the
     // header now; the map owns the whole canvas.
     expect(screen.queryByTestId('flow-map-core')).toBeNull()
     expect(screen.queryByRole('meter', { name: /HEALTH/ })).toBeNull()
-    // ringDepth is on → the cinematic dial backdrop renders.
-    expect(screen.getByTestId('radial-dial')).toBeInTheDocument()
   })
 
   it('renders the worst-first rail alongside the canvas on md+', async () => {
@@ -165,10 +164,13 @@ describe('ConstellationHome — canvas + core', () => {
   })
 
   it('selecting a node from the canvas docks the inspector (?service=)', async () => {
-    const user = userEvent.setup()
     const memory = renderHome()
     const map = await findMap()
-    await user.click(within(map).getByText('payments'))
+    // React Flow wires onNodeClick to the node wrapper's click event. We use
+    // fireEvent.click (a lone click, no mousedown sequence) so the event does
+    // not bubble into d3-zoom's pane handler, which dereferences the synthetic
+    // event's null `view` under jsdom and crashes the run.
+    fireEvent.click(await within(map).findByText('payments'))
     expect(memory.history.at(-1)).toContain('service=payments')
   })
 
@@ -224,14 +226,17 @@ describe('ConstellationHome — states', () => {
 })
 
 describe('ConstellationHome — ?impact= blast-radius overlay', () => {
-  it('tints the downstream cone and announces the overlay', async () => {
+  it('renders the downstream cone and announces the overlay', async () => {
     renderHome('/?impact=checkout')
-    const svg = within(await findMap()).getByTestId('flow-map-svg')
-    const payTint = screen.getByTestId('impact-tint-payments')
-    const dbTint = screen.getByTestId('impact-tint-db')
-    expect(Number(payTint.style.fillOpacity)).toBeGreaterThan(Number(dbTint.style.fillOpacity))
-    const rootRect = svg.querySelector('[data-node-id="checkout"] rect')
-    expect(rootRect?.getAttribute('class')).toContain('nodeImpactRoot')
+    const map = await findMap()
+    // The cone root and its two downstream services all render as map nodes.
+    // (React Flow keys each node wrapper by data-id.) The old SVG fill-opacity
+    // depth shading has no DOM equivalent in the React Flow map; the overlay
+    // semantics now live on the banner below.
+    expect(await within(map).findByText('checkout')).toBeInTheDocument()
+    expect(within(map).getByText('payments')).toBeInTheDocument()
+    expect(within(map).getByText('db')).toBeInTheDocument()
+    expect(map.querySelector('[data-id="checkout"]')).not.toBeNull()
     const banner = screen.getByRole('status')
     expect(banner).toHaveTextContent(/blast radius of/i)
     expect(banner).toHaveTextContent(/2 downstream/i)

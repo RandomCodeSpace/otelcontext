@@ -37,3 +37,40 @@ if (!('ResizeObserver' in globalThis)) {
   }
   (globalThis as Record<string, unknown>).ResizeObserver = ResizeObserverStub;
 }
+
+// --- React Flow (@xyflow/react) jsdom shims ---
+// React Flow measures its pane + nodes through offset sizes and parses the
+// viewport transform via DOMMatrixReadOnly; jsdom provides neither, so nodes
+// won't render without these. Canonical "mockReactFlow" setup.
+if (!('DOMMatrixReadOnly' in globalThis)) {
+  class DOMMatrixReadOnlyStub {
+    m22: number;
+    constructor(transform?: string) {
+      const scale = transform?.match(/scale\(([^)]+)\)/);
+      this.m22 = scale ? parseFloat(scale[1]) : 1;
+    }
+  }
+  (globalThis as Record<string, unknown>).DOMMatrixReadOnly = DOMMatrixReadOnlyStub;
+}
+if (!Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'offsetWidth')?.get) {
+  Object.defineProperties(HTMLElement.prototype, {
+    offsetWidth: {
+      get(this: HTMLElement) {
+        return parseFloat(this.style?.width) || 800;
+      },
+    },
+    offsetHeight: {
+      get(this: HTMLElement) {
+        return parseFloat(this.style?.height) || 600;
+      },
+    },
+  });
+}
+{
+  const svgProto = typeof SVGElement !== 'undefined'
+    ? (SVGElement.prototype as unknown as { getBBox?: () => DOMRect })
+    : null;
+  if (svgProto && !svgProto.getBBox) {
+    svgProto.getBBox = () => ({ x: 0, y: 0, width: 0, height: 0 }) as DOMRect;
+  }
+}

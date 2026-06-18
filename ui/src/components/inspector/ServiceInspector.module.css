@@ -89,13 +89,6 @@
 }
 
 /* ---- tabs ---- */
-.tabs {
-  display: flex;
-  flex: 1;
-  flex-direction: column;
-  min-height: 0;
-}
-
 .tabList {
   display: flex;
   flex: none;
@@ -502,65 +495,4 @@
 
 .skeletonRow {
   min-height: 16px;
-}
-
-/* ---- xs bottom sheet ---- */
-.sheetOverlay {
-  position: fixed;
-  inset: 0;
-  z-index: 48;
-  background: var(--scrim);
-}
-
-.sheet {
-  position: fixed;
-  inset: auto 0 0 0;
-  z-index: 49;
-  display: flex;
-  flex-direction: column;
-  border-top: 1px solid var(--stroke-2);
-  border-radius: var(--radius-3) var(--radius-3) 0 0;
-  /* Floating bottom sheet → overlay surface + drop shadow (the one place a
-   * shadow is for elevation, not separation). */
-  background: var(--bg-overlay);
-  box-shadow: var(--shadow-sheet);
-  transition: height var(--dur-3) var(--ease);
-}
-
-.sheetHandle {
-  display: flex;
-  flex: none;
-  align-items: center;
-  justify-content: center;
-  height: 24px;
-  cursor: grab;
-  touch-action: none;
-}
-
-.sheetGrip {
-  width: 36px;
-  height: 4px;
-  border-radius: 2px;
-  background: var(--stroke-2);
-}
-
-.sheetScroll {
-  display: flex;
-  flex: 1;
-  flex-direction: column;
-  min-height: 0;
-  overflow-y: auto;
-  padding-bottom: env(safe-area-inset-bottom);
-}
-
-.srOnly {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  margin: -1px;
-  padding: 0;
-  border: 0;
-  clip-path: inset(50%);
-  overflow: hidden;
-  white-space: nowrap;
 }

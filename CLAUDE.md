@@ -4,13 +4,13 @@
 
 OtelContext is a self-hosted OTLP observability platform. Single Go binary with embedded React frontend.
 - **Backend:** Go 1.25, native `net/http` (no frameworks), GORM ORM, gRPC + HTTP for OTLP ingestion
-- **Frontend:** React 19 + TypeScript + TanStack Query/Virtual + wouter + Radix primitives + cmdk palette + hand-rolled token CSS (`ui/src/styles/tokens.css`) with CSS Modules; the flow map is own deterministic SVG layout code. No UI framework: `@ossrandom/design-system`, cytoscape, uplot all removed (rewrite completed 2026-06-12, phases C1–C7)
+- **Frontend:** React 19 + TypeScript + TanStack Query/Virtual + wouter + Radix primitives + cmdk palette + hand-rolled token CSS (`ui/src/styles/tokens.css`) with CSS Modules. The **service map renders via React Flow (`@xyflow/react`, MIT)** fed by our own deterministic radial layout (`ui/src/lib/radialLayout.ts` — phyllotaxis, no physics); React Flow owns pan/zoom/fit/minimap/grid/a11y, nodes are token-themed React components, edges are straight centre-to-centre. No UI framework: `@ossrandom/design-system`, cytoscape, uplot remain removed (cytoscape's physics hairball → deterministic layout + React Flow; the prior hand-rolled-SVG map was replaced by React Flow on 2026-06-18)
 - **Ports:** gRPC `:4317` (OTLP), HTTP `:8080` (API + HTTP OTLP + WebSocket + UI)
 
 ## Strict Rules
 
 - NO Express.js/Gin/Echo — use native Go `net/http`
-- NO Tailwind CSS, NO Mantine, NO component frameworks — UI styling is the hand-rolled token sheet (`ui/src/styles/tokens.css`) + per-component CSS Modules; Radix primitives (unstyled) only for the a11y-hard parts (dialog/tabs/tooltip/dropdown). Token values only — no raw hex outside tokens.css.
+- NO Tailwind CSS, NO Mantine, NO general-purpose component frameworks — UI styling is the hand-rolled token sheet (`ui/src/styles/tokens.css`) + per-component CSS Modules. Sanctioned third-party UI: Radix primitives (unstyled) for the a11y-hard parts (dialog/tabs/tooltip/dropdown), and **React Flow (`@xyflow/react`) for the service map only** — themed to the token sheet, nodes/edges are our own components. Token values only — no raw hex outside tokens.css.
 - Single-service architecture (no microservices split)
 - All internal DBs must be **embedded** (no external processes)
 - Relational DB (SQLite/MySQL/PostgreSQL/MSSQL) is the **single source of truth**
