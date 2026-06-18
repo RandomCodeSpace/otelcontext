@@ -123,66 +123,91 @@ function getMap() {
 
 describe('FlowMap — React Flow render', () => {
   it('renders a node per service', async () => {
-    renderMap()
-    // React Flow mounts nodes after measuring the pane — use findBy.
-    expect(await screen.findByText('checkout')).toBeInTheDocument()
-    expect(await screen.findByText('payments')).toBeInTheDocument()
-    expect(await screen.findByText('db')).toBeInTheDocument()
+    const { container } = renderMap()
+    // React Flow mounts nodes after measuring the pane — wait for the first to
+    // appear. Assert on the `.react-flow__node` wrappers, NOT on the service
+    // NAME text: at fitView zoom (and at 120-service scale generally) the map
+    // is below LOD_ZOOM, so each node renders as a textless status dot. The
+    // wrapper exists in BOTH the dot and the labelled-chip variant.
+    await waitFor(() =>
+      expect(container.querySelectorAll('.react-flow__node')).toHaveLength(NODES.length),
+    )
   })
 
   it('wraps each service node with its stable React Flow data-id', async () => {
     const { container } = renderMap()
-    await screen.findByText('payments')
+    await waitFor(() =>
+      expect(container.querySelectorAll('.react-flow__node')).toHaveLength(NODES.length),
+    )
+    // Each service is addressable by its stable data-id (set from SystemNode.id),
+    // which React Flow stamps on the node wrapper in both LOD variants.
     for (const id of ['checkout', 'payments', 'db']) {
       expect(container.querySelector(`.react-flow__node[data-id="${id}"]`)).not.toBeNull()
     }
   })
 
-  it('renders one edge path per dependency', async () => {
+  it('renders one edge per dependency', async () => {
     const { container } = renderMap()
     // Wait for nodes (edges render in the same pass once positions exist).
-    await screen.findByText('payments')
+    // Gate on the node wrappers, not name text — the dots are textless at this zoom.
+    await waitFor(() =>
+      expect(container.querySelectorAll('.react-flow__node')).toHaveLength(NODES.length),
+    )
+    // Each native edge is a `<g class="react-flow__edge">` group that holds TWO
+    // <path>s (the visible `.react-flow__edge-path` + an invisible wide
+    // `.react-flow__edge-interaction` hit area), so counting raw `path`s gives
+    // 2× the edges. Count the edge GROUP instead — exactly one per dependency.
     await waitFor(() => {
       expect(
-        container.querySelectorAll('.react-flow__edges path').length,
+        container.querySelectorAll('.react-flow__edges .react-flow__edge').length,
       ).toBe(EDGES.length)
     })
   })
 
   it('marks exactly the failing edge and leaves the healthy one alone', async () => {
     const { container } = renderMap()
-    await screen.findByText('payments')
-    // React Flow joins the edge id with a NUL, not a space, so an exact
-    // [data-id="payments db"] match fails — instead count the edge <path>s and
-    // match the failing one by the *unhashed* CSS-module token (`edgeFailing`)
-    // via [class*=…], which survives the hash suffix. EDGES has one critical
-    // (payments→db) edge, so exactly one path should be marked failing.
+    await waitFor(() =>
+      expect(container.querySelectorAll('.react-flow__node')).toHaveLength(NODES.length),
+    )
+    // The `edgeFailing` hook now rides the React Flow edge GROUP (the `<g
+    // class="react-flow__edge …">`), not a custom edge <path> — the native
+    // bezier path is React Flow's own. The class is a plain string literal
+    // (not a CSS-module token), so it is unhashed and matches exactly. EDGES
+    // has one critical (payments→db) edge, so exactly one group is failing.
     await waitFor(() => {
-      const paths = container.querySelectorAll('.react-flow__edges path')
-      expect(paths.length).toBe(EDGES.length)
+      const groups = container.querySelectorAll('.react-flow__edges .react-flow__edge')
+      expect(groups.length).toBe(EDGES.length)
     })
     expect(
-      container.querySelectorAll('.react-flow__edges path[class*="edgeFailing"]'),
+      container.querySelectorAll('.react-flow__edge.edgeFailing'),
     ).toHaveLength(1)
   })
 })
 
 describe('FlowMap — selection', () => {
   it('node click fires onSelect with the id', async () => {
-    const { onSelect } = renderMap()
+    const { container, onSelect } = renderMap()
+    // Click the node WRAPPER by its stable data-id, not by name text — the
+    // textless LOD dot renders at this zoom, so there is no name to click.
     // fireEvent.click (not userEvent) — userEvent dispatches a full
     // mousedown→mouseup→click sequence, and d3-zoom's mousedown handler reads
     // event.view.document, which jsdom leaves null → an uncaught TypeError.
     // React Flow's onNodeClick fires on the click event alone, so a bare
-    // click both avoids the crash and exercises the handler. The click on the
-    // inner chip text bubbles to the React Flow node wrapper → onNodeClick.
-    fireEvent.click(await screen.findByText('payments'))
+    // click both avoids the crash and exercises the handler.
+    const payments = await waitFor(() => {
+      const el = container.querySelector('.react-flow__node[data-id="payments"]')
+      expect(el).not.toBeNull()
+      return el as Element
+    })
+    fireEvent.click(payments)
     expect(onSelect).toHaveBeenCalledWith('payments')
   })
 
   it('pane click clears the selection', async () => {
     const { container, onClearSelection } = renderMap({ selectedId: 'payments' })
-    await screen.findByText('payments')
+    await waitFor(() =>
+      expect(container.querySelectorAll('.react-flow__node')).toHaveLength(NODES.length),
+    )
     const pane = container.querySelector('.react-flow__pane')
     expect(pane).not.toBeNull()
     fireEvent.click(pane as Element)
@@ -191,19 +216,21 @@ describe('FlowMap — selection', () => {
 
   it('still renders the selected node (selection is a non-fatal data prop)', async () => {
     // Class names are hashed, so asserting the selected styling is brittle —
-    // we only verify the selected node continues to render.
+    // we only verify the selected node continues to render (by data-id, which is
+    // LOD-independent).
     const { container } = renderMap({ selectedId: 'payments' })
-    await screen.findByText('payments')
-    expect(
-      container.querySelector('.react-flow__node[data-id="payments"]'),
-    ).not.toBeNull()
+    await waitFor(() =>
+      expect(
+        container.querySelector('.react-flow__node[data-id="payments"]'),
+      ).not.toBeNull(),
+    )
   })
 })
 
 describe('FlowMap — imperative fit()', () => {
   it('exposes fit() on the handle and runs without throwing', async () => {
     const ref = createRef<FlowMapHandle>()
-    render(
+    const { container } = render(
       <FlowMap
         ref={ref}
         nodes={NODES}
@@ -213,7 +240,10 @@ describe('FlowMap — imperative fit()', () => {
         onClearSelection={noop}
       />,
     )
-    await screen.findByText('payments')
+    // Gate on the node wrappers (textless dots at this zoom), not name text.
+    await waitFor(() =>
+      expect(container.querySelectorAll('.react-flow__node')).toHaveLength(NODES.length),
+    )
     expect(ref.current).not.toBeNull()
     expect(() => act(() => ref.current?.fit())).not.toThrow()
   })

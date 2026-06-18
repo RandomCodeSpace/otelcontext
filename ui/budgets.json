@@ -1,12 +1,12 @@
 {
-  "$comment": "Gzipped size budgets enforced by scripts/check-budgets.mjs (npm run check-budgets). 'initial' = assets referenced from dist/index.html (entry script + modulepreloads + stylesheets). Fonts are raw woff2 bytes (already compressed). lazyChunkExceptions maps a chunk-name prefix (before the content hash) to a per-chunk cap. The ConstellationHome lazy chunk carries the service map, which now renders via React Flow (@xyflow/react, MIT) instead of hand-rolled SVG — React Flow + zustand + d3-zoom add ~52 KB gz, all lazy (initial JS is unaffected, still ~106 KB). Measured ConstellationHome chunk: 61.3 KB gz; cap set to actual + headroom.",
+  "$comment": "Gzipped size budgets enforced by scripts/check-budgets.mjs (npm run check-budgets). 'initial' = assets referenced from dist/index.html (entry script + modulepreloads + stylesheets). Fonts are raw woff2 bytes (already compressed). lazyChunkExceptions maps a chunk-name prefix (before the content hash) to a per-chunk cap. The ConstellationHome lazy chunk carries the service map: React Flow (@xyflow/react, MIT) + the dagre layout engine (@dagrejs/dagre + graphlib, MIT — crossing-minimised layout + edge routing) computed synchronously. All lazy — initial JS is unaffected (~103 KB). Measured ConstellationHome chunk ~72 KB gz; cap set to actual + headroom.",
   "gzipKb": {
     "initialJs": 118,
     "initialCss": 6,
     "fonts": 75,
     "lazyChunkDefault": 10,
     "lazyChunkExceptions": {
-      "ConstellationHome": 66
+      "ConstellationHome": 76
     }
   }
 }

@@ -5,9 +5,11 @@
  * (background grid, panes, minimap, handles) to our --bg-inset instrument
  * surface and (b) style the custom node/edge classes the component renders.
  *
- * Token-only colours (tokens.css). All motion is keyed off --dur-* tokens, which
- * the global prefers-reduced-motion block zeros — so reduced motion collapses
- * every transition/animation here without a local media query.
+ * Token-only colours (tokens.css). Token-driven motion is keyed off --dur-*,
+ * which the global prefers-reduced-motion block zeros. The ONE exception is
+ * React Flow's native edge animation (animated edges), which runs on the
+ * library's own keyframes — it gets an explicit prefers-reduced-motion guard at
+ * the bottom of this file.
  */
 
 /* ---- the wrapper that holds the whole map ---- */
@@ -67,23 +69,48 @@
   box-shadow: 0 0 0 1px var(--accent);
 }
 
-/* Hidden centred handle: edges attach here, but FloatingEdge draws
- * centre-to-centre so position is cosmetic. Must visually disappear AND not
- * eat clicks. !important beats React Flow's base .react-flow__handle (a 6×6
- * #333/#141414 dot with a border). */
+/* ---- level-of-detail: a status dot replaces the chip when zoomed out (dense
+ * 120-service view), so the 168px boxes stop occluding the routed edges. The
+ * dot is centred in the node box (dagre's edge waypoints still meet the box
+ * border) and carries the status hue. ---- */
+.dotNode {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  cursor: pointer;
+}
+.dotNode::before {
+  content: '';
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--node-color);
+  box-shadow: 0 0 0 2px var(--bg-inset);
+  transition: box-shadow var(--dur-2) var(--ease);
+}
+/* Inspected / blast-root dot: accent ring, matching the chip's selected ring. */
+.dotSelected::before {
+  box-shadow:
+    0 0 0 2px var(--bg-inset),
+    0 0 0 4px var(--accent);
+}
+
+/* Connection anchor, kept INVISIBLE. React Flow needs a source/target handle
+ * per node, but the floating edge computes the real border attachment point, so
+ * the handle dot itself must not show — otherwise edgeless nodes sprout a stray
+ * connector. opacity:0 keeps the element measured so edge routing still resolves
+ * its position; it never eats clicks. */
 .handle {
-  position: absolute !important;
-  left: 50% !important;
-  top: 50% !important;
-  width: 1px !important;
-  height: 1px !important;
-  min-width: 0 !important;
-  min-height: 0 !important;
-  border: 0 !important;
-  background: transparent !important;
-  opacity: 0 !important;
-  pointer-events: none !important;
-  transform: translate(-50%, -50%);
+  width: 6px;
+  height: 6px;
+  min-width: 0;
+  min-height: 0;
+  border: 0;
+  background: transparent;
+  opacity: 0;
+  pointer-events: none;
 }
 
 /* Status dot — the same hue as the chip outline. */
@@ -113,34 +140,6 @@
   font-size: var(--text-2xs);
   font-variant-numeric: tabular-nums;
   color: var(--text-2);
-}
-
-/* ---- custom edge: FloatingEdge renders a raw <path className="edge ..."> ---- */
-/* Hairline link, legible on both themes against the field. --edge-w is set
- * inline from the call count. */
-.edge {
-  fill: none;
-  stroke: var(--text-3);
-  stroke-width: var(--edge-w, 1.5);
-  opacity: 0.75;
-}
-
-/* Failing edge: --crit, full strength, marching dashes that drain toward the
- * target. The march runs on calc(var(--dur-3) * 6) — so reduced motion
- * (--dur-3: 0ms) yields a 0s duration and the dashes stop, leaving a static
- * red dashed line. */
-.edgeFailing {
-  stroke: var(--crit);
-  opacity: 1;
-  stroke-dasharray: 4 4;
-  animation: march calc(var(--dur-3) * 6) linear infinite;
-}
-
-@keyframes march {
-  to {
-    /* one full dash + gap (4 + 4) → seamless loop. */
-    stroke-dashoffset: -8;
-  }
 }
 
 /* ============================================================================
@@ -186,5 +185,79 @@
 .grid :global(.react-flow__background-pattern) path {
   stroke: var(--stroke-1);
   stroke-width: 1;
+}
+
+/* ============================================================================
+ * React Flow Controls + MiniMap — themed to the dark token instrument surface
+ * so the map reads as a first-class graph tool, not the library's default
+ * white chrome. (file-scope :global — these target React Flow's own DOM.)
+ * ==========================================================================*/
+
+/* Zoom / fit control cluster: a hairline token-themed stack, not a white box. */
+.controls {
+  border: 1px solid var(--stroke-1);
+  border-radius: var(--radius-2);
+  overflow: hidden;
+  background: var(--bg-raised);
+  box-shadow: none;
+}
+.controls :global(.react-flow__controls-button) {
+  width: 28px;
+  height: 28px;
+  border: none;
+  border-bottom: 1px solid var(--stroke-1);
+  background: var(--bg-raised);
+  color: var(--text-2);
+  fill: var(--text-2);
+  transition:
+    background var(--dur-1) var(--ease),
+    color var(--dur-1) var(--ease);
+}
+.controls :global(.react-flow__controls-button):last-child {
+  border-bottom: none;
+}
+.controls :global(.react-flow__controls-button):hover {
+  background: var(--bg-overlay);
+  color: var(--text-1);
+  fill: var(--text-1);
+}
+.controls :global(.react-flow__controls-button svg) {
+  fill: currentColor;
+}
+
+/* Minimap: dark inset panel, hairline border; the out-of-view area dimmed by a
+ * token overlay; dots carry the same status hue as the chips. */
+.minimap {
+  border: 1px solid var(--stroke-1);
+  border-radius: var(--radius-2);
+  background: var(--bg-inset);
+  overflow: hidden;
+}
+.minimap :global(.react-flow__minimap-mask) {
+  fill: var(--bg-inset);
+  opacity: 0.6;
+}
+/* Status fills override React Flow's base .react-flow__minimap-node fill. */
+.miniCrit {
+  fill: var(--crit) !important;
+}
+.miniWarn {
+  fill: var(--warn) !important;
+}
+.miniOk {
+  fill: var(--ok) !important;
+}
+.miniUnknown {
+  fill: var(--unknown) !important;
+}
+
+/* React Flow's native animated edges run on the library's own keyframes (not a
+ * --dur token), so the global reduced-motion rule can't reach them. Stop the
+ * marching dashes for users who ask for reduced motion — leaving a static
+ * dashed edge and dropping the continuous edge-layer repaint for them. */
+@media (prefers-reduced-motion: reduce) {
+  :global(.react-flow__edge.animated path) {
+    animation: none;
+  }
 }
 

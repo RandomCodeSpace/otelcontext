@@ -67,9 +67,20 @@
   flex: none;
   flex-direction: column;
   gap: var(--space-2);
-  width: 300px;
+  /* Autosize to the widest service row (longest name) rather than a fixed
+     300px that truncated names. The fixed width also hid a bug: `overflow-y:
+     auto` with a default `overflow-x: visible` computes overflow-x to `auto`
+     (CSS spec), so the selected row's scale(1.015) lift spilled a few px past
+     300px and raised a phantom HORIZONTAL scrollbar. fit-content sizes the
+     column to the names; the cap stops a pathological name from eating the
+     canvas (it ellipsizes past the cap, per ServiceRow); and an explicit
+     `overflow-x: hidden` pins the x-axis so the lift can't reopen the bar.
+     The inner ServiceGroups list (.cards) owns vertical scrolling. */
+  width: fit-content;
+  min-width: 300px;
+  max-width: 460px;
   min-height: 0;
-  overflow-y: auto;
+  overflow: hidden auto;
   padding-right: var(--space-1);
 }
 
