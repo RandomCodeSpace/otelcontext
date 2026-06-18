@@ -168,7 +168,7 @@ function routedPath(pts: { x: number; y: number }[], radius = 7): string {
     const u2 = unit(p2.x - p1.x, p2.y - p1.y)
     d += ` L${p1.x - u1.x * r},${p1.y - u1.y * r} Q${p1.x},${p1.y} ${p1.x + u2.x * r},${p1.y + u2.y * r}`
   }
-  const last = pts[pts.length - 1]
+  const last = pts.at(-1)!
   d += ` L${last.x},${last.y}`
   return d
 }
@@ -213,7 +213,7 @@ function RoutedEdge({ source, target, data, style }: EdgeProps) {
   // the chip edge (not its centre) and still follow a dragged node.
   if (!compact && pts.length >= 2) {
     const a = borderToward(s, pts[1] ?? nodeCenter(t))
-    const b = borderToward(t, pts[pts.length - 2] ?? nodeCenter(s))
+    const b = borderToward(t, pts.at(-2) ?? nodeCenter(s))
     return <BaseEdge path={routedPath([a, ...pts.slice(1, -1), b])} style={style} />
   }
   // LOD dot zoom, or the fallback layout with no waypoints: plain centre line.
@@ -251,7 +251,7 @@ function FlowMapInner({
   Pick<FlowMapProps, 'nodes' | 'edges' | 'selectedId' | 'impact' | 'dim' | 'onSelect' | 'onClearSelection' | 'ref'>
 >) {
   const { fitView } = useReactFlow()
-  useImperativeHandle(ref, () => ({ fit: () => void fitView(FIT_OPTIONS) }), [fitView])
+  useImperativeHandle(ref, () => ({ fit: () => { fitView(FIT_OPTIONS) } }), [fitView])
 
   const edgeRefs: GraphEdgeRef[] = useMemo(
     () => edges.map((e) => ({ source: e.source, target: e.target })),
@@ -262,7 +262,7 @@ function FlowMapInner({
   // dagre). Carries both node positions and edge routing waypoints.
   const shapeKey = useMemo(() => {
     const ids = nodes.map((n) => n.id).sort(compareIds)
-    const es = edgeRefs.map((e) => `${e.source}->${e.target}`).sort()
+    const es = edgeRefs.map((e) => `${e.source}->${e.target}`).sort((a, b) => a.localeCompare(b))
     return JSON.stringify({ ids, es })
   }, [nodes, edgeRefs])
   // dagre layout, computed synchronously. It's deterministic and instant at
@@ -327,7 +327,7 @@ function FlowMapInner({
   // polls (layout ref unchanged), so it doesn't fight the user's zoom. rAF lets
   // the nodes settle into the new positions before fitting.
   useEffect(() => {
-    const raf = requestAnimationFrame(() => void fitView(FIT_OPTIONS))
+    const raf = requestAnimationFrame(() => { fitView(FIT_OPTIONS) })
     return () => cancelAnimationFrame(raf)
   }, [layout, fitView])
 
