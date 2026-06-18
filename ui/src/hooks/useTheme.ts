@@ -48,7 +48,7 @@ export function useTheme() {
     // values mirror --bg-base in tokens.css for each theme.
     document
       .querySelector('meta[name="theme-color"]')
-      ?.setAttribute('content', theme === 'dark' ? '#0b0d10' : '#f7f8fa')
+      ?.setAttribute('content', theme === 'dark' ? '#0a0c0f' : '#f7f8fa')
   }, [theme])
 
   const toggle = useCallback(() => {

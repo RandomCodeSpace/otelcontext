@@ -125,11 +125,14 @@ select:focus-visible {
   font-feature-settings: 'tnum' 1;
 }
 
-/* Instrument legend: uppercase mono caps for units/axis/section labels. */
+/* Instrument legend: uppercase mono caps for units/axis/section labels.
+ * Medium weight + wider tracking give the caps a deliberate spec-sheet voice
+ * (the premium-label tell); the colour stays muted for restraint. */
 .legend {
   font-family: var(--font-mono);
   font-size: var(--text-2xs);
-  letter-spacing: 0.06em;
+  font-weight: 500;
+  letter-spacing: 0.09em;
   text-transform: uppercase;
   color: var(--text-3);
 }

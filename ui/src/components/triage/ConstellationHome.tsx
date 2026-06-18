@@ -5,11 +5,11 @@ import { useLocation, useSearch } from 'wouter'
 import FlowMap, { type FlowMapHandle } from '@/components/map/FlowMap'
 import ConnectInline from '@/components/shell/ConnectInline'
 import ServiceGroups from '@/components/common/ServiceGroups'
-import AnomalyStrip from './AnomalyStrip'
 import Sparkline from './Sparkline'
 import { useSystemGraph } from '@/hooks/useSystemGraph'
 import { useInvestigation } from '@/hooks/useInvestigation'
 import { useMediaQuery } from '@/hooks/useMediaQuery'
+import { useAnomalyTimeline } from '@/hooks/useAnomalyTimeline'
 import { downstreamDepths } from '@/lib/impact'
 import { buildHref, readParam } from '@/lib/urlState'
 import type { TrafficPoint } from '@/types/api'
@@ -66,6 +66,14 @@ export default function ConstellationHome() {
   const nodes = useMemo(() => graph?.nodes ?? [], [graph])
   const edges = useMemo(() => graph?.edges ?? [], [graph])
 
+  // Services with an active anomaly — feeds the side panel's "Anomalies" group.
+  // Reads the shared ['anomaly-timeline'] cache (no extra fetch of its own).
+  const { data: anomalyData } = useAnomalyTimeline()
+  const anomalyServiceIds = useMemo(
+    () => new Set((anomalyData?.anomalies ?? []).map((a) => a.service)),
+    [anomalyData],
+  )
+
   // ?impact= blast-radius overlay (Inspector "Show on map" / shared links):
   // BFS the downstream cone client-side over the already-loaded edge set —
   // re-homed here from the retired /map view, so the cone survives the fold.
@@ -105,7 +113,6 @@ export default function ConstellationHome() {
   if (loading) {
     return (
       <div className={styles.view}>
-        <AnomalyStrip onOpenService={openService} />
         <SkeletonCanvas />
       </div>
     )
@@ -114,7 +121,6 @@ export default function ConstellationHome() {
   if (error) {
     return (
       <div className={styles.view}>
-        <AnomalyStrip onOpenService={openService} />
         <div className={styles.statePanel} role="alert">
           <p>Couldn’t load the service graph: {error}</p>
           <button type="button" className={styles.stateAction} onClick={reload}>
@@ -128,7 +134,6 @@ export default function ConstellationHome() {
   if (nodes.length === 0) {
     return (
       <div className={styles.view}>
-        <AnomalyStrip onOpenService={openService} />
         <ConnectInline />
       </div>
     )
@@ -136,8 +141,6 @@ export default function ConstellationHome() {
 
   return (
     <div className={styles.view}>
-      <AnomalyStrip onOpenService={openService} />
-
       {impactService && (
         <div className={styles.impactBanner} role="status">
           <span className={styles.impactText}>
@@ -206,15 +209,22 @@ export default function ConstellationHome() {
                 Flow
               </button>
             </div>
-            <ServiceGroups nodes={nodes} onOpen={openService} selectedId={service} />
+            <ServiceGroups
+              nodes={nodes}
+              onOpen={openService}
+              selectedId={service}
+              anomalyServiceIds={anomalyServiceIds}
+            />
           </section>
         )}
 
         {/* Desktop/tablet: the slim worst-first rail rides alongside the canvas.
-            Hidden on xs (the card list IS the xs default above), and hidden while
-            the Inspector is docked so the MAP (the hero) keeps its width instead
-            of being squeezed between rail + inspector. */}
-        {!isXs && service === null && (
+            Hidden on xs (the card list IS the xs default above). It STAYS when the
+            Inspector is open — the inspector is a popup floating over the map, not
+            a docked column, so the rail no longer gets squeezed; keeping it put
+            avoids the layout jolting on every node select. The selected service is
+            reflected by the rail's focus-distortion (selectedId). */}
+        {!isXs && (
           <aside className={styles.sideRail} aria-label="Service triage feed">
             <div className={styles.railHead}>
               <h2 className={`legend ${styles.railTitle}`}>Services</h2>
@@ -225,7 +235,12 @@ export default function ConstellationHome() {
                 />
               )}
             </div>
-            <ServiceGroups nodes={nodes} onOpen={openService} selectedId={service} />
+            <ServiceGroups
+              nodes={nodes}
+              onOpen={openService}
+              selectedId={service}
+              anomalyServiceIds={anomalyServiceIds}
+            />
           </aside>
         )}
       </div>

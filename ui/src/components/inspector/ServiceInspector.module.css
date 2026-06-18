@@ -1,52 +1,26 @@
-/* Service Inspector — md: fixed overlay sheet; lg: docked 380px column;
- * xl: 440px. The xs bottom sheet is a separate Radix dialog (below). */
+/* Service Inspector — the popup IS the inspector: a single floating Radix
+ * Dialog that carries the category tabs + content on every breakpoint. There
+ * is no docked side rail (dropped once the popup became self-sufficient). */
 
-.panel {
+/* ---- details popup (Radix Dialog, non-modal, top-anchored) ---- */
+.popup {
   position: fixed;
-  inset: 0 0 0 auto;
-  z-index: 45;
+  z-index: 61;
+  /* Anchor the top edge (not vertically centered) so switching categories —
+     which changes the body height — never re-centers and shifts the box. The
+     header stays put; taller content grows downward and .tabContent scrolls. */
+  top: 12dvh;
+  left: 50%;
+  transform: translateX(-50%);
   display: flex;
   flex-direction: column;
-  width: min(420px, calc(100vw - 48px));
-  border-left: 1px solid var(--stroke-1);
+  width: min(480px, calc(100vw - 32px));
+  max-height: min(76dvh, 720px);
+  border: 1px solid var(--stroke-1);
+  border-radius: var(--radius-3);
   background: var(--bg-raised);
   box-shadow: var(--shadow-sheet);
-  overflow-y: auto;
-}
-
-@media (min-width: 1024px) {
-  .panel {
-    position: static;
-    z-index: auto;
-    flex: none;
-    width: 380px;
-    background: var(--bg-raised);
-    /* Docked = the single inspected entity anchored to the canvas selection.
-     * Hairline left border + a raised 2px inset --accent rail reads as
-     * "this column belongs to the lit node" at the same intensity as the
-     * canvas node ring and the rail row; separation by hairline + edge,
-     * never a drop shadow. */
-    border-left: 1px solid var(--stroke-1);
-    box-shadow: inset 2px 0 0 var(--accent);
-  }
-
-  /* Header wash — a faint --accent-muted gradient under the title band echoes
-   * the canvas focus-distortion (the lit node's accent ring) so the docked
-   * column reads as the selection's surface, not a generic panel. Fades to
-   * transparent before the dense content, keeping name/numeral AA intact. */
-  .header {
-    background: linear-gradient(
-      to bottom,
-      var(--accent-muted),
-      transparent
-    );
-  }
-}
-
-@media (min-width: 1440px) {
-  .panel {
-    width: 440px;
-  }
+  overflow: hidden;
 }
 
 /* ---- header ---- */
@@ -68,13 +42,17 @@
 .name {
   flex: 1;
   min-width: 0;
-  overflow: hidden;
   margin: 0;
   font-family: var(--font-sans);
-  font-size: var(--text-base);
+  font-size: var(--text-lg);
   font-weight: 600;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  /* Explicit high-contrast colour — the panel title must read clearly in both
+     themes (don't rely on inherited body colour). */
+  color: var(--text-1);
+  /* Show the FULL service name — wrap long ids instead of truncating with an
+     ellipsis (names like "notification-service" were getting cut off). */
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 /* Header health reading — mono numeral, status-tinted, the authoritative
@@ -111,13 +89,6 @@
 }
 
 /* ---- tabs ---- */
-.tabs {
-  display: flex;
-  flex: 1;
-  flex-direction: column;
-  min-height: 0;
-}
-
 .tabList {
   display: flex;
   flex: none;
@@ -524,65 +495,4 @@
 
 .skeletonRow {
   min-height: 16px;
-}
-
-/* ---- xs bottom sheet ---- */
-.sheetOverlay {
-  position: fixed;
-  inset: 0;
-  z-index: 48;
-  background: var(--scrim);
-}
-
-.sheet {
-  position: fixed;
-  inset: auto 0 0 0;
-  z-index: 49;
-  display: flex;
-  flex-direction: column;
-  border-top: 1px solid var(--stroke-2);
-  border-radius: var(--radius-3) var(--radius-3) 0 0;
-  /* Floating bottom sheet → overlay surface + drop shadow (the one place a
-   * shadow is for elevation, not separation). */
-  background: var(--bg-overlay);
-  box-shadow: var(--shadow-sheet);
-  transition: height var(--dur-3) var(--ease);
-}
-
-.sheetHandle {
-  display: flex;
-  flex: none;
-  align-items: center;
-  justify-content: center;
-  height: 24px;
-  cursor: grab;
-  touch-action: none;
-}
-
-.sheetGrip {
-  width: 36px;
-  height: 4px;
-  border-radius: 2px;
-  background: var(--stroke-2);
-}
-
-.sheetScroll {
-  display: flex;
-  flex: 1;
-  flex-direction: column;
-  min-height: 0;
-  overflow-y: auto;
-  padding-bottom: env(safe-area-inset-bottom);
-}
-
-.srOnly {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  margin: -1px;
-  padding: 0;
-  border: 0;
-  clip-path: inset(50%);
-  overflow: hidden;
-  white-space: nowrap;
 }

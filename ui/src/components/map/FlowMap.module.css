@@ -1,332 +1,190 @@
+/*
+ * FlowMap — React Flow (@xyflow/react v12) themed to the OtelContext dark token
+ * system. FlowMap.tsx imports React Flow's base stylesheet
+ * (@xyflow/react/dist/style.css); the rules here (a) theme React Flow's own DOM
+ * (background grid, panes, minimap, handles) to our --bg-inset instrument
+ * surface and (b) style the custom node/edge classes the component renders.
+ *
+ * Token-only colours (tokens.css). All motion is keyed off --dur-* tokens, which
+ * the global prefers-reduced-motion block zeros — so reduced motion collapses
+ * every transition/animation here without a local media query.
+ */
+
+/* ---- the wrapper that holds the whole map ---- */
 .container {
-  position: relative;
   flex: 1;
+  position: relative;
   min-height: 0;
+  min-width: 0;
   border: 1px solid var(--stroke-1);
   border-radius: var(--radius-2);
   background: var(--bg-inset);
+  /* React Flow's <Background> draws the grid — no CSS background-image here. */
   overflow: hidden;
 }
 
-.container:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: -2px;
-}
-
-.svg {
-  display: block;
-  position: relative;
-  z-index: 1;
-  width: 100%;
-  height: 100%;
-  /* pan/pinch are ours — but ONLY on the SVG, never the page */
-  touch-action: none;
-  cursor: grab;
-}
-
-.svg:active {
-  cursor: grabbing;
-}
-
-/* ---- nodes ---- */
-.node {
-  cursor: pointer;
-  /* Placement is a CSS transform (style.transform) so it can interpolate:
-   * living physics travels nodes between polls, and the status-tier gravity
-   * offset eases on a tier flip. transform-box/origin make the local SVG
-   * coordinate frame the basis so translate() reads in user units. */
-  transform-box: fill-box;
-  transform-origin: 0 0;
-  transition:
-    transform var(--dur-3) var(--ease),
-    opacity var(--dur-2) var(--ease);
-}
-
-.nodeRect {
-  /* Status-tinted raised surface + a status-weighted border so a node reads as
-   * a solid chip in BOTH themes (on light, a flat white --bg-raised on the
-   * --bg-inset canvas with a --stroke-2 hairline was all but invisible).
-   * --node-color is the
-   * status hue (var(--crit)/--warn/--ok/--unknown); mixing a sliver into the
-   * fill and a strong share into the stroke keeps saturation rationed to status
-   * while making the box legible against the canvas. */
-  fill: color-mix(in srgb, var(--node-color) 12%, var(--bg-raised));
-  stroke: color-mix(in srgb, var(--node-color) 60%, var(--stroke-2));
-  stroke-width: 1.5;
-  /* Scale lifts in the rect's OWN local box (fill-box), so the selection
-   * lift composes cleanly with the <g>'s inline layout translate instead of
-   * fighting it. GPU transform only — no filter/shadow. */
-  transform-box: fill-box;
-  transform-origin: center;
-  transition:
-    stroke var(--dur-2) var(--ease),
-    transform var(--dur-3) var(--ease);
-}
-
-@media (hover: hover) {
-  .node:hover .nodeRect {
-    stroke: var(--text-3);
-  }
-}
-
-.nodeSelected {
-  stroke: var(--accent);
-  stroke-width: 2;
-}
-
-/* Select → focus-distortion: the inspected node lifts (1.0→1.015) as the field
- * dims around it — the constellation's hero interaction, matched to the
- * ServiceRow fallback. Travel is keyed off --dur-3, so the global reduced-motion
- * block (zeros --dur-*) collapses the travel while this static end-state (and
- * the accent ring above) is preserved. */
-.node[data-selected] .nodeRect {
-  transform: scale(1.015);
-}
-
-.nodeFocused {
-  stroke: var(--accent);
-  stroke-width: 2;
-  stroke-dasharray: 4 3;
-}
-
-/* Anomaly prominence — failing services dominate the field. A fuller --crit
- * fill + a heavier border makes a critical chip read at a glance, in both
- * themes. Only FILL + WIDTH are set (not stroke COLOR), so the accent
- * selection/focus ring still wins when a critical node is inspected. */
-.node[data-status='critical'] .nodeRect {
-  fill: color-mix(in srgb, var(--node-color) 24%, var(--bg-raised));
-  stroke-width: 2;
-}
-
-.node[data-status='degraded'] .nodeRect {
-  fill: color-mix(in srgb, var(--node-color) 16%, var(--bg-raised));
-}
-
-/* The pulse beacon: a --crit halo the size of the chip that flashes then
- * expands+fades outward — a glance answers "what's failing now". Behind the
- * chip; pure opacity/scale (no SVG filter/blur). Static end-state is invisible
- * (opacity 0), so reduced motion simply shows the stronger crit chip above. */
-.nodePulse {
-  fill: none;
-  stroke: var(--crit);
-  stroke-width: 2;
-  opacity: 0;
-  pointer-events: none;
-  transform-box: fill-box;
-  transform-origin: center;
-}
-
-@media (prefers-reduced-motion: no-preference) {
-  .node[data-status='critical'] .nodePulse {
-    animation: node-pulse 1.8s var(--ease) infinite;
-  }
-
-  /* Pause with the rest of the ambient motion when the tab is backgrounded. */
-  .container[data-visible='false'] .nodePulse {
-    animation-play-state: paused;
-  }
-}
-
-/* Battery: no per-node pulse on coarse pointers (phones). The static crit chip
- * carries the signal there. */
-@media (pointer: coarse) {
-  .nodePulse {
-    animation: none;
-  }
-}
-
-@keyframes node-pulse {
-  0% {
-    opacity: 0.55;
-    transform: scale(1);
-  }
-  70% {
-    opacity: 0;
-    transform: scale(1.25);
-  }
-  100% {
-    opacity: 0;
-    transform: scale(1.25);
-  }
-}
-
-/* Blast-radius cone (?impact=): --crit tint over the node fill, strength
- * by depth via inline fillOpacity (lib/impact.impactAlpha). */
-.nodeImpact {
-  fill: var(--crit);
-  pointer-events: none;
-}
-
-.nodeImpactRoot {
-  stroke: var(--crit);
-  stroke-width: 2;
-}
-
-.nodeDot {
-  fill: var(--node-color);
-  /* Status tone interpolates between polls on a tier change. */
-  transition: fill var(--dur-2) var(--ease);
-}
-
-/* Galaxy marker: in a large, zoomed-out field each un-surfaced service renders
- * as a solid status-colored dot instead of a chip, so ~120 services read as a
- * dense even disc rather than a smear of overlapping labels. Centered on the
- * node, so edges connect at the same point as the chip. A hairline keeps the
- * dot crisp on both themes; the selection/focus/impact stroke classes (shared
- * with the chip) override it when the node is emphasized. */
-.nodeMarker {
-  fill: var(--node-color);
-  stroke: color-mix(in srgb, var(--node-color) 55%, var(--stroke-2));
-  stroke-width: 1;
-  transition:
-    fill var(--dur-2) var(--ease),
-    stroke var(--dur-2) var(--ease);
-}
-
-@media (hover: hover) {
-  .node:hover .nodeMarker {
-    stroke: var(--text-3);
-  }
-}
-
-.nodeName {
-  fill: var(--text-1);
-  font-family: var(--font-mono);
+/* ---- custom node: the token-themed status chip ---- */
+/* Outline-led: the FULL status hue (passed inline as --node-color) carries the
+ * border; the fill is the opaque inset surface so edges + the grid pass BEHIND
+ * the chip and never bleed through the label. Reads as a status-coloured
+ * outline against the field. */
+.chip {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 10px;
+  border: 1.5px solid var(--node-color);
+  border-radius: var(--radius-2);
+  background: var(--bg-inset);
   font-size: var(--text-xs);
-  pointer-events: none;
+  color: var(--text-1);
+  cursor: pointer;
+  box-sizing: border-box;
+  /* GPU transforms + border/shadow only — no SVG filter/blur. */
+  transition:
+    border-color var(--dur-2) var(--ease),
+    box-shadow var(--dur-2) var(--ease),
+    transform var(--dur-2) var(--ease);
 }
 
-.nodeErr {
-  fill: var(--text-2);
+/* Inspected node: accent ring + a small lift. The lift travels on --dur-2, so
+ * reduced motion (dur 0) preserves the static accent end-state. */
+.selected {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+  transform: scale(1.015);
+  transform-origin: center;
+}
+
+/* Field-wide focus-distortion: non-neighbour fade. */
+.dimmed {
+  opacity: 0.5;
+}
+
+/* Blast-radius root (?impact=): same accent emphasis as the inspected node. */
+.impactRoot {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+
+/* Hidden centred handle: edges attach here, but FloatingEdge draws
+ * centre-to-centre so position is cosmetic. Must visually disappear AND not
+ * eat clicks. !important beats React Flow's base .react-flow__handle (a 6×6
+ * #333/#141414 dot with a border). */
+.handle {
+  position: absolute !important;
+  left: 50% !important;
+  top: 50% !important;
+  width: 1px !important;
+  height: 1px !important;
+  min-width: 0 !important;
+  min-height: 0 !important;
+  border: 0 !important;
+  background: transparent !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+  transform: translate(-50%, -50%);
+}
+
+/* Status dot — the same hue as the chip outline. */
+.dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--node-color);
+}
+
+/* Service name — mono, truncates with an ellipsis when the chip is too narrow. */
+.name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  color: var(--text-1);
+}
+
+/* Error-rate suffix — mono, tabular so digits line up across chips. */
+.err {
+  flex: none;
   font-family: var(--font-mono);
   font-size: var(--text-2xs);
-  text-anchor: end;
-  pointer-events: none;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-2);
 }
 
-/* ---- edges ---- */
+/* ---- custom edge: FloatingEdge renders a raw <path className="edge ..."> ---- */
+/* Hairline link, legible on both themes against the field. --edge-w is set
+ * inline from the call count. */
 .edge {
   fill: none;
-  stroke: var(--stroke-2);
-  stroke-width: var(--edge-w, 1);
-  stroke-linecap: round;
-  transition: opacity var(--dur-2) var(--ease);
+  stroke: var(--text-3);
+  stroke-width: var(--edge-w, 1.5);
+  opacity: 0.75;
 }
 
+/* Failing edge: --crit, full strength, marching dashes that drain toward the
+ * target. The march runs on calc(var(--dur-3) * 6) — so reduced motion
+ * (--dur-3: 0ms) yields a 0s duration and the dashes stop, leaving a static
+ * red dashed line. */
 .edgeFailing {
   stroke: var(--crit);
+  opacity: 1;
+  stroke-dasharray: 4 4;
+  animation: march calc(var(--dur-3) * 6) linear infinite;
 }
 
-/* Animated dashes ONLY on failing edges AND only when motion is allowed. The
- * march flows toward the path end (source→target); core-ward edges reverse it
- * so failure always reads as draining inward to the core. Paused when the tab
- * is hidden (visibilitychange-gated via data-visible on .container). */
-@media (prefers-reduced-motion: no-preference) {
-  .edgeFailing {
-    stroke-dasharray: 7 5;
-    animation: edge-dash 1s linear infinite;
-  }
-
-  .edgeFailing[data-coreward='reverse'] {
-    animation-direction: reverse;
-  }
-
-  .container[data-visible='false'] .edgeFailing {
-    animation-play-state: paused;
-  }
-}
-
-/* Ambient motion is a desktop affordance only: on coarse pointers (phones,
- * the pinch-zoom surface) the marching dashes are battery cost with no hover
- * context, so the failing edge renders as a static --crit stroke. */
-@media (pointer: coarse) {
-  .edgeFailing {
-    animation: none;
-  }
-}
-
-@keyframes edge-dash {
+@keyframes march {
   to {
-    stroke-dashoffset: -12;
+    /* one full dash + gap (4 + 4) → seamless loop. */
+    stroke-dashoffset: -8;
   }
 }
 
-/* Selection: 1-hop neighborhood stays at full opacity, the rest dims. */
-.dimmed {
-  opacity: 0.35;
+/* ============================================================================
+ * React Flow base overrides (file-scope :global — these target React Flow's
+ * OWN DOM, which is a sibling of our chips, not nested under any module class).
+ * ==========================================================================*/
+
+/* Let our --bg-inset container surface show through React Flow's root. */
+:global(.react-flow) {
+  background: transparent;
 }
 
-/* ---- radial dial backdrop ---- */
-.dial {
-  pointer-events: none;
+/* Our .chip fully owns the node look — neutralise React Flow's node wrapper
+ * defaults (padding/border/background/radius) so they can't fight it. */
+:global(.react-flow__node) {
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--text-1);
+  font-family: var(--font-sans);
 }
 
-/* Concentric ring guides — the instrument graticule, in dial form. Faint
- * hairlines so numerals/nodes stay the focus. */
-.ring {
-  fill: none;
+/* Drop React Flow's default node focus box; keep a visible a11y ring on the
+ * chip via :focus-visible (nodes are focusable={true} in FlowMap.tsx). */
+:global(.react-flow__node):focus,
+:global(.react-flow__node):focus-visible {
+  outline: none;
+  box-shadow: none;
+}
+:global(.react-flow__node):focus-visible .chip {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* ---- grid: <Background variant="lines"> renders an SVG <pattern> of <path>s
+ * inside .react-flow__background. Colour those lines a subtle --stroke-1 (and
+ * set the lib's pattern-colour var as a belt-and-braces fallback). ---- */
+.grid {
+  --xy-background-pattern-color: var(--stroke-1);
+}
+.grid :global(.react-flow__background-pattern path),
+.grid :global(.react-flow__background-pattern) path {
   stroke: var(--stroke-1);
   stroke-width: 1;
-  transition: stroke-opacity var(--dur-3) var(--ease);
 }
 
-/* ---- cinematic depth (ringDepth-gated) ---- */
-/* Inner rings read bright, outer rings recede — a cheap parallax-of-opacity
- * depth cue. No SVG filters/blur. --ring-depth is 0 (inner) .. 1 (outer). */
-.depth .ring {
-  stroke-opacity: calc(1 - 0.7 * var(--ring-depth, 0));
-}
-
-/* ONE shared radial-gradient behind the pinned core. position:absolute HTML
- * sibling of the <svg>; pointer-events:none so it never eats clicks. Static
- * end-state, so reduced-motion is a no-op here. */
-.depth::before {
-  content: '';
-  position: absolute;
-  inset: 0;
-  pointer-events: none;
-  background: radial-gradient(
-    closest-side at 50% 50%,
-    var(--accent-edge) 0%,
-    transparent 70%
-  );
-  z-index: 0;
-}
-
-/* Health core: numerals are the source of truth, centered on the dial. */
-.coreLabel {
-  fill: var(--text-1);
-  font-family: var(--font-mono);
-  font-variant-numeric: tabular-nums;
-  font-size: var(--text-lg);
-  text-anchor: middle;
-}
-
-.coreUnit {
-  fill: var(--text-3);
-  font-family: var(--font-mono);
-  font-size: var(--text-2xs);
-  letter-spacing: 0.06em;
-  text-anchor: middle;
-}
-
-/* Health Core overlay: an absolutely-centered HTML sibling of the <svg>,
- * PINNED at viewport center while the field pans/zooms behind it. The host
- * provides the actual gauge/odometer content; this just centers it and lifts
- * it above the glow. Children opt back into pointer events as needed. */
-.core {
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  z-index: 1;
-  transform: translate(-50%, -50%);
-  pointer-events: none;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  text-align: center;
-}
-
-.core > * {
-  pointer-events: auto;
-}

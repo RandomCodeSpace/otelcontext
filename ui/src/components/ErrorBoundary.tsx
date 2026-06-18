@@ -69,8 +69,8 @@ export class ErrorBoundary extends Component<Props, State> {
           alignItems: 'center',
           justifyContent: 'center',
           padding: '24px',
-          background: 'var(--bg-base, #0b0d10)',
-          color: 'var(--text-1, #e8ecf2)',
+          background: 'var(--bg-base, #0a0c0f)',
+          color: 'var(--text-1, #eceef3)',
           fontFamily:
             'var(--font-sans, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif)',
           zIndex: 9999,

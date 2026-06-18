@@ -1,53 +1,27 @@
-import { useCallback, useRef, useState, type ReactNode } from 'react'
+import { useCallback, useState } from 'react'
 import * as Dialog from '@radix-ui/react-dialog'
-import * as Tabs from '@radix-ui/react-tabs'
 import { X } from 'lucide-react'
 import { useLocation, useSearch } from 'wouter'
 import { useInvestigation } from '@/hooks/useInvestigation'
 import { useSystemGraph } from '@/hooks/useSystemGraph'
-import { useMediaQuery } from '@/hooks/useMediaQuery'
 import { formatPercent } from '@/lib/format'
 import { Metric } from '@/components/common/Metric'
 import { nodeStatus, statusToken } from '@/lib/triage'
-import { nextSheetState, type SheetSnap } from '@/lib/sheet'
 import { buildHref, readParam } from '@/lib/urlState'
-import type { SystemNode } from '@/types/api'
 import { INSPECTOR_TABS, isInspectorTabId } from './registry'
 import styles from './ServiceInspector.module.css'
 
-// Service Inspector — the omnipresent ?service=X panel:
-//   xs  (<768)  bottom sheet (Radix dialog), snap 50/92dvh, swipe-down dismiss
-//   md  (<1024) fixed overlay sheet on the right (CSS-only difference)
-//   lg+         docked grid column (380px / 440px at xl), content reflows
+// Service Inspector — two surfaces driven by ?service= (set on a node click):
+//   • CATEGORY PANEL (md+ docked): the service name + the category list
+//     (Overview / Why / Impact / Dependencies). NO stats — picking a category
+//     just drives the popup. A slim, read-light rail.
+//   • DETAILS POPUP (Radix Dialog, every breakpoint): the active category's
+//     full content (stats / why / impact / deps). On xs the categories ride
+//     inside the popup itself (a phone has no room for a side rail).
 
-function Header({
-  node,
-  service,
-  onClose,
-}: Readonly<{ node: SystemNode | null; service: string; onClose: () => void }>) {
-  const status = nodeStatus(node?.status)
+function StatusDot({ status }: Readonly<{ status: ReturnType<typeof nodeStatus> }>) {
   return (
-    <header className={styles.header}>
-      <span
-        className={styles.statusDot}
-        style={{ background: statusToken(status) }}
-        aria-hidden="true"
-      />
-      <h2 className={styles.name}>{service}</h2>
-      {node && (
-        <span className={styles.health} style={{ color: statusToken(status) }}>
-          <Metric value={formatPercent(node.health_score)} />
-        </span>
-      )}
-      <button
-        type="button"
-        className={styles.close}
-        aria-label="Close inspector"
-        onClick={onClose}
-      >
-        <X size={16} aria-hidden="true" />
-      </button>
-    </header>
+    <span className={styles.statusDot} style={{ background: statusToken(status) }} aria-hidden="true" />
   )
 }
 
@@ -65,20 +39,113 @@ function SkeletonBody() {
   )
 }
 
-function InspectorBody({
+/** The details popup — the active category's content, opened on node click. */
+function DetailsPopup({
   service,
+  tab,
+  onTab,
   onClose,
-}: Readonly<{ service: string; onClose: () => void }>) {
+}: Readonly<{
+  service: string
+  tab: string
+  onTab: (id: string) => void
+  onClose: () => void
+}>) {
   const { openService } = useInvestigation()
   const { graph, loading, error, reload } = useSystemGraph()
   const node = graph?.nodes.find((n) => n.id === service) ?? null
-
   const search = useSearch()
   const [, navigate] = useLocation()
-  // ?tab= targets a registry tab (palette verbs / shared links). The param
-  // seeds local state; manual tab flips stay local — re-seeded whenever the
-  // param or the inspected service changes (adjust-during-render pattern,
-  // not an effect: https://react.dev/learn/you-might-not-need-an-effect).
+  const showImpactOnMap = useCallback(
+    // Cone overlay lives on /map; drop inspector params so the map is
+    // unobstructed. History push — Back returns to the inspector.
+    (svc: string) => navigate(buildHref('/map', search, { impact: svc, service: null, tab: null })),
+    [navigate, search],
+  )
+  const status = nodeStatus(node?.status)
+  const active = INSPECTOR_TABS.find((t) => t.id === tab) ?? INSPECTOR_TABS[0]
+
+  // Non-modal: the side panel + map stay interactive behind the popup, and
+  // clicking a category in the panel must NOT dismiss it — only the X / Escape
+  // close (onInteractOutside is prevented below).
+  return (
+    <Dialog.Root open modal={false} onOpenChange={(open) => !open && onClose()}>
+      <Dialog.Portal>
+        <Dialog.Content
+          className={styles.popup}
+          aria-describedby={undefined}
+          onInteractOutside={(e) => e.preventDefault()}
+        >
+          <header className={styles.header}>
+            <StatusDot status={status} />
+            <Dialog.Title className={styles.name}>{service}</Dialog.Title>
+            {node && (
+              <span className={styles.health} style={{ color: statusToken(status) }}>
+                <Metric value={formatPercent(node.health_score)} />
+              </span>
+            )}
+            <Dialog.Close asChild>
+              <button type="button" className={styles.close} aria-label="Close inspector">
+                <X size={16} aria-hidden="true" />
+              </button>
+            </Dialog.Close>
+          </header>
+
+          {/* Tabs switch Overview / Why / Impact / Dependencies inside the popup
+              on every breakpoint, so the popup is self-sufficient; the desktop
+              side rail mirrors the same nav (both drive the shared tab state). */}
+          <div className={styles.tabList} role="tablist" aria-label="Inspector sections">
+            {INSPECTOR_TABS.map((t) => (
+              <button
+                key={t.id}
+                type="button"
+                role="tab"
+                aria-selected={t.id === tab}
+                data-state={t.id === tab ? 'active' : undefined}
+                className={styles.tabTrigger}
+                onClick={() => onTab(t.id)}
+              >
+                {t.label}
+              </button>
+            ))}
+          </div>
+
+          <div className={styles.tabContent}>
+            {loading ? (
+              <SkeletonBody />
+            ) : error ? (
+              <div className={styles.statePanel} role="alert">
+                <p>Couldn’t load the service graph: {error}</p>
+                <button type="button" className={styles.stateAction} onClick={reload}>
+                  Retry
+                </button>
+              </div>
+            ) : !node ? (
+              <div className={styles.statePanel}>
+                <p>
+                  <code className={styles.mono}>{service}</code> isn’t in the current service graph — it
+                  may have stopped reporting.
+                </p>
+              </div>
+            ) : (
+              <active.Content ctx={{ node, edges: graph?.edges ?? [], openService, showImpactOnMap }} />
+            )}
+          </div>
+        </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog.Root>
+  )
+}
+
+/** Mounts when ?service= is present (App gates the lazy import on that).
+ * The popup is the sole surface — it carries the category tabs + content on
+ * every breakpoint; there is no docked side rail. */
+export default function ServiceInspector() {
+  const { service, closeInspector } = useInvestigation()
+  const search = useSearch()
+  // ?tab= targets a registry category (palette verbs / shared links); it seeds
+  // local state, re-seeded whenever the param or inspected service changes
+  // (adjust-during-render, not an effect).
   const tabParam = readParam(search, 'tab')
   const seedTab = isInspectorTabId(tabParam) ? tabParam : INSPECTOR_TABS[0].id
   const [tab, setTab] = useState(seedTab)
@@ -88,168 +155,7 @@ function InspectorBody({
     setTab(seedTab)
   }
 
-  const showImpactOnMap = useCallback(
-    (svc: string) => {
-      // Cone overlay lives on /map; drop inspector params so the map is
-      // unobstructed. History push — Back returns to the inspector.
-      navigate(
-        buildHref('/map', search, { impact: svc, service: null, tab: null }),
-      )
-    },
-    [navigate, search],
-  )
-
-  if (loading) {
-    return (
-      <>
-        <Header node={null} service={service} onClose={onClose} />
-        <SkeletonBody />
-      </>
-    )
-  }
-
-  if (error) {
-    return (
-      <>
-        <Header node={null} service={service} onClose={onClose} />
-        <div className={styles.statePanel} role="alert">
-          <p>Couldn’t load the service graph: {error}</p>
-          <button type="button" className={styles.stateAction} onClick={reload}>
-            Retry
-          </button>
-        </div>
-      </>
-    )
-  }
-
-  if (!node) {
-    return (
-      <>
-        <Header node={null} service={service} onClose={onClose} />
-        <div className={styles.statePanel}>
-          <p>
-            <code className={styles.mono}>{service}</code> isn’t in the current
-            service graph — it may have stopped reporting.
-          </p>
-        </div>
-      </>
-    )
-  }
-
-  const ctx = {
-    node,
-    edges: graph?.edges ?? [],
-    openService,
-    showImpactOnMap,
-  }
-  return (
-    <>
-      <Header node={node} service={service} onClose={onClose} />
-      <Tabs.Root value={tab} onValueChange={setTab} className={styles.tabs}>
-        <Tabs.List className={styles.tabList} aria-label="Inspector sections">
-          {INSPECTOR_TABS.map((tab) => (
-            <Tabs.Trigger key={tab.id} value={tab.id} className={styles.tabTrigger}>
-              {tab.label}
-            </Tabs.Trigger>
-          ))}
-        </Tabs.List>
-        {INSPECTOR_TABS.map((tab) => (
-          <Tabs.Content key={tab.id} value={tab.id} className={styles.tabContent}>
-            <tab.Content ctx={ctx} />
-          </Tabs.Content>
-        ))}
-      </Tabs.Root>
-    </>
-  )
-}
-
-function BottomSheet({
-  onDismiss,
-  service,
-  children,
-}: Readonly<{ onDismiss: () => void; service: string; children: ReactNode }>) {
-  const [snap, setSnap] = useState<SheetSnap>(50)
-  const [dragOffset, setDragOffset] = useState(0)
-  const dragStart = useRef<number | null>(null)
-
-  const onPointerDown = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
-    dragStart.current = e.clientY
-    e.currentTarget.setPointerCapture(e.pointerId)
-  }, [])
-
-  const onPointerMove = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
-    if (dragStart.current === null) return
-    setDragOffset(e.clientY - dragStart.current)
-  }, [])
-
-  const onPointerUp = useCallback(
-    (e: React.PointerEvent<HTMLDivElement>) => {
-      if (dragStart.current === null) return
-      const delta = e.clientY - dragStart.current
-      dragStart.current = null
-      setDragOffset(0)
-      const next = nextSheetState(snap, delta, window.innerHeight)
-      if (next === 'dismiss') onDismiss()
-      else setSnap(next)
-    },
-    [onDismiss, snap],
-  )
-
-  return (
-    <Dialog.Root open onOpenChange={(open) => !open && onDismiss()}>
-      <Dialog.Portal>
-        <Dialog.Overlay className={styles.sheetOverlay} />
-        <Dialog.Content
-          className={styles.sheet}
-          style={{
-            height: `${snap}dvh`,
-            transform: dragOffset > 0 ? `translateY(${dragOffset}px)` : undefined,
-          }}
-          aria-describedby={undefined}
-        >
-          <Dialog.Title className={styles.srOnly}>
-            Service inspector: {service}
-          </Dialog.Title>
-          <div
-            className={styles.sheetHandle}
-            data-testid="sheet-handle"
-            onPointerDown={onPointerDown}
-            onPointerMove={onPointerMove}
-            onPointerUp={onPointerUp}
-          >
-            <span className={styles.sheetGrip} aria-hidden="true" />
-          </div>
-          <div className={styles.sheetScroll}>{children}</div>
-        </Dialog.Content>
-      </Dialog.Portal>
-    </Dialog.Root>
-  )
-}
-
-/** Mounts when ?service= is present (App gates the lazy import on that). */
-export default function ServiceInspector() {
-  const { service, closeInspector } = useInvestigation()
-  const isXs = useMediaQuery('(max-width: 767px)')
-
   if (!service) return null
 
-  if (isXs) {
-    return (
-      <BottomSheet onDismiss={closeInspector} service={service}>
-        <InspectorBody service={service} onClose={closeInspector} />
-      </BottomSheet>
-    )
-  }
-
-  return (
-    <aside
-      className={styles.panel}
-      aria-label={`Service inspector: ${service}`}
-      onKeyDown={(e) => {
-        if (e.key === 'Escape') closeInspector()
-      }}
-    >
-      <InspectorBody service={service} onClose={closeInspector} />
-    </aside>
-  )
+  return <DetailsPopup service={service} tab={tab} onTab={setTab} onClose={closeInspector} />
 }

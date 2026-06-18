@@ -116,7 +116,7 @@ describe('theme-color meta sync', () => {
     try {
       mockMatchMedia(false)
       const { result } = renderHook(() => useTheme())
-      expect(meta.getAttribute('content')).toBe('#0b0d10')
+      expect(meta.getAttribute('content')).toBe('#0a0c0f')
       act(() => result.current.toggle())
       expect(meta.getAttribute('content')).toBe('#f7f8fa')
     } finally {

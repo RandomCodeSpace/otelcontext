@@ -12,38 +12,42 @@
  *   xl   1440+      labeled rail 200px
  */
 
-/* ---- vendored fonts (OFL, ui/public/fonts, air-gap safe) ---- */
+/* ---- vendored fonts (Martian Grotesk + Martian Mono, Evil Martians, OFL-1.1,
+ * ui/public/fonts, air-gap safe). Purpose-built for developer tools — a
+ * characterful, engineered grotesk paired with its sibling monospace. Sans is
+ * the wght-axis variable cut, width pinned to normal + latin-subset (36 KB);
+ * mono is the wght-axis variable latin subset (24 KB). ---- */
 @font-face {
-  font-family: 'InterVariable';
+  font-family: 'Martian Grotesk';
   font-style: normal;
   font-weight: 100 900;
   font-display: swap;
-  src: url('/fonts/inter-latin-wght-normal.woff2') format('woff2-variations');
+  src: url('/fonts/martian-grotesk-latin-wght-normal.woff2') format('woff2-variations');
 }
 
 @font-face {
-  font-family: 'JetBrains Mono';
+  font-family: 'Martian Mono';
   font-style: normal;
-  font-weight: 400;
+  font-weight: 100 900;
   font-display: swap;
-  src: url('/fonts/jetbrains-mono-latin-400-normal.woff2') format('woff2');
+  src: url('/fonts/martian-mono-latin-wght-normal.woff2') format('woff2-variations');
 }
 
 :root {
-  /* dark (default) — near-black blue-cast surfaces, hairlines not shadows */
-  --bg-base: #0b0d10;
-  --bg-raised: #12151b;
-  --bg-overlay: #171b23;
-  --bg-inset: #07090c;
-  --stroke-1: #1e232d;
-  --stroke-2: #2a3140;
-  --text-1: #e8ecf2; /* 13.9:1 on base */
-  --text-2: #9aa3b2; /*  7.1:1 on base */
-  --text-3: #646d7c; /*  4.6:1 on base */
-  --accent: #5ca8ff; /* the ONLY interactive hue */
-  --accent-muted: #5ca8ff26;
-  --accent-edge: #5ca8ff26; /* accent ~15% — focus ring + active-route hairline ONLY */
-  --bg-graticule: #5ca8ff0a; /* dotted instrument grid, ~4% accent */
+  /* dark (default) — deep near-black blue-cast surfaces, hairlines not shadows */
+  --bg-base: #0a0c0f;
+  --bg-raised: #12151c;
+  --bg-overlay: #181c25;
+  --bg-inset: #06080b;
+  --stroke-1: #20252f;
+  --stroke-2: #2c3342;
+  --text-1: #eceef3; /* 14.6:1 on base */
+  --text-2: #9aa3b3; /*  7.2:1 on base */
+  --text-3: #646d7d; /*  4.6:1 on base */
+  --accent: #818cf8; /* refined indigo — the ONLY interactive hue */
+  --accent-muted: #818cf826;
+  --accent-edge: #818cf82e; /* accent ~18% — focus ring + active-route hairline ONLY */
+  --bg-graticule: #818cf80c; /* dotted instrument grid, ~5% accent */
   --gauge-track: var(--stroke-2); /* gauge/dial hairline track — inherits prefers-contrast */
   --ok: #34d399;
   --warn: #fbbf24;
@@ -54,8 +58,8 @@
   --crit-bg: #f8717114;
   --unknown-bg: #6b728014; /* neutral status wash — 8% --unknown, parity with ok/warn/crit-bg */
   --scrim: rgb(0 0 0 / 0.5); /* neutral black dialog scrim — shared by palette + inspector overlays */
-  --font-sans: 'InterVariable', system-ui, sans-serif;
-  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+  --font-sans: 'Martian Grotesk', system-ui, sans-serif;
+  --font-mono: 'Martian Mono', ui-monospace, monospace;
   --text-2xs: 11px;
   --text-xs: 12px;
   --text-sm: 12.5px;
@@ -80,10 +84,9 @@
   /* two elevation levels — popovers/menus, and sheets/overlays */
   --shadow-pop: 0 4px 16px rgb(0 0 0 / 0.35);
   --shadow-sheet: 0 8px 32px rgb(0 0 0 / 0.45);
-  /* App atmosphere: a barely-perceptible luminance ramp from the top of the
-   * viewport (~3% lighter) into --bg-base. Texture, not decoration — it
-   * keeps the large dark field from reading flat. Painted by body only. */
-  --bg-app: radial-gradient(1100px 700px at 50% -12%, #11151d 0%, var(--bg-base) 62%);
+  /* Flat premium surface — no gradient. The graticule dots + the map's ring
+   * guides carry depth; the large dark field stays a clean instrument panel. */
+  --bg-app: var(--bg-base);
   color-scheme: dark;
 }
 
@@ -97,10 +100,10 @@
   --text-1: #171b23;
   --text-2: #49515e;
   --text-3: #687284;
-  --accent: #1d6fe0; /* darkened for ≥4.5:1 on white */
-  --accent-muted: #1d6fe01f;
-  --accent-edge: #1d6fe029;
-  --bg-graticule: #1d6fe00d;
+  --accent: #4f46e5; /* indigo-600 — ≥4.5:1 on white */
+  --accent-muted: #4f46e51f;
+  --accent-edge: #4f46e529;
+  --bg-graticule: #4f46e50d;
   --gauge-track: var(--stroke-2);
   --ok: #0e9f6e; /* status hues darkened for ≥4.5:1 */
   --warn: #b45309;
@@ -113,7 +116,7 @@
   --scrim: rgb(0 0 0 / 0.5); /* neutral black dialog scrim — shared by palette + inspector overlays */
   --shadow-pop: 0 4px 16px rgb(23 27 35 / 0.1);
   --shadow-sheet: 0 8px 32px rgb(23 27 35 / 0.16);
-  --bg-app: radial-gradient(1100px 700px at 50% -12%, #fdfdfe 0%, var(--bg-base) 62%);
+  --bg-app: var(--bg-base);
   color-scheme: light;
 }
 

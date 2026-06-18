@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { render, screen, within } from '@testing-library/react'
+import { fireEvent, render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { Router } from 'wouter'
@@ -142,17 +142,16 @@ async function findMap() {
 }
 
 describe('ConstellationHome — canvas + core', () => {
-  it('renders the radial canvas as the hero with health demoted to a corner card', async () => {
+  it('renders the canvas as the hero with health demoted to a corner card', async () => {
     renderHome()
     const map = await findMap()
-    // The map is the hero: nodes fill the field, the center is free.
-    expect(within(map).getByText('db')).toBeInTheDocument()
+    // The map is the hero: nodes fill the field, the center is free. (React Flow
+    // mounts node DOM after it measures the pane, so the node text is async.)
+    expect(await within(map).findByText('db')).toBeInTheDocument()
     // No pinned center overlay and no on-page health card — vitals live in the
     // header now; the map owns the whole canvas.
     expect(screen.queryByTestId('flow-map-core')).toBeNull()
     expect(screen.queryByRole('meter', { name: /HEALTH/ })).toBeNull()
-    // ringDepth is on → the cinematic dial backdrop renders.
-    expect(screen.getByTestId('radial-dial')).toBeInTheDocument()
   })
 
   it('renders the worst-first rail alongside the canvas on md+', async () => {
@@ -165,10 +164,13 @@ describe('ConstellationHome — canvas + core', () => {
   })
 
   it('selecting a node from the canvas docks the inspector (?service=)', async () => {
-    const user = userEvent.setup()
     const memory = renderHome()
     const map = await findMap()
-    await user.click(within(map).getByText('payments'))
+    // React Flow wires onNodeClick to the node wrapper's click event. We use
+    // fireEvent.click (a lone click, no mousedown sequence) so the event does
+    // not bubble into d3-zoom's pane handler, which dereferences the synthetic
+    // event's null `view` under jsdom and crashes the run.
+    fireEvent.click(await within(map).findByText('payments'))
     expect(memory.history.at(-1)).toContain('service=payments')
   })
 
@@ -177,67 +179,23 @@ describe('ConstellationHome — canvas + core', () => {
     const memory = renderHome()
     await findMap()
     const rail = screen.getByRole('complementary', { name: /service triage feed/i })
-    await user.click(within(rail).getByRole('button', { name: /db/i }))
+    // Critical is open by default, so the db row button is reachable directly.
+    const critical = within(rail).getByRole('region', { name: 'Critical' })
+    await user.click(within(critical).getByRole('button', { name: /db/i }))
     expect(memory.history.at(-1)).toContain('service=db')
   })
 })
 
-describe('ConstellationHome — anomaly tape', () => {
-  it('renders recent-anomaly service chips; tapping one opens the inspector', async () => {
+describe('ConstellationHome — side-panel anomalies', () => {
+  it('lists anomalous services in a collapsible Anomalies group; tapping one opens the inspector', async () => {
     const user = userEvent.setup()
     const memory = renderHome()
-    const strip = await screen.findByRole('region', { name: /recent anomalies/i })
-    await user.click(await within(strip).findByRole('button', { name: /db/i }))
+    await findMap()
+    const rail = screen.getByRole('complementary', { name: /service triage feed/i })
+    // The anomaly timeline (MCP) resolves async into the side panel's group.
+    const anomalies = await within(rail).findByRole('region', { name: 'Anomalies' })
+    await user.click(within(anomalies).getByRole('button', { name: /db/i }))
     expect(memory.history.at(-1)).toContain('service=db')
-  })
-
-  it('shows the quiet empty message when there are no anomalies', async () => {
-    mcpResponder = () =>
-      Promise.resolve(
-        new Response(
-          JSON.stringify({
-            jsonrpc: '2.0',
-            id: 1,
-            result: { content: [{ type: 'text', text: 'null' }] },
-          }),
-          { status: 200 },
-        ),
-      )
-    renderHome()
-    expect(await screen.findByText(/no anomalies in the last hour/i)).toBeInTheDocument()
-  })
-
-  it('shows an inline error with a working Retry when the MCP tool fails', async () => {
-    const user = userEvent.setup()
-    mcpResponder = () =>
-      Promise.resolve(
-        new Response(
-          JSON.stringify({
-            jsonrpc: '2.0',
-            id: 1,
-            error: { code: -32000, message: 'graph not initialized' },
-          }),
-          { status: 200 },
-        ),
-      )
-    renderHome()
-    const alert = await screen.findByRole('alert')
-    expect(alert).toHaveTextContent(/anomalies unavailable/i)
-    // Retry refetches: once the responder recovers, the strip resolves to the
-    // quiet empty message (proves the button re-runs the query, not just clears).
-    mcpResponder = () =>
-      Promise.resolve(
-        new Response(
-          JSON.stringify({
-            jsonrpc: '2.0',
-            id: 1,
-            result: { content: [{ type: 'text', text: 'null' }] },
-          }),
-          { status: 200 },
-        ),
-      )
-    await user.click(within(alert).getByRole('button', { name: /retry/i }))
-    expect(await screen.findByText(/no anomalies in the last hour/i)).toBeInTheDocument()
   })
 })
 
@@ -268,14 +226,17 @@ describe('ConstellationHome — states', () => {
 })
 
 describe('ConstellationHome — ?impact= blast-radius overlay', () => {
-  it('tints the downstream cone and announces the overlay', async () => {
+  it('renders the downstream cone and announces the overlay', async () => {
     renderHome('/?impact=checkout')
-    const svg = within(await findMap()).getByTestId('flow-map-svg')
-    const payTint = screen.getByTestId('impact-tint-payments')
-    const dbTint = screen.getByTestId('impact-tint-db')
-    expect(Number(payTint.style.fillOpacity)).toBeGreaterThan(Number(dbTint.style.fillOpacity))
-    const rootRect = svg.querySelector('[data-node-id="checkout"] rect')
-    expect(rootRect?.getAttribute('class')).toContain('nodeImpactRoot')
+    const map = await findMap()
+    // The cone root and its two downstream services all render as map nodes.
+    // (React Flow keys each node wrapper by data-id.) The old SVG fill-opacity
+    // depth shading has no DOM equivalent in the React Flow map; the overlay
+    // semantics now live on the banner below.
+    expect(await within(map).findByText('checkout')).toBeInTheDocument()
+    expect(within(map).getByText('payments')).toBeInTheDocument()
+    expect(within(map).getByText('db')).toBeInTheDocument()
+    expect(map.querySelector('[data-id="checkout"]')).not.toBeNull()
     const banner = screen.getByRole('status')
     expect(banner).toHaveTextContent(/blast radius of/i)
     expect(banner).toHaveTextContent(/2 downstream/i)
@@ -311,9 +272,10 @@ describe('ConstellationHome — xs canvas default', () => {
     expect(await screen.findByRole('region', { name: 'Critical' })).toBeInTheDocument()
     expect(screen.getByRole('region', { name: 'Degraded' })).toBeInTheDocument()
     expect(screen.queryByRole('application', { name: /service flow map/i })).toBeNull()
-    // healthy collapsed behind a disclosure
+    // healthy collapsed behind a disclosure (now a generic collapsible group:
+    // caps title + count, e.g. "Healthy 2")
     expect(screen.queryByText('checkout')).not.toBeInTheDocument()
-    await user.click(screen.getByRole('button', { name: /healthy service/i }))
+    await user.click(screen.getByRole('button', { name: /healthy/i }))
     expect(screen.getByText('checkout')).toBeInTheDocument()
     // Flow toggle returns to the canvas.
     await user.click(screen.getByRole('button', { name: 'Flow' }))

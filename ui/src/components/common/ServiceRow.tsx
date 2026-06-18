@@ -1,4 +1,3 @@
-import { formatCount, formatMs, formatPercent } from '@/lib/format'
 import { nodeStatus, statusToken } from '@/lib/triage'
 import type { SystemNode } from '@/types/api'
 import styles from './ServiceRow.module.css'
@@ -17,10 +16,11 @@ interface ServiceRowProps {
 }
 
 /**
- * One service row: status dot, name, inline health bar, then the mono
- * indicator columns (rps / err% / p99) — every measured quantity in the
- * indicator voice. Shared by the Triage feed and the flow map's xs card list
- * so "how a service looks" has one source of truth.
+ * One service row: status dot, name, alert badge, and an inline health bar.
+ * The numeric stats (rps / err% / p99) are intentionally NOT shown here — the
+ * list stays name-first and legible on the narrow rail; the full stats live in
+ * the Inspector popup, one click away. Shared by the Triage feed and the flow
+ * map's xs card list so "how a service looks" has one source of truth.
  *
  * Focus-distortion: when a service is inspected, the selected row lifts
  * (scale 1.015) with an --accent-edge ring and the rest dim. This is a pure
@@ -64,17 +64,6 @@ export default function ServiceRow({ node, onOpen, selectedId }: Readonly<Servic
             background: color,
           }}
         />
-      </span>
-      <span className={styles.metrics}>
-        <span className={styles.metric} role="group" aria-label={`rps ${node.metrics.request_rate_rps}`}>
-          <span className="num">{formatCount(node.metrics.request_rate_rps)}</span>
-        </span>
-        <span className={styles.metric} role="group" aria-label={`error rate ${formatPercent(node.metrics.error_rate)}`}>
-          <span className="num">{formatPercent(node.metrics.error_rate)}</span>
-        </span>
-        <span className={styles.metric} role="group" aria-label={`p99 ${formatMs(node.metrics.p99_latency_ms)}`}>
-          <span className="num">{formatMs(node.metrics.p99_latency_ms)}</span>
-        </span>
       </span>
     </button>
   )

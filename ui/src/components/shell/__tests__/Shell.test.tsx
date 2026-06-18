@@ -55,31 +55,15 @@ afterEach(() => {
 })
 
 describe('Shell', () => {
-  it('renders the pulse banner, navigation and main content', () => {
+  it('renders the pulse banner and main content (no nav rail)', () => {
     renderShell()
     expect(screen.getByRole('banner')).toBeInTheDocument()
-    expect(screen.getAllByRole('navigation').length).toBeGreaterThanOrEqual(1)
     expect(screen.getByRole('main')).toContainElement(
       screen.getByTestId('page-content'),
     )
-  })
-
-  it('renders the single Service Map destination in the rail', () => {
-    renderShell()
-    // The Service Map is the only human destination — logs/traces are MCP-tool
-    // surfaces, the flow map folded into home, and the bottom tab bar was
-    // removed (Search lives in the top pulse bar). One nav link, in the rail.
-    expect(screen.getAllByRole('link', { name: /service map/i })).toHaveLength(1)
-    expect(screen.getAllByRole('link')).toHaveLength(1)
-  })
-
-  it('marks the active route with aria-current', () => {
-    renderShell('/')
-    const active = screen
-      .getAllByRole('link')
-      .filter((a) => a.getAttribute('aria-current') === 'page')
-    expect(active).toHaveLength(1) // the single rail nav link
-    active.forEach((a) => expect(a).toHaveAttribute('href', '/'))
+    // Single-page app — the Service Map IS the app, so there is no nav rail.
+    expect(screen.queryByRole('navigation')).not.toBeInTheDocument()
+    expect(screen.queryByRole('link', { name: /service map/i })).not.toBeInTheDocument()
   })
 
   it('renders the palette buttons when onOpenPalette is wired', async () => {
