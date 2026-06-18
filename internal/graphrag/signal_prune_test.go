@@ -17,7 +17,7 @@ func TestSignalStore_Prune_DropsStaleMetricsKeepsFresh(t *testing.T) {
 	ss.UpsertMetric("cpu", "old-svc", 1.0, stale)
 	ss.UpsertMetric("cpu", "new-svc", 1.0, now)
 
-	if got := ss.Prune(now.Add(-24*time.Hour), 0); got != 1 {
+	if got := ss.Prune(now.Add(-24*time.Hour), 0, 0); got != 1 {
 		t.Fatalf("Prune removed %d metrics, want 1", got)
 	}
 	if _, ok := ss.Metrics["cpu|old-svc"]; ok {
@@ -46,7 +46,7 @@ func TestSignalStore_Prune_CapEvictsOldestFirst(t *testing.T) {
 		ss.UpsertMetric(fmt.Sprintf("m%d", i), "svc", 1.0, now.Add(time.Duration(i)*time.Minute))
 	}
 
-	if got := ss.Prune(now.Add(-24*time.Hour), 2); got != 3 {
+	if got := ss.Prune(now.Add(-24*time.Hour), 2, 0); got != 3 {
 		t.Fatalf("Prune removed %d metrics, want 3", got)
 	}
 	for i := 0; i < 3; i++ {
@@ -65,10 +65,12 @@ func TestSignalStore_Prune_CapEvictsOldestFirst(t *testing.T) {
 	}
 }
 
-// TestSignalStore_Prune_SweepsStaleLogClusterEdgesOnly proves LogClusters
-// themselves are untouched (they are Drain-bounded upstream) while their
-// stale EMITTED_BY / LOGGED_DURING edges are swept.
-func TestSignalStore_Prune_SweepsStaleLogClusterEdgesOnly(t *testing.T) {
+// TestSignalStore_Prune_DropsStaleLogClustersKeepsFresh proves the TTL bound on
+// LogClusters: a cluster idle past the cutoff is removed together with its
+// EMITTED_BY / LOGGED_DURING edges, while a fresh cluster and its edge survive.
+// LogClusters were previously never pruned (only their stale edges were swept),
+// which leaked the map under a sustained high-shape log stream.
+func TestSignalStore_Prune_DropsStaleLogClustersKeepsFresh(t *testing.T) {
 	ss := newSignalStore()
 	now := time.Now()
 	stale := now.Add(-48 * time.Hour)
@@ -77,19 +79,53 @@ func TestSignalStore_Prune_SweepsStaleLogClusterEdgesOnly(t *testing.T) {
 	ss.AddLoggedDuringEdge("c-old", "span-old", stale)
 	ss.UpsertLogCluster("c-new", "tmpl", "ERROR", "svc2", now)
 
-	ss.Prune(now.Add(-24*time.Hour), 0)
+	ss.Prune(now.Add(-24*time.Hour), 0, 0)
 
-	if len(ss.LogClusters) != 2 {
-		t.Fatalf("LogClusters len = %d, want 2 — Prune must not touch clusters", len(ss.LogClusters))
+	if _, ok := ss.LogClusters["c-old"]; ok {
+		t.Errorf("stale LogCluster survived Prune")
+	}
+	if _, ok := ss.LogClusters["c-new"]; !ok {
+		t.Errorf("fresh LogCluster was pruned")
 	}
 	if _, ok := ss.Edges[edgeKey(EdgeEmittedBy, "c-old", "svc")]; ok {
-		t.Errorf("stale EMITTED_BY edge survived")
+		t.Errorf("evicted cluster's EMITTED_BY edge survived")
 	}
 	if _, ok := ss.Edges[edgeKey(EdgeLoggedDuring, "c-old", "span-old")]; ok {
-		t.Errorf("stale LOGGED_DURING edge survived")
+		t.Errorf("evicted cluster's LOGGED_DURING edge survived")
 	}
 	if _, ok := ss.Edges[edgeKey(EdgeEmittedBy, "c-new", "svc2")]; !ok {
-		t.Errorf("fresh EMITTED_BY edge was swept")
+		t.Errorf("fresh cluster's EMITTED_BY edge was swept")
+	}
+}
+
+// TestSignalStore_Prune_LogClusterCapEvictsOldest proves the cap backstop: when
+// the cluster map still exceeds maxLogClusters after the TTL pass, the
+// oldest-LastSeen clusters are evicted first — with their edges — even though
+// all of them are fresh.
+func TestSignalStore_Prune_LogClusterCapEvictsOldest(t *testing.T) {
+	ss := newSignalStore()
+	now := time.Now()
+
+	for i := 0; i < 5; i++ {
+		id := fmt.Sprintf("c%d", i)
+		ss.UpsertLogCluster(id, "tmpl", "ERROR", "svc", now.Add(time.Duration(i)*time.Minute))
+	}
+
+	ss.Prune(now.Add(-24*time.Hour), 0, 2)
+
+	for i := 0; i < 3; i++ {
+		id := fmt.Sprintf("c%d", i)
+		if _, ok := ss.LogClusters[id]; ok {
+			t.Errorf("oldest cluster %s survived cap eviction", id)
+		}
+		if _, ok := ss.Edges[edgeKey(EdgeEmittedBy, id, "svc")]; ok {
+			t.Errorf("cap-evicted cluster %s left a dangling EMITTED_BY edge", id)
+		}
+	}
+	for i := 3; i < 5; i++ {
+		if _, ok := ss.LogClusters[fmt.Sprintf("c%d", i)]; !ok {
+			t.Errorf("newest cluster c%d was evicted — cap must drop oldest first", i)
+		}
 	}
 }
 
@@ -110,7 +146,7 @@ func TestSignalStore_UpsertRefreshesEdgeTimestamps(t *testing.T) {
 	ss.AddLoggedDuringEdge("c1", "span-1", stale)
 	ss.AddLoggedDuringEdge("c1", "span-1", now)
 
-	ss.Prune(now.Add(-24*time.Hour), 0)
+	ss.Prune(now.Add(-24*time.Hour), 0, 0)
 
 	for _, ek := range []string{
 		edgeKey(EdgeMeasuredBy, "cpu|svc", "svc"),

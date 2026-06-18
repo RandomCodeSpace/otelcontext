@@ -603,15 +603,16 @@ func (ss *SignalStore) LogClustersForService(service string) []*LogClusterNode {
 	return out
 }
 
-// Prune bounds the SignalStore (modeled on TraceStore.Prune): MetricNodes
-// whose LastSeen predates cutoff are removed; if the map still exceeds
-// maxMetrics (<=0 = uncapped) the oldest-LastSeen overflow is evicted. Each
-// removed metric takes its MEASURED_BY edge with it. Finally, Edges whose
-// UpdatedAt predates cutoff are swept — the upsert paths refresh edge
-// timestamps, so live correlations survive. LogClusters are NOT pruned
-// here: they are bounded upstream by the Drain template LRU; only their
-// stale edges go. Returns the number of metrics removed.
-func (ss *SignalStore) Prune(cutoff time.Time, maxMetrics int) int {
+// Prune bounds the SignalStore (modeled on TraceStore.Prune): MetricNodes and
+// LogClusterNodes whose LastSeen predates cutoff are removed; if either map
+// still exceeds its cap (maxMetrics / maxLogClusters; <=0 = uncapped) the
+// oldest-LastSeen overflow is evicted. Each removed node takes its edges with
+// it — metric MEASURED_BY edges inline, evicted-cluster EMITTED_BY /
+// LOGGED_DURING edges in the final sweep — and any edge whose UpdatedAt
+// predates cutoff is swept too (upsert paths refresh edge timestamps, so live
+// correlations survive). Returns the number of nodes (metrics + clusters)
+// removed.
+func (ss *SignalStore) Prune(cutoff time.Time, maxMetrics, maxLogClusters int) int {
 	ss.mu.Lock()
 	defer ss.mu.Unlock()
 
@@ -640,8 +641,40 @@ func (ss *SignalStore) Prune(cutoff time.Time, maxMetrics int) int {
 			pruned++
 		}
 	}
+	// LogClusters: TTL + cap, mirroring the metric bound above. This map was
+	// previously unbounded — keyed by service×Drain-template-ID with no cap, it
+	// grew with every distinct (service, template-id) pair ever seen (template
+	// IDs shift as Drain generalizes), leaking under a sustained high-shape log
+	// stream. The TTL ages out that accretion; the cap is the backstop. Evicted
+	// cluster IDs are collected so their EMITTED_BY / LOGGED_DURING edges
+	// (FromID = cluster id) are swept below even when not yet time-stale.
+	evictedClusters := make(map[string]struct{})
+	for id, lc := range ss.LogClusters {
+		if lc.LastSeen.Before(cutoff) {
+			delete(ss.LogClusters, id)
+			evictedClusters[id] = struct{}{}
+			pruned++
+		}
+	}
+	if maxLogClusters > 0 && len(ss.LogClusters) > maxLogClusters {
+		type clusterAge struct {
+			id   string
+			seen time.Time
+		}
+		byAge := make([]clusterAge, 0, len(ss.LogClusters))
+		for id, lc := range ss.LogClusters {
+			byAge = append(byAge, clusterAge{id, lc.LastSeen})
+		}
+		sort.Slice(byAge, func(i, j int) bool { return byAge[i].seen.Before(byAge[j].seen) })
+		for _, e := range byAge[:len(byAge)-maxLogClusters] {
+			delete(ss.LogClusters, e.id)
+			evictedClusters[e.id] = struct{}{}
+			pruned++
+		}
+	}
+
 	for ek, e := range ss.Edges {
-		if e.UpdatedAt.Before(cutoff) {
+		if _, fromEvicted := evictedClusters[e.FromID]; e.UpdatedAt.Before(cutoff) || fromEvicted {
 			delete(ss.Edges, ek)
 		}
 	}
