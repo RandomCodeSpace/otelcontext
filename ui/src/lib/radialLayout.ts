@@ -1,7 +1,7 @@
 // Deterministic phyllotaxis ("Sunflower Galaxy") layout for the service map.
 //
-// Same `Layout` shape as dagLayout's layoutGraph (nodes / layers / width /
-// height) so the renderer and pan/zoom math are shared. The mapping:
+// Produces the shared `Layout` shape (nodes / layers / width / height) defined
+// in dagLayout, consumed by the React Flow map renderer. The mapping:
 //
 //   radius = criticality RANK — the most-critical node lands near center, the
 //     least-critical at the rim. Ranked node i is placed on a Fermat/sunflower
@@ -26,7 +26,6 @@ import {
   type GraphEdgeRef,
   type Layout,
   type LayoutNode,
-  type WalkDir,
 } from './dagLayout'
 
 // Criticality weights. distinctCallerIndegree dominates (blast potential),
@@ -192,76 +191,4 @@ export function layoutRadial(
   })
 
   return { nodes, layers, width: span, height: span }
-}
-
-/**
- * Polar keyboard walk over a phyllotaxis Layout.
- *   left/right  → angular neighbor in the same band (by spiral angle)
- *   up          → band inward (smaller radius / lower band index)
- *   down        → band outward (larger radius / higher band index)
- * Returns null at boundaries or for an unknown focus. A null focus seeds at the
- * most-critical entry node (band 0, first by angular order) for ANY arrow key,
- * so Tabbing into the field and pressing any direction bootstraps focus — the
- * field is never keyboard-inert on entry. Subsequent presses refine from the
- * seed. The seed is deterministic (always layers[0][0]).
- */
-export function walkRadial(layout: Layout, focusId: string | null, dir: WalkDir): string | null {
-  if (focusId === null) {
-    void dir
-    return layout.layers[0]?.[0] ?? null
-  }
-  const node = layout.nodes.get(focusId)
-  if (node === undefined) return null
-
-  if (dir === 'up' || dir === 'down') {
-    // Step inward (up) or outward (down) to the nearest NON-EMPTY band.
-    const step = dir === 'up' ? -1 : 1
-    for (let r = node.layer + step; r >= 0 && r < layout.layers.length; r += step) {
-      if (layout.layers[r].length > 0) return nearestOnRing(layout, node, r)
-    }
-    return null
-  }
-
-  // left / right: move to the angular neighbor in the same band.
-  const ring = layout.layers[node.layer]
-  if (ring === undefined || ring.length <= 1) return null
-  const idx = ring.indexOf(focusId)
-  if (idx < 0) return null
-  // Band ids are stored in increasing angular order; right = next, left = prev.
-  // No wraparound (boundary returns null), matching the DAG walk semantics.
-  const nextIdx = idx + (dir === 'right' ? 1 : -1)
-  if (nextIdx < 0 || nextIdx >= ring.length) return null
-  return ring[nextIdx]
-}
-
-/** Center of a Layout's coordinate space. */
-function center(layout: Layout): { cx: number; cy: number } {
-  return { cx: layout.width / 2, cy: layout.height / 2 }
-}
-
-/** Angle of a node around the layout center, in [0, 2π). */
-function angleOf(layout: Layout, node: LayoutNode): number {
-  const { cx, cy } = center(layout)
-  const a = Math.atan2(node.y + NODE_H / 2 - cy, node.x + NODE_W / 2 - cx)
-  return a < 0 ? a + 2 * Math.PI : a
-}
-
-/** Closest node (by angle) on a target band to the focus node. */
-function nearestOnRing(layout: Layout, focus: LayoutNode, ring: number): string | null {
-  const ids = layout.layers[ring]
-  if (ids === undefined || ids.length === 0) return null
-  const target = angleOf(layout, focus)
-  let best: string | null = null
-  let bestDelta = Infinity
-  for (const id of ids) {
-    const n = layout.nodes.get(id)
-    if (n === undefined) continue
-    let delta = Math.abs(angleOf(layout, n) - target)
-    if (delta > Math.PI) delta = 2 * Math.PI - delta // shortest arc
-    if (delta < bestDelta || (delta === bestDelta && (best === null || compareIds(id, best) < 0))) {
-      bestDelta = delta
-      best = id
-    }
-  }
-  return best
 }
