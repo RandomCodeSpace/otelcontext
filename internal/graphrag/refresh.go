@@ -15,6 +15,13 @@ const (
 	// maxMetricsPerTenant caps each tenant's SignalStore metric map; past
 	// the cap the oldest-LastSeen series are evicted first.
 	maxMetricsPerTenant = 2000
+	// maxLogClustersPerTenant caps each tenant's SignalStore LogCluster map.
+	// Clusters are keyed by service×Drain-template-ID, so without a cap the
+	// map outgrows the (shared) Drain template LRU as template IDs churn and
+	// services multiply. The 24h signalRetention TTL is the primary bound;
+	// this cap is the backstop for high-shape-cardinality streams (~1KB/node
+	// => ~10MB/tenant worst case).
+	maxLogClustersPerTenant = 10000
 	// rebuildRowLimit caps how many span rows a single per-tenant rebuild
 	// pass loads. Hitting it is logged — topology lags until the next tick.
 	rebuildRowLimit = 50000
@@ -45,17 +52,17 @@ func (g *GraphRAG) refreshLoop(ctx context.Context) {
 		case <-ticker.C:
 			g.rebuildAllTenantsFromDB(ctx)
 			pruned := 0
-			prunedMetrics := 0
+			prunedSignals := 0
 			signalCutoff := time.Now().Add(-signalRetention)
 			for _, stores := range g.snapshotTenants() {
 				pruned += stores.traces.Prune()
-				prunedMetrics += stores.signals.Prune(signalCutoff, maxMetricsPerTenant)
+				prunedSignals += stores.signals.Prune(signalCutoff, maxMetricsPerTenant, maxLogClustersPerTenant)
 			}
 			if pruned > 0 {
 				slog.Debug("GraphRAG pruned expired traces/spans", "count", pruned)
 			}
-			if prunedMetrics > 0 {
-				slog.Debug("GraphRAG pruned stale/over-cap metrics", "count", prunedMetrics)
+			if prunedSignals > 0 {
+				slog.Debug("GraphRAG pruned stale/over-cap signals (metrics+clusters)", "count", prunedSignals)
 			}
 			g.pruneOldAnomalies()
 			if evicted := g.evictIdleTenants(); evicted > 0 {
