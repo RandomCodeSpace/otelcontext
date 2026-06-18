@@ -177,67 +177,23 @@ describe('ConstellationHome — canvas + core', () => {
     const memory = renderHome()
     await findMap()
     const rail = screen.getByRole('complementary', { name: /service triage feed/i })
-    await user.click(within(rail).getByRole('button', { name: /db/i }))
+    // Critical is open by default, so the db row button is reachable directly.
+    const critical = within(rail).getByRole('region', { name: 'Critical' })
+    await user.click(within(critical).getByRole('button', { name: /db/i }))
     expect(memory.history.at(-1)).toContain('service=db')
   })
 })
 
-describe('ConstellationHome — anomaly tape', () => {
-  it('renders recent-anomaly service chips; tapping one opens the inspector', async () => {
+describe('ConstellationHome — side-panel anomalies', () => {
+  it('lists anomalous services in a collapsible Anomalies group; tapping one opens the inspector', async () => {
     const user = userEvent.setup()
     const memory = renderHome()
-    const strip = await screen.findByRole('region', { name: /recent anomalies/i })
-    await user.click(await within(strip).findByRole('button', { name: /db/i }))
+    await findMap()
+    const rail = screen.getByRole('complementary', { name: /service triage feed/i })
+    // The anomaly timeline (MCP) resolves async into the side panel's group.
+    const anomalies = await within(rail).findByRole('region', { name: 'Anomalies' })
+    await user.click(within(anomalies).getByRole('button', { name: /db/i }))
     expect(memory.history.at(-1)).toContain('service=db')
-  })
-
-  it('shows the quiet empty message when there are no anomalies', async () => {
-    mcpResponder = () =>
-      Promise.resolve(
-        new Response(
-          JSON.stringify({
-            jsonrpc: '2.0',
-            id: 1,
-            result: { content: [{ type: 'text', text: 'null' }] },
-          }),
-          { status: 200 },
-        ),
-      )
-    renderHome()
-    expect(await screen.findByText(/no anomalies in the last hour/i)).toBeInTheDocument()
-  })
-
-  it('shows an inline error with a working Retry when the MCP tool fails', async () => {
-    const user = userEvent.setup()
-    mcpResponder = () =>
-      Promise.resolve(
-        new Response(
-          JSON.stringify({
-            jsonrpc: '2.0',
-            id: 1,
-            error: { code: -32000, message: 'graph not initialized' },
-          }),
-          { status: 200 },
-        ),
-      )
-    renderHome()
-    const alert = await screen.findByRole('alert')
-    expect(alert).toHaveTextContent(/anomalies unavailable/i)
-    // Retry refetches: once the responder recovers, the strip resolves to the
-    // quiet empty message (proves the button re-runs the query, not just clears).
-    mcpResponder = () =>
-      Promise.resolve(
-        new Response(
-          JSON.stringify({
-            jsonrpc: '2.0',
-            id: 1,
-            result: { content: [{ type: 'text', text: 'null' }] },
-          }),
-          { status: 200 },
-        ),
-      )
-    await user.click(within(alert).getByRole('button', { name: /retry/i }))
-    expect(await screen.findByText(/no anomalies in the last hour/i)).toBeInTheDocument()
   })
 })
 
@@ -311,9 +267,10 @@ describe('ConstellationHome — xs canvas default', () => {
     expect(await screen.findByRole('region', { name: 'Critical' })).toBeInTheDocument()
     expect(screen.getByRole('region', { name: 'Degraded' })).toBeInTheDocument()
     expect(screen.queryByRole('application', { name: /service flow map/i })).toBeNull()
-    // healthy collapsed behind a disclosure
+    // healthy collapsed behind a disclosure (now a generic collapsible group:
+    // caps title + count, e.g. "Healthy 2")
     expect(screen.queryByText('checkout')).not.toBeInTheDocument()
-    await user.click(screen.getByRole('button', { name: /healthy service/i }))
+    await user.click(screen.getByRole('button', { name: /healthy/i }))
     expect(screen.getByText('checkout')).toBeInTheDocument()
     // Flow toggle returns to the canvas.
     await user.click(screen.getByRole('button', { name: 'Flow' }))

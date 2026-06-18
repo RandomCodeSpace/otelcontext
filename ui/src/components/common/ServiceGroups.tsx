@@ -11,75 +11,93 @@ interface ServiceGroupsProps {
   /** Id of the inspected service — drives row focus-distortion. Optional so
    * the xs flow-map fallback (no inspector) renders a plain list. */
   selectedId?: string | null
+  /** Ids of services with an active anomaly. When present, a collapsible
+   * "Anomalies" group lists them worst-first — a cross-cut of "what's spiking
+   * now", distinct from the status groups (current health). */
+  anomalyServiceIds?: ReadonlySet<string>
 }
 
-function Section({
+/**
+ * A collapsible status group: a disclosure header (chevron + caps title +
+ * count) over its worst-first rows. Renders nothing when empty. Each group
+ * owns its open state so an operator can fold away groups they don't care
+ * about — at 120 services the panel stays navigable.
+ */
+function CollapsibleSection({
   title,
   nodes,
   onOpen,
   selectedId,
+  defaultOpen = true,
 }: Readonly<{
   title: string
   nodes: SystemNode[]
   onOpen: (id: string) => void
   selectedId?: string | null
+  defaultOpen?: boolean
 }>) {
+  const [open, setOpen] = useState(defaultOpen)
   if (nodes.length === 0) return null
   return (
     <section aria-label={title}>
-      <h3 className={`legend ${styles.sectionTitle}`}>{title}</h3>
-      <ul className={styles.list}>
-        {nodes.map((n) => (
-          <li key={n.id}>
-            <ServiceRow node={n} onOpen={onOpen} selectedId={selectedId} />
-          </li>
-        ))}
-      </ul>
+      <button
+        type="button"
+        className={styles.disclosure}
+        aria-expanded={open}
+        onClick={() => setOpen((o) => !o)}
+      >
+        {open ? (
+          <ChevronDown size={13} aria-hidden="true" />
+        ) : (
+          <ChevronRight size={13} aria-hidden="true" />
+        )}
+        <span className="legend">{title}</span>
+        <span className={`num ${styles.count}`}>{nodes.length}</span>
+      </button>
+      {open && (
+        <ul className={styles.list}>
+          {nodes.map((n) => (
+            <li key={n.id}>
+              <ServiceRow node={n} onOpen={onOpen} selectedId={selectedId} />
+            </li>
+          ))}
+        </ul>
+      )}
     </section>
   )
 }
 
 /**
- * Status-grouped service list, worst first; quiet healthy services collapsed
- * behind a disclosure. Hairline-separated rows (not cards). Doubles as the xs
- * default for /map.
+ * Status-grouped service list, worst first. Every group is collapsible behind a
+ * disclosure header; the quiet healthy group starts collapsed. Hairline-
+ * separated rows (not cards). Doubles as the xs default for /map.
  */
-export default function ServiceGroups({ nodes, onOpen, selectedId }: Readonly<ServiceGroupsProps>) {
+export default function ServiceGroups({
+  nodes,
+  onOpen,
+  selectedId,
+  anomalyServiceIds,
+}: Readonly<ServiceGroupsProps>) {
   const ranked = rankServices(nodes)
-  const [healthyOpen, setHealthyOpen] = useState(false)
-
+  // Worst-first list of services carrying an active anomaly.
+  const anomalous = anomalyServiceIds
+    ? [...ranked.critical, ...ranked.degraded, ...ranked.alerted, ...ranked.healthy].filter((n) =>
+        anomalyServiceIds.has(n.id),
+      )
+    : []
   return (
     <div className={styles.cards}>
-      <Section title="Critical" nodes={ranked.critical} onOpen={onOpen} selectedId={selectedId} />
-      <Section title="Degraded" nodes={ranked.degraded} onOpen={onOpen} selectedId={selectedId} />
-      <Section title="Alerts" nodes={ranked.alerted} onOpen={onOpen} selectedId={selectedId} />
-      {ranked.healthy.length > 0 && (
-        <section aria-label="Healthy">
-          <button
-            type="button"
-            className={styles.disclosure}
-            aria-expanded={healthyOpen}
-            onClick={() => setHealthyOpen((open) => !open)}
-          >
-            {healthyOpen ? (
-              <ChevronDown size={13} aria-hidden="true" />
-            ) : (
-              <ChevronRight size={13} aria-hidden="true" />
-            )}
-            <span className="num">{ranked.healthy.length}</span> healthy service
-            {ranked.healthy.length === 1 ? '' : 's'}
-          </button>
-          {healthyOpen && (
-            <ul className={styles.list}>
-              {ranked.healthy.map((n) => (
-                <li key={n.id}>
-                  <ServiceRow node={n} onOpen={onOpen} selectedId={selectedId} />
-                </li>
-              ))}
-            </ul>
-          )}
-        </section>
-      )}
+      <CollapsibleSection title="Anomalies" nodes={anomalous} onOpen={onOpen} selectedId={selectedId} />
+      <CollapsibleSection title="Critical" nodes={ranked.critical} onOpen={onOpen} selectedId={selectedId} />
+      <CollapsibleSection title="Degraded" nodes={ranked.degraded} onOpen={onOpen} selectedId={selectedId} />
+      <CollapsibleSection title="Alerts" nodes={ranked.alerted} onOpen={onOpen} selectedId={selectedId} />
+      <CollapsibleSection
+        title="Healthy"
+        nodes={ranked.healthy}
+        onOpen={onOpen}
+        selectedId={selectedId}
+        defaultOpen={false}
+      />
     </div>
   )
 }

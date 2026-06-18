@@ -115,8 +115,9 @@ export default function AnomalyStrip({ onOpenService }: Readonly<AnomalyStripPro
               onClick={() => onOpenService(service)}
               title={`${service} — ${info.severity}, ${ageLabel(now - info.latest)} ago`}
             >
+              <span className={styles.chipDot} aria-hidden="true" />
               <span className={styles.chipName}>{service}</span>
-              <span className="num">{ageLabel(now - info.latest)}</span>
+              <span className={styles.chipAge}>{ageLabel(now - info.latest)}</span>
             </button>
           ))}
           {overflow > 0 && <span className={styles.more}>+{overflow}</span>}

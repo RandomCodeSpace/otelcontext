@@ -4,7 +4,14 @@
   min-height: 0;
   border: 1px solid var(--stroke-1);
   border-radius: var(--radius-2);
-  background: var(--bg-inset);
+  /* Light blueprint grid — faint hairlines on the inset surface give the field
+   * a sense of plane + scale without competing with the nodes (token-only, so
+   * it tracks both themes + prefers-contrast). */
+  background-color: var(--bg-inset);
+  background-image:
+    linear-gradient(to right, var(--stroke-1) 1px, transparent 1px),
+    linear-gradient(to bottom, var(--stroke-1) 1px, transparent 1px);
+  background-size: 32px 32px;
   overflow: hidden;
 }
 
@@ -43,15 +50,13 @@
 }
 
 .nodeRect {
-  /* Status-tinted raised surface + a status-weighted border so a node reads as
-   * a solid chip in BOTH themes (on light, a flat white --bg-raised on the
-   * --bg-inset canvas with a --stroke-2 hairline was all but invisible).
-   * --node-color is the
-   * status hue (var(--crit)/--warn/--ok/--unknown); mixing a sliver into the
-   * fill and a strong share into the stroke keeps saturation rationed to status
-   * while making the box legible against the canvas. */
-  fill: color-mix(in srgb, var(--node-color) 12%, var(--bg-raised));
-  stroke: color-mix(in srgb, var(--node-color) 60%, var(--stroke-2));
+  /* Outline-only chip: the FULL status hue carries the border; the fill is the
+   * neutral canvas surface (no status colour). --bg-inset (not transparent) so
+   * the body is opaque — edges + the blueprint grid pass BEHIND nodes, and a
+   * see-through fill would bleed them through the label. The chip reads as just
+   * a status-coloured outline against the field. */
+  fill: var(--bg-inset);
+  stroke: var(--node-color);
   stroke-width: 1.5;
   /* Scale lifts in the rect's OWN local box (fill-box), so the selection
    * lift composes cleanly with the <g>'s inline layout translate instead of
@@ -89,17 +94,12 @@
   stroke-dasharray: 4 3;
 }
 
-/* Anomaly prominence — failing services dominate the field. A fuller --crit
- * fill + a heavier border makes a critical chip read at a glance, in both
- * themes. Only FILL + WIDTH are set (not stroke COLOR), so the accent
- * selection/focus ring still wins when a critical node is inspected. */
+/* Anomaly prominence — a critical node keeps the heavier border (width only,
+ * not a fuller fill), so the worst services read at a glance while the fill
+ * stays the same lightest tint as everything else. Stroke COLOR is left to the
+ * base rule so the accent selection/focus ring still wins when inspected. */
 .node[data-status='critical'] .nodeRect {
-  fill: color-mix(in srgb, var(--node-color) 24%, var(--bg-raised));
   stroke-width: 2;
-}
-
-.node[data-status='degraded'] .nodeRect {
-  fill: color-mix(in srgb, var(--node-color) 16%, var(--bg-raised));
 }
 
 /* The pulse beacon: a --crit halo the size of the chip that flashes then
@@ -175,9 +175,9 @@
  * dot crisp on both themes; the selection/focus/impact stroke classes (shared
  * with the chip) override it when the node is emphasized. */
 .nodeMarker {
-  fill: var(--node-color);
-  stroke: color-mix(in srgb, var(--node-color) 55%, var(--stroke-2));
-  stroke-width: 1;
+  fill: color-mix(in srgb, var(--node-color) 12%, var(--bg-raised));
+  stroke: var(--node-color);
+  stroke-width: 1.5;
   transition:
     fill var(--dur-2) var(--ease),
     stroke var(--dur-2) var(--ease);
@@ -207,9 +207,12 @@
 /* ---- edges ---- */
 .edge {
   fill: none;
-  stroke: var(--stroke-2);
+  /* Links read clearly against the field — --stroke-2 was too dark to follow
+     node-to-node; --text-3 is a legible hairline on both themes. */
+  stroke: var(--text-3);
   stroke-width: var(--edge-w, 1);
   stroke-linecap: round;
+  opacity: 0.75;
   transition: opacity var(--dur-2) var(--ease);
 }
 
@@ -277,21 +280,9 @@
   stroke-opacity: calc(1 - 0.7 * var(--ring-depth, 0));
 }
 
-/* ONE shared radial-gradient behind the pinned core. position:absolute HTML
- * sibling of the <svg>; pointer-events:none so it never eats clicks. Static
- * end-state, so reduced-motion is a no-op here. */
-.depth::before {
-  content: '';
-  position: absolute;
-  inset: 0;
-  pointer-events: none;
-  background: radial-gradient(
-    closest-side at 50% 50%,
-    var(--accent-edge) 0%,
-    transparent 70%
-  );
-  z-index: 0;
-}
+/* No gradient on the map — the premium backdrop is the flat instrument surface
+ * + the concentric ring guides. (The former radial-gradient core glow was
+ * removed per design: gradients out, graticule/rings in.) */
 
 /* Health core: numerals are the source of truth, centered on the dial. */
 .coreLabel {

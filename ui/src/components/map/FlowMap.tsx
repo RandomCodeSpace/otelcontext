@@ -105,6 +105,10 @@ const NAME_ALWAYS_MAX = 24
  *  identically whether the node draws as a dot or a chip. */
 const DOT_R = 16
 
+/** Pointer travel (px) past which a press becomes a pan rather than a tap —
+ *  below it the press falls through to a node's click (open the Inspector). */
+const DRAG_SLOP = 4
+
 /** Fit padding (px) and the small-field legibility floor for the initial fit. */
 const FIT_PADDING = 24
 const FIT_FLOOR = 0.5
@@ -114,6 +118,14 @@ const IDENTITY: Transform = { x: 0, y: 0, k: 1 }
 
 function isEdgeFailing(status: string | undefined): boolean {
   return status === 'critical' || status === 'failing'
+}
+
+/** Chars that fit the chip's name slot (mono, 168px chip). Tighter when the
+ *  err% label occupies the chip's right edge, so long names truncate with an
+ *  ellipsis instead of running under the percentage. */
+function chipName(id: string, withErr: boolean): string {
+  const max = withErr ? 10 : 16
+  return id.length > max ? `${id.slice(0, max - 1)}…` : id
 }
 
 /** Center of a node box in layout coordinates. */
@@ -191,6 +203,20 @@ export default function FlowMap({
     return mode === 'radial' ? layoutRadial(shape.ids, refs) : layoutGraph(shape.ids, refs)
   }, [shapeKey, mode])
 
+  // Galaxy-dot radius scales with a node's EDGE COUNT (degree) so busier, more
+  // connected services read as bigger dots. Degree comes from the edge set only
+  // (not metrics), so this never recomputes on a metric poll.
+  const markerRadius = useMemo(() => {
+    const deg = new Map<string, number>()
+    for (const e of edgeRefs) {
+      deg.set(e.source, (deg.get(e.source) ?? 0) + 1)
+      deg.set(e.target, (deg.get(e.target) ?? 0) + 1)
+    }
+    let max = 1
+    for (const d of deg.values()) if (d > max) max = d
+    return (id: string): number => Math.round(DOT_R * (0.55 + 0.85 * Math.sqrt((deg.get(id) ?? 0) / max)))
+  }, [edgeRefs])
+
   // ---- fit ----------------------------------------------------------------
   const fit = useCallback(() => {
     const rect = containerRef.current?.getBoundingClientRect()
@@ -228,11 +254,29 @@ export default function FlowMap({
   // ---- pointer pan + pinch -------------------------------------------------
   const pointers = useRef(new Map<number, { x: number; y: number }>())
   const pinchDist = useRef(0)
+  // Pointer capture is deferred until a real drag starts. Capturing on
+  // pointerdown retargets the pointerup/click to the <svg>, which SWALLOWS a
+  // node's native onClick (the click target becomes the capturing element) — so
+  // tapping a node would never open the Inspector. We only capture once motion
+  // crosses DRAG_SLOP, leaving a plain tap to fall through to onSelect.
+  const dragStart = useRef<{ x: number; y: number } | null>(null)
+  const panning = useRef(false)
 
   const onPointerDown = useCallback((e: React.PointerEvent<SVGSVGElement>) => {
-    e.currentTarget.setPointerCapture(e.pointerId)
     pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY })
-    if (pointers.current.size === 2) {
+    if (pointers.current.size === 1) {
+      dragStart.current = { x: e.clientX, y: e.clientY }
+      panning.current = false
+    } else if (pointers.current.size === 2) {
+      // A second finger is unambiguously a pinch gesture — capture both now.
+      for (const id of pointers.current.keys()) {
+        try {
+          e.currentTarget.setPointerCapture(id)
+        } catch {
+          /* pointer already released */
+        }
+      }
+      panning.current = true
       const [a, b] = [...pointers.current.values()]
       pinchDist.current = Math.hypot(a.x - b.x, a.y - b.y)
     }
@@ -244,6 +288,18 @@ export default function FlowMap({
     const next = { x: e.clientX, y: e.clientY }
     pointers.current.set(e.pointerId, next)
     if (pointers.current.size === 1) {
+      if (!panning.current) {
+        const s = dragStart.current
+        if (!s || Math.hypot(next.x - s.x, next.y - s.y) < DRAG_SLOP) return
+        // Crossed the slop — this is a pan, not a tap. Capture so the drag
+        // keeps tracking even if the pointer leaves the SVG.
+        panning.current = true
+        try {
+          e.currentTarget.setPointerCapture(e.pointerId)
+        } catch {
+          /* pointer already released */
+        }
+      }
       setTransform((t) => ({ ...t, x: t.x + next.x - prev.x, y: t.y + next.y - prev.y }))
       return
     }
@@ -264,6 +320,10 @@ export default function FlowMap({
   const onPointerEnd = useCallback((e: React.PointerEvent<SVGSVGElement>) => {
     pointers.current.delete(e.pointerId)
     pinchDist.current = 0
+    if (pointers.current.size === 0) {
+      panning.current = false
+      dragStart.current = null
+    }
   }, [])
 
   // ---- ambient-motion gate: pause animations when the tab is hidden --------
@@ -462,6 +522,8 @@ export default function FlowMap({
             // of overlapping chips. Both shapes share the node center, so edges
             // (which use layout coords) connect identically either way.
             const labelled = showNames || selected || focused || (neighbors?.has(n.id) ?? false)
+            // Dot size encodes edge count (degree) in the galaxy view.
+            const r = markerRadius(n.id)
             return (
               <g
                 key={n.id}
@@ -501,7 +563,7 @@ export default function FlowMap({
                       data-testid={`node-pulse-${n.id}`}
                       cx={NODE_W / 2}
                       cy={NODE_H / 2}
-                      r={DOT_R}
+                      r={r}
                       aria-hidden="true"
                     />
                   ))}
@@ -525,7 +587,7 @@ export default function FlowMap({
                     )}
                     <circle className={styles.nodeDot} cx={16} cy={NODE_H / 2} r={4} />
                     <text className={styles.nodeName} x={28} y={NODE_H / 2 + 4}>
-                      {n.id.length > 16 ? `${n.id.slice(0, 15)}…` : n.id}
+                      {chipName(n.id, showErrLabels)}
                     </text>
                     {showErrLabels && (
                       <text className={styles.nodeErr} x={NODE_W - 8} y={NODE_H / 2 + 4}>
@@ -539,7 +601,7 @@ export default function FlowMap({
                       className={`${styles.nodeMarker} ${selected ? styles.nodeSelected : ''} ${focused ? styles.nodeFocused : ''} ${depth === 0 ? styles.nodeImpactRoot : ''}`}
                       cx={NODE_W / 2}
                       cy={NODE_H / 2}
-                      r={DOT_R}
+                      r={r}
                     />
                     {depth !== undefined && depth > 0 && (
                       <circle
@@ -547,7 +609,7 @@ export default function FlowMap({
                         data-testid={`impact-tint-${n.id}`}
                         cx={NODE_W / 2}
                         cy={NODE_H / 2}
-                        r={DOT_R}
+                        r={r}
                         style={{ fillOpacity: impactAlpha(depth) }}
                       />
                     )}

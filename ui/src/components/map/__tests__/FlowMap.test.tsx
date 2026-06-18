@@ -119,6 +119,16 @@ describe('FlowMap — radial render', () => {
     expect(screen.getByText('4.2%')).toBeInTheDocument()
   })
 
+  it('truncates a long node name so it never runs under the err% label', () => {
+    renderMap({
+      nodes: [...NODES, node('inventory-service', 'critical', 0.456)],
+    })
+    // err% shows at default zoom, so the name is clipped with an ellipsis…
+    expect(screen.getByText('inventory…')).toBeInTheDocument()
+    // …and the full untruncated name is NOT rendered (would overlap "45.6%").
+    expect(screen.queryByText('inventory-service')).not.toBeInTheDocument()
+  })
+
   it('carries the ring/rank in node aria-labels (radial)', () => {
     renderMap()
     const svg = screen.getByTestId('flow-map-svg')

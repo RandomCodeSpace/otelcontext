@@ -40,20 +40,22 @@
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: var(--space-1);
+  gap: var(--space-2);
 }
 
+/* Anomaly tag — outline-only pill: the FULL status hue carries the border and
+ * there is no fill. A haloed status dot + the quiet mono recency suffix carry
+ * the rest of the read. --chip-color is set per-severity inline. */
 .chip {
   display: inline-flex;
   align-items: center;
-  gap: var(--space-2);
-  min-height: 30px;
-  padding: 0 var(--space-2);
-  border: 1px solid var(--stroke-1);
-  /* status-tinted left edge — the one place a chip carries saturation */
-  border-left: 2px solid var(--chip-color, var(--stroke-2));
-  border-radius: var(--radius-1);
-  background: var(--bg-raised);
+  gap: 7px;
+  min-height: 28px;
+  padding: 0 11px;
+  border: 1px solid var(--chip-color, var(--stroke-2));
+  /* Match the service-map node rounding (rect rx=6 = --radius-2). */
+  border-radius: var(--radius-2);
+  background: transparent;
   color: var(--text-1);
   font-size: var(--text-xs);
   cursor: pointer;
@@ -68,17 +70,33 @@
 
 @media (hover: hover) {
   .chip:hover {
+    /* Neutral hover wash for click affordance — no status colour reintroduced. */
     background: var(--bg-overlay);
   }
 }
 
-.chipName {
-  font-family: var(--font-sans);
+/* Status dot with a soft concentric halo — the severity tell. */
+.chipDot {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--chip-color, var(--text-3));
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--chip-color, var(--text-3)) 20%, transparent);
 }
 
-.chip :global(.num) {
-  color: var(--text-3);
+.chipName {
+  font-family: var(--font-sans);
+  font-weight: 500;
+  letter-spacing: -0.003em;
+}
+
+/* Recency reads as a quiet status-tinted suffix, not a boxed badge. */
+.chipAge {
+  font-family: var(--font-mono);
   font-size: var(--text-2xs);
+  font-variant-numeric: tabular-nums;
+  color: color-mix(in srgb, var(--chip-color, var(--text-3)) 50%, var(--text-3));
 }
 
 .more {

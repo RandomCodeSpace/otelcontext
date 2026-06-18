@@ -75,11 +75,9 @@ function renderApp(path: string) {
 describe('App routing', () => {
   it('mounts the Constellation home at /', async () => {
     renderApp('/')
-    // Empty graph → the home's anomaly tape + connect empty state prove the
+    // Empty graph → the home's OTLP connect empty state proves the
     // ConstellationHome lazy chunk mounted.
-    expect(
-      await screen.findByRole('region', { name: /recent anomalies/i }),
-    ).toBeInTheDocument()
+    expect(await screen.findByText(/no telemetry yet/i)).toBeInTheDocument()
   })
 
   it('redirects unknown paths to /', async () => {
@@ -134,17 +132,10 @@ describe('App routing', () => {
     ).toBeInTheDocument()
   })
 
-  it('renders the trail bar when ?trail= is present', async () => {
-    renderApp('/?trail=svc:checkout')
-    expect(
-      await screen.findByRole('navigation', { name: /investigation trail/i }),
-    ).toBeInTheDocument()
-  })
-
   it('opens the command palette on the global ⌘K shortcut', async () => {
     const user = userEvent.setup()
     renderApp('/')
-    await screen.findByRole('region', { name: /recent anomalies/i })
+    await screen.findByText(/no telemetry yet/i)
     await user.keyboard('{Meta>}k{/Meta}')
     expect(
       await screen.findByRole('dialog', { name: /command palette/i }),
@@ -154,7 +145,7 @@ describe('App routing', () => {
   it('opens the shortcut sheet on "?"', async () => {
     const user = userEvent.setup()
     renderApp('/')
-    await screen.findByRole('region', { name: /recent anomalies/i })
+    await screen.findByText(/no telemetry yet/i)
     await user.keyboard('?')
     expect(
       await screen.findByRole('dialog', { name: /keyboard shortcuts/i }),

@@ -2,7 +2,6 @@ import { lazy, Suspense, useCallback, useState } from 'react'
 import { Redirect, Route, Switch, useSearch } from 'wouter'
 import RouteFallback from './components/common/RouteFallback'
 import Shell from './components/shell/Shell'
-import TrailBar from './components/trail/TrailBar'
 import { useGlobalKeys } from './hooks/useGlobalKeys'
 import { useInvestigation } from './hooks/useInvestigation'
 import type { Theme } from './hooks/useTheme'
@@ -32,7 +31,7 @@ function MapRedirect() {
 }
 
 export default function App({ theme, onToggleTheme }: Readonly<AppProps>) {
-  const { service, trail, popToFrame, popOne } = useInvestigation()
+  const { service } = useInvestigation()
 
   const [paletteOpen, setPaletteOpen] = useState(false)
   const [shortcutsOpen, setShortcutsOpen] = useState(false)
@@ -83,7 +82,6 @@ export default function App({ theme, onToggleTheme }: Readonly<AppProps>) {
           </Suspense>
         )}
       </div>
-      <TrailBar frames={trail} onPopTo={popToFrame} onPopOne={popOne} />
       {overlaysWanted && (
         <Suspense fallback={null}>
           <PaletteHost

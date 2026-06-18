@@ -24,7 +24,8 @@
 .disclosure {
   display: flex;
   align-items: center;
-  gap: var(--space-1);
+  gap: var(--space-2);
+  width: 100%;
   min-height: 44px;
   padding: 0 var(--space-2);
   border: none;
@@ -32,6 +33,13 @@
   color: var(--text-2);
   font-size: var(--text-sm);
   cursor: pointer;
+}
+
+/* Group size — always visible in the header, open OR collapsed, pushed to the
+ * trailing edge so a folded group still reads "CRITICAL  3". */
+.count {
+  margin-left: auto;
+  color: var(--text-3);
 }
 
 @media (hover: hover) {
