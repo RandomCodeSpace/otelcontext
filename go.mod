@@ -8,7 +8,7 @@ require (
 	github.com/coder/websocket v1.8.14
 	github.com/glebarez/go-sqlite v1.22.0
 	github.com/glebarez/sqlite v1.11.0
-	github.com/jackc/pgx/v5 v5.9.2
+	github.com/jackc/pgx/v5 v5.10.0
 	github.com/joho/godotenv v1.5.1
 	github.com/klauspost/compress v1.18.6
 	github.com/microsoft/go-mssqldb v1.9.8
