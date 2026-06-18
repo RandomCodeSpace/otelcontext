@@ -26,6 +26,10 @@ var cacheableTools = map[string]struct{}{
 	"get_service_health":   {},
 	"root_cause_analysis":  {},
 	"impact_analysis":      {},
+	// A completed trace's topology is immutable, so memoizing by trace_id is
+	// safe and high-hit for repeated drill-downs; only non-error results are
+	// cached, so "trace not found" is never memoized.
+	"trace_graph": {},
 }
 
 // isCacheable reports whether a tool name is on the cache whitelist.

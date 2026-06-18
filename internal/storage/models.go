@@ -120,16 +120,20 @@ type Trace struct {
 // is retained for query-plan stability across upgrades.
 type Span struct {
 	ID             uint           `gorm:"primaryKey" json:"id"`
-	TenantID       string         `gorm:"size:64;default:'default';not null;index:idx_spans_tenant_trace,priority:1;index:idx_spans_tenant_service_start,priority:1;uniqueIndex:idx_spans_tenant_trace_span,priority:1" json:"tenant_id"`
+	TenantID       string         `gorm:"size:64;default:'default';not null;index:idx_spans_tenant_trace,priority:1;index:idx_spans_tenant_service_start,priority:1;index:idx_spans_tenant_status_start,priority:1;uniqueIndex:idx_spans_tenant_trace_span,priority:1" json:"tenant_id"`
 	TraceID        string         `gorm:"size:32;not null;index:idx_spans_tenant_trace,priority:2;uniqueIndex:idx_spans_tenant_trace_span,priority:2" json:"trace_id"`
 	SpanID         string         `gorm:"size:16;not null;uniqueIndex:idx_spans_tenant_trace_span,priority:3" json:"span_id"`
 	ParentSpanID   string         `gorm:"size:16" json:"parent_span_id"`
 	OperationName  string         `gorm:"size:255;index" json:"operation_name"`
-	StartTime      time.Time      `gorm:"index:idx_spans_tenant_service_start,priority:3" json:"start_time"`
+	StartTime      time.Time      `gorm:"index:idx_spans_tenant_service_start,priority:3;index:idx_spans_tenant_status_start,priority:3" json:"start_time"`
 	EndTime        time.Time      `json:"end_time"`
 	Duration       int64          `json:"duration"`                                                                     // Microseconds
 	ServiceName    string         `gorm:"size:255;index:idx_spans_tenant_service_start,priority:2" json:"service_name"` // Originating service
-	Status         string         `gorm:"size:50;default:'STATUS_CODE_UNSET';index" json:"status"`                      // OTLP status code (e.g. STATUS_CODE_ERROR); drives GraphRAG error signal
+	// Status drives the GraphRAG error signal. The composite (tenant_id, status,
+	// start_time) backs per-tenant error scans (status='STATUS_CODE_ERROR' over a
+	// time window) far better than a bare low-cardinality status index, which no
+	// query used for an indexed equality scan.
+	Status string `gorm:"size:50;default:'STATUS_CODE_UNSET';index:idx_spans_tenant_status_start,priority:2" json:"status"` // OTLP status code (e.g. STATUS_CODE_ERROR)
 	AttributesJSON CompressedText `json:"attributes_json"`                                                              // Compressed JSON string
 }
 

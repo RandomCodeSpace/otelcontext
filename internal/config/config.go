@@ -185,11 +185,12 @@ type Config struct {
 	IngestPipelineWorkers  int // default 8 worker goroutines
 	// IngestPipelinePerTenantCap caps in-flight batches per tenant so a noisy
 	// tenant cannot starve siblings of fresh queue slots when fullness is
-	// below the soft-backpressure threshold. 0 (default) disables — single-
-	// tenant deployments need no cap. Operators on multi-tenant deployments
-	// should set INGEST_PIPELINE_PER_TENANT_CAP to roughly Capacity/N where
-	// N is the expected number of concurrently-active tenants, with some
-	// headroom (e.g. 2× the fair-share value) for short bursts.
+	// below the soft-backpressure threshold. When unset it defaults to ~30% of
+	// the resolved queue size (see Load) so multi-tenant deployments are
+	// protected out of the box; an explicit INGEST_PIPELINE_PER_TENANT_CAP=0
+	// disables the cap for single-tenant deployments. Operators can instead
+	// pin it to roughly Capacity/N where N is the expected number of
+	// concurrently-active tenants, with headroom for short bursts.
 	IngestPipelinePerTenantCap int
 
 	// TLS (HTTP + gRPC). When both paths are set, TLS is enabled on both servers.
@@ -377,6 +378,16 @@ func Load(customPath string) (*Config, error) {
 		AllowSqliteProd: parseTruthy(getEnv("OTELCONTEXT_ALLOW_SQLITE_PROD", "")),
 	}
 	applyDriverDefaults(cfg)
+
+	// Derive a sane per-tenant ingest cap when the operator did not set one.
+	// Run AFTER applyDriverDefaults so it tracks the (possibly SQLite-adjusted)
+	// queue size: ~30% of the queue lets a single tenant burst but stops one
+	// noisy tenant from monopolising every slot at 100–200 services. An explicit
+	// INGEST_PIPELINE_PER_TENANT_CAP=0 is respected as "disabled".
+	if _, set := os.LookupEnv("INGEST_PIPELINE_PER_TENANT_CAP"); !set && cfg.IngestPipelinePerTenantCap == 0 {
+		cfg.IngestPipelinePerTenantCap = cfg.IngestPipelineQueueSize * 30 / 100
+	}
+
 	return cfg, nil
 }
 

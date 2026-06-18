@@ -61,6 +61,61 @@
   }
 }
 
+/* Service search — translucent chrome pinned to the canvas top-left (mirrors
+   the .fit button's corner treatment) so the graticule reads through. Filters
+   the map's highlight; does not refetch. */
+.searchBar {
+  position: absolute;
+  top: var(--space-2);
+  left: var(--space-2);
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  max-width: min(60%, 320px);
+  padding: 0 var(--space-2);
+  height: 32px;
+  border: 1px solid var(--stroke-1);
+  border-radius: var(--radius-2);
+  background: color-mix(in srgb, var(--bg-raised) 70%, transparent);
+  color: var(--text-2);
+}
+.searchIcon {
+  flex: none;
+  color: var(--text-3);
+}
+.searchInput {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  background: transparent;
+  color: var(--text-1);
+  font-size: var(--text-sm);
+  outline: none;
+}
+.searchInput::placeholder {
+  color: var(--text-3);
+}
+.searchClear {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border: none;
+  border-radius: var(--radius-1);
+  background: transparent;
+  color: var(--text-2);
+  cursor: pointer;
+}
+.searchCount {
+  flex: none;
+  font-size: var(--text-xs);
+  color: var(--text-3);
+  white-space: nowrap;
+}
+
 /* ---- the worst-first side rail (md+) ---- */
 .sideRail {
   display: flex;

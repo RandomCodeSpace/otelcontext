@@ -28,7 +28,7 @@ func newTestRepo(t *testing.T) *storage.Repository {
 // newTestGraphRAG constructs a GraphRAG usable in tests without a repo or
 // vectordb. The event workers are started so ingestion callbacks process
 // events asynchronously; tests must call Stop() via t.Cleanup.
-func newTestGraphRAG(t *testing.T) *GraphRAG {
+func newTestGraphRAG(t testing.TB) *GraphRAG {
 	t.Helper()
 	g := New(nil, nil, nil, DefaultConfig())
 	// Start only the event workers — the background refresh/snapshot/anomaly

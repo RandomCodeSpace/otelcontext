@@ -1,6 +1,6 @@
-import { useCallback, useMemo, useRef } from 'react'
+import { useCallback, useDeferredValue, useMemo, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { Maximize2, X } from 'lucide-react'
+import { Maximize2, Search, X } from 'lucide-react'
 import { useLocation, useSearch } from 'wouter'
 import FlowMap, { type FlowMapHandle } from '@/components/map/FlowMap'
 import ConnectInline from '@/components/shell/ConnectInline'
@@ -65,6 +65,22 @@ export default function ConstellationHome() {
 
   const nodes = useMemo(() => graph?.nodes ?? [], [graph])
   const edges = useMemo(() => graph?.edges ?? [], [graph])
+
+  // Client-side service search over the already-loaded graph (no API call).
+  // useDeferredValue keeps typing responsive — the match recompute + map
+  // re-emphasis run at a lower priority than the keystroke. Matches drive the
+  // map's `searchMatches` highlight; null when the box is empty (no highlight).
+  const [query, setQuery] = useState('')
+  const deferredQuery = useDeferredValue(query)
+  const searchMatches = useMemo(() => {
+    const q = deferredQuery.trim().toLowerCase()
+    if (!q) return null
+    const out = new Set<string>()
+    for (const n of nodes) {
+      if (n.id.toLowerCase().includes(q)) out.add(n.id)
+    }
+    return out
+  }, [deferredQuery, nodes])
 
   // Services with an active anomaly — feeds the side panel's "Anomalies" group.
   // Reads the shared ['anomaly-timeline'] cache (no extra fetch of its own).
@@ -162,12 +178,39 @@ export default function ConstellationHome() {
       <div className={styles.stage}>
         {showCanvas ? (
           <div className={styles.canvas}>
+            <div className={styles.searchBar}>
+              <Search size={14} aria-hidden="true" className={styles.searchIcon} />
+              <input
+                type="search"
+                className={styles.searchInput}
+                placeholder="Find a service…"
+                aria-label="Find a service on the map"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+              />
+              {query && (
+                <button
+                  type="button"
+                  className={styles.searchClear}
+                  aria-label="Clear service search"
+                  onClick={() => setQuery('')}
+                >
+                  <X size={13} aria-hidden="true" />
+                </button>
+              )}
+              {searchMatches && (
+                <span className={styles.searchCount} role="status">
+                  {searchMatches.size === 0 ? 'No match' : `${searchMatches.size} match${searchMatches.size === 1 ? '' : 'es'}`}
+                </span>
+              )}
+            </div>
             <FlowMap
               ref={mapRef}
               nodes={nodes}
               edges={edges}
               selectedId={service}
               impact={impactDepths}
+              searchMatches={searchMatches}
               dim={service !== null}
               ringDepth
               centerLabel={false}

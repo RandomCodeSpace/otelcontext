@@ -156,12 +156,18 @@ func NewDatabase(driver, dsn string) (*gorm.DB, error) {
 			log.Printf("📊 SQLite Optimization: MaxOpen=1, WAL Mode=Enabled")
 		default:
 			maxOpen := getEnvPoolInt("DB_MAX_OPEN_CONNS", 50)
-			maxIdle := getEnvPoolInt("DB_MAX_IDLE_CONNS", 10)
+			// Default idle pool raised 10→25: under 100–200 services the concurrent
+			// readers (MCP semaphore up to 32) + ingest workers + retention +
+			// partition scheduler churn far more than 10 idle conns, forcing constant
+			// reconnects. 25 keeps a warm pool roughly half of MaxOpen.
+			maxIdle := getEnvPoolInt("DB_MAX_IDLE_CONNS", 25)
 			lifetime := getEnvPoolDuration("DB_CONN_MAX_LIFETIME", time.Hour)
+			idleTime := getEnvPoolDuration("DB_CONN_MAX_IDLE_TIME", 10*time.Minute)
 			sqlDB.SetMaxOpenConns(maxOpen)
 			sqlDB.SetMaxIdleConns(maxIdle)
 			sqlDB.SetConnMaxLifetime(lifetime)
-			log.Printf("📊 DB Pool Configured: MaxOpen=%d, MaxIdle=%d, Driver=%s", maxOpen, maxIdle, driver) // #nosec G706 -- log.Printf with controlled config ints and enum driver
+			sqlDB.SetConnMaxIdleTime(idleTime)
+			log.Printf("📊 DB Pool Configured: MaxOpen=%d, MaxIdle=%d, MaxIdleTime=%s, Driver=%s", maxOpen, maxIdle, idleTime, driver) // #nosec G706 -- log.Printf with controlled config ints and enum driver
 
 			// Entra override: Azure AD tokens are ~60-90 min TTL. Cap pooled-conn
 			// lifetime below that window so we never present a stale token on
@@ -442,6 +448,21 @@ func AutoMigrateModelsWithOptions(db *gorm.DB, driver string, opts MigrateOption
 			}
 			if bodyErr == nil && svcErr == nil {
 				log.Println("🔎 Postgres: pg_trgm extension verified; GIN indexes ready on logs.body and logs.service_name")
+			}
+		}
+
+		// BRIN indexes on the time columns that drive the by-age retention DELETE.
+		// spans/traces are append-mostly and physically time-ordered, so BRIN is a
+		// tiny (kilobytes) index that lets the planner range-prune the 7-day purge
+		// without the write/space cost of a B-tree. Best-effort: a failure here
+		// only means retention falls back to a fuller scan, so we log and continue.
+		brinIndexes := []struct{ name, ddl string }{
+			{"idx_spans_start_time_brin", "CREATE INDEX IF NOT EXISTS idx_spans_start_time_brin ON spans USING BRIN (start_time)"},
+			{"idx_traces_timestamp_brin", "CREATE INDEX IF NOT EXISTS idx_traces_timestamp_brin ON traces USING BRIN (timestamp)"},
+		}
+		for _, idx := range brinIndexes {
+			if err := db.Exec(idx.ddl).Error; err != nil {
+				log.Printf("⚠️  index creation failed: %s: %v", idx.name, err)
 			}
 		}
 	}

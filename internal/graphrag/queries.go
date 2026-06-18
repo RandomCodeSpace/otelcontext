@@ -383,23 +383,74 @@ func (g *GraphRAG) ServiceMap(ctx context.Context, depth int) []ServiceMapEntry 
 	result := make([]ServiceMapEntry, 0, len(services))
 
 	for _, svc := range services {
-		entry := ServiceMapEntry{
-			Service:  svc,
-			CallsTo:  stores.service.CallEdgesFrom(svc.Name),
-			CalledBy: stores.service.CallEdgesTo(svc.Name),
-		}
-
-		// Get operations for this service
-		stores.service.mu.RLock()
-		for _, op := range stores.service.Operations {
-			if op.Service == svc.Name {
-				entry.Operations = append(entry.Operations, op)
-			}
-		}
-		stores.service.mu.RUnlock()
-
-		result = append(result, entry)
+		result = append(result, g.serviceMapEntry(stores, svc))
 	}
 
+	return result
+}
+
+// serviceMapEntry builds the topology entry for one service via the adjacency
+// indexes (O(deg + ops_of_svc), not a full-store scan).
+func (g *GraphRAG) serviceMapEntry(stores *tenantStores, svc *ServiceNode) ServiceMapEntry {
+	return ServiceMapEntry{
+		Service:    svc,
+		CallsTo:    stores.service.CallEdgesFrom(svc.Name),
+		CalledBy:   stores.service.CallEdgesTo(svc.Name),
+		Operations: stores.service.OperationsForService(svc.Name),
+	}
+}
+
+// ServiceMapAround returns the subgraph reachable from seed within depth hops in
+// either direction (downstream via CALLS-from, upstream via CALLS-to). It bounds
+// both the compute and the payload for focused "map around service X" queries at
+// 100–200 services; callers wanting the full map use ServiceMap. depth<=0 falls
+// back to a single hop so a focus query always returns the seed + neighbours.
+func (g *GraphRAG) ServiceMapAround(ctx context.Context, seed string, depth int) []ServiceMapEntry {
+	if depth <= 0 {
+		depth = 1
+	}
+	stores := g.storesFor(ctx)
+	if _, ok := stores.service.GetService(seed); !ok {
+		return nil
+	}
+
+	visited := map[string]bool{seed: true}
+	type queueItem struct {
+		svc   string
+		depth int
+	}
+	queue := []queueItem{{seed, 0}}
+	order := []string{seed}
+
+	for len(queue) > 0 {
+		item := queue[0]
+		queue = queue[1:]
+		if item.depth >= depth {
+			continue
+		}
+		neighbours := stores.service.CallEdgesFrom(item.svc)
+		neighbours = append(neighbours, stores.service.CallEdgesTo(item.svc)...)
+		for _, e := range neighbours {
+			next := e.ToID
+			if e.FromID != item.svc {
+				next = e.FromID
+			}
+			if visited[next] {
+				continue
+			}
+			visited[next] = true
+			order = append(order, next)
+			queue = append(queue, queueItem{next, item.depth + 1})
+		}
+	}
+
+	result := make([]ServiceMapEntry, 0, len(order))
+	for _, name := range order {
+		svc, ok := stores.service.GetService(name)
+		if !ok {
+			continue
+		}
+		result = append(result, g.serviceMapEntry(stores, svc))
+	}
 	return result
 }
