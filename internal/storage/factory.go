@@ -167,7 +167,11 @@ func NewDatabase(driver, dsn string) (*gorm.DB, error) {
 			sqlDB.SetMaxIdleConns(maxIdle)
 			sqlDB.SetConnMaxLifetime(lifetime)
 			sqlDB.SetConnMaxIdleTime(idleTime)
-			log.Printf("📊 DB Pool Configured: MaxOpen=%d, MaxIdle=%d, MaxIdleTime=%s, Driver=%s", maxOpen, maxIdle, idleTime, driver) // #nosec G706 -- log.Printf with controlled config ints and enum driver
+			// driver is operator-set config (DB_DRIVER); strip CR/LF before logging so a
+			// malformed value can't forge log lines (CWE-117 / go/log-injection). The
+			// counts and duration are non-injectable.
+			safeDriver := strings.NewReplacer("\r", "", "\n", "").Replace(driver)
+			log.Printf("📊 DB Pool Configured: MaxOpen=%d, MaxIdle=%d, MaxIdleTime=%s, Driver=%s", maxOpen, maxIdle, idleTime, safeDriver)
 
 			// Entra override: Azure AD tokens are ~60-90 min TTL. Cap pooled-conn
 			// lifetime below that window so we never present a stale token on
