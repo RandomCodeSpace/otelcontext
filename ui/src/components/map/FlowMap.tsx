@@ -373,13 +373,16 @@ function FlowMapInner({
   // match its stroke, so flow direction is legible statically — at any zoom and
   // under reduced motion. Failing edges keep the `edgeFailing` class hook.
   const rfEdges: Edge[] = useMemo(() => {
-    const focusing = selectedId !== null || impact != null
+    const focusing = selectedId !== null || impact != null || searchMatches != null
     return edges.map((e) => {
       const failing = isEdgeFailing(e.status)
       const key = `${e.source}->${e.target}`
-      const active = impact
-        ? impact.has(e.source) && impact.has(e.target)
-        : selectedId !== null && (e.source === selectedId || e.target === selectedId)
+      // Precedence mirrors the node emphasis ladder: a blast-radius cone wins,
+      // then an active search (edges incident to a match), then selection.
+      let active: boolean
+      if (impact) active = impact.has(e.source) && impact.has(e.target)
+      else if (searchMatches) active = searchMatches.has(e.source) || searchMatches.has(e.target)
+      else active = selectedId !== null && (e.source === selectedId || e.target === selectedId)
       const dimmed = focusing && !active
       const stroke = failing ? 'var(--crit)' : active ? 'var(--accent)' : 'var(--text-3)'
       const width = active
@@ -400,7 +403,7 @@ function FlowMapInner({
         } as CSSProperties,
       }
     })
-  }, [edges, selectedId, impact])
+  }, [edges, selectedId, impact, searchMatches])
 
   const onNodeClick = useCallback((_: unknown, n: Node) => onSelect(n.id), [onSelect])
 
