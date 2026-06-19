@@ -74,6 +74,13 @@ interface FlowMapProps {
   impact?: ReadonlyMap<string, number> | null
   onSelect: (id: string) => void
   onClearSelection: () => void
+  /**
+   * Active search highlight. When non-null the matched services are accented
+   * (and always labelled), their 1-hop neighbours emphasised, and the rest of
+   * the field dims — reusing the same emphasis machinery as selection. null
+   * means no active search. In non-impact mode an active search owns emphasis.
+   */
+  searchMatches?: ReadonlySet<string> | null
   /** Reserved (palette filter). No-op in the React Flow map. */
   onFocusFilter?: () => void
   /** Reserved overlay slots — kept for API stability, unused here. */
@@ -91,6 +98,9 @@ interface ServiceNodeData {
   node: SystemNode
   emphasis: Emphasis
   impactDepth: number | null
+  /** Phyllotaxis band (0 = disc centre = most critical); drives label priority
+   *  at dot zoom so the most important services stay labelled when zoomed out. */
+  labelBand: number
   [key: string]: unknown
 }
 type ServiceNode = Node<ServiceNodeData, 'service'>
@@ -101,13 +111,36 @@ const FIT_OPTIONS = { padding: 0.18 } as const
 // services fitView lands well under this, so the dense view is dots, not a wall
 // of overlapping 168px boxes; zooming in past it restores the labelled chips.
 const LOD_ZOOM = 0.62
+// Below this zoom only emphasized dots (selected/neighbour/search-match/cone)
+// carry a label; between here and LOD_ZOOM the per-band label budget grows so
+// the most-critical services label first and the field reveals progressively as
+// you zoom in — avoiding a wall of overlapping labels at the densest view.
+const LABEL_ZOOM_MIN = 0.22
+const LABEL_MAX_BAND = 16
+
+/** Shorten a service id to its last dotted/slashed segment, capped — keeps dot
+ *  labels legible without a wall of text. The full id stays in the tooltip. */
+function shortName(id: string): string {
+  const seg = id.split(/[./]/).filter(Boolean).pop() ?? id
+  return seg.length > 14 ? seg.slice(0, 13) + '…' : seg
+}
+
+/** Whether a dot should show its label at the given zoom: emphasized nodes
+ *  always do; the rest only once the zoom-scaled band budget reaches them. */
+function dotLabelVisible(zoom: number, emphasized: boolean, band: number): boolean {
+  if (emphasized) return true
+  if (zoom <= LABEL_ZOOM_MIN) return false
+  const t = (zoom - LABEL_ZOOM_MIN) / (LOD_ZOOM - LABEL_ZOOM_MIN)
+  return band <= Math.round(t * LABEL_MAX_BAND)
+}
 
 /** The token-themed status chip, with a level-of-detail dot variant when zoomed
  *  out. Handles are invisible border anchors (React Flow needs them; the routed
  *  edge draws its own path). */
 function ServiceMapNode({ data }: NodeProps<ServiceNode>) {
-  const compact = useStore((s) => s.transform[2] < LOD_ZOOM)
-  const { node, emphasis, impactDepth } = data
+  const zoom = useStore((s) => s.transform[2])
+  const compact = zoom < LOD_ZOOM
+  const { node, emphasis, impactDepth, labelBand } = data
   const status = nodeStatus(node.status)
   const styleVar = { '--node-color': statusToken(status), width: NODE_W, height: NODE_H } as CSSProperties
   const handles = (
@@ -117,6 +150,8 @@ function ServiceMapNode({ data }: NodeProps<ServiceNode>) {
     </>
   )
   if (compact) {
+    const emphasized =
+      emphasis === 'selected' || emphasis === 'neighbor' || impactDepth !== null
     const cls = [
       styles.dotNode,
       emphasis === 'dim' && styles.dimmed,
@@ -126,8 +161,11 @@ function ServiceMapNode({ data }: NodeProps<ServiceNode>) {
       .filter(Boolean)
       .join(' ')
     return (
-      <div className={cls} style={styleVar} title={node.id}>
+      <div className={cls} style={styleVar} title={node.id} aria-label={node.id}>
         {handles}
+        {dotLabelVisible(zoom, emphasized, labelBand) && (
+          <span className={styles.dotLabel} aria-hidden="true">{shortName(node.id)}</span>
+        )}
       </div>
     )
   }
@@ -221,12 +259,13 @@ function FlowMapInner({
   edges,
   selectedId,
   impact,
+  searchMatches,
   dim,
   onSelect,
   onClearSelection,
   ref,
 }: Readonly<
-  Pick<FlowMapProps, 'nodes' | 'edges' | 'selectedId' | 'impact' | 'dim' | 'onSelect' | 'onClearSelection' | 'ref'>
+  Pick<FlowMapProps, 'nodes' | 'edges' | 'selectedId' | 'impact' | 'searchMatches' | 'dim' | 'onSelect' | 'onClearSelection' | 'ref'>
 >) {
   const { fitView } = useReactFlow()
   useImperativeHandle(ref, () => ({ fit: () => { fitView(FIT_OPTIONS) } }), [fitView])
@@ -257,14 +296,28 @@ function FlowMapInner({
     () => (selectedId ? neighborsOf(edgeRefs, selectedId) : null),
     [edgeRefs, selectedId],
   )
+  // 1-hop neighbours of ALL search matches, so a search highlights matched
+  // services together with what they talk to.
+  const searchNeighbors = useMemo(() => {
+    if (!searchMatches || searchMatches.size === 0) return null
+    const out = new Set<string>()
+    for (const id of searchMatches) {
+      for (const nb of neighborsOf(edgeRefs, id)) out.add(nb)
+    }
+    return out
+  }, [edgeRefs, searchMatches])
 
   const desired: ServiceNode[] = useMemo(() => {
     return nodes.map((n) => {
       const p = layout.nodes.get(n.id)
       const depth = impact?.get(n.id)
       let emphasis: Emphasis = 'normal'
+      // Precedence: a blast-radius cone (impact) wins; otherwise an active search
+      // owns emphasis; otherwise the normal selection/neighbour/dim ladder.
       if (impact) emphasis = depth === undefined ? 'dim' : 'normal'
-      else if (selectedId === n.id) emphasis = 'selected'
+      else if (searchMatches) {
+        emphasis = searchMatches.has(n.id) ? 'selected' : searchNeighbors?.has(n.id) ? 'neighbor' : 'dim'
+      } else if (selectedId === n.id) emphasis = 'selected'
       else if (neighbors?.has(n.id)) emphasis = 'neighbor'
       else if (dimField) emphasis = 'dim'
       return {
@@ -273,12 +326,12 @@ function FlowMapInner({
         position: { x: p?.x ?? 0, y: p?.y ?? 0 },
         width: NODE_W,
         height: NODE_H,
-        data: { node: n, emphasis, impactDepth: depth ?? null },
+        data: { node: n, emphasis, impactDepth: depth ?? null, labelBand: p?.layer ?? 0 },
         connectable: false,
         focusable: true,
       }
     })
-  }, [nodes, layout, selectedId, neighbors, impact, dimField])
+  }, [nodes, layout, selectedId, neighbors, impact, searchMatches, searchNeighbors, dimField])
 
   // React Flow owns node state; we reconcile `desired` into it. Re-seed
   // positions when a FRESH layout lands (worker result or topology change) or on
@@ -320,13 +373,16 @@ function FlowMapInner({
   // match its stroke, so flow direction is legible statically — at any zoom and
   // under reduced motion. Failing edges keep the `edgeFailing` class hook.
   const rfEdges: Edge[] = useMemo(() => {
-    const focusing = selectedId !== null || impact != null
+    const focusing = selectedId !== null || impact != null || searchMatches != null
     return edges.map((e) => {
       const failing = isEdgeFailing(e.status)
       const key = `${e.source}->${e.target}`
-      const active = impact
-        ? impact.has(e.source) && impact.has(e.target)
-        : selectedId !== null && (e.source === selectedId || e.target === selectedId)
+      // Precedence mirrors the node emphasis ladder: a blast-radius cone wins,
+      // then an active search (edges incident to a match), then selection.
+      let active: boolean
+      if (impact) active = impact.has(e.source) && impact.has(e.target)
+      else if (searchMatches) active = searchMatches.has(e.source) || searchMatches.has(e.target)
+      else active = selectedId !== null && (e.source === selectedId || e.target === selectedId)
       const dimmed = focusing && !active
       const stroke = failing ? 'var(--crit)' : active ? 'var(--accent)' : 'var(--text-3)'
       const width = active
@@ -347,7 +403,7 @@ function FlowMapInner({
         } as CSSProperties,
       }
     })
-  }, [edges, selectedId, impact])
+  }, [edges, selectedId, impact, searchMatches])
 
   const onNodeClick = useCallback((_: unknown, n: Node) => onSelect(n.id), [onSelect])
 
@@ -395,6 +451,7 @@ export default function FlowMap({
   edges,
   selectedId,
   impact,
+  searchMatches,
   dim,
   onSelect,
   onClearSelection,
@@ -413,6 +470,7 @@ export default function FlowMap({
           edges={edges}
           selectedId={selectedId}
           impact={impact}
+          searchMatches={searchMatches}
           dim={dim}
           onSelect={onSelect}
           onClearSelection={onClearSelection}

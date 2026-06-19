@@ -398,7 +398,6 @@ func (r *Repository) PurgeTracesBatched(ctx context.Context, olderThan time.Time
 	if batchSize <= 0 {
 		batchSize = 10_000
 	}
-	driver := strings.ToLower(r.driver)
 
 	// Delete traces older than cutoff, then sweep any spans whose trace_id is no longer
 	// present. Correlating via trace existence alone races with concurrent ingest:
@@ -407,20 +406,13 @@ func (r *Repository) PurgeTracesBatched(ctx context.Context, olderThan time.Time
 	// Constrain the sweep to old spans (start_time < cutoff) so fresh in-flight spans
 	// are never candidates. Clock-skewed historical spans under a still-present trace
 	// are still protected by the trace-existence subquery.
-	deleteOrphanSpansSQL := "DELETE FROM spans WHERE start_time < ? AND trace_id NOT IN (SELECT trace_id FROM traces)"
-
-	if driver == "sqlite" || driver == "" {
-		// Unscoped() forces a hard DELETE so the orphan-span sweep below sees a
-		// consistent traces table. Retention must reclaim disk, not soft-delete.
-		result := r.db.WithContext(ctx).Unscoped().Where("timestamp < ?", olderThan).Delete(&Trace{})
-		if result.Error != nil {
-			return result.RowsAffected, result.Error
-		}
-		if err := r.db.WithContext(ctx).Exec(deleteOrphanSpansSQL, olderThan).Error; err != nil {
-			return result.RowsAffected, fmt.Errorf("sweep orphan spans: %w", err)
-		}
-		return result.RowsAffected, nil
-	}
+	//
+	// Both the trace purge and the orphan-span sweep run in bounded LIMIT batches
+	// with a yield between batches for EVERY driver — including SQLite. The raw-SQL
+	// DELETEs are hard deletes (they bypass GORM soft-delete), so the orphan sweep
+	// still sees a consistent traces table. SQLite previously ran these two DELETEs
+	// UNBATCHED, holding the single writer lock for the whole multi-GB purge and
+	// stalling ingest into a 429 storm; batching releases the lock between chunks.
 
 	var total int64
 	for {

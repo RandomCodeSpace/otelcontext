@@ -64,13 +64,25 @@ type ServiceStore struct {
 	Services   map[string]*ServiceNode   // key: service name
 	Operations map[string]*OperationNode // key: service|operation
 	Edges      map[string]*Edge          // key: type|from|to
+	// Adjacency indexes over the CALLS edges and operations, maintained at the
+	// upsert sites so ServiceMap/ImpactAnalysis don't rescan the whole Edges map
+	// per service (O(N·E)→O(N+E)). Safe as plain slices because ServiceStore
+	// CALLS edges and operations are append-only at runtime — the only
+	// .Edges deletions live in TraceStore/SignalStore/AnomalyStore, and the
+	// store is never replaced or cleared after newServiceStore().
+	edgesByFrom  map[string][]*Edge          // CALLS edges keyed by FromID
+	edgesByTo    map[string][]*Edge          // CALLS edges keyed by ToID
+	opsByService map[string][]*OperationNode // operations keyed by service
 }
 
 func newServiceStore() *ServiceStore {
 	return &ServiceStore{
-		Services:   make(map[string]*ServiceNode),
-		Operations: make(map[string]*OperationNode),
-		Edges:      make(map[string]*Edge),
+		Services:     make(map[string]*ServiceNode),
+		Operations:   make(map[string]*OperationNode),
+		Edges:        make(map[string]*Edge),
+		edgesByFrom:  make(map[string][]*Edge),
+		edgesByTo:    make(map[string][]*Edge),
+		opsByService: make(map[string][]*OperationNode),
 	}
 }
 
@@ -179,6 +191,7 @@ func (s *ServiceStore) UpsertOperation(service, operation string, durationMs flo
 			LastSeen:  ts,
 		}
 		s.Operations[key] = op
+		s.opsByService[service] = append(s.opsByService[service], op)
 	}
 	op.CallCount++
 	op.TotalMs += durationMs
@@ -217,6 +230,8 @@ func (s *ServiceStore) UpsertCallEdge(source, target string, durationMs float64,
 			ToID:   target,
 		}
 		s.Edges[ek] = e
+		s.edgesByFrom[source] = append(s.edgesByFrom[source], e)
+		s.edgesByTo[target] = append(s.edgesByTo[target], e)
 	}
 	e.CallCount++
 	e.TotalMs += durationMs
@@ -270,12 +285,15 @@ func (s *ServiceStore) EnsureCallEdge(source, target string, ts time.Time) bool 
 	if _, ok := s.Edges[ek]; ok {
 		return false
 	}
-	s.Edges[ek] = &Edge{
+	e := &Edge{
 		Type:      EdgeCalls,
 		FromID:    source,
 		ToID:      target,
 		UpdatedAt: ts,
 	}
+	s.Edges[ek] = e
+	s.edgesByFrom[source] = append(s.edgesByFrom[source], e)
+	s.edgesByTo[target] = append(s.edgesByTo[target], e)
 	return true
 }
 
@@ -309,24 +327,38 @@ func (s *ServiceStore) AllEdges() []*Edge {
 func (s *ServiceStore) CallEdgesFrom(service string) []*Edge {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	var out []*Edge
-	for _, e := range s.Edges {
-		if e.Type == EdgeCalls && e.FromID == service {
-			out = append(out, e)
-		}
+	src := s.edgesByFrom[service]
+	if len(src) == 0 {
+		return nil
 	}
+	out := make([]*Edge, len(src))
+	copy(out, src)
 	return out
 }
 
 func (s *ServiceStore) CallEdgesTo(service string) []*Edge {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	var out []*Edge
-	for _, e := range s.Edges {
-		if e.Type == EdgeCalls && e.ToID == service {
-			out = append(out, e)
-		}
+	src := s.edgesByTo[service]
+	if len(src) == 0 {
+		return nil
 	}
+	out := make([]*Edge, len(src))
+	copy(out, src)
+	return out
+}
+
+// OperationsForService returns the operations exposed by a service via the
+// per-service index, avoiding a full Operations-map scan per service.
+func (s *ServiceStore) OperationsForService(service string) []*OperationNode {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	src := s.opsByService[service]
+	if len(src) == 0 {
+		return nil
+	}
+	out := make([]*OperationNode, len(src))
+	copy(out, src)
 	return out
 }
 

@@ -153,7 +153,7 @@ func (s *Server) toolGetServiceHealth(ctx context.Context, args map[string]any) 
 	}
 	for _, entry := range s.graphRAG.ServiceMap(mcpCtx(ctx), 0) {
 		if entry.Service != nil && entry.Service.Name == svcName {
-			data, err := json.MarshalIndent(entry, "", "  ")
+			data, err := json.Marshal(entry)
 			if err != nil {
 				return errorResult(fmt.Sprintf("failed to marshal service health: %v", err))
 			}
@@ -242,7 +242,7 @@ func (s *Server) toolSearchLogs(ctx context.Context, args map[string]any) ToolCa
 		"count":   len(logs),
 		"entries": toLogSummaries(logs),
 	}
-	data, err := json.MarshalIndent(result, "", "  ")
+	data, err := json.Marshal(result)
 	if err != nil {
 		return errorResult(fmt.Sprintf("failed to marshal search results: %v", err))
 	}
@@ -256,8 +256,16 @@ func (s *Server) toolGetServiceMap(ctx context.Context, args map[string]any) Too
 		return errorResult(errGraphRAGNotInit)
 	}
 	depth := argInt(args, "depth", 3)
-	result := s.graphRAG.ServiceMap(mcpCtx(ctx), depth)
-	data, err := json.MarshalIndent(result, "", "  ")
+	// When a focus service is supplied, return only the subgraph reachable within
+	// `depth` hops (bounds compute + payload at 100–200 services). With no focus,
+	// return the full topology so existing clients are unaffected.
+	var result []graphrag.ServiceMapEntry
+	if svc, _ := args["service"].(string); svc != "" {
+		result = s.graphRAG.ServiceMapAround(mcpCtx(ctx), svc, depth)
+	} else {
+		result = s.graphRAG.ServiceMap(mcpCtx(ctx), depth)
+	}
+	data, err := json.Marshal(result)
 	if err != nil {
 		return errorResult(fmt.Sprintf("failed to marshal service map: %v", err))
 	}
@@ -279,13 +287,13 @@ func (s *Server) toolTraceGraph(ctx context.Context, args map[string]any) ToolCa
 		if err != nil {
 			return errorResult(fmt.Sprintf("trace not found: %v", err))
 		}
-		data, err := json.MarshalIndent(trace, "", "  ")
+		data, err := json.Marshal(trace)
 		if err != nil {
 			return errorResult(fmt.Sprintf("failed to marshal trace: %v", err))
 		}
 		return resourceResult(resourceURIPrefix+"traces/"+traceID, httpconst.ContentTypeJSON, string(data))
 	}
-	data, err := json.MarshalIndent(spans, "", "  ")
+	data, err := json.Marshal(spans)
 	if err != nil {
 		return errorResult(fmt.Sprintf("failed to marshal trace graph: %v", err))
 	}
@@ -302,7 +310,7 @@ func (s *Server) toolImpactAnalysis(ctx context.Context, args map[string]any) To
 	}
 	depth := argInt(args, "depth", 5)
 	result := s.graphRAG.ImpactAnalysis(mcpCtx(ctx), svcName, depth)
-	data, err := json.MarshalIndent(result, "", "  ")
+	data, err := json.Marshal(result)
 	if err != nil {
 		return errorResult(fmt.Sprintf("failed to marshal impact analysis: %v", err))
 	}
@@ -321,7 +329,7 @@ func (s *Server) toolRootCauseAnalysis(ctx context.Context, args map[string]any)
 	parseTimeRange(args, "time_range", &since)
 
 	causes := s.graphRAG.RootCauseAnalysis(mcpCtx(ctx), svcName, since)
-	data, err := json.MarshalIndent(causes, "", "  ")
+	data, err := json.Marshal(causes)
 	if err != nil {
 		return errorResult(fmt.Sprintf("failed to marshal root cause analysis: %v", err))
 	}
@@ -342,7 +350,7 @@ func (s *Server) toolGetAnomalyTimeline(ctx context.Context, args map[string]any
 	} else {
 		anomalies = s.graphRAG.AnomalyTimeline(mcpCtx(ctx), since)
 	}
-	data, err := json.MarshalIndent(anomalies, "", "  ")
+	data, err := json.Marshal(anomalies)
 	if err != nil {
 		return errorResult(fmt.Sprintf("failed to marshal anomaly timeline: %v", err))
 	}
