@@ -83,6 +83,11 @@ jobs:
           npm ci
           npm run build
           test -f ../internal/ui/dist/index.html
+          # vite's emptyOutDir wipes internal/ui/dist on rebuild, deleting the
+          # committed .gitkeep placeholder that script-cut release tags carry.
+          # Restore it so the working tree matches the tag and GoReleaser's
+          # dirty-state check passes (no-op for tags that don't track .gitkeep).
+          git -C "$GITHUB_WORKSPACE" checkout -- internal/ui/dist/.gitkeep 2>/dev/null || true
 
       - name: Install cosign
         # sigstore/cosign-installer v3.9.2 — provides `cosign` for the keyless
