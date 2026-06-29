@@ -47,13 +47,13 @@ jobs:
     steps:
       - name: Harden runner egress
         # step-security/harden-runner v2.19.0
-        uses: step-security/harden-runner@8d3c67de8e2fe68ef647c8db1e6a09f647780f40
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411
         with:
           egress-policy: audit
 
       - name: Checkout tag
         # actions/checkout v4.2.2
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
           # On workflow_dispatch, build the supplied existing tag; on a tag
           # push, the pushed ref. Full history so goreleaser version detection
@@ -92,7 +92,7 @@ jobs:
       - name: Install cosign
         # sigstore/cosign-installer v3.9.2 — provides `cosign` for the keyless
         # signing step in .goreleaser.yaml (signs: cmd: cosign).
-        uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
 
       - name: Install syft
         # anchore/sbom-action v0.24.0 (download-syft sub-action) — puts `syft`
@@ -103,7 +103,7 @@ jobs:
 
       - name: Run GoReleaser
         # goreleaser/goreleaser-action v6.2.1
-        uses: goreleaser/goreleaser-action@90a3faa9d0182683851fbfa97ca1a2cb983bfca3
+        uses: goreleaser/goreleaser-action@5daf1e915a5f0af01ddbcd89a43b8061ff4f1a89
         with:
           version: '~> v2'
           args: release --clean
