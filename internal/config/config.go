@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -291,6 +292,12 @@ type Config struct {
 	// AggregateMaxProducerBaselinesPerSeries. Nonzero overrides.
 	// Use ResolvedAggregateMaxBaselines() to get the final value.
 	AggregateMaxBaselines int
+
+	// AggregateMetricDims is the parsed AGGREGATE_METRIC_DIMS config:
+	// map of metric name -> sorted list of OTLP attribute keys.
+	// Empty map when AGGREGATE_METRIC_DIMS is unset/empty.
+	// Populated during Load() by parsing and validating the env var.
+	AggregateMetricDims map[string][]string
 }
 
 func Load(customPath string) (*Config, error) {
@@ -434,6 +441,13 @@ func Load(customPath string) (*Config, error) {
 		AggregateMaxProducerBaselinesPerSeries: getEnvInt("AGGREGATE_MAX_PRODUCER_BASELINES_PER_SERIES", 8),
 		AggregateMaxBaselines:                  getEnvInt("AGGREGATE_MAX_BASELINES", 0),
 	}
+
+	// Parse AGGREGATE_METRIC_DIMS config
+	metricDims, err := ParseAggregateMetricDims(getEnv("AGGREGATE_METRIC_DIMS", ""))
+	if err != nil {
+		return nil, fmt.Errorf("parsing AGGREGATE_METRIC_DIMS: %w", err)
+	}
+	cfg.AggregateMetricDims = metricDims
 	applyDriverDefaults(cfg)
 
 	// Derive a sane per-tenant ingest cap when the operator did not set one.
@@ -808,4 +822,71 @@ func (c *Config) ResolvedAggregateMaxBaselines() int {
 		return c.AggregateMaxBaselines
 	}
 	return c.AggregateMaxSeriesMetrics * c.AggregateMaxProducerBaselinesPerSeries
+}
+
+// ParseAggregateMetricDims parses the AGGREGATE_METRIC_DIMS config string.
+// Format: "metric_name:key1,key2;metric_name2:key3,key4"
+// Returns a map of metric name -> sorted list of dimension keys.
+// Fails on malformed input (fail-closed): empty metric name, empty key list,
+// duplicate metric, duplicate key within a metric, stray separators.
+// Empty/unset var is valid (returns empty map).
+func ParseAggregateMetricDims(s string) (map[string][]string, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return make(map[string][]string), nil
+	}
+
+	result := make(map[string][]string)
+
+	// Split by semicolon to get metric:keys pairs
+	metricPairs := strings.Split(s, ";")
+	for _, pair := range metricPairs {
+		pair = strings.TrimSpace(pair)
+		if pair == "" {
+			return nil, fmt.Errorf("empty metric pair (stray semicolon)")
+		}
+
+		// Split by colon to get metric name and keys
+		parts := strings.Split(pair, ":")
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("%q must have exactly one colon (format: metric_name:key1,key2)", pair)
+		}
+
+		metricName := strings.TrimSpace(parts[0])
+		keysStr := strings.TrimSpace(parts[1])
+
+		if metricName == "" {
+			return nil, fmt.Errorf("empty metric name in %q", pair)
+		}
+		if keysStr == "" {
+			return nil, fmt.Errorf("empty key list for metric %q", metricName)
+		}
+
+		if _, ok := result[metricName]; ok {
+			return nil, fmt.Errorf("duplicate metric name %q", metricName)
+		}
+
+		// Split keys by comma
+		rawKeys := strings.Split(keysStr, ",")
+		seenKeys := make(map[string]bool)
+		var keys []string
+
+		for _, rawKey := range rawKeys {
+			key := strings.TrimSpace(rawKey)
+			if key == "" {
+				return nil, fmt.Errorf("empty key in metric %q", metricName)
+			}
+			if seenKeys[key] {
+				return nil, fmt.Errorf("duplicate key %q in metric %q", key, metricName)
+			}
+			seenKeys[key] = true
+			keys = append(keys, key)
+		}
+
+		// Sort keys for canonical ordering
+		sort.Strings(keys)
+		result[metricName] = keys
+	}
+
+	return result, nil
 }
