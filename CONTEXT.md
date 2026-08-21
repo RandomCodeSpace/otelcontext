@@ -41,6 +41,21 @@ A UTC-aligned five-minute tumbling interval. Finalized windows are immutable; mu
 **Exemplar**:
 A bounded raw sample (trace, span, or log) retained for diagnostics alongside an aggregate bucket. Eligibility is universal for errors; persistence is always capped.
 
+**Delta**:
+The compact aggregate contribution of one Export request to one series and window, produced by request-local reduction. Deltas are what gets committed; buckets are what finalization builds from them.
+
+**Group-commit writer**:
+The single component that batches deltas from many Export requests into one durable SQLite transaction and then applies them to the in-memory shards. The only shard mutator.
+
+**Delta log**:
+The append-only table of committed deltas for mutable windows. Replayed on restart; consumed and deleted atomically by finalization.
+
+**Finalization**:
+The transactional step that materializes a window's bucket rows from its delta-log entries and deletes those entries. After finalization a window is immutable and never re-enters memory.
+
+**Arrival time**:
+The single timestamp captured per Export request, used to evaluate lateness and future-skew for every point in that request.
+
 ### Signals
 
 **Log template**:
