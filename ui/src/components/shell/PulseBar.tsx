@@ -9,6 +9,7 @@ import LiveDot from './LiveDot'
 import ConnectPopover from './ConnectPopover'
 import { UptimeOdometer } from './UptimeOdometer'
 import styles from './PulseBar.module.css'
+import AccuracyLabel from "@/components/data-honesty/AccuracyLabel"
 
 // Operator honesty about the SQLite growth incident: tint the DB segment
 // as a warning once the database crosses this size.
@@ -110,7 +111,7 @@ export default function PulseBar({
                   </span>
                   <Sep />
                   <span className={styles.reading}>
-                    p99 {formatMs(dashboard.p99_latency_ms)}
+                    p99 <AccuracyLabel value={formatMs(dashboard.p99_latency_ms)} accuracy={dashboard.accuracy} />
                   </span>
                 </>
               )}

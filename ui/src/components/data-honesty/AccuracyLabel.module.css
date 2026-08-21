@@ -5,21 +5,13 @@
 }
 
 .bound {
-  font-size: 0.875rem;
   opacity: 0.75;
-  font-weight: 500;
 }
 
 .degradedIndicator {
   display: inline-block;
-  color: var(--tone-warn-fg);
-  font-weight: 700;
 }
 
 .degraded {
   opacity: 0.85;
-}
-
-.degraded .bound {
-  color: var(--tone-warn-fg);
 }
