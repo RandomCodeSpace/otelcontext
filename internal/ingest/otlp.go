@@ -11,6 +11,7 @@ import (
 
 	"runtime"
 
+	"github.com/RandomCodeSpace/otelcontext/internal/aggregate"
 	"github.com/RandomCodeSpace/otelcontext/internal/config"
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 	"github.com/RandomCodeSpace/otelcontext/internal/telemetry"
@@ -110,7 +111,12 @@ type TraceServer struct {
 	// sampler's keep/drop decision so cross-service call topology survives
 	// sampling (see graphrag.GraphRAG.ObserveSpanTopology). Args:
 	// tenant, traceID, spanID, parentSpanID, service. nil = disabled.
-	topologyObserver    func(tenant, traceID, spanID, parentSpanID, service string)
+	topologyObserver func(tenant, traceID, spanID, parentSpanID, service string)
+	// aggregateEngine, when set (AGGREGATE_MODE != legacy), runs request-local
+	// aggregate reduction BEFORE the sampler so aggregate counts describe
+	// accepted telemetry rather than the sampling rate (#153 §8). nil leaves
+	// the legacy path untouched.
+	aggregateEngine     *aggregate.Engine
 	minSeverity         int
 	allowedServices     map[string]bool
 	excludedServices    map[string]bool
@@ -123,9 +129,12 @@ type TraceServer struct {
 }
 
 type LogsServer struct {
-	repo                *storage.Repository
-	metrics             *telemetry.Metrics
-	logCallback         func(storage.Log)
+	repo        *storage.Repository
+	metrics     *telemetry.Metrics
+	logCallback func(storage.Log)
+	// aggregateEngine — see TraceServer.aggregateEngine. Reduction runs before
+	// the severity gate.
+	aggregateEngine     *aggregate.Engine
 	minSeverity         int
 	allowedServices     map[string]bool
 	excludedServices    map[string]bool
@@ -136,10 +145,12 @@ type LogsServer struct {
 }
 
 type MetricsServer struct {
-	repo                *storage.Repository
-	metrics             *telemetry.Metrics
-	aggregator          *tsdb.Aggregator
-	metricCallback      func(tsdb.RawMetric)
+	repo           *storage.Repository
+	metrics        *telemetry.Metrics
+	aggregator     *tsdb.Aggregator
+	metricCallback func(tsdb.RawMetric)
+	// aggregateEngine — see TraceServer.aggregateEngine.
+	aggregateEngine     *aggregate.Engine
 	allowedServices     map[string]bool
 	excludedServices    map[string]bool
 	defaultTenant       string
@@ -197,6 +208,23 @@ func (s *LogsServer) SetPipeline(p *Pipeline) {
 	s.pipeline = p
 }
 
+// SetAggregateEngine enables aggregate accounting on this server. The reducer
+// runs inside Export() ahead of the sampler and severity gates; passing nil
+// (the AGGREGATE_MODE=legacy case) leaves the export path unchanged.
+func (s *TraceServer) SetAggregateEngine(e *aggregate.Engine) {
+	s.aggregateEngine = e
+}
+
+// SetAggregateEngine — see TraceServer.SetAggregateEngine.
+func (s *LogsServer) SetAggregateEngine(e *aggregate.Engine) {
+	s.aggregateEngine = e
+}
+
+// SetAggregateEngine — see TraceServer.SetAggregateEngine.
+func (s *MetricsServer) SetAggregateEngine(e *aggregate.Engine) {
+	s.aggregateEngine = e
+}
+
 func NewLogsServer(repo *storage.Repository, metrics *telemetry.Metrics, cfg *config.Config) *LogsServer {
 	return &LogsServer{
 		repo:                repo,
@@ -235,6 +263,16 @@ func (s *MetricsServer) SetMetricCallback(cb func(tsdb.RawMetric)) {
 func (s *MetricsServer) Export(ctx context.Context, req *colmetricspb.ExportMetricsServiceRequest) (*colmetricspb.ExportMetricsServiceResponse, error) {
 	start := time.Now()
 	defer func() { s.metrics.ObserveIngestDuration("metrics", time.Since(start)) }()
+
+	// Aggregate accounting. One reducer, one arrival time for the whole
+	// request (#160): lateness must not depend on a point's position in the
+	// batch. nil engine = AGGREGATE_MODE=legacy = nothing below runs.
+	var reducer *aggregate.Reducer
+	if s.aggregateEngine != nil {
+		reducer = s.aggregateEngine.NewReducer(start)
+		defer func() { s.aggregateEngine.ApplyReducer(reducer) }()
+	}
+
 	for _, resourceMetrics := range req.ResourceMetrics {
 		serviceName := getServiceName(resourceMetrics.Resource.Attributes)
 
@@ -243,6 +281,11 @@ func (s *MetricsServer) Export(ctx context.Context, req *colmetricspb.ExportMetr
 		}
 
 		tenantID := resolveTenant(ctx, resourceMetrics.Resource.Attributes, s.defaultTenant, s.trustResourceTenant)
+
+		var producerIdentity aggregate.ResourceIdentity
+		if reducer != nil {
+			producerIdentity = aggregateResourceIdentity(resourceMetrics.Resource.Attributes)
+		}
 
 		for _, scopeMetrics := range resourceMetrics.ScopeMetrics {
 			for _, m := range scopeMetrics.Metrics {
@@ -281,6 +324,22 @@ func (s *MetricsServer) Export(ctx context.Context, req *colmetricspb.ExportMetr
 						raw.Attributes[kv.Key] = kv.Value.String()
 					}
 
+					// 0. Aggregate accounting, ahead of every other consumer.
+					if reducer != nil {
+						temporality, monotonic := aggregateTemporality(m)
+						reducer.ReduceMetricPoint(aggregate.MetricInput{
+							Tenant:      tenantID,
+							Service:     serviceName,
+							Name:        m.Name,
+							Value:       val,
+							Timestamp:   raw.Timestamp,
+							StartTime:   time.Unix(0, int64(p.StartTimeUnixNano)), // #nosec G115 -- OTLP time in nanos: uint64 source fits int64 until year 2262
+							Temporality: temporality,
+							Monotonic:   monotonic,
+							Resource:    producerIdentity,
+						})
+					}
+
 					// 1. Process via TSDB Aggregator (for storage)
 					if s.aggregator != nil {
 						s.aggregator.Ingest(raw)
@@ -315,6 +374,10 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 		logs    []storage.Log
 		hasErr  bool // any span in this slice had STATUS_CODE_ERROR
 		hasSlow bool // any span exceeded latencyThresholdMs
+		// reducer holds this resource batch's aggregate deltas. Reduction is
+		// request-local and lock-free, so each goroutine owns its own reducer
+		// and they are merged once below.
+		reducer *aggregate.Reducer
 	}
 
 	results := make([]batchResult, len(req.ResourceSpans))
@@ -340,6 +403,13 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 			// exactly one Trace row per trace instead of one per span.
 			traceIdx := make(map[string]int)
 			var localHasErr, localHasSlow bool
+
+			// Aggregate accounting. One arrival time for the whole Export
+			// request (#160), captured above as `start`.
+			var reducer *aggregate.Reducer
+			if s.aggregateEngine != nil {
+				reducer = s.aggregateEngine.NewReducer(start)
+			}
 
 			for _, scopeSpans := range resourceSpans.ScopeSpans {
 				for _, span := range scopeSpans.Spans {
@@ -374,6 +444,14 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 							parentSpanIDHex,
 							serviceName,
 						)
+					}
+
+					// Aggregate reduction runs BEFORE the sampler. Aggregate
+					// counts must describe accepted telemetry, not the
+					// sampling rate (#153 §8) — that invariant is the entire
+					// reason the engine sits at this point in the path.
+					if reducer != nil {
+						reducer.ReduceSpan(aggregateSpanInput(tenantID, serviceName, span, startTime, endTime))
 					}
 
 					if s.sampler != nil {
@@ -506,6 +584,7 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 				logs:    localLogs,
 				hasErr:  localHasErr,
 				hasSlow: localHasSlow,
+				reducer: reducer,
 			}
 
 			return nil
@@ -519,6 +598,7 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 	var tracesToUpsert []storage.Trace
 	var synthesizedLogs []storage.Log
 	var batchHasErr, batchHasSlow bool
+	var merged *aggregate.Reducer
 	for _, r := range results {
 		spansToInsert = append(spansToInsert, r.spans...)
 		tracesToUpsert = append(tracesToUpsert, r.traces...)
@@ -529,6 +609,21 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 		if r.hasSlow {
 			batchHasSlow = true
 		}
+		if r.reducer == nil {
+			continue
+		}
+		if merged == nil {
+			merged = r.reducer
+			continue
+		}
+		merged.MergeFrom(r.reducer)
+	}
+
+	// Apply the request's aggregate deltas before the persist decision: the
+	// aggregate path has already accepted this telemetry, and a downstream
+	// queue rejection must not retroactively unaccount it.
+	if merged != nil {
+		s.aggregateEngine.ApplyReducer(merged)
 	}
 
 	// Intake metrics fire before the persist decision so operators see
@@ -611,6 +706,9 @@ func (s *LogsServer) Export(ctx context.Context, req *collogspb.ExportLogsServic
 	// slog.Debug("📥 [LOGS] Received Request", "resource_logs", len(req.ResourceLogs))
 
 	logResults := make([][]storage.Log, len(req.ResourceLogs))
+	// One reducer per resource batch (reduction is request-local and not
+	// concurrency-safe); merged into one after the group finishes.
+	reducers := make([]*aggregate.Reducer, len(req.ResourceLogs))
 
 	g, _ := errgroup.WithContext(ctx)
 
@@ -627,6 +725,12 @@ func (s *LogsServer) Export(ctx context.Context, req *collogspb.ExportLogsServic
 
 			localLogs := make([]storage.Log, 0)
 
+			var reducer *aggregate.Reducer
+			if s.aggregateEngine != nil {
+				reducer = s.aggregateEngine.NewReducer(start)
+				reducers[idx] = reducer
+			}
+
 			for _, scopeLogs := range resourceLogs.ScopeLogs {
 				for _, l := range scopeLogs.LogRecords {
 					severity := l.SeverityText
@@ -634,13 +738,27 @@ func (s *LogsServer) Export(ctx context.Context, req *collogspb.ExportLogsServic
 						severity = l.SeverityNumber.String()
 					}
 
-					if !shouldIngestSeverity(severity, s.minSeverity) {
-						continue
-					}
-
 					timestamp := time.Unix(0, int64(l.TimeUnixNano)) // #nosec G115 -- OTLP time in nanos: uint64 source fits int64 until year 2262
 					if timestamp.Unix() == 0 {
 						timestamp = time.Now()
+					}
+
+					// Aggregate reduction runs BEFORE the severity gate: a
+					// DEBUG log that never reaches the DB is still accepted
+					// telemetry and must be accounted (#153 §8).
+					if reducer != nil {
+						reducer.ReduceLog(aggregate.LogInput{
+							Tenant:         tenantID,
+							Service:        serviceName,
+							Severity:       severity,
+							SeverityNumber: int32(l.SeverityNumber),
+							Body:           l.Body.GetStringValue(),
+							Timestamp:      timestamp,
+						})
+					}
+
+					if !shouldIngestSeverity(severity, s.minSeverity) {
+						continue
 					}
 
 					bodyStr := l.Body.GetStringValue()
@@ -672,6 +790,24 @@ func (s *LogsServer) Export(ctx context.Context, req *collogspb.ExportLogsServic
 	var logsToInsert []storage.Log
 	for _, lr := range logResults {
 		logsToInsert = append(logsToInsert, lr...)
+	}
+
+	// Apply the request's aggregate deltas. This happens before the early
+	// return below: a request whose every record was filtered out still
+	// carries aggregate accounting.
+	var mergedReducer *aggregate.Reducer
+	for _, r := range reducers {
+		if r == nil {
+			continue
+		}
+		if mergedReducer == nil {
+			mergedReducer = r
+			continue
+		}
+		mergedReducer.MergeFrom(r)
+	}
+	if mergedReducer != nil {
+		s.aggregateEngine.ApplyReducer(mergedReducer)
 	}
 
 	if len(logsToInsert) == 0 {

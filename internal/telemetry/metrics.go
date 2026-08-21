@@ -152,6 +152,36 @@ type Metrics struct {
 	// --- Dashboard p99 (Task 10) ---
 	DashboardP99RowCapHitsTotal prometheus.Counter
 
+	// --- Aggregate engine (AGGREGATE_MODE != legacy) ---
+	// AggregateInputPointsTotal — points offered to the request-local reducer
+	// per signal, counted BEFORE the sampler and severity gates. This is
+	// accepted telemetry, not persisted telemetry.
+	AggregateInputPointsTotal *prometheus.CounterVec
+	// AggregateDeltasTotal — series deltas emitted by reduction. The gap
+	// between this and input points is the whole value of the engine.
+	AggregateDeltasTotal *prometheus.CounterVec
+	// AggregateReductionRatio — input points per emitted delta, per Export
+	// request. A ratio collapsing toward 1 means cardinality is exploding.
+	AggregateReductionRatio *prometheus.HistogramVec
+	// AggregateLatePointsTotal — points excluded from aggregates because they
+	// fell outside the mutable-window horizon. reason="late" (older than the
+	// allowed lateness) or reason="future" (beyond the tolerated skew).
+	AggregateLatePointsTotal *prometheus.CounterVec
+	// AggregateSeriesActive — series present in at least one mutable window,
+	// per signal. This is what the AGGREGATE_MAX_SERIES* caps bound.
+	AggregateSeriesActive *prometheus.GaugeVec
+	// AggregateOverflowTotal — admissions rerouted to an __other__ series,
+	// labeled by the cap that triggered it (tenant|service_names|
+	// service_series|signal|global). Totals are preserved; identity is not.
+	AggregateOverflowTotal *prometheus.CounterVec
+	// AggregateShadowAcceptedTotal — telemetry accounted on the aggregate
+	// side per signal. In shadow mode this is compared against the legacy
+	// path's accepted counts; it must not move with the sampling rate.
+	AggregateShadowAcceptedTotal *prometheus.CounterVec
+	// AggregateShadowErrorsTotal — errors accounted on the aggregate side per
+	// service. Cheap invariant only (#165): no per-series comparison.
+	AggregateShadowErrorsTotal *prometheus.CounterVec
+
 	// Atomic counters for JSON health endpoint (avoids scraping Prometheus)
 	totalIngested  atomic.Int64
 	activeConns    atomic.Int64
@@ -424,6 +454,39 @@ func New() *Metrics {
 		Name: "otelcontext_dashboard_p99_row_cap_hits_total",
 		Help: "Number of dashboard p99 computations that hit the SQLite row cap (200k). Indicates the dataset is too large for in-memory p99 — use Postgres for prod.",
 	})
+	m.AggregateInputPointsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "otelcontext_aggregate_input_points_total",
+		Help: "Points offered to the aggregate reducer, per signal, counted before sampling and severity gates.",
+	}, []string{"signal"})
+	m.AggregateDeltasTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "otelcontext_aggregate_deltas_total",
+		Help: "Series deltas emitted by aggregate reduction, per signal.",
+	}, []string{"signal"})
+	m.AggregateReductionRatio = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "otelcontext_aggregate_reduction_ratio",
+		Help:    "Input points per emitted delta, per Export request. Falling toward 1 means cardinality is exploding.",
+		Buckets: []float64{1, 2, 5, 10, 25, 50, 100, 250, 500, 1000},
+	}, []string{"signal"})
+	m.AggregateLatePointsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "otelcontext_aggregate_late_points_total",
+		Help: "Points excluded from aggregates for falling outside the mutable-window horizon. reason=late|future.",
+	}, []string{"signal", "reason"})
+	m.AggregateSeriesActive = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "otelcontext_aggregate_series_active",
+		Help: "Series present in at least one mutable window, per signal. Bounded by the AGGREGATE_MAX_SERIES* caps.",
+	}, []string{"signal"})
+	m.AggregateOverflowTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "otelcontext_aggregate_overflow_total",
+		Help: "Admissions rerouted to an __other__ series, by the cap that triggered it. Totals are preserved; identity detail is not.",
+	}, []string{"signal", "reason"})
+	m.AggregateShadowAcceptedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "otelcontext_aggregate_shadow_accepted_total",
+		Help: "Telemetry accounted on the aggregate side, per signal. Must not move with SAMPLING_RATE.",
+	}, []string{"signal"})
+	m.AggregateShadowErrorsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "otelcontext_aggregate_shadow_errors_total",
+		Help: "Errors accounted on the aggregate side, per service. Cheap shadow-mode invariant only.",
+	}, []string{"service"})
 	return m
 }
 

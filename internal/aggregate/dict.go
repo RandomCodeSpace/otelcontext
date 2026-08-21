@@ -204,6 +204,13 @@ func (c *Cache) register(scope dictScope, value []byte) uint32 {
 	return id
 }
 
+// OtherID returns the pre-created overflow ID for (tenantID, kind). Cardinality
+// overflow routing needs it directly, not just as a miss fallback: an overflow
+// series carries the __other__ entry as its NameID.
+func (c *Cache) OtherID(tenantID uint32, kind Kind) uint32 {
+	return c.reg.OtherID(tenantID, kind)
+}
+
 // Len returns the number of cached entries across every scope. Diagnostic only.
 func (c *Cache) Len() int {
 	c.mu.RLock()
