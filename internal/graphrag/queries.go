@@ -2,6 +2,7 @@ package graphrag
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"sort"
 	"time"
@@ -31,7 +32,7 @@ func (g *GraphRAG) ErrorChain(ctx context.Context, service string, since time.Ti
 		}
 		seen[span.TraceID] = true
 
-		chain := traceErrorChainUpstream(stores, span)
+		chain, rooted := traceErrorChainUpstream(stores, span)
 		if len(chain) == 0 {
 			continue
 		}
@@ -46,6 +47,7 @@ func (g *GraphRAG) ErrorChain(ctx context.Context, service string, since time.Ti
 			},
 			SpanChain: chain,
 			TraceID:   span.TraceID,
+			Coverage:  chainCoverage(rooted, len(chain)),
 		}
 
 		// Gather correlated logs
@@ -68,8 +70,12 @@ func (g *GraphRAG) ErrorChain(ctx context.Context, service string, since time.Ti
 
 // traceErrorChainUpstream walks CHILD_OF edges upstream from an error span to
 // the root within a single tenant's TraceStore.
-func traceErrorChainUpstream(stores *tenantStores, span *SpanNode) []SpanNode {
-	var chain []SpanNode
+//
+// rooted reports whether the walk actually reached a span with no parent. A
+// walk that stopped because the parent span was never retained produces a
+// chain whose last element is NOT the root cause, and the caller must present
+// it as partial coverage rather than as an answer (#163).
+func traceErrorChainUpstream(stores *tenantStores, span *SpanNode) (chain []SpanNode, rooted bool) {
 	visited := make(map[string]bool)
 	current := span
 
@@ -78,16 +84,79 @@ func traceErrorChainUpstream(stores *tenantStores, span *SpanNode) []SpanNode {
 		chain = append(chain, *current)
 
 		if current.ParentSpanID == "" {
-			break
+			return chain, true
 		}
 		parent, ok := stores.traces.GetSpan(current.ParentSpanID)
 		if !ok {
-			break
+			return chain, false
 		}
 		current = parent
 	}
 
-	return chain
+	return chain, false
+}
+
+// chainCoverage renders the quality contract for one upstream walk.
+func chainCoverage(rooted bool, spans int) Coverage {
+	if rooted {
+		return Coverage{Complete: true, RetainedSpans: spans, Source: CoverageRetained}
+	}
+	return Coverage{
+		Complete:      false,
+		Truncated:     true,
+		RetainedSpans: spans,
+		Source:        CoveragePartial,
+		Note:          "upstream walk stopped at a span that was not retained; the last element is not proven to be the root",
+	}
+}
+
+// TraceGraph returns the retained span tree for a trace together with an
+// explicit statement of what it covers.
+//
+// The tree is assembled solely from retained exemplars. A trace nobody retained
+// returns CoverageNone and an empty span list — "not retained or not found" is
+// the honest answer, and it is a successful response, not an error.
+func (g *GraphRAG) TraceGraph(ctx context.Context, traceID string) TraceGraphResult {
+	spans := g.DependencyChain(ctx, traceID)
+	res := TraceGraphResult{TraceID: traceID, Spans: spans}
+	if len(spans) == 0 {
+		res.Coverage = Coverage{
+			Source: CoverageNone,
+			Note:   "no retained exemplar for this trace in the in-memory window",
+		}
+		return res
+	}
+
+	ids := make(map[string]struct{}, len(spans))
+	for _, s := range spans {
+		ids[s.ID] = struct{}{}
+	}
+	dangling, roots := 0, 0
+	for _, s := range spans {
+		if s.ParentSpanID == "" {
+			roots++
+			continue
+		}
+		if _, ok := ids[s.ParentSpanID]; !ok {
+			dangling++
+		}
+	}
+	res.Coverage = Coverage{
+		Complete:      roots > 0 && dangling == 0,
+		Truncated:     dangling > 0,
+		RetainedSpans: len(spans),
+		Source:        CoverageRetained,
+	}
+	if !res.Coverage.Complete {
+		res.Coverage.Source = CoveragePartial
+		res.Coverage.Note = fmt.Sprintf(
+			"%d span(s) reference a parent that was not retained; the tree is incomplete", dangling,
+		)
+		if roots == 0 && dangling == 0 {
+			res.Coverage.Note = "no root span was retained; the tree is incomplete"
+		}
+	}
+	return res
 }
 
 // ImpactAnalysis performs BFS downstream from a service to find affected services.
@@ -169,6 +238,11 @@ func (g *GraphRAG) RootCauseAnalysis(ctx context.Context, service string, since 
 		rc.Evidence = append(rc.Evidence, "error chain from trace "+ec.TraceID)
 		if len(ec.SpanChain) > 0 {
 			rc.ErrorChain = ec.SpanChain
+			// The ranking is only as good as the weakest chain behind it: one
+			// partial chain makes the whole cause partial.
+			if rc.Coverage.Source == "" || !ec.Coverage.Complete {
+				rc.Coverage = ec.Coverage
+			}
 		}
 	}
 
@@ -189,6 +263,10 @@ func (g *GraphRAG) RootCauseAnalysis(ctx context.Context, service string, since 
 				Score:     2.0,
 				Anomalies: []AnomalyNode{*a},
 				Evidence:  []string{"anomaly: " + a.Evidence},
+				Coverage: Coverage{
+					Source: CoverageNone,
+					Note:   "ranked from aggregate anomaly evidence only; no retained exemplar chain backs this cause",
+				},
 			}
 		}
 	}

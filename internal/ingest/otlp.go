@@ -476,7 +476,17 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 					// sampling rate (#153 §8) — that invariant is the entire
 					// reason the engine sits at this point in the path.
 					if reducer != nil {
-						reducer.ReduceSpan(aggregateSpanInput(tenantID, serviceName, span, startTime, endTime))
+						spanIn := aggregateSpanInput(tenantID, serviceName, span, startTime, endTime)
+						reducer.ReduceSpan(spanIn)
+						// Recover this call's caller from its parent span and
+						// emit the caller->callee edge series. #183 shipped
+						// SignalServiceEdge but emitted nothing into it; the
+						// caller join was explicitly deferred to #174.
+						if caller, ok := s.aggregateEngine.EdgeResolver().Observe(
+							tenantID, spanIDHex, parentSpanIDHex, serviceName,
+						); ok {
+							reducer.ReduceEdge(aggregateEdgeInput(caller, spanIn))
+						}
 					}
 
 					// Raw-retention gate. Exactly one policy governs this per

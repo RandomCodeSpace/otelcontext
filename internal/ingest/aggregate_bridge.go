@@ -96,6 +96,26 @@ func aggregateSpanInput(tenantID, serviceName string, span *tracepb.Span, start,
 	return in
 }
 
+// aggregateEdgeInput derives the service-edge reducer input from a resolved
+// caller and the callee's own span input. Everything except the caller comes
+// from the callee: an edge measures the callee's work as observed by this call.
+func aggregateEdgeInput(caller string, in aggregate.SpanInput) aggregate.EdgeInput {
+	return aggregate.EdgeInput{
+		Tenant:         in.Tenant,
+		Caller:         caller,
+		Callee:         in.Service,
+		HTTPRoute:      in.HTTPRoute,
+		URLPath:        in.URLPath,
+		SpanName:       in.SpanName,
+		Method:         in.Method,
+		HTTPStatusCode: in.HTTPStatusCode,
+		SpanKind:       in.SpanKind,
+		StatusCode:     in.StatusCode,
+		Timestamp:      in.Timestamp,
+		DurationMicros: in.DurationMicros,
+	}
+}
+
 // aggregateResourceIdentity extracts the stable resource identity used to
 // derive a metric producer's ProducerID (#166). Only the first-present value
 // per slot is taken: attributes that vary per export would fragment baselines.
