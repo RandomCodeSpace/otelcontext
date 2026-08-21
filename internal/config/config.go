@@ -316,6 +316,13 @@ type Config struct {
 	// Group-commit cadence (#160): the first waiter opens a coalescing
 	// window of AggregateCommitCoalesceMs, and the commit fires early once
 	// the batch reaches the delta-count or byte target.
+	//
+	// The default is 25 ms, not #160's provisional 5 ms. Measured on the
+	// wave-5 2-vCPU acceptance run at 10k pts/s: 5 ms held the writer at a
+	// 37.8% duty cycle for a 286 ms ACK p99, while 25 ms measured 109 ms p99
+	// and still absorbed the 2x burst. Wider batches amortise the fixed cost
+	// of a WAL commit over more deltas, which is the opposite of what the
+	// latency arithmetic suggests until you notice the writer is the queue.
 	AggregateCommitCoalesceMs int
 	AggregateCommitMaxDeltas  int
 	AggregateCommitMaxBytes   int
@@ -504,7 +511,7 @@ func Load(customPath string) (*Config, error) {
 		AggregateDBPath:                 strings.TrimSpace(getEnv("AGGREGATE_DB_PATH", "./data/aggregate.db")),
 		AggregateAllowRebuild:           parseTruthy(getEnv("AGGREGATE_ALLOW_REBUILD", "")),
 		AggregateSynchronous:            strings.ToUpper(strings.TrimSpace(getEnv("AGGREGATE_SYNCHRONOUS", "NORMAL"))),
-		AggregateCommitCoalesceMs:       getEnvInt("AGGREGATE_COMMIT_COALESCE_MS", 5),
+		AggregateCommitCoalesceMs:       getEnvInt("AGGREGATE_COMMIT_COALESCE_MS", 25),
 		AggregateCommitMaxDeltas:        getEnvInt("AGGREGATE_COMMIT_MAX_DELTAS", 5000),
 		AggregateCommitMaxBytes:         getEnvInt("AGGREGATE_COMMIT_MAX_BYTES", 8*1024*1024),
 		AggregateCommitMaxPendingBytes:  getEnvInt("AGGREGATE_COMMIT_MAX_PENDING_BYTES", 64*1024*1024),

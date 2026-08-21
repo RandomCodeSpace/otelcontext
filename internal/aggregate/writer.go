@@ -31,8 +31,12 @@ import (
 // Writer defaults. They are the provisional numbers of #160/#162; the
 // benchmark gate ratifies or replaces them.
 const (
-	// DefaultCommitCoalesceMs is the first-waiter coalescing window.
-	DefaultCommitCoalesceMs = 5
+	// DefaultCommitCoalesceMs is the first-waiter coalescing window. 25 ms,
+	// not #160's provisional 5 ms: measured at 10k pts/s on 2 vCPU, 5 ms cost
+	// a 37.8% writer duty cycle and a 286 ms ACK p99 against 109 ms at 25 ms
+	// (#173). Kept in step with config.AggregateCommitCoalesceMs, which is
+	// what production actually passes in.
+	DefaultCommitCoalesceMs = 25
 	// DefaultCommitMaxDeltas is the early-commit count target — the "5k dirty
 	// series" shape the gate benchmarks.
 	DefaultCommitMaxDeltas = 5000

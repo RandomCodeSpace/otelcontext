@@ -364,14 +364,22 @@ func schemaDDL() []string {
 		`CREATE INDEX IF NOT EXISTS idx_aggregate_series_scope
 			ON aggregate_series (tenant_id, signal)`,
 
+		// Keyed by (window_start, series_id), NOT by an append sequence: each
+		// group commit merges into the row an earlier commit left behind, so a
+		// window holds one row per active series instead of one row per commit
+		// per series. Finalization — and the writer-lock hold that comes with
+		// it — is then O(active series), which is the whole point (#173).
+		//
+		// WITHOUT ROWID for the same reason as aggregate_buckets: the composite
+		// key IS the table B-tree, so the point lookup every commit performs and
+		// the window range scan every finalize performs are both leading-key
+		// operations with no second structure to keep in sync.
 		`CREATE TABLE IF NOT EXISTS aggregate_delta_log (
-			seq INTEGER PRIMARY KEY,
-			series_id INTEGER NOT NULL,
 			window_start INTEGER NOT NULL,
-			` + deltaColumnDDL + `
-		)`,
-		`CREATE INDEX IF NOT EXISTS idx_aggregate_delta_log_window
-			ON aggregate_delta_log (window_start, series_id, seq)`,
+			series_id INTEGER NOT NULL,
+			` + deltaColumnDDL + `,
+			PRIMARY KEY (window_start, series_id)
+		) WITHOUT ROWID`,
 
 		// WITHOUT ROWID so the composite PK IS the table B-tree: purge,
 		// finalize and window reads are all leading-range operations on
@@ -628,7 +636,7 @@ func (s *SQLiteStore) commitGroup(b *GroupBatch) (int64, error) {
 	if err := insertSeries(tx, b.Series); err != nil {
 		return 0, err
 	}
-	bytes, err := insertDeltas(tx, b.Deltas)
+	bytes, err := mergeDeltas(tx, b.Deltas)
 	if err != nil {
 		return 0, err
 	}
@@ -712,19 +720,38 @@ func joinStatus(signal Signal, statusClass, severity StatusClass) StatusClass {
 	return statusClass
 }
 
-// insertDeltas appends the pre-merged delta rows and returns their approximate
-// payload size.
+// mergeDeltas folds the batch's per-(series, window) deltas into the delta log
+// and returns the approximate payload it wrote.
 //
-// One prepared statement, one Exec per row, and one scratch buffer reused
+// The log is keyed (window_start, series_id), so this is a read-modify-write,
+// not an append: the row a previous commit left behind absorbs this commit's
+// contribution. That is what holds a window's row count at O(active series)
+// instead of O(commits x dirty series) and keeps FinalizeWindow's transaction —
+// which runs under the writer lock every Export needs — bounded (#173).
+//
+// The scalar columns could be folded by a SQL UPSERT with no read, but the
+// sketch blob cannot: merging two sketches means decoding both and collapsing
+// bins, and this driver has no custom aggregate function to do it in SQL (the
+// same constraint #162 records for bucket reads). So the read-modify-write is
+// uniform across every column. The read is a point lookup into the mutable
+// window's few thousand rows, which stay in the page cache.
+//
+// Two prepared statements, one Exec per row, and one scratch buffer reused
 // across rows. Batching rows into multi-row VALUES was measured and is SLOWER
 // with this driver (~105 ms vs ~87 ms for a 5,000-row commit): the cost is in
-// per-parameter binding, which a wider statement does not avoid, and a
+// per-parameter binding, which a wider statement does not avoid, and an
 // 800-parameter statement pays extra to compile.
-func insertDeltas(tx *sql.Tx, rows []DeltaRow) (int64, error) {
+func mergeDeltas(tx *sql.Tx, rows []DeltaRow) (int64, error) {
 	if len(rows) == 0 {
 		return 0, nil
 	}
-	stmt, err := tx.Prepare(`INSERT INTO aggregate_delta_log
+	sel, err := tx.Prepare(`SELECT ` + deltaColumnList + `
+		FROM aggregate_delta_log WHERE window_start = ? AND series_id = ?`)
+	if err != nil {
+		return 0, fmt.Errorf("aggregate store: prepare delta read: %w", err)
+	}
+	defer func() { _ = sel.Close() }()
+	stmt, err := tx.Prepare(`INSERT OR REPLACE INTO aggregate_delta_log
 		(series_id, window_start, ` + deltaColumnList + `)
 		VALUES (?,?,` + deltaValuePlaceholders + `)`)
 	if err != nil {
@@ -738,15 +765,29 @@ func insertDeltas(tx *sql.Tx, rows []DeltaRow) (int64, error) {
 		args    = make([]any, 0, 20)
 	)
 	for _, r := range rows {
+		// Merge into a COPY read from the row, never into r.Delta: the caller
+		// applies that same delta to the shards after the commit returns, and
+		// folding the durable history into it would double-count in memory.
+		d := r.Delta
+		existing, err := scanDelta(sel.QueryRow(r.WindowStart, int64(r.SeriesID)).Scan, nil)
+		switch {
+		case err == nil:
+			existing.Merge(d)
+			d = existing
+		case errors.Is(err, sql.ErrNoRows):
+		default:
+			return 0, fmt.Errorf("aggregate store: read delta (series %d, window %d): %w", r.SeriesID, r.WindowStart, err)
+		}
+
 		var sketch []byte
-		if r.Delta != nil && r.Delta.Sketch != nil {
+		if d != nil && d.Sketch != nil {
 			// Safe to reuse scratch: Exec has consumed the bind before the
 			// next iteration overwrites it.
-			scratch = r.Delta.Sketch.AppendTo(scratch[:0])
+			scratch = d.Sketch.AppendTo(scratch[:0])
 			sketch = scratch
 		}
 		args = append(args[:0], int64(r.SeriesID), r.WindowStart)
-		args = append(args, deltaArgs(r.Delta, sketch)...)
+		args = append(args, deltaArgs(d, sketch)...)
 		if _, err := stmt.Exec(args...); err != nil {
 			return 0, fmt.Errorf("aggregate store: insert delta (series %d, window %d): %w", r.SeriesID, r.WindowStart, err)
 		}
@@ -756,7 +797,7 @@ func insertDeltas(tx *sql.Tx, rows []DeltaRow) (int64, error) {
 }
 
 // deltaRowBytes is the fixed on-disk cost of a delta row before its sketch:
-// eighteen scalar columns plus the seq/series/window key.
+// eighteen scalar columns plus the (window, series) key.
 const deltaRowBytes = 96
 
 // upsertBaselines writes the durable cumulative baselines (#166). They ride the
@@ -812,16 +853,20 @@ func (s *SQLiteStore) FinalizableWindows(cutoff int64, limit int) ([]int64, erro
 // FinalizeWindow implements Store: it materializes the window's buckets and
 // deletes exactly the delta rows it incorporated, in one transaction.
 //
-// "Exactly the incorporated rows" is enforced with a sequence bound rather than
-// a bare window predicate: the maximum seq is read first and only rows at or
-// below it are merged and deleted. The writer lock is held throughout, so no
-// commit can interleave — but the bound is what makes that a structural
-// guarantee instead of a scheduling accident.
+// "Exactly the incorporated rows" is a structural property of the predicate,
+// not of the scheduling: the SELECT that materializes and the DELETE that
+// clears the log carry the identical `window_start = ?` predicate inside one
+// transaction, with the writer lock held so nothing can add to the window in
+// between. The earlier sequence bound existed because the log was append-only;
+// with one row per (window, series) there is no partial-append to fence off.
 //
-// The delta rows are streamed from the READ pool while the writes go to the
-// writer transaction. A window can hold hundreds of thousands of delta rows;
-// loading them all to satisfy one transaction would trade a durability win for
-// an OOM.
+// The lock hold is O(active series in the window). Before the delta log was
+// pre-merged this was O(commits x dirty series) — ~1.6M rows and 16 s of
+// blocked ingestion every five minutes at 10k pts/s (#173).
+//
+// The delta rows are still streamed from the READ pool while the writes go to
+// the writer transaction: bounded is not the same as small, and there is no
+// reason to hold the whole window in memory to satisfy one transaction.
 func (s *SQLiteStore) FinalizeWindow(windowStart int64) (FinalizeStats, error) {
 	start := time.Now()
 	stats, err := s.finalizeWindow(windowStart)
@@ -836,15 +881,6 @@ func (s *SQLiteStore) finalizeWindow(windowStart int64) (FinalizeStats, error) {
 	s.lockWriter()
 	defer s.unlockWriter()
 
-	var maxSeq sql.NullInt64
-	if err := s.reader.QueryRow(
-		`SELECT MAX(seq) FROM aggregate_delta_log WHERE window_start = ?`, windowStart).Scan(&maxSeq); err != nil {
-		return stats, fmt.Errorf("aggregate store: finalize %d: bound seq: %w", windowStart, err)
-	}
-	if !maxSeq.Valid {
-		return stats, nil // nothing to finalize
-	}
-
 	tx, err := s.writer.Begin()
 	if err != nil {
 		return stats, fmt.Errorf("aggregate store: finalize %d: begin: %w", windowStart, err)
@@ -856,12 +892,15 @@ func (s *SQLiteStore) finalizeWindow(windowStart int64) (FinalizeStats, error) {
 		}
 	}()
 
-	if err := s.materializeWindow(tx, windowStart, maxSeq.Int64, &stats); err != nil {
+	if err := s.materializeWindow(tx, windowStart, &stats); err != nil {
 		return stats, fmt.Errorf("aggregate store: finalize %d: %w", windowStart, err)
+	}
+	if stats.DeltaRows == 0 {
+		return stats, nil // nothing to finalize; the rollback stands
 	}
 
 	if _, err := tx.Exec(
-		`DELETE FROM aggregate_delta_log WHERE window_start = ? AND seq <= ?`, windowStart, maxSeq.Int64); err != nil {
+		`DELETE FROM aggregate_delta_log WHERE window_start = ?`, windowStart); err != nil {
 		return stats, fmt.Errorf("aggregate store: finalize %d: delete deltas: %w", windowStart, err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -871,38 +910,64 @@ func (s *SQLiteStore) finalizeWindow(windowStart int64) (FinalizeStats, error) {
 	return stats, nil
 }
 
-// materializeWindow streams the window's delta rows from the READ pool, merging
-// each series in Go (SQL cannot merge sketches) and writing its bucket into the
-// writer transaction as soon as the series id changes. Only one series' worth of
-// state is held at a time: a busy window carries hundreds of thousands of delta
-// rows, and loading them all to satisfy one transaction would trade a durability
-// win for an OOM.
-func (s *SQLiteStore) materializeWindow(tx *sql.Tx, windowStart, maxSeq int64, stats *FinalizeStats) error {
+// materializeWindow streams the window's delta rows from the READ pool and
+// writes one bucket per row into the writer transaction. The delta log holds at
+// most one row per (window, series), so there is no cross-row merge left to do
+// here — the merging happened on the commit path, spread across thousands of
+// short transactions instead of concentrated into one long one.
+//
+// The statements are prepared once for the whole window: at a few thousand rows
+// the per-row statement compile the old code paid was itself a measurable slice
+// of the lock hold.
+func (s *SQLiteStore) materializeWindow(tx *sql.Tx, windowStart int64, stats *FinalizeStats) error {
+	// A window is normally finalized exactly once, and then no bucket row for
+	// it exists yet. Probing aggregate_buckets per series would be thousands of
+	// B-tree descents into the seven-day table to learn that; one EXISTS
+	// settles it. The probe runs inside the writer transaction, so it sees
+	// anything an earlier partial finalize or a recovery pass wrote.
+	var probe int
+	err := tx.QueryRow(
+		`SELECT 1 FROM aggregate_buckets WHERE window_start = ? LIMIT 1`, windowStart).Scan(&probe)
+	rewrite := false
+	switch {
+	case err == nil:
+		rewrite = true
+	case errors.Is(err, sql.ErrNoRows):
+	default:
+		return fmt.Errorf("probe buckets: %w", err)
+	}
+
+	var selBucket *sql.Stmt
+	if rewrite {
+		selBucket, err = tx.Prepare(
+			`SELECT ` + deltaColumnList + ` FROM aggregate_buckets WHERE window_start = ? AND series_id = ?`)
+		if err != nil {
+			return fmt.Errorf("prepare bucket read: %w", err)
+		}
+		defer func() { _ = selBucket.Close() }()
+	}
+	insBucket, err := tx.Prepare(
+		`INSERT OR REPLACE INTO aggregate_buckets (window_start, series_id, ` + deltaColumnList + `)
+		 VALUES (?,?,` + deltaValuePlaceholders + `)`)
+	if err != nil {
+		return fmt.Errorf("prepare bucket write: %w", err)
+	}
+	defer func() { _ = insBucket.Close() }()
+
 	rows, err := s.reader.Query(
 		`SELECT series_id, `+deltaColumnList+`
 		 FROM aggregate_delta_log
-		 WHERE window_start = ? AND seq <= ?
-		 ORDER BY series_id, seq`, windowStart, maxSeq)
+		 WHERE window_start = ?
+		 ORDER BY series_id`, windowStart)
 	if err != nil {
 		return fmt.Errorf("read deltas: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 
 	var (
-		curID    SeriesID
-		curDelta *AggregateDelta
+		scratch []byte
+		args    = make([]any, 0, 20)
 	)
-	flush := func() error {
-		if curDelta == nil {
-			return nil
-		}
-		if err := s.mergeBucket(tx, windowStart, curID, curDelta); err != nil {
-			return err
-		}
-		stats.Buckets++
-		curDelta = nil
-		return nil
-	}
 	for rows.Next() {
 		var id int64
 		d, err := scanDelta(rows.Scan, &id)
@@ -910,55 +975,41 @@ func (s *SQLiteStore) materializeWindow(tx *sql.Tx, windowStart, maxSeq int64, s
 			return err
 		}
 		stats.DeltaRows++
-		if curDelta != nil && SeriesID(id) != curID {
-			if err := flush(); err != nil {
-				return err
+
+		// A window finalized during downtime recovery and then again by the
+		// scheduler must ADD to its bucket, not replace it.
+		if selBucket != nil {
+			existing, err := scanDelta(selBucket.QueryRow(windowStart, id).Scan, nil)
+			switch {
+			case err == nil:
+				existing.Merge(d)
+				d = existing
+			case errors.Is(err, sql.ErrNoRows):
+			default:
+				return fmt.Errorf("read bucket (series %d): %w", id, err)
 			}
 		}
-		if curDelta == nil {
-			curID = SeriesID(id)
-			curDelta = d
-			continue
+
+		scratch = scratch[:0]
+		if d.Sketch != nil {
+			scratch = d.Sketch.AppendTo(scratch)
 		}
-		curDelta.Merge(d)
+		var sketch []byte
+		if len(scratch) > 0 {
+			sketch = scratch
+		}
+		args = append(args[:0], windowStart, id)
+		args = append(args, deltaArgs(d, sketch)...)
+		if _, err := insBucket.Exec(args...); err != nil {
+			return fmt.Errorf("write bucket (series %d): %w", id, err)
+		}
+		stats.Buckets++
 	}
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("read deltas: %w", err)
 	}
 	if err := rows.Close(); err != nil {
 		return fmt.Errorf("read deltas: %w", err)
-	}
-	return flush()
-}
-
-// mergeBucket folds one merged delta into the bucket row, reading any existing
-// row first. A window is normally finalized once, but a window finalized during
-// downtime recovery and then again by the scheduler must add, not replace.
-func (s *SQLiteStore) mergeBucket(tx *sql.Tx, windowStart int64, id SeriesID, d *AggregateDelta) error {
-	row := tx.QueryRow(
-		`SELECT `+deltaColumnList+` FROM aggregate_buckets WHERE window_start = ? AND series_id = ?`,
-		windowStart, int64(id))
-	existing, err := scanDelta(row.Scan, nil)
-	switch {
-	case err == nil:
-		existing.Merge(d)
-		d = existing
-	case errors.Is(err, sql.ErrNoRows):
-	default:
-		return fmt.Errorf("read bucket (series %d): %w", id, err)
-	}
-
-	var sketch []byte
-	if d.Sketch != nil {
-		sketch = d.Sketch.Encode()
-	}
-	args := make([]any, 0, 20)
-	args = append(args, windowStart, int64(id))
-	args = append(args, deltaArgs(d, sketch)...)
-	if _, err := tx.Exec(
-		`INSERT OR REPLACE INTO aggregate_buckets (window_start, series_id, `+deltaColumnList+`)
-		 VALUES (?,?,`+deltaValuePlaceholders+`)`, args...); err != nil {
-		return fmt.Errorf("write bucket (series %d): %w", id, err)
 	}
 	return nil
 }
@@ -1132,22 +1183,22 @@ func (s *SQLiteStore) ReadBuckets(sel Selector) ([]Bucket, error) {
 // history never hydrates into RAM (#160).
 func (s *SQLiteStore) ReplayMutable(since int64) ([]DeltaRow, error) {
 	rows, err := s.reader.Query(
-		`SELECT seq, series_id, window_start, `+deltaColumnList+`
-		 FROM aggregate_delta_log WHERE window_start >= ? ORDER BY window_start, series_id, seq`, since)
+		`SELECT series_id, window_start, `+deltaColumnList+`
+		 FROM aggregate_delta_log WHERE window_start >= ? ORDER BY window_start, series_id`, since)
 	if err != nil {
 		return nil, fmt.Errorf("aggregate store: replay: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 	var out []DeltaRow
 	for rows.Next() {
-		var seq, id, window int64
+		var id, window int64
 		d, err := scanDelta(func(dst ...any) error {
-			return rows.Scan(append([]any{&seq, &id, &window}, dst...)...)
+			return rows.Scan(append([]any{&id, &window}, dst...)...)
 		}, nil)
 		if err != nil {
 			return nil, fmt.Errorf("aggregate store: replay: %w", err)
 		}
-		out = append(out, DeltaRow{Seq: seq, SeriesID: SeriesID(id), WindowStart: window, Delta: d})
+		out = append(out, DeltaRow{SeriesID: SeriesID(id), WindowStart: window, Delta: d})
 	}
 	return out, rows.Err()
 }

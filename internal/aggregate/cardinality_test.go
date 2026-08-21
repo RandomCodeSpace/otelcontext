@@ -333,3 +333,69 @@ func TestLogTemplateCapDrivesLogSeriesOverflow(t *testing.T) {
 		t.Errorf("active log series = %d, want at most 3 (2 templates + __other__)", got)
 	}
 }
+
+// TestSignalSubCapBindsUnderSaturation is the #173 regression. The wave-5 run
+// measured aggregate_series_active{signal="log"} at 1,005 against a 500 log
+// sub-cap: 500 admitted series plus 505 __other__ series, because every
+// overflow series a cap minted was charged back to the same cap it was minted
+// to relieve. The reserve is now reported apart from the census, so the census
+// a cap is compared against is one a cap can actually bind.
+func TestSignalSubCapBindsUnderSaturation(t *testing.T) {
+	const (
+		cap      = 50
+		services = 30
+		names    = 40
+	)
+	l := newTestLimiter(LimiterConfig{
+		MaxSeries: 1000, MaxSeriesLogs: cap,
+		// Every per-service cap is wide open so only the log sub-cap can bind.
+		MaxLogTemplatesPerService: 10000,
+	})
+
+	// 1,200 distinct log series across 30 services — 24x the sub-cap, spread
+	// so each service mints its own __other__ series once it overflows.
+	for svc := uint32(1); svc <= services; svc++ {
+		for name := uint32(1); name <= names; name++ {
+			l.Admit(SeriesKey{
+				TenantID: 1, ServiceID: svc, NameID: name,
+				Signal: SignalLog, StatusClass: SeverityTierInfo,
+			}, testWindow)
+		}
+	}
+
+	stats := l.Stats()
+	if got := stats.ActiveBySignal[SignalLog]; got > cap {
+		t.Fatalf("active log series = %d, want <= %d — the sub-cap does not bind", got, cap)
+	}
+	if got := stats.ActiveBySignal[SignalLog]; got != cap {
+		t.Fatalf("active log series = %d, want exactly %d — the budget is not being spent", got, cap)
+	}
+	// The reserve exists and is visible, it is just not charged to the cap.
+	// Service 1's 40 names and 10 of service 2's fill the 50-series budget, so
+	// service 1 is the one service that never overflows and never mints an
+	// __other__ series.
+	if got := stats.OverflowSeriesBySignal[SignalLog]; got != services-1 {
+		t.Fatalf("live __other__ log series = %d, want %d (one per overflowing service)", got, services-1)
+	}
+	if stats.Overflow[OverflowSignal] == 0 {
+		t.Fatal("no admission was attributed to the signal sub-cap")
+	}
+
+	// Releasing every window returns the budget AND the reserve: the two
+	// censuses must not drift apart.
+	for svc := uint32(1); svc <= services; svc++ {
+		for name := uint32(1); name <= names; name++ {
+			l.Release(SeriesKey{
+				TenantID: 1, ServiceID: svc, NameID: name,
+				Signal: SignalLog, StatusClass: SeverityTierInfo,
+			}, testWindow)
+		}
+		l.Release(l.overflowKey(SeriesKey{
+			TenantID: 1, ServiceID: svc, Signal: SignalLog, StatusClass: SeverityTierInfo,
+		}), testWindow)
+	}
+	if stats := l.Stats(); stats.Active != 0 || stats.OverflowSeries != 0 {
+		t.Fatalf("after releasing every window: active = %d, overflow series = %d, want 0/0",
+			stats.Active, stats.OverflowSeries)
+	}
+}

@@ -25,8 +25,10 @@ type MetricsRecorder interface {
 	RecordReduction(stats ReducerStats, deltas map[Signal]uint64)
 	// RecordOverflow counts one admission rerouted to an __other__ series.
 	RecordOverflow(signal Signal, reason OverflowReason)
-	// SetActiveSeries publishes the active-series census per signal.
-	SetActiveSeries(active map[Signal]int)
+	// SetActiveSeries publishes the budgeted active-series census and the
+	// __other__ reserve occupancy, both per signal. They are separate numbers
+	// because only the first is bounded by the AGGREGATE_MAX_SERIES* caps.
+	SetActiveSeries(active, overflow map[Signal]int)
 }
 
 // noopRecorder is the default when no metrics are wired.
@@ -34,7 +36,7 @@ type noopRecorder struct{}
 
 func (noopRecorder) RecordReduction(ReducerStats, map[Signal]uint64) {}
 func (noopRecorder) RecordOverflow(Signal, OverflowReason)           {}
-func (noopRecorder) SetActiveSeries(map[Signal]int)                  {}
+func (noopRecorder) SetActiveSeries(_, _ map[Signal]int)             {}
 
 // promRecorder bridges the engine onto the platform's Prometheus metrics.
 type promRecorder struct{ m *telemetry.Metrics }
@@ -88,9 +90,11 @@ func (r promRecorder) RecordOverflow(signal Signal, reason OverflowReason) {
 }
 
 // SetActiveSeries implements MetricsRecorder.
-func (r promRecorder) SetActiveSeries(active map[Signal]int) {
+func (r promRecorder) SetActiveSeries(active, overflow map[Signal]int) {
 	for sig := SignalTraceOp; sig <= signalMax; sig++ {
-		r.m.AggregateSeriesActive.WithLabelValues(sig.String()).Set(float64(active[sig]))
+		label := sig.String()
+		r.m.AggregateSeriesActive.WithLabelValues(label).Set(float64(active[sig]))
+		r.m.AggregateOverflowSeriesActive.WithLabelValues(label).Set(float64(overflow[sig]))
 	}
 }
 

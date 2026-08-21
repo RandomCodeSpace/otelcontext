@@ -27,6 +27,14 @@ import (
 // dimension tuple to none and the name to the dictionary's __other__ entry.
 // Overflow series draw on reserved capacity: a cap can never block creation of
 // the series whose job is to absorb violations of that cap.
+//
+// "Reserved" is literal: an __other__ series is NOT charged against the budget
+// it exists to enforce. Charging it made the caps non-binding — at 150 services
+// the log sub-cap of 500 was observed holding 1,005 active series, 500 real and
+// 505 __other__, because every overflow series it minted counted toward the
+// same sub-cap and pushed the census past it (#173). The occupancy the
+// reserve costs is reported separately, per signal, so it is visible rather
+// than folded into a number that claims to be bounded by a cap.
 
 // Platform default caps, matching the #158 resolution and the AGGREGATE_*
 // defaults in internal/config.
@@ -184,14 +192,22 @@ type Admission struct {
 
 // LimiterStats is a snapshot of Limiter occupancy.
 type LimiterStats struct {
-	// Active is the number of distinct series present in a mutable window.
+	// Active is the number of distinct budgeted series present in a mutable
+	// window. __other__ series are excluded: they are the reserve the caps
+	// spend, not occupancy the caps admit, and counting them here is what let
+	// the observed census exceed its own sub-cap (#173).
 	Active int
-	// ActiveBySignal breaks Active down per signal.
+	// ActiveBySignal breaks Active down per signal. Each entry is bounded by
+	// that signal's sub-cap.
 	ActiveBySignal map[Signal]int
 	// Overflow counts admissions routed to an __other__ series, per reason.
 	Overflow map[OverflowReason]uint64
 	// OverflowSeries is the number of live __other__ series.
 	OverflowSeries int
+	// OverflowSeriesBySignal breaks OverflowSeries down per signal. This is
+	// the reserve's real occupancy — unbudgeted, bounded by
+	// (services x signals x status classes).
+	OverflowSeriesBySignal map[Signal]int
 }
 
 // Limiter owns the active-series census and enforces the budget. It is safe for
@@ -216,7 +232,12 @@ type Limiter struct {
 	byService map[serviceScope]int
 	names     map[serviceScope]map[uint32]struct{}
 	byTenant  map[uint32]int
-	overflow  map[SeriesKey]struct{}
+	// overflow and overflowBySignal are the reserve's census. They are kept
+	// apart from total/bySignal/byService/byTenant on purpose: the reserve is
+	// what a cap spends, so it must never be part of what the cap is compared
+	// against.
+	overflow         map[SeriesKey]struct{}
+	overflowBySignal map[Signal]int
 
 	overflowCounts map[OverflowReason]uint64
 }
@@ -224,15 +245,16 @@ type Limiter struct {
 // NewLimiter returns a Limiter for cfg.
 func NewLimiter(cfg LimiterConfig) *Limiter {
 	return &Limiter{
-		cfg:            cfg.withDefaults(),
-		present:        make(map[SeriesWindowKey]struct{}),
-		windows:        make(map[SeriesKey]int),
-		bySignal:       make(map[Signal]int),
-		byService:      make(map[serviceScope]int),
-		names:          make(map[serviceScope]map[uint32]struct{}),
-		byTenant:       make(map[uint32]int),
-		overflow:       make(map[SeriesKey]struct{}),
-		overflowCounts: make(map[OverflowReason]uint64),
+		cfg:              cfg.withDefaults(),
+		present:          make(map[SeriesWindowKey]struct{}),
+		windows:          make(map[SeriesKey]int),
+		bySignal:         make(map[Signal]int),
+		byService:        make(map[serviceScope]int),
+		names:            make(map[serviceScope]map[uint32]struct{}),
+		byTenant:         make(map[uint32]int),
+		overflow:         make(map[SeriesKey]struct{}),
+		overflowBySignal: make(map[Signal]int),
+		overflowCounts:   make(map[OverflowReason]uint64),
 	}
 }
 
@@ -308,10 +330,15 @@ func (l *Limiter) checkLocked(key SeriesKey) OverflowReason {
 }
 
 // admitOverflowLocked records an __other__ series. It bypasses every cap: the
-// series that absorbs quota violations can never be blocked by a quota. It is
-// still counted in the totals, so an operator sees the true occupancy — which
-// means the active count can exceed the global cap by the number of live
-// overflow series, bounded by (services x signals x status classes).
+// series that absorbs quota violations can never be blocked by a quota.
+//
+// It is also not CHARGED to any cap. An __other__ series is the reserve a cap
+// spends when it binds, so adding it to the same census the cap is compared
+// against makes the cap unenforceable: the census walks past the limit by one
+// per (service, status class) that overflowed, which is exactly the 1,005
+// active log series against a 500 sub-cap the wave-5 run measured (#173). The
+// reserve is reported through OverflowSeriesBySignal instead, so its cost is
+// visible without being laundered through a bounded-looking number.
 func (l *Limiter) admitOverflowLocked(other SeriesKey, window int64) {
 	if _, ok := l.present[SeriesWindowKey{Key: other, WindowStart: window}]; ok {
 		return
@@ -320,11 +347,17 @@ func (l *Limiter) admitOverflowLocked(other SeriesKey, window int64) {
 }
 
 // addLocked records presence of key in window and, on the series' first window,
-// charges it against the budget. l.mu must be held.
+// charges it against the budget. Overflow series are recorded but not charged.
+// l.mu must be held.
 func (l *Limiter) addLocked(key SeriesKey, window int64, isOverflow bool) {
 	l.present[SeriesWindowKey{Key: key, WindowStart: window}] = struct{}{}
 	l.windows[key]++
 	if l.windows[key] > 1 {
+		return
+	}
+	if isOverflow {
+		l.overflow[key] = struct{}{}
+		l.overflowBySignal[key.Signal]++
 		return
 	}
 	l.total++
@@ -339,9 +372,6 @@ func (l *Limiter) addLocked(key SeriesKey, window int64, isOverflow bool) {
 			l.names[scope] = names
 		}
 		names[key.NameID] = struct{}{}
-	}
-	if isOverflow {
-		l.overflow[key] = struct{}{}
 	}
 }
 
@@ -365,6 +395,16 @@ func (l *Limiter) releaseLocked(key SeriesKey, window int64) {
 		return
 	}
 	delete(l.windows, key)
+	if _, isOverflow := l.overflow[key]; isOverflow {
+		// Symmetric with addLocked: the reserve was never charged, so there is
+		// nothing to give back except the reserve's own census.
+		delete(l.overflow, key)
+		l.overflowBySignal[key.Signal]--
+		if l.overflowBySignal[key.Signal] <= 0 {
+			delete(l.overflowBySignal, key.Signal)
+		}
+		return
+	}
 	l.total--
 	l.bySignal[key.Signal]--
 	scope := serviceScope{tenant: key.TenantID, service: key.ServiceID, signal: key.Signal}
@@ -382,7 +422,6 @@ func (l *Limiter) releaseLocked(key SeriesKey, window int64) {
 			delete(l.names, scope)
 		}
 	}
-	delete(l.overflow, key)
 }
 
 // overflowKey builds the per-(service, signal) __other__ series for key.
@@ -467,10 +506,17 @@ func (l *Limiter) Stats() LimiterStats {
 	for r, n := range l.overflowCounts {
 		overflow[r] = n
 	}
+	overflowSeries := make(map[Signal]int, len(l.overflowBySignal))
+	for s, n := range l.overflowBySignal {
+		if n > 0 {
+			overflowSeries[s] = n
+		}
+	}
 	return LimiterStats{
-		Active:         l.total,
-		ActiveBySignal: bySignal,
-		Overflow:       overflow,
-		OverflowSeries: len(l.overflow),
+		Active:                 l.total,
+		ActiveBySignal:         bySignal,
+		Overflow:               overflow,
+		OverflowSeries:         len(l.overflow),
+		OverflowSeriesBySignal: overflowSeries,
 	}
 }

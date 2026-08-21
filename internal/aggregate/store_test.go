@@ -273,8 +273,9 @@ func TestFinalizeWindowMaterializesAndDeletes(t *testing.T) {
 	if err := store.CommitGroup(seed); err != nil {
 		t.Fatalf("seed series: %v", err)
 	}
-	// Three commits touching two series in one window: the pre-merge shape the
-	// finalizer has to collapse.
+	// Three commits touching two series in one window. The delta log is keyed
+	// (window, series), so the three commits merge into two rows rather than
+	// six — that is what the finalizer's transaction is sized by (#173).
 	for i := 0; i < 3; i++ {
 		batch := &GroupBatch{Deltas: []DeltaRow{
 			{SeriesID: 1, WindowStart: 600, Delta: spanDelta(2, 100)},
@@ -284,14 +285,14 @@ func TestFinalizeWindowMaterializesAndDeletes(t *testing.T) {
 			t.Fatalf("commit %d: %v", i, err)
 		}
 	}
-	assertCount(t, store, "aggregate_delta_log", 6)
+	assertCount(t, store, "aggregate_delta_log", 2)
 
 	stats, err := store.FinalizeWindow(600)
 	if err != nil {
 		t.Fatalf("FinalizeWindow: %v", err)
 	}
-	if stats.Buckets != 2 || stats.DeltaRows != 6 {
-		t.Fatalf("finalize stats = %+v, want 2 buckets / 6 delta rows", stats)
+	if stats.Buckets != 2 || stats.DeltaRows != 2 {
+		t.Fatalf("finalize stats = %+v, want 2 buckets / 2 delta rows", stats)
 	}
 	assertCount(t, store, "aggregate_delta_log", 0)
 	assertCount(t, store, "aggregate_buckets", 2)

@@ -60,7 +60,7 @@ func baseValid() *Config {
 		// Durable aggregate store defaults (#173)
 		AggregateDBPath:                 "./data/aggregate.db",
 		AggregateSynchronous:            "NORMAL",
-		AggregateCommitCoalesceMs:       5,
+		AggregateCommitCoalesceMs:       25,
 		AggregateCommitMaxDeltas:        5000,
 		AggregateCommitMaxBytes:         8 * 1024 * 1024,
 		AggregateCommitMaxPendingBytes:  64 * 1024 * 1024,

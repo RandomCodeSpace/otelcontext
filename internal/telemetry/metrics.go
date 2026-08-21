@@ -167,9 +167,15 @@ type Metrics struct {
 	// fell outside the mutable-window horizon. reason="late" (older than the
 	// allowed lateness) or reason="future" (beyond the tolerated skew).
 	AggregateLatePointsTotal *prometheus.CounterVec
-	// AggregateSeriesActive — series present in at least one mutable window,
-	// per signal. This is what the AGGREGATE_MAX_SERIES* caps bound.
+	// AggregateSeriesActive — budgeted series present in at least one mutable
+	// window, per signal. This is what the AGGREGATE_MAX_SERIES* caps bound,
+	// and it never exceeds them: the __other__ series a cap mints when it
+	// binds are the reserve, counted by AggregateOverflowSeriesActive instead.
 	AggregateSeriesActive *prometheus.GaugeVec
+	// AggregateOverflowSeriesActive — live __other__ series per signal. This
+	// is the unbudgeted reserve the caps spend; it is bounded by
+	// (services x signals x status classes), not by AGGREGATE_MAX_SERIES*.
+	AggregateOverflowSeriesActive *prometheus.GaugeVec
 	// AggregateOverflowTotal — admissions rerouted to an __other__ series,
 	// labeled by the cap that triggered it (tenant|service_names|
 	// service_series|signal|global). Totals are preserved; identity is not.
@@ -524,7 +530,11 @@ func New() *Metrics {
 	}, []string{"signal", "reason"})
 	m.AggregateSeriesActive = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "otelcontext_aggregate_series_active",
-		Help: "Series present in at least one mutable window, per signal. Bounded by the AGGREGATE_MAX_SERIES* caps.",
+		Help: "Budgeted series present in at least one mutable window, per signal. Bounded by the AGGREGATE_MAX_SERIES* caps.",
+	}, []string{"signal"})
+	m.AggregateOverflowSeriesActive = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "otelcontext_aggregate_overflow_series_active",
+		Help: "Live __other__ series per signal — the unbudgeted reserve a cap spends when it binds. Bounded by services x status classes, not by the caps.",
 	}, []string{"signal"})
 	m.AggregateOverflowTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "otelcontext_aggregate_overflow_total",
