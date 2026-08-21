@@ -87,6 +87,19 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 		checks["pipeline"] = "skipped"
 	}
 
+	// Aggregate store recovery. Until the delta log has been replayed the
+	// shards hold only part of the acknowledged aggregates, and numbers served
+	// from them would be wrong in a way no dashboard can detect (#173).
+	switch {
+	case s.aggregateRecovered == nil:
+		checks["aggregate_store"] = "skipped"
+	case !s.aggregateRecovered():
+		checks["aggregate_store"] = "recovering"
+		ready = false
+	default:
+		checks["aggregate_store"] = "ok"
+	}
+
 	status := http.StatusOK
 	if !ready {
 		status = http.StatusServiceUnavailable

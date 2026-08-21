@@ -270,7 +270,6 @@ func (s *MetricsServer) Export(ctx context.Context, req *colmetricspb.ExportMetr
 	var reducer *aggregate.Reducer
 	if s.aggregateEngine != nil {
 		reducer = s.aggregateEngine.NewReducer(start)
-		defer func() { s.aggregateEngine.ApplyReducer(reducer) }()
 	}
 
 	for _, resourceMetrics := range req.ResourceMetrics {
@@ -352,6 +351,12 @@ func (s *MetricsServer) Export(ctx context.Context, req *colmetricspb.ExportMetr
 				}
 			}
 		}
+	}
+
+	// Apply the request's aggregate deltas. Under durable ACK this blocks
+	// until the group commit lands, and a refusal is the client's answer.
+	if err := applyAggregate(s.aggregateEngine, reducer); err != nil {
+		return nil, err
 	}
 
 	if s.metrics != nil {
@@ -621,9 +626,10 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 
 	// Apply the request's aggregate deltas before the persist decision: the
 	// aggregate path has already accepted this telemetry, and a downstream
-	// queue rejection must not retroactively unaccount it.
-	if merged != nil {
-		s.aggregateEngine.ApplyReducer(merged)
+	// queue rejection must not retroactively unaccount it. Under durable ACK
+	// this blocks until the group commit lands.
+	if err := applyAggregate(s.aggregateEngine, merged); err != nil {
+		return nil, err
 	}
 
 	// Intake metrics fire before the persist decision so operators see
@@ -806,8 +812,8 @@ func (s *LogsServer) Export(ctx context.Context, req *collogspb.ExportLogsServic
 		}
 		mergedReducer.MergeFrom(r)
 	}
-	if mergedReducer != nil {
-		s.aggregateEngine.ApplyReducer(mergedReducer)
+	if err := applyAggregate(s.aggregateEngine, mergedReducer); err != nil {
+		return nil, err
 	}
 
 	if len(logsToInsert) == 0 {

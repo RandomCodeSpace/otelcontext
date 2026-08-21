@@ -29,6 +29,12 @@ type Server struct {
 	// imports and lets tests inject deterministic values.
 	dlqSaturation      func() float64
 	pipelineSaturation func() float64
+
+	// aggregateRecovered reports whether the durable aggregate store has
+	// finished startup recovery. /ready stays 503 until it returns true, so
+	// no orchestrator routes traffic to a process whose shards are only
+	// half-replayed (#173). nil means "no store configured" and is skipped.
+	aggregateRecovered func() bool
 }
 
 // NewServer creates a new API server.
@@ -65,6 +71,13 @@ func (s *Server) SetDLQSaturationProbe(fn func() float64) {
 // to clients). Pass nil to disable the check.
 func (s *Server) SetPipelineSaturationProbe(fn func() float64) {
 	s.pipelineSaturation = fn
+}
+
+// SetAggregateRecoveryProbe registers a callback reporting whether the durable
+// aggregate store has finished replaying its delta log. /ready returns 503
+// until it does. Pass nil (the default) when no aggregate store is configured.
+func (s *Server) SetAggregateRecoveryProbe(fn func() bool) {
+	s.aggregateRecovered = fn
 }
 
 // RegisterRoutes registers API endpoints on the provided mux.

@@ -1,13 +1,48 @@
 package ingest
 
 import (
+	"errors"
+	"log/slog"
 	"time"
 
 	"github.com/RandomCodeSpace/otelcontext/internal/aggregate"
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	metricspb "go.opentelemetry.io/proto/otlp/metrics/v1"
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
+	"google.golang.org/grpc/codes"
+	grpcstatus "google.golang.org/grpc/status"
 )
+
+// applyAggregate applies one Export's reduced deltas and maps a refusal onto
+// the error the OTLP client should see.
+//
+// Under the durable-ACK contract (#160) an Export may only succeed once its
+// deltas are inside a committed transaction, so a saturated group-commit
+// writer answers RESOURCE_EXHAUSTED — the same signal, and the same HTTP 429
+// mapping, the raw pipeline's ErrQueueFull already produces.
+//
+// A commit FAILURE is treated by mode. In aggregate mode the store is the
+// authoritative dataset and a failed commit must not be acknowledged. In shadow
+// mode the legacy path is still the source of truth and the aggregate numbers
+// exist to be compared: failing the Export there would turn a shadow-side
+// problem into raw telemetry loss, so it is logged and metered instead.
+func applyAggregate(eng *aggregate.Engine, r *aggregate.Reducer) error {
+	if eng == nil || r == nil {
+		return nil
+	}
+	_, err := eng.ApplyReducerErr(r)
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, aggregate.ErrSaturated) {
+		return grpcstatus.Errorf(codes.ResourceExhausted, "aggregate store at capacity")
+	}
+	if eng.Mode() == aggregate.ModeAggregate {
+		return grpcstatus.Errorf(codes.Unavailable, "aggregate store commit failed")
+	}
+	slog.Error("aggregate shadow commit failed (legacy path remains the source of truth)", "error", err)
+	return nil
+}
 
 // OTLP -> aggregate translation.
 //

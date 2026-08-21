@@ -223,8 +223,8 @@ func main() {
 		time.Duration(cfg.RetentionBatchSleepMs)*time.Millisecond,
 	)
 	retention.SetFullVacuum(cfg.RetentionFullVacuum)
-	retention.Start(ctxRetention)
-	slog.Info("🧹 Retention scheduler started", "retention_days", cfg.HotRetentionDays)
+	// Start() is deferred until after the aggregate store is wired in below —
+	// SetAggregateRetention must be called before the loop reads the fields.
 
 	// 2b. Partition scheduler: only when DB_POSTGRES_PARTITIONING=daily.
 	// Maintains lookahead daily partitions and drops expired ones — DROP
@@ -456,14 +456,52 @@ func main() {
 	logsServer := ingest.NewLogsServer(repo, metrics, cfg)
 	metricsServer := ingest.NewMetricsServer(repo, metrics, tsdbAgg, cfg)
 
-	// Aggregate engine (AGGREGATE_MODE != legacy). Phase 1 is accounting only:
-	// the reducer runs inside Export() ahead of the sampler, the read path
-	// stays legacy, and mutable windows are discarded rather than persisted
-	// until the durable store lands (#173). AGGREGATE_MODE=legacy constructs
-	// nothing and leaves every ingest path byte-for-byte unchanged.
+	// Aggregate engine + durable store (AGGREGATE_MODE != legacy). The reducer
+	// runs inside Export() ahead of the sampler; the group-commit writer makes
+	// the reduced deltas durable before the Export is acknowledged (#160), and
+	// startup recovery replays the mutable delta log before readiness flips.
+	// Shadow mode persists too — shadow IS the durability rehearsal.
+	// AGGREGATE_MODE=legacy constructs nothing and leaves every ingest path
+	// byte-for-byte unchanged.
+	var (
+		aggStore     *aggregate.SQLiteStore
+		aggWriter    *aggregate.Writer
+		aggRecovery  *aggregate.RecoveryGate
+		aggStoreMetr = aggregate.NewPrometheusStoreMetrics(metrics)
+	)
 	if cfg.AggregateMode != aggregate.ModeLegacy {
+		store, err := aggregate.OpenSQLiteStore(aggregate.StoreConfig{
+			Path:         cfg.AggregateDBPath,
+			AllowRebuild: cfg.AggregateAllowRebuild,
+			Synchronous:  cfg.AggregateSynchronous,
+			Metrics:      aggStoreMetr,
+		})
+		if err != nil {
+			fatal("❌ Aggregate store rejected", err, "path", cfg.AggregateDBPath)
+		}
+		aggStore = store
+
+		// Dictionary IDs become DB-owned: the in-memory registrar's IDs are
+		// provisional and would strand every persisted SeriesKey on restart.
+		//
+		// The per-kind caps bound dictionary DISK growth. A name that can never
+		// appear in an admitted series is pure disk cost, so each name namespace
+		// is capped at the series budget that could reference it; past the cap
+		// the value resolves to __other__, the designed degradation. Service,
+		// tenant and dimension namespaces stay uncapped — they are bounded by
+		// the deployment and by AGGREGATE_METRIC_DIMS respectively.
+		registrar, err := aggregate.NewDurableRegistrar(aggStore, map[aggregate.Kind]int{
+			aggregate.KindOperation:   cfg.AggregateMaxSeriesTraces + cfg.AggregateMaxSeriesEdges,
+			aggregate.KindMetricName:  cfg.AggregateMaxSeriesMetrics,
+			aggregate.KindLogTemplate: cfg.AggregateMaxSeriesLogs,
+		})
+		if err != nil {
+			fatal("❌ Aggregate dictionary could not be loaded", err, "path", cfg.AggregateDBPath)
+		}
+
 		aggEngine, err := aggregate.NewEngine(aggregate.EngineConfig{
-			Mode: cfg.AggregateMode,
+			Mode:      cfg.AggregateMode,
+			Registrar: registrar,
 			Limiter: aggregate.LimiterConfig{
 				MaxSeries:                 cfg.AggregateMaxSeries,
 				MaxSeriesMetrics:          cfg.AggregateMaxSeriesMetrics,
@@ -484,6 +522,40 @@ func main() {
 		if err != nil {
 			fatal("❌ Aggregate engine configuration rejected", err, "mode", cfg.AggregateMode)
 		}
+
+		aggWriter, err = aggregate.NewWriter(aggregate.WriterConfig{
+			Store:            aggStore,
+			Engine:           aggEngine,
+			Registrar:        registrar,
+			CoalesceWindow:   time.Duration(cfg.AggregateCommitCoalesceMs) * time.Millisecond,
+			MaxBatchDeltas:   cfg.AggregateCommitMaxDeltas,
+			MaxBatchBytes:    int64(cfg.AggregateCommitMaxBytes),
+			MaxPendingBytes:  int64(cfg.AggregateCommitMaxPendingBytes),
+			MaxWaiters:       cfg.AggregateCommitMaxWaiters,
+			MaxPendingDeltas: cfg.AggregateCommitMaxPendingDeltas,
+			FinalizeInterval: time.Duration(cfg.AggregateFinalizeIntervalSec) * time.Second,
+			Metrics:          aggStoreMetr,
+		})
+		if err != nil {
+			fatal("❌ Aggregate group-commit writer rejected", err)
+		}
+
+		// Recovery runs BEFORE the writer starts accepting Exports and before
+		// readiness flips: acknowledged-but-unfinalized deltas go back into the
+		// shards, windows whose lateness expired during downtime finalize, and
+		// durable baselines are seeded.
+		aggRecovery = aggregate.NewRecoveryGate()
+		recoveryStats, err := aggregate.Recover(aggStore, aggEngine, aggWriter, time.Now())
+		if err != nil {
+			fatal("❌ Aggregate store recovery failed", err, "path", cfg.AggregateDBPath)
+		}
+		aggregate.LogRecovery(recoveryStats, cfg.AggregateDBPath)
+		aggStoreMetr.RecordRecovery(recoveryStats.Duration, recoveryStats.ReplayedRows, recoveryStats.FinalizedWindows)
+
+		aggEngine.SetApplier(aggWriter)
+		aggWriter.Start()
+		aggRecovery.Complete()
+
 		traceServer.SetAggregateEngine(aggEngine)
 		logsServer.SetAggregateEngine(aggEngine)
 		metricsServer.SetAggregateEngine(aggEngine)
@@ -491,9 +563,29 @@ func main() {
 			"mode", cfg.AggregateMode,
 			"max_series", cfg.AggregateMaxSeries,
 			"max_baselines", cfg.ResolvedAggregateMaxBaselines(),
-			"note", "Phase 1: accounting only, windows are not persisted",
+			"store_path", cfg.AggregateDBPath,
+			"store_uuid", aggStore.UUID(),
+			"synchronous", cfg.AggregateSynchronous,
+			"commit_coalesce_ms", cfg.AggregateCommitCoalesceMs,
+			"note", "durable ACK: Export returns only after the group commit",
+		)
+
+		// Retention owns the hourly aggregate purge and the conservative daily
+		// ANALYZE. No VACUUM on this file, by decision (#162).
+		retention.SetAggregateRetention(
+			func(cutoff time.Time) (int64, error) {
+				stats, err := aggStore.PurgeBefore(aggregate.WindowStart(cutoff))
+				return stats.Buckets + stats.Deltas + stats.Baselines, err
+			},
+			aggStore.Analyze,
 		)
 	}
+
+	retention.Start(ctxRetention)
+	slog.Info("🧹 Retention scheduler started",
+		"retention_days", cfg.HotRetentionDays,
+		"aggregate_store", cfg.AggregateMode != aggregate.ModeLegacy,
+	)
 
 	// Wire adaptive sampler (only when rate < 1.0 to avoid unnecessary overhead)
 	if cfg.SamplingRate > 0 && cfg.SamplingRate < 1.0 {
@@ -574,6 +666,10 @@ func main() {
 			}
 			return float64(st.QueueDepth) / float64(st.Capacity)
 		})
+	}
+	if aggRecovery != nil {
+		// /ready stays 503 until the aggregate delta log has been replayed.
+		apiServer.SetAggregateRecoveryProbe(aggRecovery.Done)
 	}
 
 	// Wire up live log streaming + AI + DLQ metrics
@@ -992,6 +1088,13 @@ func main() {
 		ingestPipeline.Stop()
 	}
 
+	// 3b. Drain the aggregate group-commit writer. gRPC GracefulStop above
+	// guarantees no new Exports, so this commits whatever was still queued
+	// rather than dropping deltas an Export is still waiting on.
+	if aggWriter != nil {
+		aggWriter.Stop()
+	}
+
 	// 4. Stop DLQ (may still be replaying)
 	dlq.Stop()
 
@@ -1028,7 +1131,14 @@ func main() {
 		slog.Warn("hydrator did not finish before shutdown; cancelling")
 	}
 
-	// 5. Close database last (everything above may still write)
+	// 5. Close the databases last (everything above may still write). The
+	// aggregate store closes before the main DB: its writer has already
+	// drained, and retention — which touches both — has already stopped.
+	if aggStore != nil {
+		if err := aggStore.Close(); err != nil {
+			slog.Error("Failed to close aggregate store", "error", err)
+		}
+	}
 	if err := repo.Close(); err != nil {
 		slog.Error("Failed to close database", "error", err)
 	}
