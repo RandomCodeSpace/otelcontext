@@ -27,7 +27,13 @@ import (
 // aggregate_meta at creation and verified at every open. There are no
 // automatic migrations in v1 (#162): a mismatch fails startup and the operator
 // chooses between an older binary and AGGREGATE_ALLOW_REBUILD=true.
-const StoreSchemaVersion = 1
+//
+// v2 re-keyed aggregate_delta_log on (window_start, series_id) and dropped its
+// append sequence (#173). A v1 file cannot be read by this binary and is not
+// migrated: the rows it holds are unfinalized deltas with a retention horizon
+// measured in minutes, so AGGREGATE_ALLOW_REBUILD loses far less than a
+// migration would risk getting wrong.
+const StoreSchemaVersion = 2
 
 // Store errors.
 var (
@@ -113,12 +119,14 @@ type SeriesRow struct {
 	Key SeriesKey
 }
 
-// DeltaRow is one append-only delta-log row: the pre-merged contribution of one
-// group commit to one (series, window).
+// DeltaRow is one delta-log row: the accumulated, not-yet-finalized
+// contribution to one (series, window).
+//
+// On the write side it carries one group commit's contribution, which the store
+// merges into the row already standing for that (series, window) — the log is
+// keyed by identity, not by an append sequence, so a window's row count tracks
+// its active series rather than the number of commits that touched it (#173).
 type DeltaRow struct {
-	// Seq is the monotonic local sequence number. It is assigned by the
-	// database on insert and is only meaningful on rows read back.
-	Seq int64
 	// SeriesID and WindowStart identify the bucket the row contributes to.
 	SeriesID    SeriesID
 	WindowStart int64

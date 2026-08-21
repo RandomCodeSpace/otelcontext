@@ -732,7 +732,8 @@ func (e *Engine) Rollover(now time.Time) int {
 // publishActiveSeries pushes the limiter's occupancy into the active-series
 // gauge.
 func (e *Engine) publishActiveSeries() {
-	e.metrics.SetActiveSeries(e.limiter.Stats().ActiveBySignal)
+	ls := e.limiter.Stats()
+	e.metrics.SetActiveSeries(ls.ActiveBySignal, ls.OverflowSeriesBySignal)
 }
 
 // recordReduction publishes one Export request's reduction accounting.
