@@ -56,6 +56,14 @@ The transactional step that materializes a window's bucket rows from its delta-l
 **Arrival time**:
 The single timestamp captured per Export request, used to evaluate lateness and future-skew for every point in that request.
 
+**Producer**:
+One concrete emitter of a cumulative metric series — an instance, pod, or process. Identified internally by a ProducerID that never affects series identity.
+_Avoid_: instance (overloaded), source
+
+**Cumulative baseline**:
+The per-(series, producer) record of the last cumulative value, start time, and timestamp, used to convert cumulative points into deltas and to detect resets. Durable in the same commit as the deltas it justifies.
+_Avoid_: prior state, counter cache
+
 ### Signals
 
 **Log template**:
