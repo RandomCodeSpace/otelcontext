@@ -336,6 +336,9 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 			localSpans := make([]storage.Span, 0)
 			localTraces := make([]storage.Trace, 0)
 			localLogs := make([]storage.Log, 0)
+			// traceIdx maps trace ID -> index in localTraces so this batch emits
+			// exactly one Trace row per trace instead of one per span.
+			traceIdx := make(map[string]int)
 			var localHasErr, localHasSlow bool
 
 			for _, scopeSpans := range resourceSpans.ScopeSpans {
@@ -350,6 +353,14 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 						statusStr = span.Status.Code.String()
 					}
 
+					// Hex-encode the IDs exactly once per span. These are needed
+					// by the topology observer, the span/trace rows and every
+					// synthesized log below; formatting them per use turned the
+					// hot path into an allocation mill.
+					traceIDHex := fmt.Sprintf("%x", span.TraceId)
+					spanIDHex := fmt.Sprintf("%x", span.SpanId)
+					parentSpanIDHex := fmt.Sprintf("%x", span.ParentSpanId)
+
 					// Observe cross-service call topology for EVERY span BEFORE
 					// the sampler can drop it. The sampled path below still owns
 					// edge aggregates; this only guarantees the edge exists so the
@@ -358,15 +369,15 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 					if s.topologyObserver != nil {
 						s.topologyObserver(
 							tenantID,
-							fmt.Sprintf("%x", span.TraceId),
-							fmt.Sprintf("%x", span.SpanId),
-							fmt.Sprintf("%x", span.ParentSpanId),
+							traceIDHex,
+							spanIDHex,
+							parentSpanIDHex,
 							serviceName,
 						)
 					}
 
 					if s.sampler != nil {
-						isError := statusStr == "STATUS_CODE_ERROR"
+						isError := statusStr == storage.StatusCodeError
 						durationMs := float64(duration) / 1000.0
 						if !s.sampler.ShouldSample(serviceName, isError, durationMs) {
 							continue
@@ -378,9 +389,9 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 					// Create Span Model
 					sModel := storage.Span{
 						TenantID:       tenantID,
-						TraceID:        fmt.Sprintf("%x", span.TraceId),
-						SpanID:         fmt.Sprintf("%x", span.SpanId),
-						ParentSpanID:   fmt.Sprintf("%x", span.ParentSpanId),
+						TraceID:        traceIDHex,
+						SpanID:         spanIDHex,
+						ParentSpanID:   parentSpanIDHex,
 						OperationName:  span.Name,
 						StartTime:      startTime,
 						EndTime:        endTime,
@@ -394,22 +405,39 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 					// Flag the batch for the async pipeline's priority lane.
 					// Errors and slow spans bypass soft-backpressure drops so
 					// diagnostic data is never silently lost at >=90% queue.
-					if statusStr == "STATUS_CODE_ERROR" {
+					if statusStr == storage.StatusCodeError {
 						localHasErr = true
 					}
 					if s.latencyThresholdMs > 0 && float64(duration)/1000.0 >= s.latencyThresholdMs {
 						localHasSlow = true
 					}
 
-					tModel := storage.Trace{
-						TenantID:    tenantID,
-						TraceID:     fmt.Sprintf("%x", span.TraceId),
-						ServiceName: serviceName,
-						Timestamp:   startTime,
-						Duration:    duration,
-						Status:      statusStr,
+					// One Trace row per trace ID per resource-spans batch, not per
+					// span. The first span of a trace seeds timestamp/duration/
+					// service; later spans of the same trace can only UPGRADE the
+					// status to ERROR, never downgrade it (the DB upsert applies
+					// the same rule across batches).
+					if i, seen := traceIdx[traceIDHex]; seen {
+						if statusStr == storage.StatusCodeError {
+							localTraces[i].Status = storage.StatusCodeError
+						}
+					} else {
+						traceIdx[traceIDHex] = len(localTraces)
+						localTraces = append(localTraces, storage.Trace{
+							TenantID:    tenantID,
+							TraceID:     traceIDHex,
+							ServiceName: serviceName,
+							Timestamp:   startTime,
+							Duration:    duration,
+							Status:      statusStr,
+						})
 					}
-					localTraces = append(localTraces, tModel)
+
+					// spanHasErrorLog records whether an ERROR log was already
+					// synthesized for THIS span from its events. It replaces a
+					// rescan of every previously synthesized log per span, which
+					// made the loop O(n^2) in spans-per-resource.
+					spanHasErrorLog := false
 
 					// Synthesize Logs from Span Events (exceptions) and Status
 					for _, event := range span.Events {
@@ -434,8 +462,8 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 
 						l := storage.Log{
 							TenantID:       tenantID,
-							TraceID:        fmt.Sprintf("%x", span.TraceId),
-							SpanID:         fmt.Sprintf("%x", span.SpanId),
+							TraceID:        traceIDHex,
+							SpanID:         spanIDHex,
 							Severity:       severity,
 							Body:           body,
 							ServiceName:    serviceName,
@@ -443,17 +471,12 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 							Timestamp:      time.Unix(0, int64(event.TimeUnixNano)), // #nosec G115 -- OTLP time in nanos: uint64 source fits int64 until year 2262
 						}
 						localLogs = append(localLogs, l)
-					}
-
-					hasErrorLog := false
-					for _, sl := range localLogs {
-						if sl.Severity == "ERROR" && sl.SpanID == fmt.Sprintf("%x", span.SpanId) {
-							hasErrorLog = true
-							break
+						if severity == "ERROR" {
+							spanHasErrorLog = true
 						}
 					}
 
-					if !hasErrorLog && span.Status != nil && span.Status.Code == tracepb.Status_STATUS_CODE_ERROR {
+					if !spanHasErrorLog && span.Status != nil && span.Status.Code == tracepb.Status_STATUS_CODE_ERROR {
 						if shouldIngestSeverity("ERROR", s.minSeverity) {
 							msg := span.Status.Message
 							if msg == "" {
@@ -462,8 +485,8 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 
 							l := storage.Log{
 								TenantID:       tenantID,
-								TraceID:        fmt.Sprintf("%x", span.TraceId),
-								SpanID:         fmt.Sprintf("%x", span.SpanId),
+								TraceID:        traceIDHex,
+								SpanID:         spanIDHex,
 								Severity:       "ERROR",
 								Body:           msg,
 								ServiceName:    serviceName,
