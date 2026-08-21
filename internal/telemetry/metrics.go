@@ -182,6 +182,24 @@ type Metrics struct {
 	// service. Cheap invariant only (#165): no per-series comparison.
 	AggregateShadowErrorsTotal *prometheus.CounterVec
 
+	// --- Bounded exemplar retention (AGGREGATE_MODE=aggregate) ---
+	// ExemplarEligibleTotal — telemetry that qualified for raw retention,
+	// per signal and priority class. Eligible is not retained: the gap between
+	// this and the drop counter is what makes aggregate completeness and raw
+	// diagnostic coverage distinguishable during a storm (#161).
+	ExemplarEligibleTotal *prometheus.CounterVec
+	// ExemplarDroppedTotal — eligible telemetry refused raw persistence,
+	// reason=budget_count|budget_bytes|stratum.
+	ExemplarDroppedTotal *prometheus.CounterVec
+	// ExemplarEvictionTotal — selected exemplars displaced by a better-ranked
+	// trace. Each eviction is one trace's worth of bounded OVER-retention:
+	// already-persisted spans are never deleted.
+	ExemplarEvictionTotal prometheus.Counter
+	// ExemplarTruncatedTotal — retained traces forced past their max spans or
+	// max bytes. These persist truncated=true plus retained/observed counts,
+	// and causal-analysis tools report partial coverage for them (#163).
+	ExemplarTruncatedTotal prometheus.Counter
+
 	// Atomic counters for JSON health endpoint (avoids scraping Prometheus)
 	totalIngested  atomic.Int64
 	activeConns    atomic.Int64
@@ -487,8 +505,40 @@ func New() *Metrics {
 		Name: "otelcontext_aggregate_shadow_errors_total",
 		Help: "Errors accounted on the aggregate side, per service. Cheap shadow-mode invariant only.",
 	}, []string{"service"})
+	m.ExemplarEligibleTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "otelcontext_exemplar_eligible_total",
+		Help: "Telemetry eligible for raw exemplar retention, by signal and priority class (error|slow|healthy|warn). Eligible is not retained.",
+	}, []string{"signal", "class"})
+	m.ExemplarDroppedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "otelcontext_exemplar_dropped_total",
+		Help: "Eligible telemetry refused raw persistence by the exemplar budgets. reason=budget_count|budget_bytes|stratum.",
+	}, []string{"signal", "reason"})
+	m.ExemplarEvictionTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "otelcontext_exemplar_eviction_total",
+		Help: "Selected exemplars displaced by a better-ranked trace. Bounded over-retention: already-persisted spans are not deleted.",
+	})
+	m.ExemplarTruncatedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "otelcontext_exemplar_truncated_total",
+		Help: "Retained traces forced past max spans/bytes. Persisted with truncated=true plus retained/observed span counts.",
+	})
 	return m
 }
+
+// RecordExemplarEligible implements ingest.ExemplarMetrics.
+func (m *Metrics) RecordExemplarEligible(signal, class string) {
+	m.ExemplarEligibleTotal.WithLabelValues(signal, class).Inc()
+}
+
+// RecordExemplarDropped implements ingest.ExemplarMetrics.
+func (m *Metrics) RecordExemplarDropped(signal, reason string) {
+	m.ExemplarDroppedTotal.WithLabelValues(signal, reason).Inc()
+}
+
+// RecordExemplarEviction implements ingest.ExemplarMetrics.
+func (m *Metrics) RecordExemplarEviction() { m.ExemplarEvictionTotal.Inc() }
+
+// RecordExemplarTruncation implements ingest.ExemplarMetrics.
+func (m *Metrics) RecordExemplarTruncation() { m.ExemplarTruncatedTotal.Inc() }
 
 // StartRuntimeMetrics samples Go runtime stats every 15 seconds.
 func (m *Metrics) StartRuntimeMetrics() {

@@ -298,6 +298,27 @@ type Config struct {
 	// Empty map when AGGREGATE_METRIC_DIMS is unset/empty.
 	// Populated during Load() by parsing and validating the env var.
 	AggregateMetricDims map[string][]string
+
+	// Bounded exemplar retention (#176; budgets frozen in #161).
+	//
+	// These apply ONLY when AggregateMode == "aggregate", where the adaptive
+	// Sampler is retired and the exemplar policy is the sole raw-retention
+	// gate. In legacy and aggregate-shadow the Sampler is untouched and none of
+	// these values are read.
+	//
+	// Counts AND bytes bind; first breach wins. SamplingLatencyThresholdMs
+	// stays the shared definition of "slow" in every mode.
+	ExemplarTracesPerServiceWindow    int     // Default 25, unified budget with priority fill
+	ExemplarTracesGlobalWindow        int     // Default 1500
+	ExemplarBytesPerServiceWindow     int     // Default 524288 (512 KiB)
+	ExemplarBytesGlobalWindow         int     // Default 8388608 (8 MiB)
+	ExemplarHealthyRate               float64 // Default 0.005 (0.5% eligibility target)
+	ExemplarStratumTopK               int     // Default 5, per (operation × status class)
+	ExemplarLogsErrorPerServiceWindow int     // Default 50
+	ExemplarLogsWarnEnabled           bool    // Default false — WARN is opt-in
+	ExemplarLogsWarnPerServiceWindow  int     // Default 20
+	ExemplarMaxSpansPerTrace          int     // Default 500
+	ExemplarMaxBytesPerTrace          int     // Default 262144 (256 KiB)
 }
 
 func Load(customPath string) (*Config, error) {
@@ -440,6 +461,19 @@ func Load(customPath string) (*Config, error) {
 		AggregateSeriesPerTenantFraction:       getEnvFloat("AGGREGATE_SERIES_PER_TENANT_FRACTION", 0),
 		AggregateMaxProducerBaselinesPerSeries: getEnvInt("AGGREGATE_MAX_PRODUCER_BASELINES_PER_SERIES", 8),
 		AggregateMaxBaselines:                  getEnvInt("AGGREGATE_MAX_BASELINES", 0),
+
+		// Bounded exemplar retention (aggregate mode only)
+		ExemplarTracesPerServiceWindow:    getEnvInt("EXEMPLAR_TRACES_PER_SERVICE_WINDOW", 25),
+		ExemplarTracesGlobalWindow:        getEnvInt("EXEMPLAR_TRACES_GLOBAL_WINDOW", 1500),
+		ExemplarBytesPerServiceWindow:     getEnvInt("EXEMPLAR_BYTES_PER_SERVICE_WINDOW", 512*1024),
+		ExemplarBytesGlobalWindow:         getEnvInt("EXEMPLAR_BYTES_GLOBAL_WINDOW", 8*1024*1024),
+		ExemplarHealthyRate:               getEnvFloat("EXEMPLAR_HEALTHY_RATE", 0.005),
+		ExemplarStratumTopK:               getEnvInt("EXEMPLAR_STRATUM_TOP_K", 5),
+		ExemplarLogsErrorPerServiceWindow: getEnvInt("EXEMPLAR_LOGS_ERROR_PER_SERVICE_WINDOW", 50),
+		ExemplarLogsWarnEnabled:           getEnvBool("EXEMPLAR_LOGS_WARN_ENABLED", false),
+		ExemplarLogsWarnPerServiceWindow:  getEnvInt("EXEMPLAR_LOGS_WARN_PER_SERVICE_WINDOW", 20),
+		ExemplarMaxSpansPerTrace:          getEnvInt("EXEMPLAR_MAX_SPANS_PER_TRACE", 500),
+		ExemplarMaxBytesPerTrace:          getEnvInt("EXEMPLAR_MAX_BYTES_PER_TRACE", 256*1024),
 	}
 
 	// Parse AGGREGATE_METRIC_DIMS config
@@ -755,6 +789,40 @@ func (c *Config) Validate() error {
 	}
 	if c.AggregateMaxBaselines > 0 && c.AggregateMaxBaselines < c.AggregateMaxProducerBaselinesPerSeries {
 		return fmt.Errorf("AGGREGATE_MAX_BASELINES when nonzero must be >= AGGREGATE_MAX_PRODUCER_BASELINES_PER_SERIES (%d), got %d", c.AggregateMaxProducerBaselinesPerSeries, c.AggregateMaxBaselines)
+	}
+
+	// Bounded exemplar retention validation (#176). Validated in every mode so
+	// a typo is caught at startup rather than the day the operator flips
+	// AGGREGATE_MODE=aggregate during an incident.
+	if c.ExemplarTracesPerServiceWindow < 1 {
+		return fmt.Errorf("EXEMPLAR_TRACES_PER_SERVICE_WINDOW must be >= 1, got %d", c.ExemplarTracesPerServiceWindow)
+	}
+	if c.ExemplarTracesGlobalWindow < c.ExemplarTracesPerServiceWindow {
+		return fmt.Errorf("EXEMPLAR_TRACES_GLOBAL_WINDOW (%d) must be >= EXEMPLAR_TRACES_PER_SERVICE_WINDOW (%d): a global cap below the per-service cap makes the per-service budget unreachable", c.ExemplarTracesGlobalWindow, c.ExemplarTracesPerServiceWindow)
+	}
+	if c.ExemplarBytesPerServiceWindow < 1024 {
+		return fmt.Errorf("EXEMPLAR_BYTES_PER_SERVICE_WINDOW must be >= 1024, got %d", c.ExemplarBytesPerServiceWindow)
+	}
+	if c.ExemplarBytesGlobalWindow < c.ExemplarBytesPerServiceWindow {
+		return fmt.Errorf("EXEMPLAR_BYTES_GLOBAL_WINDOW (%d) must be >= EXEMPLAR_BYTES_PER_SERVICE_WINDOW (%d)", c.ExemplarBytesGlobalWindow, c.ExemplarBytesPerServiceWindow)
+	}
+	if c.ExemplarHealthyRate < 0 || c.ExemplarHealthyRate > 1.0 {
+		return fmt.Errorf("EXEMPLAR_HEALTHY_RATE must be between 0 and 1, got %f", c.ExemplarHealthyRate)
+	}
+	if c.ExemplarStratumTopK < 1 {
+		return fmt.Errorf("EXEMPLAR_STRATUM_TOP_K must be >= 1, got %d", c.ExemplarStratumTopK)
+	}
+	if c.ExemplarLogsErrorPerServiceWindow < 1 {
+		return fmt.Errorf("EXEMPLAR_LOGS_ERROR_PER_SERVICE_WINDOW must be >= 1, got %d", c.ExemplarLogsErrorPerServiceWindow)
+	}
+	if c.ExemplarLogsWarnPerServiceWindow < 1 {
+		return fmt.Errorf("EXEMPLAR_LOGS_WARN_PER_SERVICE_WINDOW must be >= 1, got %d", c.ExemplarLogsWarnPerServiceWindow)
+	}
+	if c.ExemplarMaxSpansPerTrace < 1 {
+		return fmt.Errorf("EXEMPLAR_MAX_SPANS_PER_TRACE must be >= 1, got %d", c.ExemplarMaxSpansPerTrace)
+	}
+	if c.ExemplarMaxBytesPerTrace < 1024 {
+		return fmt.Errorf("EXEMPLAR_MAX_BYTES_PER_TRACE must be >= 1024, got %d", c.ExemplarMaxBytesPerTrace)
 	}
 
 	// Sum-of-caps validation: sub-caps must fit under global cap

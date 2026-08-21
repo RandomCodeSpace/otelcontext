@@ -42,6 +42,18 @@ func baseValid() *Config {
 		AggregateMaxProducerBaselinesPerSeries: 8,
 		AggregateMaxBaselines:                  0,
 		AggregateMetricDims:                    make(map[string][]string),
+		// Bounded exemplar retention defaults (#161)
+		ExemplarTracesPerServiceWindow:    25,
+		ExemplarTracesGlobalWindow:        1500,
+		ExemplarBytesPerServiceWindow:     512 * 1024,
+		ExemplarBytesGlobalWindow:         8 * 1024 * 1024,
+		ExemplarHealthyRate:               0.005,
+		ExemplarStratumTopK:               5,
+		ExemplarLogsErrorPerServiceWindow: 50,
+		ExemplarLogsWarnEnabled:           false,
+		ExemplarLogsWarnPerServiceWindow:  20,
+		ExemplarMaxSpansPerTrace:          500,
+		ExemplarMaxBytesPerTrace:          256 * 1024,
 	}
 }
 
@@ -704,6 +716,31 @@ func TestParseAggregateMetricDims_KeysSorted(t *testing.T) {
 	}
 }
 
+// --- Bounded exemplar retention (#176) ---
+
+func TestValidate_ExemplarBudgets_LowerBounds(t *testing.T) {
+	cases := []struct {
+		name  string
+		field string
+		mut   func(*Config)
+	}{
+		{"traces per service", "EXEMPLAR_TRACES_PER_SERVICE_WINDOW", func(c *Config) { c.ExemplarTracesPerServiceWindow = 0 }},
+		{"bytes per service", "EXEMPLAR_BYTES_PER_SERVICE_WINDOW", func(c *Config) { c.ExemplarBytesPerServiceWindow = 512 }},
+		{"stratum top k", "EXEMPLAR_STRATUM_TOP_K", func(c *Config) { c.ExemplarStratumTopK = 0 }},
+		{"error log budget", "EXEMPLAR_LOGS_ERROR_PER_SERVICE_WINDOW", func(c *Config) { c.ExemplarLogsErrorPerServiceWindow = 0 }},
+		{"warn log budget", "EXEMPLAR_LOGS_WARN_PER_SERVICE_WINDOW", func(c *Config) { c.ExemplarLogsWarnPerServiceWindow = 0 }},
+		{"max spans per trace", "EXEMPLAR_MAX_SPANS_PER_TRACE", func(c *Config) { c.ExemplarMaxSpansPerTrace = 0 }},
+		{"max bytes per trace", "EXEMPLAR_MAX_BYTES_PER_TRACE", func(c *Config) { c.ExemplarMaxBytesPerTrace = 1 }},
+	}
+	for _, tc := range cases {
+		c := baseValid()
+		tc.mut(c)
+		if err := c.Validate(); err == nil || !strings.Contains(err.Error(), tc.field) {
+			t.Errorf("%s should fail validation with %s, got %v", tc.name, tc.field, err)
+		}
+	}
+}
+
 func TestParseAggregateMetricDims_Whitespace(t *testing.T) {
 	result, err := ParseAggregateMetricDims("  metric : key1 , key2  ")
 	if err != nil {
@@ -817,5 +854,69 @@ func TestLoad_AggregateMetricDims_InvalidConfig(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "parsing AGGREGATE_METRIC_DIMS") {
 		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// A global cap below the per-service cap makes the per-service budget
+// unreachable — a misconfiguration worth refusing at startup rather than
+// debugging during an incident.
+func TestValidate_ExemplarGlobalBudgetsMustCoverPerService(t *testing.T) {
+	c := baseValid()
+	c.ExemplarTracesGlobalWindow = 10 // below the 25 per-service default
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "EXEMPLAR_TRACES_GLOBAL_WINDOW") {
+		t.Errorf("expected global trace cap error, got %v", err)
+	}
+
+	c = baseValid()
+	c.ExemplarBytesGlobalWindow = 4096
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "EXEMPLAR_BYTES_GLOBAL_WINDOW") {
+		t.Errorf("expected global byte cap error, got %v", err)
+	}
+}
+
+func TestValidate_ExemplarHealthyRate_Range(t *testing.T) {
+	for _, tc := range []struct {
+		val     float64
+		wantErr bool
+	}{{-0.1, true}, {0, false}, {0.005, false}, {1.0, false}, {1.1, true}} {
+		c := baseValid()
+		c.ExemplarHealthyRate = tc.val
+		err := c.Validate()
+		if tc.wantErr && err == nil {
+			t.Errorf("healthy rate %.3f should fail, got nil", tc.val)
+		}
+		if !tc.wantErr && err != nil {
+			t.Errorf("healthy rate %.3f should pass, got %v", tc.val, err)
+		}
+	}
+}
+
+func TestLoad_ExemplarDefaultsMatchResolution(t *testing.T) {
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	checks := []struct {
+		name string
+		got  int
+		want int
+	}{
+		{"EXEMPLAR_TRACES_PER_SERVICE_WINDOW", cfg.ExemplarTracesPerServiceWindow, 25},
+		{"EXEMPLAR_TRACES_GLOBAL_WINDOW", cfg.ExemplarTracesGlobalWindow, 1500},
+		{"EXEMPLAR_BYTES_PER_SERVICE_WINDOW", cfg.ExemplarBytesPerServiceWindow, 512 * 1024},
+		{"EXEMPLAR_BYTES_GLOBAL_WINDOW", cfg.ExemplarBytesGlobalWindow, 8 * 1024 * 1024},
+		{"EXEMPLAR_LOGS_ERROR_PER_SERVICE_WINDOW", cfg.ExemplarLogsErrorPerServiceWindow, 50},
+		{"EXEMPLAR_LOGS_WARN_PER_SERVICE_WINDOW", cfg.ExemplarLogsWarnPerServiceWindow, 20},
+	}
+	for _, c := range checks {
+		if c.got != c.want {
+			t.Errorf("%s = %d, want %d", c.name, c.got, c.want)
+		}
+	}
+	if cfg.ExemplarHealthyRate != 0.005 {
+		t.Errorf("EXEMPLAR_HEALTHY_RATE = %v, want 0.005", cfg.ExemplarHealthyRate)
+	}
+	if cfg.ExemplarLogsWarnEnabled {
+		t.Error("EXEMPLAR_LOGS_WARN_ENABLED should default off — WARN raw retention is opt-in")
 	}
 }
