@@ -116,6 +116,10 @@ type EngineConfig struct {
 	// Metrics is the Prometheus recorder. nil disables metric recording.
 	Metrics MetricsRecorder
 
+	// MetricDims maps metric names to their configured aggregation dimension keys.
+	// Nil or empty means no metrics are configured for custom dimensions.
+	MetricDims DimsConfig
+
 	// Now is the clock, injectable for tests. Defaults to time.Now.
 	Now func() time.Time
 }
@@ -130,6 +134,7 @@ type Engine struct {
 	limiter   *Limiter
 	baselines *BaselineTracker
 	metrics   MetricsRecorder
+	dims      DimsConfig
 
 	shards [NumShards]shard
 
@@ -169,6 +174,7 @@ func NewEngine(cfg EngineConfig) (*Engine, error) {
 		cache:   NewCache(reg),
 		miner:   cfg.Miner,
 		metrics: cfg.Metrics,
+		dims:    cfg.MetricDims,
 	}
 	if e.metrics == nil {
 		e.metrics = noopRecorder{}
@@ -212,6 +218,9 @@ func (e *Engine) Limiter() *Limiter { return e.limiter }
 
 // Baselines returns the cumulative baseline tracker.
 func (e *Engine) Baselines() *BaselineTracker { return e.baselines }
+
+// MetricDims returns the configured metric dimension keys for aggregation.
+func (e *Engine) MetricDims() DimsConfig { return e.dims }
 
 // Revision returns the current revision. It increases by one on every applied
 // batch and never decreases, so a consumer can tell "nothing changed" from

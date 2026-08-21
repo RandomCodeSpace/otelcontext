@@ -132,7 +132,21 @@ func TestApplyDriverDefaults_Postgres_NoChange(t *testing.T) {
 			cfg := postgresDefaultsConfig(drv)
 			before := *cfg
 			applyDriverDefaults(cfg)
-			if *cfg != before {
+			// Compare individual fields (map fields cannot be compared with ==).
+			// Check all fields set by postgresDefaultsConfig.
+			if cfg.DBDriver != before.DBDriver ||
+				cfg.DBMaxOpenConns != before.DBMaxOpenConns ||
+				cfg.DBMaxIdleConns != before.DBMaxIdleConns ||
+				cfg.IngestPipelineWorkers != before.IngestPipelineWorkers ||
+				cfg.IngestPipelineQueueSize != before.IngestPipelineQueueSize ||
+				cfg.IngestPipelineMaxBytes != before.IngestPipelineMaxBytes ||
+				cfg.MetricMaxCardinality != before.MetricMaxCardinality ||
+				cfg.StoreMinSeverity != before.StoreMinSeverity ||
+				cfg.SamplingRate != before.SamplingRate ||
+				cfg.GRPCMaxConcurrentStreams != before.GRPCMaxConcurrentStreams ||
+				cfg.GraphRAGEventQueueSize != before.GraphRAGEventQueueSize ||
+				cfg.LogFTSEnabled != before.LogFTSEnabled ||
+				cfg.GraphRAGTraceTTL != before.GraphRAGTraceTTL {
 				t.Errorf("Postgres driver %q was mutated by SQLite override: %+v → %+v", drv, before, *cfg)
 			}
 		})
