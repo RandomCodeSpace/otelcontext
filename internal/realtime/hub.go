@@ -66,6 +66,12 @@ type Hub struct {
 	maxClients  int
 	clientCount atomic.Int64
 
+	// aggregateMode disables per-event broadcasts. In aggregate mode the raw
+	// log/metric stream is no longer the source of truth for the UI, and
+	// re-broadcasting every event would contradict the coalesced,
+	// revision-driven publication the event hub performs (#164).
+	aggregateMode atomic.Bool
+
 	stopCh   chan struct{}
 	stopped  atomic.Bool
 	wg       sync.WaitGroup
@@ -280,8 +286,15 @@ func (h *Hub) SetWSMetrics(onMessageSent func(string), onSlowClientDrop func()) 
 	h.onSlowClientDrop = onSlowClientDrop
 }
 
-// Broadcast adds a log entry to the broadcast buffer.
+// SetAggregateMode disables per-event log and metric broadcasts. Keepalive and
+// connection handling are unaffected.
+func (h *Hub) SetAggregateMode(on bool) { h.aggregateMode.Store(on) }
+
+// Broadcast adds a log entry to the broadcast buffer. No-op in aggregate mode.
 func (h *Hub) Broadcast(entry LogEntry) {
+	if h.aggregateMode.Load() {
+		return
+	}
 	select {
 	case h.broadcast <- entry:
 	default:
@@ -289,8 +302,12 @@ func (h *Hub) Broadcast(entry LogEntry) {
 	}
 }
 
-// BroadcastMetric adds a metric entry to the broadcast buffer.
+// BroadcastMetric adds a metric entry to the broadcast buffer. No-op in
+// aggregate mode.
 func (h *Hub) BroadcastMetric(entry MetricEntry) {
+	if h.aggregateMode.Load() {
+		return
+	}
 	select {
 	case h.metricsCh <- entry:
 	default:

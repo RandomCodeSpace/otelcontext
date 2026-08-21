@@ -1,0 +1,389 @@
+package aggregate
+
+import (
+	"math"
+	"testing"
+	"time"
+)
+
+// stubStore is a Store that serves a fixed set of finalized buckets. It exists
+// so the query facade's ownership rules can be tested without a live SQLite
+// file: what matters here is WHICH source a window is read from, not how the
+// bytes got there.
+type stubStore struct {
+	buckets []Bucket
+	infos   map[SeriesID]SeriesKey
+	reads   int
+	// readRanges records every [Start,End) the facade asked for, so a test can
+	// assert that a memory-owned window was never requested from the store.
+	readRanges [][2]int64
+}
+
+func newStubStore() *stubStore {
+	return &stubStore{infos: make(map[SeriesID]SeriesKey)}
+}
+
+// put records one finalized bucket under a stable series ID.
+func (s *stubStore) put(id SeriesID, key SeriesKey, windowStart int64, d *AggregateDelta) {
+	s.infos[id] = key
+	s.buckets = append(s.buckets, Bucket{WindowStart: windowStart, SeriesID: id, Delta: d})
+}
+
+func (s *stubStore) CommitGroup(*GroupBatch) error { return nil }
+func (s *stubStore) FinalizeWindow(int64) (FinalizeStats, error) {
+	return FinalizeStats{}, nil
+}
+func (s *stubStore) FinalizableWindows(int64, int) ([]int64, error) { return nil, nil }
+func (s *stubStore) PurgeBefore(int64) (PurgeStats, error)          { return PurgeStats{}, nil }
+func (s *stubStore) ReadBuckets(sel Selector) ([]Bucket, error) {
+	s.reads++
+	s.readRanges = append(s.readRanges, [2]int64{sel.Start, sel.End})
+	out := make([]Bucket, 0, len(s.buckets))
+	for _, b := range s.buckets {
+		if b.WindowStart < sel.Start || b.WindowStart >= sel.End {
+			continue
+		}
+		key := s.infos[b.SeriesID]
+		if key.TenantID != sel.TenantID {
+			continue
+		}
+		if sel.Signal != SignalUnspecified && key.Signal != sel.Signal {
+			continue
+		}
+		out = append(out, b)
+	}
+	return out, nil
+}
+func (s *stubStore) ReplayMutable(int64) ([]DeltaRow, error)  { return nil, nil }
+func (s *stubStore) LoadBaselines(int) ([]BaselineRow, error) { return nil, nil }
+func (s *stubStore) ResolveSeries(ids []SeriesID) ([]SeriesInfo, error) {
+	out := make([]SeriesInfo, 0, len(ids))
+	for _, id := range ids {
+		if key, ok := s.infos[id]; ok {
+			out = append(out, SeriesInfo{ID: id, Key: key})
+		}
+	}
+	return out, nil
+}
+func (s *stubStore) LoadDict(int) ([]DictRow, error)     { return nil, nil }
+func (s *stubStore) LoadSeries(int) ([]SeriesRow, error) { return nil, nil }
+func (s *stubStore) Backlog() (BacklogStats, error)      { return BacklogStats{}, nil }
+func (s *stubStore) Close() error                        { return nil }
+
+var _ Store = (*stubStore)(nil)
+
+// queryFixture builds an engine with a fixed clock and named services.
+type queryFixture struct {
+	engine   *Engine
+	now      time.Time
+	tenantID uint32
+}
+
+func newQueryFixture(t *testing.T) *queryFixture {
+	t.Helper()
+	now := mustTime(t, "2026-08-21T12:02:00Z")
+	e := testEngine(t, now)
+	return &queryFixture{engine: e, now: now, tenantID: e.TenantID("default")}
+}
+
+// traceKey builds a trace-operation series key for a named service.
+func (f *queryFixture) traceKey(service, op string) SeriesKey {
+	return SeriesKey{
+		TenantID:    f.tenantID,
+		ServiceID:   f.engine.Cache().Intern(f.tenantID, KindService, service),
+		NameID:      f.engine.Cache().Intern(f.tenantID, KindOperation, op),
+		Signal:      SignalTraceOp,
+		StatusClass: StatusOK,
+		Variant:     SpanKindServer,
+	}
+}
+
+// logKey builds a log series key for a named service.
+func (f *queryFixture) logKey(service, template string) SeriesKey {
+	return SeriesKey{
+		TenantID:  f.tenantID,
+		ServiceID: f.engine.Cache().Intern(f.tenantID, KindService, service),
+		NameID:    f.engine.Cache().Intern(f.tenantID, KindLogTemplate, template),
+		Signal:    SignalLog,
+	}
+}
+
+// apply folds one delta into the engine's mutable window set.
+func (f *queryFixture) apply(key SeriesKey, windowStart int64, d *AggregateDelta) {
+	f.engine.ApplyCommitted(DeltaMap{{Key: key, WindowStart: windowStart}: d})
+}
+
+// window is the fixture's current window start.
+func (f *queryFixture) window() int64 { return WindowStart(f.now) }
+
+// rangeQuery is a query covering the fixture's whole mutable horizon.
+func (f *queryFixture) rangeQuery() Query {
+	return Query{
+		Tenant: "default",
+		Start:  f.now.Add(-30 * time.Minute),
+		End:    f.now.Add(time.Minute),
+	}
+}
+
+func TestQueryDashboardFromMutableMemory(t *testing.T) {
+	f := newQueryFixture(t)
+	f.apply(f.traceKey("checkout", "POST /pay"), f.window(), spanDelta(9, 1000))
+	f.apply(f.traceKey("cart", "GET /cart"), f.window(), spanDelta(3, 4000))
+	logs := &AggregateDelta{}
+	logs.ObserveLog(f.now, true)
+	logs.ObserveLog(f.now, false)
+	f.apply(f.logKey("checkout", "payment failed <*>"), f.window(), logs)
+
+	res, err := f.engine.QueryDashboard(f.rangeQuery())
+	if err != nil {
+		t.Fatalf("QueryDashboard: %v", err)
+	}
+	if res.TotalTraces != 12 {
+		t.Errorf("TotalTraces = %d, want 12", res.TotalTraces)
+	}
+	if res.TotalLogs != 2 {
+		t.Errorf("TotalLogs = %d, want 2", res.TotalLogs)
+	}
+	// spanDelta marks every third observation an error: 3 of 9 plus 1 of 3.
+	if res.TotalErrors != 4 {
+		t.Errorf("TotalErrors = %d, want 4", res.TotalErrors)
+	}
+	if res.ActiveServices != 2 {
+		t.Errorf("ActiveServices = %d, want 2", res.ActiveServices)
+	}
+	wantAvg := (9*1000.0 + 3*4000.0) / 12 / 1000.0
+	if math.Abs(res.AvgLatencyMs-wantAvg) > 1e-9 {
+		t.Errorf("AvgLatencyMs = %v, want %v", res.AvgLatencyMs, wantAvg)
+	}
+	if res.Coverage != CoverageFull {
+		t.Errorf("Coverage = %q, want %q", res.Coverage, CoverageFull)
+	}
+	if res.Epoch != f.engine.Epoch() {
+		t.Errorf("Epoch = %q, want %q", res.Epoch, f.engine.Epoch())
+	}
+	if len(res.TopFailing) != 2 {
+		t.Fatalf("TopFailing = %d entries, want 2", len(res.TopFailing))
+	}
+	if res.TopFailing[0].Service != "checkout" {
+		t.Errorf("top failing service = %q, want checkout", res.TopFailing[0].Service)
+	}
+}
+
+// TestQueryDashboardPercentileWithinReportedBound is the accuracy contract:
+// the p99 must land inside the relative-error bound the response advertises,
+// and that bound must come from the merged sketch rather than a constant.
+func TestQueryDashboardPercentileWithinReportedBound(t *testing.T) {
+	f := newQueryFixture(t)
+	d := &AggregateDelta{}
+	for i := 1; i <= 1000; i++ {
+		d.ObserveSpan(float64(i)*100, false)
+	}
+	f.apply(f.traceKey("checkout", "POST /pay"), f.window(), d)
+
+	res, err := f.engine.QueryDashboard(f.rangeQuery())
+	if err != nil {
+		t.Fatalf("QueryDashboard: %v", err)
+	}
+	if !res.Accuracy.Approximate {
+		t.Error("Accuracy.Approximate = false, want true for a sketch-derived percentile")
+	}
+	if res.Accuracy.SketchScale != SketchDefaultScale {
+		t.Errorf("SketchScale = %d, want %d", res.Accuracy.SketchScale, SketchDefaultScale)
+	}
+	if res.Accuracy.RelativeErrorBound <= 0 {
+		t.Fatalf("RelativeErrorBound = %v, want > 0", res.Accuracy.RelativeErrorBound)
+	}
+	want := 99000.0 // the 990th of 1000 values, in microseconds
+	rel := math.Abs(res.P99LatencyMicros-want) / want
+	if rel > res.Accuracy.RelativeErrorBound {
+		t.Errorf("p99 = %v (rel err %v) exceeds advertised bound %v",
+			res.P99LatencyMicros, rel, res.Accuracy.RelativeErrorBound)
+	}
+}
+
+// TestAccuracyMetadataTracksDownscaledMerge pins the reason the bound is
+// computed and not hard-coded: merging a coarser sketch downscales the result,
+// so the advertised error must GROW past the scale-4 2.17%.
+func TestAccuracyMetadataTracksDownscaledMerge(t *testing.T) {
+	f := newQueryFixture(t)
+
+	fine := &AggregateDelta{}
+	fine.ObserveSpan(1000, false)
+
+	coarse := &AggregateDelta{}
+	coarse.ObserveSpan(1000, false)
+	sk, err := NewSketchAtScale(1)
+	if err != nil {
+		t.Fatalf("NewSketchAtScale: %v", err)
+	}
+	sk.Observe(1000)
+	coarse.Sketch = sk
+
+	f.apply(f.traceKey("a", "op"), f.window(), fine)
+	f.apply(f.traceKey("b", "op"), f.window(), coarse)
+
+	res, err := f.engine.QueryDashboard(f.rangeQuery())
+	if err != nil {
+		t.Fatalf("QueryDashboard: %v", err)
+	}
+	if res.Accuracy.SketchScale != 1 {
+		t.Fatalf("SketchScale = %d, want 1 (the coarser of the merged pair)", res.Accuracy.SketchScale)
+	}
+	defaultBound := AccuracyFromSketch(NewSketch()).RelativeErrorBound
+	if res.Accuracy.RelativeErrorBound <= defaultBound {
+		t.Errorf("RelativeErrorBound = %v, want greater than the scale-%d bound %v",
+			res.Accuracy.RelativeErrorBound, SketchDefaultScale, defaultBound)
+	}
+}
+
+// TestAccuracyMetadataReportsCollapse covers the other way a sketch leaves its
+// nominal bound: a collapsed sketch's low tail is outside it.
+func TestAccuracyMetadataReportsCollapse(t *testing.T) {
+	s := NewSketch()
+	// A dynamic range wide enough to force a collapse into the lowest bin.
+	s.Observe(1)
+	s.Observe(1e12)
+	if !s.Collapsed() {
+		t.Skip("sketch did not collapse at this scale; nothing to assert")
+	}
+	acc := AccuracyFromSketch(s)
+	if !acc.Degraded {
+		t.Error("Degraded = false for a collapsed sketch, want true")
+	}
+}
+
+// TestQueryBucketsOnePointPerWindow pins the traffic shape: one point per
+// five-minute window, ordered, with error counts carried through.
+func TestQueryBucketsOnePointPerWindow(t *testing.T) {
+	f := newQueryFixture(t)
+	cur := f.window()
+	prev := cur - int64(WindowSize/time.Second)
+	f.apply(f.traceKey("checkout", "op"), prev, spanDelta(3, 1000))
+	f.apply(f.traceKey("checkout", "op"), cur, spanDelta(6, 1000))
+
+	res, err := f.engine.QueryBuckets(f.rangeQuery())
+	if err != nil {
+		t.Fatalf("QueryBuckets: %v", err)
+	}
+	if len(res.Points) != 2 {
+		t.Fatalf("points = %d, want 2", len(res.Points))
+	}
+	if !res.Points[0].WindowStart.Before(res.Points[1].WindowStart) {
+		t.Error("points are not ordered oldest first")
+	}
+	if res.Points[0].Count != 3 || res.Points[1].Count != 6 {
+		t.Errorf("counts = %d,%d want 3,6", res.Points[0].Count, res.Points[1].Count)
+	}
+	if res.Points[1].ErrorCount != 2 {
+		t.Errorf("error count = %d, want 2", res.Points[1].ErrorCount)
+	}
+}
+
+func TestQueryTopologyNodesFromAggregates(t *testing.T) {
+	f := newQueryFixture(t)
+	f.apply(f.traceKey("cart", "op"), f.window(), spanDelta(3, 2000))
+	f.apply(f.traceKey("checkout", "op"), f.window(), spanDelta(6, 1000))
+
+	res, err := f.engine.QueryTopology(f.rangeQuery())
+	if err != nil {
+		t.Fatalf("QueryTopology: %v", err)
+	}
+	if len(res.Nodes) != 2 {
+		t.Fatalf("nodes = %d, want 2", len(res.Nodes))
+	}
+	if res.Nodes[0].Service != "cart" || res.Nodes[1].Service != "checkout" {
+		t.Errorf("nodes not sorted by service: %v", res.Nodes)
+	}
+	if res.Nodes[1].Count != 6 {
+		t.Errorf("checkout count = %d, want 6", res.Nodes[1].Count)
+	}
+	if math.Abs(res.Nodes[1].AvgLatencyMs-1.0) > 1e-9 {
+		t.Errorf("checkout avg latency = %v ms, want 1", res.Nodes[1].AvgLatencyMs)
+	}
+}
+
+// TestOwnershipIsExclusivePerWindow is the read-consistency contract of #164:
+// a window owned by the engine is read ONLY from memory even when the store
+// holds rows for it, and after finalization it is read ONLY from the store.
+// Neither transition may omit or double-count.
+func TestOwnershipIsExclusivePerWindow(t *testing.T) {
+	f := newQueryFixture(t)
+	st := newStubStore()
+	f.engine.SetStore(st)
+
+	key := f.traceKey("checkout", "op")
+	w := f.window()
+	f.apply(key, w, spanDelta(10, 1000))
+	// A crash-recovery checkpoint row exists for the SAME window. Row presence
+	// must not add a second count.
+	st.put(1, key, w, spanDelta(10, 1000))
+
+	res, err := f.engine.QueryDashboard(f.rangeQuery())
+	if err != nil {
+		t.Fatalf("QueryDashboard: %v", err)
+	}
+	if res.TotalTraces != 10 {
+		t.Fatalf("TotalTraces = %d with a checkpointed mutable window, want 10", res.TotalTraces)
+	}
+	for _, r := range st.readRanges {
+		if w >= r[0] && w < r[1] {
+			t.Fatalf("store was asked for memory-owned window %d (range %v)", w, r)
+		}
+	}
+
+	own := f.engine.Ownership()
+	if !own.OwnsInMemory(w) {
+		t.Fatalf("window %d is not memory-owned before finalization", w)
+	}
+
+	// Finalization hands the window over. The count must stay 10 — now served
+	// entirely from the store.
+	f.engine.MarkFinalized(w)
+	own = f.engine.Ownership()
+	if own.OwnsInMemory(w) {
+		t.Fatal("window is still memory-owned after MarkFinalized")
+	}
+	if own.FinalizedWatermark != w {
+		t.Errorf("FinalizedWatermark = %d, want %d", own.FinalizedWatermark, w)
+	}
+
+	res, err = f.engine.QueryDashboard(f.rangeQuery())
+	if err != nil {
+		t.Fatalf("QueryDashboard after finalize: %v", err)
+	}
+	if res.TotalTraces != 10 {
+		t.Fatalf("TotalTraces = %d after finalization, want 10", res.TotalTraces)
+	}
+}
+
+// TestQueryRejectsUnboundedRange keeps the store-side bound rule visible at the
+// facade: a query without a forward range is refused, not clamped silently.
+func TestQueryRejectsUnboundedRange(t *testing.T) {
+	f := newQueryFixture(t)
+	if _, err := f.engine.QueryDashboard(Query{Tenant: "default"}); err == nil {
+		t.Fatal("QueryDashboard accepted an empty range")
+	}
+	if _, err := f.engine.QueryDashboard(Query{Start: f.now.Add(-time.Hour), End: f.now}); err == nil {
+		t.Fatal("QueryDashboard accepted a query with no tenant")
+	}
+}
+
+// TestRolloverHandsOwnershipToTheStore pins that an evicted window stops
+// claiming memory ownership: claiming it would report zero for a window whose
+// deltas are already durable.
+func TestRolloverHandsOwnershipToTheStore(t *testing.T) {
+	f := newQueryFixture(t)
+	old := f.window() - int64((WindowSize+AllowedLateness+WindowSize)/time.Second)
+	f.engine.own.mu.Lock()
+	f.engine.own.mutable[old] = struct{}{}
+	f.engine.own.mu.Unlock()
+
+	f.engine.Rollover(f.now)
+	own := f.engine.Ownership()
+	if own.OwnsInMemory(old) {
+		t.Fatal("expired window is still memory-owned after rollover")
+	}
+	if own.FinalizedWatermark < old {
+		t.Errorf("FinalizedWatermark = %d, want at least %d", own.FinalizedWatermark, old)
+	}
+}

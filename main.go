@@ -335,9 +335,10 @@ func main() {
 		metrics.IncrementActiveConns,
 		metrics.DecrementActiveConns,
 	)
+	// The hub is STARTED further down, after the aggregate engine exists: in
+	// AGGREGATE_MODE=aggregate its publication loop is revision-driven and
+	// needs the publisher wired before the first tick.
 	ctxEvents, cancelEvents := context.WithCancel(context.Background())
-	go eventHub.Start(ctxEvents, 5*time.Second, 500*time.Millisecond)
-	slog.Info("⚡ Event notification hub started (5s snapshots, 500ms batches)")
 
 	// 4c. Initialize TSDB Aggregator + Ring Buffer
 	tsdbAgg := tsdb.NewAggregator(repo, 30*time.Second)
@@ -479,6 +480,7 @@ func main() {
 		aggStore     *aggregate.SQLiteStore
 		aggWriter    *aggregate.Writer
 		aggRecovery  *aggregate.RecoveryGate
+		aggEngine    *aggregate.Engine
 		aggStoreMetr = aggregate.NewPrometheusStoreMetrics(metrics)
 	)
 	if cfg.AggregateMode != aggregate.ModeLegacy {
@@ -511,7 +513,7 @@ func main() {
 			fatal("❌ Aggregate dictionary could not be loaded", err, "path", cfg.AggregateDBPath)
 		}
 
-		aggEngine, err := aggregate.NewEngine(aggregate.EngineConfig{
+		aggEngine, err = aggregate.NewEngine(aggregate.EngineConfig{
 			Mode:      cfg.AggregateMode,
 			Registrar: registrar,
 			Limiter: aggregate.LimiterConfig{
@@ -614,6 +616,32 @@ func main() {
 			aggStore.Analyze,
 		)
 	}
+
+	// Aggregate READ path (#175). Only AGGREGATE_MODE=aggregate switches the
+	// dashboard, the WebSocket publisher and the MCP coverage metadata over;
+	// shadow mode writes aggregates but keeps serving the legacy reads.
+	if cfg.AggregateMode == aggregate.ModeAggregate && aggEngine != nil {
+		apiServer.SetAggregateEngine(aggEngine)
+		mcpServer.SetAggregateMode(true)
+		// Per-event log/metric broadcasts are replaced by the coalesced,
+		// revision-driven snapshot.
+		hub.SetAggregateMode(true)
+		eventHub.SetAggregatePublisher(realtime.NewEnginePublisher(realtime.EnginePublisherConfig{
+			Engine: aggEngine,
+			Tenant: cfg.DefaultTenant,
+			Edges: func(ctx context.Context) []storage.ServiceMapEdge {
+				return graphRAGServiceEdges(ctx, graphRAG)
+			},
+		}), realtime.DefaultPublishFloor)
+		slog.Info("📊 Aggregate read path enabled",
+			"epoch", aggEngine.Epoch(),
+			"ws_publish_floor", realtime.DefaultPublishFloor,
+			"note", "dashboard, topology and WebSocket snapshots are served from the aggregate engine",
+		)
+	}
+
+	go eventHub.Start(ctxEvents, 5*time.Second, 500*time.Millisecond)
+	slog.Info("⚡ Event notification hub started (5s snapshots, 500ms batches)")
 
 	retention.Start(ctxRetention)
 	slog.Info("🧹 Retention scheduler started",
@@ -1308,4 +1336,29 @@ func printBanner() {
   version: %s
 `
 	fmt.Printf(banner, Version)
+}
+
+// graphRAGServiceEdges projects the GraphRAG service store's CALLS edges into
+// the storage topology shape. Caller/callee identity is not part of an
+// aggregate SeriesKey, so the aggregate read path sources edges here — which is
+// also why any response carrying them is marked "sampled" rather than "full".
+func graphRAGServiceEdges(ctx context.Context, g *graphrag.GraphRAG) []storage.ServiceMapEdge {
+	if g == nil {
+		return nil
+	}
+	all := g.AllServiceEdges(ctx)
+	edges := make([]storage.ServiceMapEdge, 0, len(all))
+	for _, e := range all {
+		if e.Type != "CALLS" {
+			continue
+		}
+		edges = append(edges, storage.ServiceMapEdge{
+			Source:       e.FromID,
+			Target:       e.ToID,
+			CallCount:    e.CallCount,
+			AvgLatencyMs: e.AvgMs,
+			ErrorRate:    e.ErrorRate,
+		})
+	}
+	return edges
 }

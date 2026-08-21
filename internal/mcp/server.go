@@ -72,6 +72,11 @@ type Server struct {
 	graphRAG      *graphrag.GraphRAG
 	defaultTenant string
 
+	// aggregateMode makes every successful tool result carry coverage body
+	// metadata. Set only in AGGREGATE_MODE=aggregate; legacy and shadow
+	// responses stay byte-for-byte what they were.
+	aggregateMode bool
+
 	// callSlots is a counting-semaphore implemented as a buffered channel:
 	// buffer size is the max concurrent tools/call invocations. A non-
 	// blocking send acquires a slot, a receive on defer releases it.
@@ -187,6 +192,12 @@ func (s *Server) SetDefaultTenant(t string) {
 // SetGraphRAG wires the GraphRAG instance for advanced query tools.
 func (s *Server) SetGraphRAG(g *graphrag.GraphRAG) {
 	s.graphRAG = g
+}
+
+// SetAggregateMode makes tool results carry coverage body metadata. Call it
+// with true only in AGGREGATE_MODE=aggregate.
+func (s *Server) SetAggregateMode(on bool) {
+	s.aggregateMode = on
 }
 
 // Handler returns an http.Handler for the MCP server with CORS applied.
