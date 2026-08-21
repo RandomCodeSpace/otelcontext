@@ -18,7 +18,7 @@ export default function CoverageBadge({
 }: Readonly<CoverageBadgeProps>) {
   if (!coverage) return null
 
-  let tone: 'full' | 'sampled' | 'exemplar' = coverage as any
+  const tone: 'full' | 'sampled' | 'exemplar' = coverage
 
   return (
     <span

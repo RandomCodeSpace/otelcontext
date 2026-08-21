@@ -23,7 +23,7 @@ export function useWsEpoch(manager?: WsManager): EpochSnapshot {
     () => {
       // Return current epoch/revision from the manager
       // This requires exposing getEpochSnapshot() on WsManager
-      return (ws as any).getEpochSnapshot?.() ?? { epoch: 0, revision: 0 }
+      return (ws.getEpochSnapshot as () => EpochSnapshot)() ?? { epoch: 0, revision: 0 }
     },
   )
 

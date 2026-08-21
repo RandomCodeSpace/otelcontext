@@ -173,15 +173,15 @@ export class WsManager {
         clearTimeout(this.heartbeatTimeout)
         this.heartbeatTimeout = null
       }
-      let payload: any
+      let payload: Record<string, unknown>
       try {
-        payload = JSON.parse(event.data) as any
+        payload = JSON.parse(event.data) as Record<string, unknown>
       } catch {
         return // non-JSON frames (incl. server ping echoes) are ignored
       }
 
       // Handle epoch change (full snapshot on connect is marked reset=true)
-      if (payload.epoch !== undefined && payload.epoch !== this.currentEpoch) {
+      if (typeof payload.epoch === 'number' && payload.epoch !== this.currentEpoch) {
         this.currentEpoch = payload.epoch
         this.lastRevision = 0
         // On epoch change, discard accumulated state and re-request full snapshot
@@ -191,7 +191,7 @@ export class WsManager {
       }
 
       // Ignore messages with revision <= last applied revision in same epoch
-      if (payload.revision !== undefined) {
+      if (typeof payload.revision === 'number') {
         if (payload.revision <= this.lastRevision) {
           return
         }
