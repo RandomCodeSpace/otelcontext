@@ -96,7 +96,7 @@ func oneServiceSnapshot(revision uint64, count, errors uint64) aggregate.Topolog
 			LastSeen:  now.Add(aggregate.WindowSize),
 			Windows:   []aggregate.TopologyWindow{aggWindow(now, count, errors, 4000)},
 		}},
-		Edges: []aggregate.TopologyEdge{{
+		Edges: []aggregate.SnapshotEdge{{
 			Caller:    "gateway",
 			Callee:    "checkout",
 			FirstSeen: now,

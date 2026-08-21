@@ -210,7 +210,7 @@ func operationNodeFrom(op aggregate.TopologyOperation) *OperationNode {
 	return node
 }
 
-func callEdgeFrom(e aggregate.TopologyEdge) *Edge {
+func callEdgeFrom(e aggregate.SnapshotEdge) *Edge {
 	t := totalsOf(e.Windows)
 	edge := &Edge{
 		Type:       EdgeCalls,

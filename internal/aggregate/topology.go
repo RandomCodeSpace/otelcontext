@@ -151,8 +151,8 @@ type TopologyOperation struct {
 	Windows   []TopologyWindow `json:"windows"`
 }
 
-// TopologyEdge is one caller/callee service pair and its retained windows.
-type TopologyEdge struct {
+// SnapshotEdge is one caller/callee service pair and its retained windows.
+type SnapshotEdge struct {
 	Caller    string           `json:"caller"`
 	Callee    string           `json:"callee"`
 	FirstSeen time.Time        `json:"first_seen"`
@@ -186,7 +186,7 @@ type TopologySnapshot struct {
 
 	Services   []TopologyService   `json:"services"`
 	Operations []TopologyOperation `json:"operations"`
-	Edges      []TopologyEdge      `json:"edges"`
+	Edges      []SnapshotEdge      `json:"edges"`
 	Metrics    []TopologyMetric    `json:"metrics"`
 
 	// Dropped* count facts refused by the projection caps since startup.
@@ -644,9 +644,9 @@ func (p *topologyProjection) Snapshot(tenant string, now time.Time) TopologySnap
 		return snap.Operations[i].Operation < snap.Operations[j].Operation
 	})
 
-	snap.Edges = make([]TopologyEdge, 0, len(tt.edges))
+	snap.Edges = make([]SnapshotEdge, 0, len(tt.edges))
 	for key, e := range tt.edges {
-		snap.Edges = append(snap.Edges, TopologyEdge{
+		snap.Edges = append(snap.Edges, SnapshotEdge{
 			Caller:    key.a,
 			Callee:    key.b,
 			FirstSeen: e.first,
