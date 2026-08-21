@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/RandomCodeSpace/otelcontext/internal/aggregate"
 	"github.com/RandomCodeSpace/otelcontext/internal/ai"
 	"github.com/RandomCodeSpace/otelcontext/internal/api"
 	"github.com/RandomCodeSpace/otelcontext/internal/config"
@@ -454,6 +455,45 @@ func main() {
 	traceServer := ingest.NewTraceServer(repo, metrics, cfg)
 	logsServer := ingest.NewLogsServer(repo, metrics, cfg)
 	metricsServer := ingest.NewMetricsServer(repo, metrics, tsdbAgg, cfg)
+
+	// Aggregate engine (AGGREGATE_MODE != legacy). Phase 1 is accounting only:
+	// the reducer runs inside Export() ahead of the sampler, the read path
+	// stays legacy, and mutable windows are discarded rather than persisted
+	// until the durable store lands (#173). AGGREGATE_MODE=legacy constructs
+	// nothing and leaves every ingest path byte-for-byte unchanged.
+	if cfg.AggregateMode != aggregate.ModeLegacy {
+		aggEngine, err := aggregate.NewEngine(aggregate.EngineConfig{
+			Mode: cfg.AggregateMode,
+			Limiter: aggregate.LimiterConfig{
+				MaxSeries:                 cfg.AggregateMaxSeries,
+				MaxSeriesMetrics:          cfg.AggregateMaxSeriesMetrics,
+				MaxSeriesTraces:           cfg.AggregateMaxSeriesTraces,
+				MaxSeriesEdges:            cfg.AggregateMaxSeriesEdges,
+				MaxSeriesLogs:             cfg.AggregateMaxSeriesLogs,
+				MaxSeriesSystem:           cfg.AggregateMaxSeriesSystem,
+				MaxOperationsPerService:   cfg.AggregateMaxOperationsPerService,
+				MaxLogTemplatesPerService: cfg.AggregateMaxLogTemplatesPerService,
+				MaxTraceSeriesPerService:  cfg.AggregateMaxTraceSeriesPerService,
+				MaxMetricSeriesPerService: cfg.AggregateMaxMetricSeriesPerService,
+				SeriesPerTenantFraction:   cfg.AggregateSeriesPerTenantFraction,
+			},
+			MaxProducerBaselinesPerSeries: cfg.AggregateMaxProducerBaselinesPerSeries,
+			MaxBaselines:                  cfg.ResolvedAggregateMaxBaselines(),
+			Metrics:                       aggregate.NewPrometheusRecorder(metrics),
+		})
+		if err != nil {
+			fatal("❌ Aggregate engine configuration rejected", err, "mode", cfg.AggregateMode)
+		}
+		traceServer.SetAggregateEngine(aggEngine)
+		logsServer.SetAggregateEngine(aggEngine)
+		metricsServer.SetAggregateEngine(aggEngine)
+		slog.Info("🧮 Aggregate engine enabled",
+			"mode", cfg.AggregateMode,
+			"max_series", cfg.AggregateMaxSeries,
+			"max_baselines", cfg.ResolvedAggregateMaxBaselines(),
+			"note", "Phase 1: accounting only, windows are not persisted",
+		)
+	}
 
 	// Wire adaptive sampler (only when rate < 1.0 to avoid unnecessary overhead)
 	if cfg.SamplingRate > 0 && cfg.SamplingRate < 1.0 {
