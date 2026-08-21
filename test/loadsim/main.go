@@ -25,8 +25,8 @@ import (
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/metric"
-	"go.opentelemetry.io/otel/sdk/resource"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.17.0"
 	"go.opentelemetry.io/otel/trace"
@@ -121,10 +121,10 @@ func (p *producer) generateLogBody(seq int) string {
 	for i := 0; i < strings.Count(template, "%"); i++ {
 		if i%2 == 0 {
 			// Alternate between numeric and string IDs.
-			tokens = append(tokens, p.rng.Intn(10000))
+			tokens = append(tokens, p.rng.Intn(10000)) // NOSONAR go:S2245 -- synthetic load data, not security-sensitive
 		} else {
 			// Generate a service-scoped ID token.
-			tokens = append(tokens, fmt.Sprintf("id-%d", p.rng.Intn(1000)))
+			tokens = append(tokens, fmt.Sprintf("id-%d", p.rng.Intn(1000))) // NOSONAR go:S2245 -- synthetic load data, not security-sensitive
 		}
 	}
 	return fmt.Sprintf(template, tokens...)
@@ -229,17 +229,17 @@ type producer struct {
 	metricsErrors atomic.Int64
 
 	// Metric state.
-	requestCount     atomic.Int64 // monotonic cumulative
-	queueDepth       atomic.Int64 // gauge value
-	resetCountSeq    atomic.Int64 // resets every ~5 minutes
-	resetCountStart  time.Time
+	requestCount    atomic.Int64 // monotonic cumulative
+	queueDepth      atomic.Int64 // gauge value
+	resetCountSeq   atomic.Int64 // resets every ~5 minutes
+	resetCountStart time.Time
 }
 
 // producerMeters holds pre-created metric instruments.
 type producerMeters struct {
-	requestCounter   metric.Int64Counter
-	queueDepthGauge  metric.Int64Gauge
-	resetCounter     metric.Int64Counter
+	requestCounter  metric.Int64Counter
+	queueDepthGauge metric.Int64Gauge
+	resetCounter    metric.Int64Counter
 }
 
 func newProducer(ctx context.Context, idx int, endpoint, tenantID string, insecure bool) (*producer, error) {
@@ -454,7 +454,7 @@ func (p *producer) emitSpan(ctx context.Context, seq int) {
 // For now, we track sent/error counts but don't actually export logs via the SDK
 // since the Go OTel logs API is still in early development.
 func (p *producer) emitLog(ctx context.Context, seq int) {
-	_ = pickSeverity(seq) // Severity is determined but not used until logs SDK is available.
+	_ = pickSeverity(seq)      // Severity is determined but not used until logs SDK is available.
 	_ = p.generateLogBody(seq) // Generate but don't export (no logs SDK yet)
 	p.logsSent.Add(1)
 
@@ -471,7 +471,7 @@ func (p *producer) emitMetrics(ctx context.Context, seq int) {
 	p.meters.requestCounter.Add(ctx, 1)
 
 	// Update queue depth gauge (simulate a value).
-	depth := int64(p.rng.Intn(100))
+	depth := int64(p.rng.Intn(100)) // NOSONAR go:S2245 -- synthetic load data, not security-sensitive
 	p.queueDepth.Store(depth)
 	p.meters.queueDepthGauge.Record(ctx, depth)
 
