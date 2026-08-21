@@ -133,6 +133,12 @@ type Reducer struct {
 	arrival time.Time
 	deltas  DeltaMap
 	stats   ReducerStats
+	// ids carries the STRING identity of each delta for the engine's topology
+	// projection (#174). It is one small struct per delta, not per point, and
+	// it exists so the projection never has to reverse a dictionary ID — after
+	// a restart the durable dictionary is warm but the intern cache is empty,
+	// so a reverse lookup would silently render an unnamed topology.
+	ids map[SeriesWindowKey]topoIdentity
 }
 
 // NewReducer returns a reducer for one Export request. arrival is the single
@@ -171,6 +177,12 @@ func (r *Reducer) MergeFrom(other *Reducer) {
 		}
 		r.deltas[swk] = d
 	}
+	for swk, id := range other.ids {
+		if r.ids == nil {
+			r.ids = make(map[SeriesWindowKey]topoIdentity, len(other.ids))
+		}
+		r.ids[swk] = id
+	}
 	r.stats.merge(&other.stats)
 }
 
@@ -197,6 +209,20 @@ func (r *Reducer) delta(key SeriesKey, window int64) *AggregateDelta {
 	r.deltas[swk] = d
 	return d
 }
+
+// identify records the string identity of one (series, window) for the
+// topology projection. Repeated calls for the same key are idempotent.
+func (r *Reducer) identify(key SeriesKey, window int64, id topoIdentity) {
+	swk := SeriesWindowKey{Key: key, WindowStart: window}
+	if r.ids == nil {
+		r.ids = make(map[SeriesWindowKey]topoIdentity, 8)
+	}
+	r.ids[swk] = id
+}
+
+// topologyIDs returns the reducer's identity map. The engine folds it into the
+// topology projection after a successful apply.
+func (r *Reducer) topologyIDs() map[SeriesWindowKey]topoIdentity { return r.ids }
 
 // admitPoint applies the window/lateness rules and updates the per-signal
 // counters. It reports ok=false when the point is excluded.
@@ -243,10 +269,71 @@ func (r *Reducer) ReduceSpan(in SpanInput) {
 	}
 	isError := key.StatusClass == StatusError
 	r.delta(key, window).ObserveSpan(in.DurationMicros, isError)
+	r.identify(key, window, topoIdentity{Kind: topoTrace, Tenant: in.Tenant, A: in.Service, B: operation})
 	r.stats.Accepted[SignalTraceOp]++
 	if isError {
 		r.countError(in.Service)
 	}
+}
+
+// EdgeInput is one resolved caller/callee call, derived from a child span whose
+// parent span belongs to a different service. Everything except Caller comes
+// from the child span, matching what the edge measures: the callee's work as
+// observed by this call.
+type EdgeInput struct {
+	Tenant string
+	// Caller is the service that owns the parent span.
+	Caller string
+	// Callee is the service that owns this span.
+	Callee string
+	// HTTPRoute, URLPath and SpanName resolve the callee's operation for
+	// route normalization; only the callee service name enters edge identity.
+	HTTPRoute string
+	URLPath   string
+	SpanName  string
+
+	Method         string
+	HTTPStatusCode int
+	SpanKind       int32
+	StatusCode     int32
+
+	Timestamp      time.Time
+	DurationMicros float64
+}
+
+// ReduceEdge folds one resolved cross-service call into its service-edge series.
+//
+// #183 shipped SignalServiceEdge but emitted nothing into it: a single span
+// does not know its caller. #174 supplies the caller through the engine's
+// EdgeResolver and this is where it lands. Edge identity is
+// (caller service, callee service) plus the callee's status/HTTP/kind
+// dimensions — never a span ID, never an operation of the caller.
+func (r *Reducer) ReduceEdge(in EdgeInput) {
+	if in.Caller == "" || in.Callee == "" || in.Caller == in.Callee {
+		return
+	}
+	window, ok := r.admitPoint(SignalServiceEdge, in.Timestamp)
+	if !ok {
+		return
+	}
+	tenantID := r.eng.cache.InternTenant(in.Tenant)
+	key := SeriesKey{
+		TenantID:  tenantID,
+		ServiceID: r.eng.cache.Intern(tenantID, KindService, in.Caller),
+		// NameKind(SignalServiceEdge) is KindOperation: the callee service
+		// name is the edge's "name" within the caller's namespace, so
+		// MAX_OPERATIONS_PER_SERVICE bounds a caller's fan-out.
+		NameID:      r.eng.cache.Intern(tenantID, KindOperation, in.Callee),
+		Signal:      SignalServiceEdge,
+		StatusClass: TraceStatusFromCode(in.StatusCode),
+		HTTPClass:   HTTPClassFromStatus(in.HTTPStatusCode),
+		Method:      ParseMethod(in.Method),
+		Variant:     VariantFromSpanKind(in.SpanKind),
+	}
+	isError := key.StatusClass == StatusError
+	r.delta(key, window).ObserveSpan(in.DurationMicros, isError)
+	r.identify(key, window, topoIdentity{Kind: topoEdge, Tenant: in.Tenant, A: in.Caller, B: in.Callee})
+	r.stats.Accepted[SignalServiceEdge]++
 }
 
 // ReduceLog folds one log record into its log series. The template is mined
@@ -314,6 +401,7 @@ func (r *Reducer) ReduceMetricPoint(in MetricInput) {
 		d := r.delta(key, window)
 		d.ObserveCounter(out.Delta, out.Reset)
 	}
+	r.identify(key, window, topoIdentity{Kind: topoMetric, Tenant: in.Tenant, A: in.Service, B: in.Name})
 	r.stats.Accepted[SignalMetric]++
 }
 

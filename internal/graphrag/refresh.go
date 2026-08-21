@@ -40,8 +40,9 @@ func (g *GraphRAG) refreshLoop(ctx context.Context) {
 	ticker := time.NewTicker(g.refreshEvery)
 	defer ticker.Stop()
 
-	// Initial rebuild on startup.
-	g.rebuildAllTenantsFromDB(ctx)
+	// Initial topology load on startup. In aggregate mode this is a snapshot
+	// read from the engine's projection, not a spans-table scan.
+	g.refreshTopology(ctx)
 
 	for {
 		select {
@@ -50,7 +51,7 @@ func (g *GraphRAG) refreshLoop(ctx context.Context) {
 		case <-g.stopCh:
 			return
 		case <-ticker.C:
-			g.rebuildAllTenantsFromDB(ctx)
+			g.refreshTopology(ctx)
 			pruned := 0
 			prunedSignals := 0
 			signalCutoff := time.Now().Add(-signalRetention)
@@ -79,6 +80,20 @@ func (g *GraphRAG) refreshLoop(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// refreshTopology brings the in-memory topology up to date for one tick.
+//
+// Aggregate mode: replace from the engine's per-tenant snapshot, skipping any
+// tenant whose revision has not moved. It issues no database query — the
+// raw-span rebuild and the legacy internal/graph scanner are both retired
+// there (#163, #174). Every other mode keeps the historical rebuild verbatim.
+func (g *GraphRAG) refreshTopology(ctx context.Context) {
+	if g.AggregateMode() {
+		g.reconcileTopology()
+		return
+	}
+	g.rebuildAllTenantsFromDB(ctx)
 }
 
 // evictIdleTenants drops tenant store slices whose lastAccess is older than
@@ -132,6 +147,8 @@ func (g *GraphRAG) snapshotLoop(ctx context.Context) {
 		case <-g.stopCh:
 			return
 		case <-ticker.C:
+			// No-op when the miner lives on the ingest path (shadow and
+			// aggregate modes); persistDrainTemplates guards on g.drain.
 			g.persistDrainTemplates()
 		}
 	}
@@ -160,6 +177,12 @@ func (g *GraphRAG) persistDrainTemplates() {
 // spans — this catches historical tenants that have not yet ingested via
 // live callbacks since startup.
 func (g *GraphRAG) rebuildAllTenantsFromDB(ctx context.Context) {
+	// Hard guard, not just a caller-side branch: the raw-span rebuild is the
+	// scan #174 retires, and no future caller may reintroduce it in aggregate
+	// mode by accident.
+	if g.AggregateMode() {
+		return
+	}
 	if g.repo == nil || g.repo.DB() == nil {
 		return
 	}
@@ -215,6 +238,9 @@ func incrementalSince(stores *tenantStores, since time.Time) time.Time {
 // merges it into that tenant's slice of the graph. Catches data from before
 // callbacks started (e.g., restart recovery).
 func (g *GraphRAG) rebuildFromDBForTenant(_ context.Context, tenant string, since time.Time) {
+	if g.AggregateMode() {
+		return
+	}
 	type spanRow struct {
 		SpanID        string
 		ParentSpanID  string

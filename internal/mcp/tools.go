@@ -51,29 +51,29 @@ func mkTool(name, desc string, opts ...schemaOpt) Tool {
 }
 
 var toolDefs = []Tool{
-	mkTool("get_anomaly_timeline", "Returns recent anomalies with temporal causal links, optionally filtered by service. The triage entry point — answers \"what's wrong right now\".",
+	mkTool("get_anomaly_timeline", "Returns recent anomalies with temporal causal links, optionally filtered by service. The triage entry point — answers \"what's wrong right now\". Aggregate-backed: complete within aggregate retention, independent of which traces were retained as raw exemplars.",
 		param("since", "string", "Start time RFC3339. Defaults to 1h ago."),
 		param("service", "string", "Filter by service."),
 	),
-	mkTool("get_service_map", "Returns the service topology with health scores, error rates, call counts, and dependency edges. Powered by the live GraphRAG.",
+	mkTool("get_service_map", "Returns the service topology with health scores, error rates, call counts, and dependency edges. Aggregate-backed: counts describe ALL accepted telemetry, not the sampled subset, and are complete within aggregate retention.",
 		param("depth", "number", "Max traversal depth (default 3)."),
 		param("service", "string", "Focus on a specific service and its neighbors."),
 	),
-	mkTool("get_service_health", "Returns detailed health metrics for a specific service: error rate, latency percentiles, request rate, and active alerts.",
+	mkTool("get_service_health", "Returns detailed health metrics for a specific service: error rate, latency, request counts and dependency edges. Aggregate-backed and complete within aggregate retention. Returns an explicit \"not found in the current tenant window\" message rather than an empty guess.",
 		required("service_name"),
 		param("service_name", "string", "The service name to query."),
 	),
-	mkTool("root_cause_analysis", "Ranked probable root causes with evidence: error chains, anomalous metrics, correlated logs.",
+	mkTool("root_cause_analysis", "Ranked probable root causes with evidence: error chains, anomalous metrics, correlated logs. Each ranked cause carries a `coverage` block: `source=retained_exemplar` means a complete retained error chain backs it, `partial_exemplar` means the upstream walk stopped at a span that was not retained (the named service is NOT proven to be the root), and `not_retained_or_not_found` means the ranking rests on aggregate anomaly evidence with no chain behind it. Errors are always eligible for retention but never all retained — treat a partial cause as a lead, not a conclusion.",
 		required("service"),
 		param("service", "string", "Service experiencing issues."),
 		param("time_range", "string", "Lookback window. Defaults to '15m'."),
 	),
-	mkTool("impact_analysis", "BFS downstream from a service to find all affected services and impact scores.",
+	mkTool("impact_analysis", "BFS downstream from a service to find all affected services and impact scores. Aggregate-backed: edges come from the aggregate topology snapshot and are complete within aggregate retention.",
 		required("service"),
 		param("service", "string", "Service to analyze blast radius for."),
 		param("depth", "number", "Max traversal depth (default 5)."),
 	),
-	mkTool("trace_graph", "Returns the full span tree for a trace with service names, durations, errors, and linked logs.",
+	mkTool("trace_graph", "Returns the retained span tree for a trace with service names, durations and errors, plus a `coverage` block stating what it covers. `coverage.source=retained_exemplar` with `complete=true` is a complete retained trace; `partial_exemplar` means spans reference parents that were not retained (per-trace span/byte bound or TTL) and `retained_spans`/`observed_spans` quantify the gap; `not_retained_or_not_found` means no exemplar exists for this trace — that is a definitive answer, not an error, and the trace should not be assumed to have been error-free. Only a fraction of healthy traces are retained by design; errors are always eligible but capped.",
 		required("trace_id"),
 		param("trace_id", "string", "The trace ID to visualize."),
 	),
@@ -272,6 +272,11 @@ func (s *Server) toolGetServiceMap(ctx context.Context, args map[string]any) Too
 	return textResult(string(data))
 }
 
+// toolTraceGraph answers with the retained span tree and an explicit coverage
+// block (#163's causal-analysis quality contract). A trace nobody retained is
+// answered "not retained or not found" — a definitive, successful response.
+// Fabricating certainty about a trace that was never persisted is the failure
+// mode this replaces.
 func (s *Server) toolTraceGraph(ctx context.Context, args map[string]any) ToolCallResult {
 	if s.graphRAG == nil {
 		return errorResult(errGraphRAGNotInit)
@@ -280,24 +285,55 @@ func (s *Server) toolTraceGraph(ctx context.Context, args map[string]any) ToolCa
 	if traceID == "" {
 		return errorResult("trace_id is required")
 	}
-	spans := s.graphRAG.DependencyChain(mcpCtx(ctx), traceID)
-	if len(spans) == 0 {
-		// Fallback to DB
-		trace, err := s.repo.GetTrace(mcpCtx(ctx), traceID)
-		if err != nil {
-			return errorResult(fmt.Sprintf("trace not found: %v", err))
+	tctx := mcpCtx(ctx)
+	res := s.graphRAG.TraceGraph(tctx, traceID)
+	if len(res.Spans) == 0 {
+		// The in-memory trace TTL is shorter than raw retention, so a trace
+		// that WAS retained can still be absent from the graph. The DB row
+		// carries the truncation counters the exemplar policy stamped on it.
+		if enriched, ok := s.traceGraphFromDB(tctx, traceID); ok {
+			res = enriched
 		}
-		data, err := json.Marshal(trace)
-		if err != nil {
-			return errorResult(fmt.Sprintf("failed to marshal trace: %v", err))
-		}
-		return resourceResult(resourceURIPrefix+"traces/"+traceID, httpconst.ContentTypeJSON, string(data))
 	}
-	data, err := json.Marshal(spans)
+	data, err := json.Marshal(res)
 	if err != nil {
 		return errorResult(fmt.Sprintf("failed to marshal trace graph: %v", err))
 	}
-	return textResult(string(data))
+	return resourceResult(resourceURIPrefix+"traces/"+traceID, httpconst.ContentTypeJSON, string(data))
+}
+
+// traceGraphFromDB reads the persisted trace row for a trace the in-memory
+// window no longer holds and renders its coverage from the retained/observed
+// counters the exemplar policy stamped on it.
+func (s *Server) traceGraphFromDB(ctx context.Context, traceID string) (graphrag.TraceGraphResult, bool) {
+	if s.repo == nil {
+		return graphrag.TraceGraphResult{}, false
+	}
+	trace, err := s.repo.GetTrace(ctx, traceID)
+	if err != nil {
+		return graphrag.TraceGraphResult{}, false
+	}
+	out := graphrag.TraceGraphResult{
+		TraceID: traceID,
+		Coverage: graphrag.Coverage{
+			Complete: true,
+			Source:   graphrag.CoverageRetained,
+			Note:     "trace row retained; its spans are outside the in-memory trace window",
+		},
+	}
+	if trace.Truncated != nil && *trace.Truncated {
+		out.Coverage.Complete = false
+		out.Coverage.Truncated = true
+		out.Coverage.Source = graphrag.CoveragePartial
+		out.Coverage.Note = "trace was truncated by the per-trace span/byte bound"
+	}
+	if trace.RetainedSpanCount != nil {
+		out.Coverage.RetainedSpans = *trace.RetainedSpanCount
+	}
+	if trace.ObservedSpanCount != nil {
+		out.Coverage.ObservedSpans = *trace.ObservedSpanCount
+	}
+	return out, true
 }
 
 func (s *Server) toolImpactAnalysis(ctx context.Context, args map[string]any) ToolCallResult {

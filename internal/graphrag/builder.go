@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/RandomCodeSpace/otelcontext/internal/aggregate"
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 	"github.com/RandomCodeSpace/otelcontext/internal/telemetry"
 	"github.com/RandomCodeSpace/otelcontext/internal/tsdb"
@@ -86,6 +87,10 @@ type event struct {
 	span   *spanEvent
 	log    *logEvent
 	metric *metricEvent
+	// tmpl carries an ingest-mined log template fact (shadow and aggregate
+	// modes). It rides the same channel as everything else so the miner's
+	// synchronous callback never does a store write on the OTLP goroutine.
+	tmpl *aggregate.TemplateFact
 }
 
 // GraphRAG is the main coordinator for the layered graph system.
@@ -148,6 +153,16 @@ type GraphRAG struct {
 	// detectAnomalies pass. Tenants whose lastEventAt predates it are
 	// skipped — no events means their stats cannot have changed.
 	lastAnomalyScan atomic.Int64
+
+	// mode is the aggregate mode this coordinator runs under: one of
+	// aggregate.ModeLegacy, ModeShadow or ModeAggregate. Legacy behaviour is
+	// the default and is unchanged in every respect; everything the aggregate
+	// phase adds is gated on this field (see aggregate.go).
+	mode string
+
+	// aggSource is the aggregate engine's topology projection, consulted only
+	// in aggregate mode.
+	aggSource AggregateSource
 }
 
 // SetMetrics wires the Prometheus registry so GraphRAG event drops are
@@ -231,6 +246,13 @@ type Config struct {
 	// without any ingest event or query. 0 = defaultTenantIdleTTL;
 	// negative disables eviction.
 	TenantIdleTTL time.Duration
+
+	// Mode is the aggregate mode (AGGREGATE_MODE): aggregate.ModeLegacy,
+	// ModeShadow or ModeAggregate. Empty means legacy. In shadow mode the only
+	// change is that log templates come from the ingest-owned miner; in
+	// aggregate mode the raw-span rebuild and the per-span topology upserts
+	// are retired in favour of engine snapshots (#163, #174).
+	Mode string
 }
 
 // DefaultConfig returns sensible defaults.
@@ -244,6 +266,7 @@ func DefaultConfig() Config {
 		ChannelSize:       defaultChannelSize,
 		MaxSpansPerTenant: defaultMaxSpansPerTenant,
 		TenantIdleTTL:     defaultTenantIdleTTL,
+		Mode:              aggregate.ModeLegacy,
 	}
 }
 
@@ -277,6 +300,9 @@ func New(repo *storage.Repository, tsdbAgg *tsdb.Aggregator, ringBuf *tsdb.RingB
 	if cfg.TenantIdleTTL == 0 {
 		cfg.TenantIdleTTL = defaultTenantIdleTTL
 	}
+	if cfg.Mode == "" {
+		cfg.Mode = aggregate.ModeLegacy
+	}
 
 	g := &GraphRAG{
 		tenants:           make(map[string]*tenantStores),
@@ -293,7 +319,15 @@ func New(repo *storage.Repository, tsdbAgg *tsdb.Aggregator, ringBuf *tsdb.RingB
 		workerCount:       cfg.WorkerCount,
 		maxSpansPerTenant: cfg.MaxSpansPerTenant,
 		tenantIdleTTL:     cfg.TenantIdleTTL,
+		mode:              cfg.Mode,
 		invCooldown:       newInvestigationCooldown(5 * time.Minute),
+	}
+	if g.externalTemplates() {
+		// Shadow and aggregate modes mine templates on the ingest path. A
+		// second miner here would mint a second ID space for the same log
+		// shapes (#163), so there is no Drain instance to construct, restore
+		// or persist.
+		g.drain = nil
 	}
 
 	// Bootstrap the default tenant slice so refresh/snapshot loops have a
@@ -309,7 +343,7 @@ func New(repo *storage.Repository, tsdbAgg *tsdb.Aggregator, ringBuf *tsdb.RingB
 	// learned templates as belonging to DefaultTenantID. The persistence layer
 	// is already keyed by (tenant_id, id) so a future per-tenant Drain miner
 	// can load each tenant's slice without colliding cluster IDs.
-	if repo != nil && repo.DB() != nil {
+	if repo != nil && repo.DB() != nil && g.drain != nil {
 		if tpls, err := LoadDrainTemplates(repo.DB(), storage.DefaultTenantID); err != nil {
 			slog.Info("GraphRAG: drain template restore skipped", "reason", err)
 		} else if len(tpls) > 0 {
@@ -471,6 +505,9 @@ func (g *GraphRAG) eventWorker(ctx context.Context) {
 			if ev.metric != nil {
 				g.processMetric(ev.metric)
 			}
+			if ev.tmpl != nil {
+				g.processTemplateFact(ev.tmpl)
+			}
 		}
 	}
 }
@@ -489,12 +526,18 @@ func (g *GraphRAG) processSpan(ev *spanEvent) {
 	stores := g.storesForTenant(ev.Tenant)
 	stores.lastEventAt.Store(time.Now().UnixNano())
 
-	// 1. Upsert ServiceNode
-	stores.service.UpsertService(span.ServiceName, durationMs, isError, span.StartTime)
-
-	// 2. Upsert OperationNode + EXPOSES edge
-	if span.OperationName != "" {
-		stores.service.UpsertOperation(span.ServiceName, span.OperationName, durationMs, isError, span.StartTime)
+	// 1./2./4. Service, operation and CALLS-edge aggregates.
+	//
+	// In aggregate mode these are owned by the engine's topology snapshot and
+	// replaced per revision (see aggregate.go). Folding a retained exemplar's
+	// span in here as well would double-count it against a snapshot that
+	// already accounted for every accepted span, sampled or not. Only the
+	// exemplar detail below is GraphRAG's to record.
+	if !g.AggregateMode() {
+		stores.service.UpsertService(span.ServiceName, durationMs, isError, span.StartTime)
+		if span.OperationName != "" {
+			stores.service.UpsertOperation(span.ServiceName, span.OperationName, durationMs, isError, span.StartTime)
+		}
 	}
 
 	// 3. Create TraceNode + SpanNode + CONTAINS + CHILD_OF edges
@@ -516,7 +559,7 @@ func (g *GraphRAG) processSpan(ev *spanEvent) {
 	}
 
 	// 4. If parent span exists and belongs to different service, create CALLS edge
-	if span.ParentSpanID != "" {
+	if !g.AggregateMode() && span.ParentSpanID != "" {
 		if parentSpan, ok := stores.traces.GetSpan(span.ParentSpanID); ok {
 			if parentSpan.Service != span.ServiceName {
 				stores.service.UpsertCallEdge(parentSpan.Service, span.ServiceName, durationMs, isError, span.StartTime)
@@ -534,6 +577,15 @@ func (g *GraphRAG) processLog(ev *logEvent) {
 
 	stores := g.storesForTenant(ev.Tenant)
 	stores.lastEventAt.Store(time.Now().UnixNano())
+
+	// Shadow and aggregate modes: templates are mined once, on the ingest
+	// path, and arrive through OnTemplateFact. Mining here as well would mint
+	// a second ID space for the same log shapes (#163). A template fact
+	// carries no span ID, so the LOGGED_DURING correlation edge is not formed
+	// in those modes; nothing in the 7-tool surface reads it.
+	if g.externalTemplates() {
+		return
+	}
 
 	// Drain-based clustering (replaces hash+TF-IDF clustering). The Drain
 	// miner is shared across tenants — its template tokens describe log shape,
@@ -558,6 +610,11 @@ func (g *GraphRAG) processMetric(ev *metricEvent) {
 	}
 	stores := g.storesForTenant(ev.Tenant)
 	stores.lastEventAt.Store(time.Now().UnixNano())
+	// Aggregate mode: metric nodes are replaced from the engine snapshot per
+	// revision, so a per-point upsert here would fight the projection.
+	if g.AggregateMode() {
+		return
+	}
 	stores.signals.UpsertMetric(m.Name, m.ServiceName, m.Value, m.Timestamp)
 }
 

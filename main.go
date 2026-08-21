@@ -388,8 +388,16 @@ func main() {
 		return out, nil
 	}, 5*time.Minute, 30*time.Second)
 	ctxGraph, cancelGraph := context.WithCancel(context.Background())
-	go svcGraph.Start(ctxGraph)
-	slog.Info("🕸️  In-memory service graph started (5m window, 30s refresh)")
+	// The legacy graph is a raw-span scanner. In aggregate mode the topology
+	// comes from the aggregate engine's snapshot and this scan is retired
+	// outright (#174) — the object stays wired so the nil-tolerant handlers
+	// keep their shape, but nothing refreshes it.
+	if cfg.AggregateMode != aggregate.ModeAggregate {
+		go svcGraph.Start(ctxGraph)
+		slog.Info("🕸️  In-memory service graph started (5m window, 30s refresh)")
+	} else {
+		slog.Info("🕸️  Legacy in-memory service graph disabled (AGGREGATE_MODE=aggregate)")
+	}
 
 	// 4g. Initialize GraphRAG (replaces simple graph for advanced queries)
 	graphrag.SetPanicMetrics(metrics)
@@ -397,6 +405,9 @@ func main() {
 	graphRAGCfg.WorkerCount = cfg.GraphRAGWorkerCount
 	graphRAGCfg.ChannelSize = cfg.GraphRAGEventQueueSize
 	graphRAGCfg.MaxSpansPerTenant = cfg.GraphRAGMaxSpansPerTenant
+	// Aggregate mode retires the raw-span rebuild and the GraphRAG-owned
+	// Drain miner; shadow mode retires only the miner (#163).
+	graphRAGCfg.Mode = cfg.AggregateMode
 	// Duration knobs follow the DLQ_REPLAY_INTERVAL pattern: unparsable
 	// values fall back to the package default rather than aborting startup.
 	if ttl, err := time.ParseDuration(cfg.GraphRAGTraceTTL); err == nil && ttl > 0 {
@@ -415,6 +426,7 @@ func main() {
 		"trace_ttl", graphRAGCfg.TraceTTL,
 		"max_spans_per_tenant", graphRAGCfg.MaxSpansPerTenant,
 		"tenant_idle_ttl", graphRAGCfg.TenantIdleTTL,
+		"mode", graphRAGCfg.Mode,
 	)
 
 	// Auto-migrate GraphRAG models (Investigation, DrainTemplateRow)
@@ -519,6 +531,13 @@ func main() {
 			MaxBaselines:                  cfg.ResolvedAggregateMaxBaselines(),
 			Metrics:                       aggregate.NewPrometheusRecorder(metrics),
 			MetricDims:                    aggregate.DimsConfig(cfg.AggregateMetricDims),
+			// Keep the topology projection's caps in step with the series
+			// budget: an operation the limiter would collapse into __other__
+			// must not survive as a named topology entry.
+			Topology: aggregate.TopologyConfig{
+				MaxOperationsPerService: cfg.AggregateMaxOperationsPerService,
+				MaxEdges:                cfg.AggregateMaxSeriesEdges,
+			},
 		})
 		if err != nil {
 			fatal("❌ Aggregate engine configuration rejected", err, "mode", cfg.AggregateMode)
@@ -560,6 +579,20 @@ func main() {
 		traceServer.SetAggregateEngine(aggEngine)
 		logsServer.SetAggregateEngine(aggEngine)
 		metricsServer.SetAggregateEngine(aggEngine)
+
+		// Shadow and aggregate modes: log templates are mined once, on the
+		// ingest path, and handed to GraphRAG as facts. GraphRAG runs no
+		// miner of its own in either mode, so the two never disagree about a
+		// template's identity (#163).
+		aggEngine.SetTemplateFactSink(graphRAG.OnTemplateFact)
+		// Aggregate mode: GraphRAG replaces its topology from the engine's
+		// per-revision snapshot instead of rescanning the spans table (#174).
+		if cfg.AggregateMode == aggregate.ModeAggregate {
+			graphRAG.SetAggregateSource(aggEngine)
+			slog.Info("🧭 GraphRAG consuming aggregate topology snapshots (raw-span rebuild retired)",
+				"epoch", aggEngine.TopologyEpoch(),
+			)
+		}
 		slog.Info("🧮 Aggregate engine enabled",
 			"mode", cfg.AggregateMode,
 			"max_series", cfg.AggregateMaxSeries,
@@ -740,9 +773,13 @@ func main() {
 
 	// Observe cross-service call topology pre-sample so the service map keeps
 	// flow direction even when sampling drops the spans forming each edge.
-	traceServer.SetTopologyObserver(func(tenant, traceID, spanID, parentSpanID, service string) {
-		graphRAG.ObserveSpanTopology(tenant, traceID, spanID, parentSpanID, service)
-	})
+	// In aggregate mode edges come from the engine's service-edge series and
+	// this observer would fight the snapshot, so it is not wired.
+	if cfg.AggregateMode != aggregate.ModeAggregate {
+		traceServer.SetTopologyObserver(func(tenant, traceID, spanID, parentSpanID, service string) {
+			graphRAG.ObserveSpanTopology(tenant, traceID, spanID, parentSpanID, service)
+		})
+	}
 
 	metricsServer.SetMetricCallback(func(m tsdb.RawMetric) {
 		eventHub.BroadcastMetric(realtime.MetricEntry{

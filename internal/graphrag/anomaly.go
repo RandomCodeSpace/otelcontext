@@ -19,10 +19,23 @@ func (g *GraphRAG) detectAnomalies(ctx context.Context) {
 		// previous scan cannot have changed stats — skip the whole walk.
 		// The first scan after startup (prevScan == 0) always runs so
 		// DB-rebuilt state is examined at least once.
-		if prevScan != 0 && stores.lastEventAt.Load() < prevScan {
+		//
+		// Aggregate mode uses the topology revision instead: only retained
+		// exemplars reach the event path there, so a busy service can be
+		// event-quiet while its aggregate counters move.
+		if !g.AggregateMode() && prevScan != 0 && stores.lastEventAt.Load() < prevScan {
 			continue
 		}
 		tctx := storage.WithTenantContext(ctx, tenant)
+		if g.AggregateMode() {
+			// Aggregate mode: the detector reads the engine's topology
+			// snapshot and is gated on its revision (anomaly_aggregate.go).
+			// The legacy walk below is retired there along with its
+			// hard-coded 2% baseline, avg>500ms threshold and min/max
+			// pseudo-z-score (#163).
+			g.detectAnomaliesFromTopology(tctx, tenant, stores)
+			continue
+		}
 		g.detectAnomaliesForTenant(tctx, tenant, stores)
 	}
 }

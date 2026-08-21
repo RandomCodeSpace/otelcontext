@@ -134,6 +134,19 @@ type EngineConfig struct {
 	// Nil or empty means no metrics are configured for custom dimensions.
 	MetricDims DimsConfig
 
+	// Topology bounds the per-tenant topology projection GraphRAG consumes in
+	// aggregate mode (#174). Zero values take the package defaults.
+	Topology TopologyConfig
+
+	// EdgeResolverSpans bounds the span-ID memory used to recover a call
+	// edge's caller service. Zero takes DefaultEdgeResolverSpans.
+	EdgeResolverSpans int
+
+	// Epoch identifies this engine instance. A consumer that sees a new epoch
+	// knows the revision counter restarted and must replace its state rather
+	// than reconcile against it. Zero derives one from the clock.
+	Epoch uint64
+
 	// Now is the clock, injectable for tests. Defaults to time.Now.
 	Now func() time.Time
 }
@@ -149,6 +162,9 @@ type Engine struct {
 	baselines *BaselineTracker
 	metrics   MetricsRecorder
 	dims      DimsConfig
+	topology  *topologyProjection
+	edges     *EdgeResolver
+	epoch     uint64
 
 	shards [NumShards]shard
 
@@ -182,6 +198,10 @@ func NewEngine(cfg EngineConfig) (*Engine, error) {
 	if reg == nil {
 		reg = NewMemRegistrar(nil)
 	}
+	epoch := cfg.Epoch
+	if epoch == 0 {
+		epoch = uint64(cfg.Now().UnixNano()) // #nosec G115 -- wall clock as an opaque instance tag
+	}
 	e := &Engine{
 		mode:    cfg.Mode,
 		now:     cfg.Now,
@@ -189,7 +209,10 @@ func NewEngine(cfg EngineConfig) (*Engine, error) {
 		miner:   cfg.Miner,
 		metrics: cfg.Metrics,
 		dims:    cfg.MetricDims,
+		epoch:   epoch,
 	}
+	e.topology = newTopologyProjection(cfg.Topology, epoch)
+	e.edges = NewEdgeResolver(cfg.EdgeResolverSpans)
 	if e.metrics == nil {
 		e.metrics = noopRecorder{}
 	}
@@ -235,6 +258,39 @@ func (e *Engine) Baselines() *BaselineTracker { return e.baselines }
 
 // MetricDims returns the configured metric dimension keys for aggregation.
 func (e *Engine) MetricDims() DimsConfig { return e.dims }
+
+// EdgeResolver returns the caller-resolution memory used to derive service
+// edges. The OTLP trace receiver feeds every received span through it.
+func (e *Engine) EdgeResolver() *EdgeResolver { return e.edges }
+
+// TopologyEpoch returns this engine instance's epoch.
+func (e *Engine) TopologyEpoch() uint64 { return e.epoch }
+
+// TopologyTenants returns the tenants the projection currently holds.
+func (e *Engine) TopologyTenants() []string { return e.topology.Tenants() }
+
+// TopologyRevision returns a tenant's topology revision without rendering a
+// snapshot, so an unchanged tenant costs one map lookup.
+func (e *Engine) TopologyRevision(tenant string) uint64 { return e.topology.Revision(tenant) }
+
+// TopologySnapshot renders one tenant's replacement-by-revision topology.
+func (e *Engine) TopologySnapshot(tenant string) TopologySnapshot {
+	return e.topology.Snapshot(tenant, e.now())
+}
+
+// PruneTopology drops topology windows past the retention horizon. The fold
+// path prunes the tenants it touches; this is what bounds a tenant that has
+// gone silent.
+func (e *Engine) PruneTopology() { e.topology.Prune(e.now()) }
+
+// SetTemplateFactSink installs the log-fact consumer on the ingest-owned
+// template miner (#163). GraphRAG performs no mining of its own in shadow and
+// aggregate modes; it consumes these facts. Passing nil detaches the sink.
+func (e *Engine) SetTemplateFactSink(fn func(TemplateFact)) {
+	if e.miner != nil {
+		e.miner.SetFactSink(fn)
+	}
+}
 
 // Revision returns the current revision. It increases by one on every applied
 // batch and never decreases, so a consumer can tell "nothing changed" from
@@ -308,11 +364,8 @@ func Classify(arrival, pointTime time.Time) (int64, PointDisposition) {
 // ApplyReducer records the reduction metrics for one Export request and applies
 // its deltas. This is the entry point the OTLP servers call.
 func (e *Engine) ApplyReducer(r *Reducer) uint64 {
-	if r == nil {
-		return e.revision.Load()
-	}
-	e.recordReduction(r)
-	return e.ApplyDeltas(r.Deltas())
+	rev, _ := e.ApplyReducerErr(r)
+	return rev
 }
 
 // ApplyDeltas applies one reducer's output through the configured applier.
@@ -329,7 +382,14 @@ func (e *Engine) ApplyReducerErr(r *Reducer) (uint64, error) {
 		return e.revision.Load(), nil
 	}
 	e.recordReduction(r)
-	return e.ApplyDeltasErr(r.Deltas())
+	rev, err := e.ApplyDeltasErr(r.Deltas())
+	if err != nil {
+		// Nothing became durable, so nothing may enter the topology a
+		// consumer will present as accounted-for.
+		return rev, err
+	}
+	e.topology.fold(e.now(), rev, r.topologyIDs(), r.Deltas())
+	return rev, nil
 }
 
 // ApplyDeltasErr applies one reducer's output and surfaces any refusal. When

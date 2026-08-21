@@ -170,8 +170,11 @@ type TemplateMiner struct {
 	maxChildren  int
 	maxTokens    int
 
-	reg    TemplateRegistrar
-	onFact func(TemplateFact)
+	reg TemplateRegistrar
+	// onFact is swapped atomically: the engine installs GraphRAG's sink after
+	// construction (the miner has to exist before the engine that owns the
+	// dictionary it mints IDs from), while MineAt reads it on the hot path.
+	onFact atomic.Pointer[func(TemplateFact)]
 
 	// mu guards the partition map only. It is taken for writing exactly once
 	// per new (tenant, service) pair; mining an existing partition takes it
@@ -195,7 +198,6 @@ func NewTemplateMiner(cfg TemplateMinerConfig) *TemplateMiner {
 		maxChildren:  cfg.MaxChildren,
 		maxTokens:    cfg.MaxTokens,
 		reg:          cfg.Registrar,
-		onFact:       cfg.OnFact,
 		parts:        make(map[tmPartKey]*tmPartition),
 		text:         make(map[uint32]string),
 		alias:        make(map[uint32]uint32),
@@ -218,7 +220,26 @@ func NewTemplateMiner(cfg TemplateMinerConfig) *TemplateMiner {
 	if m.reg == nil {
 		m.reg = NewInMemoryTemplateRegistrar()
 	}
+	m.SetFactSink(cfg.OnFact)
 	return m
+}
+
+// SetFactSink installs (or, with nil, removes) the log-fact consumer. Safe to
+// call while mining is in flight.
+func (m *TemplateMiner) SetFactSink(fn func(TemplateFact)) {
+	if fn == nil {
+		m.onFact.Store(nil)
+		return
+	}
+	m.onFact.Store(&fn)
+}
+
+// factSink returns the installed sink, or nil.
+func (m *TemplateMiner) factSink() func(TemplateFact) {
+	if p := m.onFact.Load(); p != nil {
+		return *p
+	}
+	return nil
 }
 
 // Mine clusters one log body and returns its template ID. isOther is true when
@@ -235,11 +256,11 @@ func (m *TemplateMiner) MineAt(tenant, service, severity, body string, at time.T
 	p := m.partition(tenant, service)
 	tokens := tmSplitTokens(body, m.maxTokens)
 
-	wantText := m.onFact != nil
-	id, isOther, text := m.mine(p, tokens, body, at, wantText)
+	onFact := m.factSink()
+	id, isOther, text := m.mine(p, tokens, body, at, onFact != nil)
 
-	if m.onFact != nil {
-		m.onFact(TemplateFact{
+	if onFact != nil {
+		onFact(TemplateFact{
 			Tenant:     tenant,
 			Service:    service,
 			Severity:   severity,

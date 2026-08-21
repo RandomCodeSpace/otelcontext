@@ -6,6 +6,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/RandomCodeSpace/otelcontext/internal/aggregate"
 )
 
 // tenantStores bundles one tenant's slice of the four layered in-memory
@@ -42,6 +44,25 @@ type tenantStores struct {
 	// trailing window. Zero on a fresh slice (first build / post-eviction)
 	// forces a full-window rebuild.
 	lastRebuildMax atomic.Int64
+
+	// --- aggregate mode (#174) ---
+
+	// topoEpoch and topoRevision record the aggregate topology snapshot this
+	// slice currently reflects. A snapshot whose pair matches is a no-op; a
+	// changed epoch means the engine restarted and the revision counter began
+	// again, so the slice is replaced rather than reconciled.
+	topoEpoch    atomic.Uint64
+	topoRevision atomic.Uint64
+
+	// lastTopology is the most recently applied snapshot, kept so the
+	// aggregate anomaly detector reads windowed history without going back to
+	// the engine (and never to a database).
+	lastTopology atomic.Pointer[aggregate.TopologySnapshot]
+
+	// anomalyRevision is the topology revision the aggregate anomaly detector
+	// last evaluated. Detection is revision-gated: an unchanged topology
+	// cannot produce a new anomaly.
+	anomalyRevision atomic.Uint64
 }
 
 func newTenantStores(traceTTL time.Duration, maxSpans int) *tenantStores {
@@ -802,4 +823,84 @@ func computeHealth(errorRate, avgLatencyMs float64) float64 {
 		score = 1
 	}
 	return score
+}
+
+// --- replacement-by-revision (aggregate mode) ---
+
+// ReplaceTopology swaps the entire service topology for a new one under a
+// single write lock.
+//
+// Aggregate mode consumes a per-revision snapshot from the aggregate engine
+// rather than accumulating per-span upserts, so the only correct way to apply
+// it is replacement: re-applying a cumulative snapshot through UpsertService /
+// UpsertCallEdge would multiply every counter by the number of ticks it
+// survived. Rebuilding the adjacency indexes here (rather than mutating them)
+// is what keeps their append-only invariant intact — after the swap they
+// describe exactly the maps they were built from.
+func (s *ServiceStore) ReplaceTopology(services []*ServiceNode, operations []*OperationNode, edges []*Edge) {
+	svcMap := make(map[string]*ServiceNode, len(services))
+	for _, svc := range services {
+		if svc == nil || svc.Name == "" {
+			continue
+		}
+		svcMap[svc.Name] = svc
+	}
+
+	opMap := make(map[string]*OperationNode, len(operations))
+	opsByService := make(map[string][]*OperationNode, len(svcMap))
+	edgeMap := make(map[string]*Edge, len(edges)+len(operations))
+	for _, op := range operations {
+		if op == nil || op.Service == "" || op.Operation == "" {
+			continue
+		}
+		opMap[op.ID] = op
+		opsByService[op.Service] = append(opsByService[op.Service], op)
+		ek := edgeKey(EdgeExposes, op.Service, op.ID)
+		edgeMap[ek] = &Edge{Type: EdgeExposes, FromID: op.Service, ToID: op.ID, UpdatedAt: op.LastSeen}
+	}
+
+	edgesByFrom := make(map[string][]*Edge, len(svcMap))
+	edgesByTo := make(map[string][]*Edge, len(svcMap))
+	for _, e := range edges {
+		if e == nil || e.Type != EdgeCalls || e.FromID == "" || e.ToID == "" {
+			continue
+		}
+		edgeMap[edgeKey(EdgeCalls, e.FromID, e.ToID)] = e
+		edgesByFrom[e.FromID] = append(edgesByFrom[e.FromID], e)
+		edgesByTo[e.ToID] = append(edgesByTo[e.ToID], e)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Services = svcMap
+	s.Operations = opMap
+	s.Edges = edgeMap
+	s.edgesByFrom = edgesByFrom
+	s.edgesByTo = edgesByTo
+	s.opsByService = opsByService
+}
+
+// ReplaceMetrics swaps the metric nodes (and their MEASURED_BY edges) for a new
+// set. Same reasoning as ReplaceTopology: aggregate-mode metric state is a
+// projection of a revision, not an accumulation. Log-cluster nodes and their
+// edges are untouched — they arrive as ingest-owned template facts on their own
+// schedule.
+func (ss *SignalStore) ReplaceMetrics(metrics []*MetricNode) {
+	metricMap := make(map[string]*MetricNode, len(metrics))
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	for ek, e := range ss.Edges {
+		if e.Type == EdgeMeasuredBy {
+			delete(ss.Edges, ek)
+		}
+	}
+	for _, m := range metrics {
+		if m == nil || m.ID == "" {
+			continue
+		}
+		metricMap[m.ID] = m
+		ek := edgeKey(EdgeMeasuredBy, m.ID, m.Service)
+		ss.Edges[ek] = &Edge{Type: EdgeMeasuredBy, FromID: m.ID, ToID: m.Service, UpdatedAt: m.LastSeen}
+	}
+	ss.Metrics = metricMap
 }

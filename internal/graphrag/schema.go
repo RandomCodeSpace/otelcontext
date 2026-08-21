@@ -169,6 +169,47 @@ type Edge struct {
 
 // --- Query Result Types ---
 
+// --- Causal-analysis quality contract (#163) ---
+
+// Coverage source values. They are part of the MCP response contract: a client
+// reads Source to know whether an answer is a fact about a complete retained
+// exemplar, a fact about a deliberately truncated one, or an admission that
+// nothing was retained.
+const (
+	// CoverageRetained — the complete parent/child chain was retained.
+	CoverageRetained = "retained_exemplar"
+	// CoveragePartial — the exemplar exists but its chain is incomplete:
+	// truncated by the per-trace span/byte bound, or still arriving, or aged
+	// out of the in-memory trace TTL.
+	CoveragePartial = "partial_exemplar"
+	// CoverageNone — no exemplar. The honest answer is "not retained or not
+	// found", never a chain assembled from whatever happened to be around.
+	CoverageNone = "not_retained_or_not_found"
+)
+
+// Coverage states what a causal-analysis answer is actually backed by.
+//
+// Errors are always ELIGIBLE for retention; they are never all PERSISTED
+// (#161, #163). ErrorChain, RootCauseAnalysis, DependencyChain and the
+// trace_graph tool are guaranteed only for complete retained exemplars. A
+// truncated exemplar reports explicit partial coverage and an absent one says
+// so — fabricated certainty is the one answer that is never acceptable.
+type Coverage struct {
+	// Complete is true only for a chain that reaches a root span with every
+	// parent link resolved.
+	Complete bool `json:"complete"`
+	// Truncated marks a chain cut short by the per-trace span or byte bound.
+	Truncated bool `json:"truncated"`
+	// RetainedSpans and ObservedSpans are the retained/observed counts when
+	// they are known.
+	RetainedSpans int `json:"retained_spans,omitempty"`
+	ObservedSpans int `json:"observed_spans,omitempty"`
+	// Source is one of the Coverage* constants.
+	Source string `json:"source"`
+	// Note explains a non-complete answer in plain words.
+	Note string `json:"note,omitempty"`
+}
+
 // ErrorChainResult is the output of an error chain query.
 type ErrorChainResult struct {
 	RootCause        *RootCauseInfo   `json:"root_cause"`
@@ -176,6 +217,18 @@ type ErrorChainResult struct {
 	CorrelatedLogs   []LogClusterNode `json:"correlated_logs,omitempty"`
 	AnomalousMetrics []MetricNode     `json:"anomalous_metrics,omitempty"`
 	TraceID          string           `json:"trace_id"`
+	// Coverage states whether this chain is backed by a complete retained
+	// exemplar. A chain whose upstream walk stopped at a missing parent is
+	// reported as partial, not presented as a root cause.
+	Coverage Coverage `json:"coverage"`
+}
+
+// TraceGraphResult is the trace_graph tool's response shape: the retained span
+// tree plus an explicit statement of what it covers.
+type TraceGraphResult struct {
+	TraceID  string     `json:"trace_id"`
+	Spans    []SpanNode `json:"spans"`
+	Coverage Coverage   `json:"coverage"`
 }
 
 // RootCauseInfo identifies the responsible service and operation.
@@ -210,6 +263,9 @@ type RankedCause struct {
 	Evidence   []string      `json:"evidence"`
 	ErrorChain []SpanNode    `json:"error_chain,omitempty"`
 	Anomalies  []AnomalyNode `json:"anomalies,omitempty"`
+	// Coverage states what the ranking rests on: a complete retained
+	// exemplar, a partial one, or aggregate anomaly evidence with no chain.
+	Coverage Coverage `json:"coverage"`
 }
 
 // --- Drain Template Persistence ---
