@@ -2,12 +2,27 @@ package aggregate
 
 import "testing"
 
+type normCase struct {
+	name string
+	in   string
+	want string
+}
+
+// runNormCases exercises a single-string normalization function against a
+// case table. Shared by the NormalizePath and NormalizeSpanName tests.
+func runNormCases(t *testing.T, fnName string, fn func(string) string, cases []normCase) {
+	t.Helper()
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := fn(tc.in); got != tc.want {
+				t.Fatalf("%s(%q) = %q, want %q", fnName, tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestNormalizePath(t *testing.T) {
-	cases := []struct {
-		name string
-		in   string
-		want string
-	}{
+	cases := []normCase{
 		// Untouched paths.
 		{"empty", "", ""},
 		{"root", "/", "/"},
@@ -69,13 +84,7 @@ func TestNormalizePath(t *testing.T) {
 		{"invalid utf8", "/users/\xff\xfe", "/users/\xff\xfe"},
 		{"query only", "?a=b", "?a=b"},
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := NormalizePath(tc.in); got != tc.want {
-				t.Fatalf("NormalizePath(%q) = %q, want %q", tc.in, got, tc.want)
-			}
-		})
-	}
+	runNormCases(t, "NormalizePath", NormalizePath, cases)
 }
 
 func TestNormalizePathIsDeterministic(t *testing.T) {
@@ -92,11 +101,7 @@ func TestNormalizePathIsDeterministic(t *testing.T) {
 }
 
 func TestNormalizeSpanName(t *testing.T) {
-	cases := []struct {
-		name string
-		in   string
-		want string
-	}{
+	cases := []normCase{
 		{"method and path", "GET /users/1234/orders/987", "GET /users/{id}/orders/{id}"},
 		{"method and static path", "POST /orders", "POST /orders"},
 		{"lowercase method preserved", "get /users/1", "get /users/{id}"},
@@ -118,13 +123,7 @@ func TestNormalizeSpanName(t *testing.T) {
 		{"span name with numbers", "process batch 1234", "process batch 1234"},
 		{"invalid utf8", "GET /users/\xff", "GET /users/\xff"},
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := NormalizeSpanName(tc.in); got != tc.want {
-				t.Fatalf("NormalizeSpanName(%q) = %q, want %q", tc.in, got, tc.want)
-			}
-		})
-	}
+	runNormCases(t, "NormalizeSpanName", NormalizeSpanName, cases)
 }
 
 func TestNormalizeSpanNameAcceptsEveryKnownMethod(t *testing.T) {
