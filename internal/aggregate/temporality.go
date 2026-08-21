@@ -21,10 +21,12 @@ import (
 // Non-monotonic sums never enter this path at all: they are gauge-like, and
 // applying value-decrease reset detection to an UpDownCounter mangles it.
 //
-// Baselines are in-memory in Phase 1. Durability — upserting the baseline row
-// inside the same group commit as the deltas it justifies — is #173. Until then
-// a restart re-seeds every baseline, which is the accepted-gap fallback #166
-// documents, not the target contract.
+// Baselines are durable when the store is enabled (#173): every mutation marks
+// the record dirty, the group-commit writer drains the dirty set into the same
+// transaction as the deltas it justifies, and startup recovery seeds the
+// tracker from the store. Without a store the tracker is in-memory only and a
+// restart re-seeds every baseline — the accepted-gap fallback #166 documents,
+// not the target contract.
 
 // Temporality is the OTLP aggregation temporality of a metric point.
 type Temporality uint8
@@ -195,6 +197,21 @@ type BaselineTrackerConfig struct {
 	GapThreshold time.Duration
 }
 
+// DirtyBaseline is one baseline awaiting durable upsert. The group-commit
+// writer drains them into the same transaction as the deltas they justify
+// (#166), which is what closes the restart gap durable ACK exists to close.
+type DirtyBaseline struct {
+	Key      SeriesKey
+	Producer ProducerID
+	Baseline Baseline
+}
+
+// baselineRef identifies one baseline record.
+type baselineRef struct {
+	key      SeriesKey
+	producer ProducerID
+}
+
 // BaselineTracker converts cumulative monotonic points into deltas and detects
 // resets. It is safe for concurrent use.
 type BaselineTracker struct {
@@ -202,6 +219,7 @@ type BaselineTracker struct {
 
 	mu      sync.Mutex
 	series  map[SeriesKey]map[ProducerID]*Baseline
+	dirty   map[baselineRef]struct{}
 	entries int
 
 	stale            uint64
@@ -228,7 +246,75 @@ func NewBaselineTracker(cfg BaselineTrackerConfig) *BaselineTracker {
 	return &BaselineTracker{
 		cfg:    cfg,
 		series: make(map[SeriesKey]map[ProducerID]*Baseline),
+		dirty:  make(map[baselineRef]struct{}),
 	}
+}
+
+// Seed installs a baseline read back from the durable store at startup. It
+// does NOT mark the record dirty: it is already durable, and re-writing every
+// recovered baseline on the first commit would make restart the most expensive
+// transaction the store ever runs.
+func (t *BaselineTracker) Seed(key SeriesKey, producer ProducerID, b Baseline) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	byProducer, ok := t.series[key]
+	if !ok {
+		byProducer = make(map[ProducerID]*Baseline, 1)
+		t.series[key] = byProducer
+	}
+	if _, exists := byProducer[producer]; !exists {
+		t.entries++
+	}
+	cp := b
+	byProducer[producer] = &cp
+}
+
+// DrainDirty returns the baselines mutated since the last drain and clears the
+// dirty set. The writer calls it while building a group batch, so every drained
+// record is at least as new as the deltas in that batch: on a crash a baseline
+// can be ahead of the durable deltas (the next point under-counts by one
+// interval) but never behind them (which would double-count).
+func (t *BaselineTracker) DrainDirty() []DirtyBaseline {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if len(t.dirty) == 0 {
+		return nil
+	}
+	out := make([]DirtyBaseline, 0, len(t.dirty))
+	for ref := range t.dirty {
+		b, ok := t.series[ref.key][ref.producer]
+		if !ok {
+			continue
+		}
+		out = append(out, DirtyBaseline{Key: ref.key, Producer: ref.producer, Baseline: *b})
+	}
+	clear(t.dirty)
+	return out
+}
+
+// Redirty puts drained baselines back after a failed commit.
+func (t *BaselineTracker) Redirty(rows []DirtyBaseline) {
+	if len(rows) == 0 {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for _, r := range rows {
+		t.dirty[baselineRef{key: r.Key, producer: r.Producer}] = struct{}{}
+	}
+}
+
+// DirtyCount reports how many baselines are awaiting a durable upsert.
+func (t *BaselineTracker) DirtyCount() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return len(t.dirty)
+}
+
+// markDirtyLocked records that (key, producer) needs a durable upsert. t.mu
+// must be held.
+func (t *BaselineTracker) markDirtyLocked(key SeriesKey, producer ProducerID) {
+	t.dirty[baselineRef{key: key, producer: producer}] = struct{}{}
 }
 
 // ObserveCumulative applies the normative #166 evaluation order to one
@@ -271,6 +357,7 @@ func (t *BaselineTracker) ObserveCumulative(key SeriesKey, producer ProducerID, 
 		byProducer[producer] = &Baseline{StartTime: startTime, LastTimestamp: ts, Value: value}
 		t.entries++
 		t.seeded++
+		t.markDirtyLocked(key, producer)
 		out.Seeded = true
 		return out
 	}
@@ -289,6 +376,7 @@ func (t *BaselineTracker) ObserveCumulative(key SeriesKey, producer ProducerID, 
 		b.LastTimestamp = ts
 		b.Value = value
 		t.gaps++
+		t.markDirtyLocked(key, producer)
 		out.Gap = true
 		return out
 	}
@@ -314,6 +402,7 @@ func (t *BaselineTracker) ObserveCumulative(key SeriesKey, producer ProducerID, 
 	b.StartTime = startTime
 	b.LastTimestamp = ts
 	b.Value = value
+	t.markDirtyLocked(key, producer)
 	return out
 }
 

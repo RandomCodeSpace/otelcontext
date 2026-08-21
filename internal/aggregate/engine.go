@@ -16,12 +16,14 @@ import (
 // mutable set is the current window plus the windows still inside the lateness
 // horizon; everything older is finalized and never re-enters memory.
 //
-// PHASE 1 LOSS, STATED PLAINLY: there is no durable store yet (#173). A window
-// that rolls out of the mutable set is DISCARDED, not finalized — its counts
-// are gone. That is acceptable only because Phase 1 runs in shadow mode, where
-// the legacy path remains the source of truth and the aggregate numbers exist
-// to be compared, not queried. Nothing in this package may be presented to a
-// user as authoritative until the group-commit writer lands.
+// ROLLOVER IS AN EVICTION, NOT A DELETION — once the durable store is wired
+// (#173). A window leaving the mutable set is dropped from the shards, and the
+// writer's finalize pass has already materialized it from the delta log into
+// aggregate_buckets; finalized history lives on disk and never comes back into
+// RAM. WITHOUT a store (no writer installed, engine constructed directly in a
+// test) rollover really is loss: the counts in the expiring window are gone,
+// which is why nothing may be presented to a user as authoritative unless the
+// group-commit writer is the applier.
 //
 // Shards are four plain mutex-guarded maps (hash & 3). No shard goroutines, no
 // channels. Two shard locks are NEVER held at once: a delta touches exactly one
@@ -89,6 +91,18 @@ type DeltaMap map[SeriesWindowKey]*AggregateDelta
 // the shards a projection of committed state. No caller changes when it does.
 type Applier interface {
 	Apply(DeltaMap) uint64
+}
+
+// FailableApplier is an Applier whose apply path can refuse. The durable
+// group-commit writer (#173) implements it: admission can be saturated
+// (ErrSaturated, mapped to RESOURCE_EXHAUSTED / 429) and a COMMIT can fail, and
+// under the durable-ACK contract neither may be acknowledged as success. The
+// Phase 1 direct applier does not implement it, which is what keeps legacy and
+// shadow behaviour identical when no store is wired.
+type FailableApplier interface {
+	Applier
+	// ApplyErr applies the deltas, returning the revision and any refusal.
+	ApplyErr(DeltaMap) (uint64, error)
 }
 
 // EngineConfig configures an Engine. Zero values take platform defaults.
@@ -294,11 +308,33 @@ func (e *Engine) ApplyReducer(r *Reducer) uint64 {
 
 // ApplyDeltas applies one reducer's output through the configured applier.
 func (e *Engine) ApplyDeltas(m DeltaMap) uint64 {
+	rev, _ := e.ApplyDeltasErr(m)
+	return rev
+}
+
+// ApplyReducerErr is ApplyReducer for callers that must honour the durable-ACK
+// contract: it returns the applier's refusal so an Export can answer
+// RESOURCE_EXHAUSTED instead of acknowledging telemetry that is not durable.
+func (e *Engine) ApplyReducerErr(r *Reducer) (uint64, error) {
+	if r == nil {
+		return e.revision.Load(), nil
+	}
+	e.recordReduction(r)
+	return e.ApplyDeltasErr(r.Deltas())
+}
+
+// ApplyDeltasErr applies one reducer's output and surfaces any refusal. When
+// the configured applier cannot fail (Phase 1's direct applier) the error is
+// always nil.
+func (e *Engine) ApplyDeltasErr(m DeltaMap) (uint64, error) {
 	if len(m) == 0 {
-		return e.revision.Load()
+		return e.revision.Load(), nil
 	}
 	a := *e.applier.Load()
-	return a.Apply(m)
+	if fa, ok := a.(FailableApplier); ok {
+		return fa.ApplyErr(m)
+	}
+	return a.Apply(m), nil
 }
 
 // directApplier is the Phase 1 apply path: no durability, no batching.
@@ -318,6 +354,30 @@ func (d directApplier) Apply(m DeltaMap) uint64 { return d.e.ApplyCommitted(m) }
 func (e *Engine) ApplyCommitted(m DeltaMap) uint64 {
 	if len(m) == 0 {
 		return e.revision.Load()
+	}
+	resolved := e.Admit(m)
+
+	for i := range e.shards {
+		e.applyShard(i, resolved)
+	}
+
+	rev := e.revision.Add(1)
+	e.publishActiveSeries()
+	return rev
+}
+
+// Admit rolls the mutable window set forward and resolves one batch of deltas
+// against the cardinality budget WITHOUT touching the shards.
+//
+// The durable writer (#173) calls it before its COMMIT so the row that becomes
+// durable carries the same identity the shards will later hold: admitting after
+// the write would let the store accumulate series the in-memory caps already
+// rerouted to __other__. Admission is idempotent for a series already present
+// in a window, so the ApplyCommitted that follows the commit re-resolves the
+// same map to itself.
+func (e *Engine) Admit(m DeltaMap) DeltaMap {
+	if len(m) == 0 {
+		return m
 	}
 	e.Rollover(e.now())
 
@@ -344,14 +404,7 @@ func (e *Engine) ApplyCommitted(m DeltaMap) uint64 {
 		}
 		resolved[target] = d
 	}
-
-	for i := range e.shards {
-		e.applyShard(i, resolved)
-	}
-
-	rev := e.revision.Add(1)
-	e.publishActiveSeries()
-	return rev
+	return resolved
 }
 
 // applyShard folds every entry belonging to shard i into it, under that shard's
@@ -385,12 +438,12 @@ func (e *Engine) applyShard(i int, resolved DeltaMap) {
 	}
 }
 
-// Rollover discards every window whose lateness horizon has expired and returns
+// Rollover evicts every window whose lateness horizon has expired and returns
 // how many it dropped.
 //
-// Phase 1 DISCARDS. There is no delta log to finalize from and no bucket table
-// to materialize into, so the counts in an expiring window are lost. See the
-// file header: this is shadow-mode behavior, not the durability contract.
+// With the durable store wired, the window has already been finalized into
+// aggregate_buckets by the writer's finalize pass, so this is an eviction from
+// RAM. Without a store it is loss. See the file header.
 func (e *Engine) Rollover(now time.Time) int {
 	cutoff := now.Unix() - int64(WindowSize/time.Second) - int64(AllowedLateness/time.Second)
 	dropped := 0
