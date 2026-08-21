@@ -93,7 +93,11 @@ describe('PulseBar', () => {
     )
     // err 4.2% — already-percent field must NOT be re-scaled.
     expect(screen.getByText(/err 4\.2%/)).toBeInTheDocument()
-    expect(screen.getByText(/p99 230ms/)).toBeInTheDocument()
+    // AccuracyLabel splits the reading into nested spans, so match on the
+    // composed text of the element rather than a single text node.
+    expect(
+      screen.getByText((_, el) => el?.textContent === 'p99 230ms' && el.tagName === 'SPAN'),
+    ).toBeInTheDocument()
     expect(screen.getByText(/DB 1\.2GB/)).toBeInTheDocument()
   })
 

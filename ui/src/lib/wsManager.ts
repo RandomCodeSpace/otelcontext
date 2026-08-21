@@ -15,10 +15,6 @@ import { cryptoRandom } from './random'
 //   - useSyncExternalStore-compatible subscribe/getSnapshot pairs for
 //     both connection status and the log buffer.
 
-interface HubBatch {
-  type: string
-  data: unknown
-}
 
 export type WsStatus =
   | 'connecting'
@@ -66,6 +62,9 @@ export class WsManager {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
   private heartbeatInterval: ReturnType<typeof setInterval> | null = null
   private heartbeatTimeout: ReturnType<typeof setTimeout> | null = null
+
+  private currentEpoch = 0
+  private lastRevision = 0
 
   private readonly statusSubs = new Set<() => void>()
   private readonly logSubs = new Set<() => void>()
@@ -174,12 +173,31 @@ export class WsManager {
         clearTimeout(this.heartbeatTimeout)
         this.heartbeatTimeout = null
       }
-      let payload: HubBatch
+      let payload: Record<string, unknown>
       try {
-        payload = JSON.parse(event.data) as HubBatch
+        payload = JSON.parse(event.data) as Record<string, unknown>
       } catch {
         return // non-JSON frames (incl. server ping echoes) are ignored
       }
+
+      // Handle epoch change (full snapshot on connect is marked reset=true)
+      if (typeof payload.epoch === 'number' && payload.epoch !== this.currentEpoch) {
+        this.currentEpoch = payload.epoch
+        this.lastRevision = 0
+        // On epoch change, discard accumulated state and re-request full snapshot
+        this.logBuf.length = 0 // reset log buffer
+        // Notify subscribers that state was reset
+        this.requestVersionBump()
+      }
+
+      // Ignore messages with revision <= last applied revision in same epoch
+      if (typeof payload.revision === 'number') {
+        if (payload.revision <= this.lastRevision) {
+          return
+        }
+        this.lastRevision = payload.revision
+      }
+
       if (payload.type === 'logs' && Array.isArray(payload.data)) {
         this.appendLogs(payload.data as LogEntry[])
       }
@@ -331,6 +349,14 @@ export class WsManager {
     this.logVersion += 1
     for (const cb of this.logSubs) cb()
   }
+
+  /**
+   * Get current epoch and revision state for external consumers.
+   */
+  readonly getEpochSnapshot = () => ({
+    epoch: this.currentEpoch,
+    revision: this.lastRevision,
+  })
 }
 
 /** App-lifetime singleton. Created lazily so tests can use fresh instances. */
