@@ -116,7 +116,11 @@ type TraceServer struct {
 	// aggregate reduction BEFORE the sampler so aggregate counts describe
 	// accepted telemetry rather than the sampling rate (#153 §8). nil leaves
 	// the legacy path untouched.
-	aggregateEngine     *aggregate.Engine
+	aggregateEngine *aggregate.Engine
+	// exemplar, when set (AGGREGATE_MODE=aggregate), is the ONLY raw-retention
+	// gate: the adaptive Sampler is retired in that mode (#161). nil in
+	// legacy/shadow, where the Sampler keeps governing the raw path unchanged.
+	exemplar            *ExemplarPolicy
 	minSeverity         int
 	allowedServices     map[string]bool
 	excludedServices    map[string]bool
@@ -134,7 +138,10 @@ type LogsServer struct {
 	logCallback func(storage.Log)
 	// aggregateEngine — see TraceServer.aggregateEngine. Reduction runs before
 	// the severity gate.
-	aggregateEngine     *aggregate.Engine
+	aggregateEngine *aggregate.Engine
+	// exemplar — see TraceServer.exemplar. In aggregate mode INFO/DEBUG logs
+	// are aggregate-only and ERROR/FATAL/WARN are budgeted per service/window.
+	exemplar            *ExemplarPolicy
 	minSeverity         int
 	allowedServices     map[string]bool
 	excludedServices    map[string]bool
@@ -223,6 +230,19 @@ func (s *LogsServer) SetAggregateEngine(e *aggregate.Engine) {
 // SetAggregateEngine — see TraceServer.SetAggregateEngine.
 func (s *MetricsServer) SetAggregateEngine(e *aggregate.Engine) {
 	s.aggregateEngine = e
+}
+
+// SetExemplarPolicy installs the bounded exemplar retention policy (#176).
+// Wired only for AGGREGATE_MODE=aggregate, where it replaces the adaptive
+// Sampler as the sole raw-retention gate. Passing nil (legacy / shadow) leaves
+// the Sampler in charge and every byte of the export path unchanged.
+func (s *TraceServer) SetExemplarPolicy(p *ExemplarPolicy) {
+	s.exemplar = p
+}
+
+// SetExemplarPolicy — see TraceServer.SetExemplarPolicy.
+func (s *LogsServer) SetExemplarPolicy(p *ExemplarPolicy) {
+	s.exemplar = p
 }
 
 func NewLogsServer(repo *storage.Repository, metrics *telemetry.Metrics, cfg *config.Config) *LogsServer {
@@ -459,9 +479,25 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 						reducer.ReduceSpan(aggregateSpanInput(tenantID, serviceName, span, startTime, endTime))
 					}
 
-					if s.sampler != nil {
-						isError := statusStr == storage.StatusCodeError
-						durationMs := float64(duration) / 1000.0
+					// Raw-retention gate. Exactly one policy governs this per
+					// mode (#161): in aggregate mode the exemplar policy is it
+					// and the Sampler is retired; in legacy/shadow the Sampler
+					// is unchanged and s.exemplar is nil.
+					isError := statusStr == storage.StatusCodeError
+					durationMs := float64(duration) / 1000.0
+					if s.exemplar != nil {
+						if !s.exemplar.AdmitSpan(ExemplarSpan{
+							Tenant:     tenantID,
+							Service:    serviceName,
+							TraceID:    traceIDHex,
+							Operation:  span.Name,
+							Status:     statusStr,
+							DurationMs: durationMs,
+							Timestamp:  startTime,
+						}) {
+							continue
+						}
+					} else if s.sampler != nil {
 						if !s.sampler.ShouldSample(serviceName, isError, durationMs) {
 							continue
 						}
@@ -483,7 +519,19 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 						Status:         statusStr,
 						AttributesJSON: storage.CompressedText(attrs),
 					}
-					localSpans = append(localSpans, sModel)
+					// Byte metering happens here, on the row that is actually
+					// handed to persistence, not on the OTLP wire message —
+					// the byte budget is a budget on what gets written. A
+					// refusal drops this span and marks the trace truncated;
+					// the trace row below still lands so the gap is recorded
+					// in the data rather than left to be inferred.
+					keepSpan := true
+					if s.exemplar != nil {
+						keepSpan = s.exemplar.ChargeSpan(tenantID, serviceName, traceIDHex, startTime, spanRowBytes(&sModel))
+					}
+					if keepSpan {
+						localSpans = append(localSpans, sModel)
+					}
 
 					// Flag the batch for the async pipeline's priority lane.
 					// Errors and slow spans bypass soft-backpressure drops so
@@ -516,6 +564,14 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 						})
 					}
 
+					// Synthesized logs ride along with their span. A span the
+					// byte budget refused takes its synthesized logs with it —
+					// persisting a log whose span was dropped would be exactly
+					// the dangling evidence #163 forbids.
+					if !keepSpan {
+						continue
+					}
+
 					// spanHasErrorLog records whether an ERROR log was already
 					// synthesized for THIS span from its events. It replaces a
 					// rescan of every previously synthesized log per span, which
@@ -530,6 +586,12 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 						}
 
 						if !shouldIngestSeverity(severity, s.minSeverity) {
+							continue
+						}
+						// Aggregate mode: INFO/DEBUG never persist raw (#161).
+						// Only the severity floor applies — these logs belong
+						// to a span the policy already selected and budgeted.
+						if s.exemplar != nil && !s.exemplar.AllowSynthesizedLog(severity) {
 							continue
 						}
 
@@ -579,6 +641,22 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 							localLogs = append(localLogs, l)
 						}
 					}
+				}
+			}
+
+			// Stamp the complete-retained-trace contract onto the trace rows
+			// (#163). Only traces the exemplar policy actually cut short carry
+			// a claim; everything else leaves the columns NULL.
+			if s.exemplar != nil {
+				for i := range localTraces {
+					st, ok := s.exemplar.TraceStats(tenantID, serviceName, localTraces[i].TraceID, localTraces[i].Timestamp)
+					if !ok || !st.Truncated {
+						continue
+					}
+					truncated, retained, observed := true, st.Retained, st.Observed
+					localTraces[i].Truncated = &truncated
+					localTraces[i].RetainedSpanCount = &retained
+					localTraces[i].ObservedSpanCount = &observed
 				}
 			}
 
@@ -769,6 +847,16 @@ func (s *LogsServer) Export(ctx context.Context, req *collogspb.ExportLogsServic
 
 					bodyStr := l.Body.GetStringValue()
 					attrs, _ := json.Marshal(l.Attributes)
+
+					// Aggregate mode: raw log retention is bounded per
+					// service/window and by severity — ERROR/FATAL budgeted,
+					// WARN opt-in, INFO/DEBUG aggregate-only (#161). The
+					// reduction above already accounted every one of them.
+					if s.exemplar != nil {
+						if !s.exemplar.AdmitLog(tenantID, serviceName, severity, timestamp, len(bodyStr)+len(attrs)) {
+							continue
+						}
+					}
 
 					logEntry := storage.Log{
 						TenantID:       tenantID,
