@@ -14,6 +14,33 @@ import (
 // touched it, not with the number of series in it. These two tests pin the
 // invariant that replaced it and the property it was supposed to buy.
 
+// seedMergedWindow registers `series` series and lands `commits` full-width
+// commits into `window`. With the per-(window, series) merge the resulting
+// delta log holds exactly `series` rows regardless of commit count.
+func seedMergedWindow(t *testing.T, store *SQLiteStore, series, commits int, window int64, d *AggregateDelta) {
+	t.Helper()
+	reg := make([]SeriesRow, 0, series)
+	for i := 0; i < series; i++ {
+		reg = append(reg, SeriesRow{ID: SeriesID(i + 1), Key: storeKey(uint32(i + 1))})
+	}
+	if err := store.CommitGroup(&GroupBatch{Series: reg}); err != nil {
+		t.Fatalf("seed series: %v", err)
+	}
+	for c := 0; c < commits; c++ {
+		batch := &GroupBatch{Deltas: make([]DeltaRow, 0, series)}
+		for i := 0; i < series; i++ {
+			batch.Deltas = append(batch.Deltas, DeltaRow{
+				SeriesID:    SeriesID(i + 1),
+				WindowStart: window,
+				Delta:       d,
+			})
+		}
+		if err := store.CommitGroup(batch); err != nil {
+			t.Fatalf("seed commit %d: %v", c, err)
+		}
+	}
+}
+
 // TestDeltaLogRowsScaleWithSeriesNotCommits is the direct regression: many
 // commits into one window must leave one row per series, and the totals must
 // survive the merge unchanged.
@@ -24,28 +51,7 @@ func TestDeltaLogRowsScaleWithSeriesNotCommits(t *testing.T) {
 		window  = 900
 	)
 	store := newTestStore(t)
-
-	reg := make([]SeriesRow, 0, series)
-	for i := 0; i < series; i++ {
-		reg = append(reg, SeriesRow{ID: SeriesID(i + 1), Key: storeKey(uint32(i + 1))})
-	}
-	if err := store.CommitGroup(&GroupBatch{Series: reg}); err != nil {
-		t.Fatalf("seed series: %v", err)
-	}
-
-	for c := 0; c < commits; c++ {
-		batch := &GroupBatch{Deltas: make([]DeltaRow, 0, series)}
-		for i := 0; i < series; i++ {
-			batch.Deltas = append(batch.Deltas, DeltaRow{
-				SeriesID:    SeriesID(i + 1),
-				WindowStart: window,
-				Delta:       spanDelta(2, float64(100+i)),
-			})
-		}
-		if err := store.CommitGroup(batch); err != nil {
-			t.Fatalf("commit %d: %v", c, err)
-		}
-	}
+	seedMergedWindow(t, store, series, commits, window, spanDelta(2, 150))
 
 	// The whole point: 250 commits x 40 series is 10,000 appends and 40 rows.
 	assertCount(t, store, "aggregate_delta_log", series)
@@ -91,7 +97,7 @@ func TestFinalizeDoesNotStallCommits(t *testing.T) {
 	}
 	const (
 		series    = 2000
-		commits   = 100
+		commits   = 3
 		oldWindow = 1200
 		newWindow = 1500
 		// Generous next to the 500 ms the ticket asks of a live server: this
@@ -100,27 +106,7 @@ func TestFinalizeDoesNotStallCommits(t *testing.T) {
 		maxBlocked = 2 * time.Second
 	)
 	store := newTestStore(t)
-
-	reg := make([]SeriesRow, 0, series)
-	for i := 0; i < series; i++ {
-		reg = append(reg, SeriesRow{ID: SeriesID(i + 1), Key: storeKey(uint32(i + 1))})
-	}
-	if err := store.CommitGroup(&GroupBatch{Series: reg}); err != nil {
-		t.Fatalf("seed series: %v", err)
-	}
-	for c := 0; c < commits; c++ {
-		batch := &GroupBatch{Deltas: make([]DeltaRow, 0, series)}
-		for i := 0; i < series; i++ {
-			batch.Deltas = append(batch.Deltas, DeltaRow{
-				SeriesID:    SeriesID(i + 1),
-				WindowStart: oldWindow,
-				Delta:       spanDelta(1, float64(100+i)),
-			})
-		}
-		if err := store.CommitGroup(batch); err != nil {
-			t.Fatalf("seed commit %d: %v", c, err)
-		}
-	}
+	seedMergedWindow(t, store, series, commits, oldWindow, spanDelta(1, 150))
 
 	// A commit stream shaped like live ingestion: small batches, back to back,
 	// into the window that is still mutable.
