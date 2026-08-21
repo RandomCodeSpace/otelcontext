@@ -1,0 +1,3 @@
+# Aggregate series identity is a struct of dictionary IDs, not a hash or attribute JSON
+
+The aggregate engine identifies every series by a fixed struct of durable dictionary IDs plus small enums (signal, status class, HTTP class, method, span kind), serialized field-wise with a version byte. We rejected hashing the canonical key to a uint64 (collisions silently merge unrelated series — an unbounded correctness failure to save a few bytes) and rejected the legacy TSDB approach of serialized attribute JSON in the key (unbounded cardinality, allocation-heavy, and the reason the old path could not scale). Dictionary IDs are only ever minted by the database so a crash can never recover a bucket whose identity no longer resolves. Full decision record: issue #159; map #154.
