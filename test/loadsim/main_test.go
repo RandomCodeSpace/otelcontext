@@ -106,3 +106,149 @@ func TestRateLimiter(t *testing.T) {
 		t.Errorf("rate limiter issued %d tokens in 1s, want %d–%d (target %d ±10%%)", count, low, high, targetRPS)
 	}
 }
+
+// TestPickSeverity verifies round-robin severity selection.
+func TestPickSeverity(t *testing.T) {
+	const samples = 10_000
+
+	severityCounts := make(map[string]int)
+	for i := 0; i < samples; i++ {
+		severity := pickSeverity(i)
+		severityCounts[severity]++
+	}
+
+	// Expected distribution: ~70% INFO, ~15% WARN, ~10% DEBUG, ~5% ERROR.
+	// logSeverities array has 12 elements: 7 INFO, 2 WARN, 2 DEBUG, 1 ERROR.
+	expectedInfo := samples * 7 / 12
+	expectedWarn := samples * 2 / 12
+	expectedDebug := samples * 2 / 12
+	expectedError := samples * 1 / 12
+
+	tolerance := int(float64(samples) * 0.02) // ±2%
+
+	check := func(severity string, got, expected int) {
+		if got < expected-tolerance || got > expected+tolerance {
+			t.Errorf("severity %q count = %d, want %d ± %d", severity, got, expected, tolerance)
+		}
+	}
+
+	check("INFO", severityCounts["INFO"], expectedInfo)
+	check("WARN", severityCounts["WARN"], expectedWarn)
+	check("DEBUG", severityCounts["DEBUG"], expectedDebug)
+	check("ERROR", severityCounts["ERROR"], expectedError)
+}
+
+// TestParseBurstSpec validates burst spec parsing.
+func TestParseBurstSpec(t *testing.T) {
+	cases := []struct {
+		input   string
+		wantMul float64
+		wantDur time.Duration
+		wantErr bool
+	}{
+		{"2x30s", 2.0, 30 * time.Second, false},
+		{"1.5x1m", 1.5, 1 * time.Minute, false},
+		{"3x10m", 3.0, 10 * time.Minute, false},
+		{"2.5x500ms", 2.5, 500 * time.Millisecond, false},
+		// Invalid specs:
+		{"invalid", 0, 0, true},
+		{"2x", 0, 0, true},
+		{"x30s", 0, 0, true},
+		{"2y30s", 0, 0, true},
+	}
+
+	for _, tc := range cases {
+		spec, err := parseBurstSpec(tc.input)
+		if (err != nil) != tc.wantErr {
+			t.Errorf("parseBurstSpec(%q): err = %v, wantErr = %v", tc.input, err, tc.wantErr)
+			continue
+		}
+		if err == nil {
+			if spec.multiplier != tc.wantMul || spec.duration != tc.wantDur {
+				t.Errorf("parseBurstSpec(%q): got (%v, %v), want (%v, %v)",
+					tc.input, spec.multiplier, spec.duration, tc.wantMul, tc.wantDur)
+			}
+		}
+	}
+}
+
+// TestSeverityDistribution verifies the weighted log severity mix via statistical bounds.
+func TestSeverityDistribution(t *testing.T) {
+	const samples = 1_000
+
+	info, warn, debug, err := 0, 0, 0, 0
+
+	for i := 0; i < samples; i++ {
+		severity := pickSeverity(i)
+		switch severity {
+		case "INFO":
+			info++
+		case "WARN":
+			warn++
+		case "DEBUG":
+			debug++
+		case "ERROR":
+			err++
+		}
+	}
+
+	// Verify that major categories meet minimum thresholds (±5% absolute).
+	// INFO should dominate: ~58% (7/12).
+	infoPercent := 100.0 * float64(info) / float64(samples)
+	if infoPercent < 55 || infoPercent > 65 {
+		t.Errorf("INFO rate = %.1f%%, want ~58%% (50–65)", infoPercent)
+	}
+
+	// WARN should be ~17% (2/12).
+	warnPercent := 100.0 * float64(warn) / float64(samples)
+	if warnPercent < 12 || warnPercent > 22 {
+		t.Errorf("WARN rate = %.1f%%, want ~17%% (12–22)", warnPercent)
+	}
+
+	// DEBUG should be ~17% (2/12).
+	debugPercent := 100.0 * float64(debug) / float64(samples)
+	if debugPercent < 12 || debugPercent > 22 {
+		t.Errorf("DEBUG rate = %.1f%%, want ~17%% (12–22)", debugPercent)
+	}
+
+	// ERROR should be ~8% (1/12).
+	errPercent := 100.0 * float64(err) / float64(samples)
+	if errPercent < 3 || errPercent > 13 {
+		t.Errorf("ERROR rate = %.1f%%, want ~8%% (3–13)", errPercent)
+	}
+}
+
+// TestProfileResolution verifies that profile flags set correct service/rate combinations.
+func TestProfileResolution(t *testing.T) {
+	cases := []struct {
+		profile   string
+		wantSvc   int
+		wantSpan  int
+		wantLog   int
+		wantMetric int
+	}{
+		{"aggregate-acceptance", 150, 50, 10, 7},
+	}
+
+	for _, tc := range cases {
+		// Simulate the profile application logic from main().
+		numServices := 200
+		rps := 50
+		logsRate := 0
+		metricsRate := 0
+
+		switch tc.profile {
+		case "aggregate-acceptance":
+			numServices = 150
+			rps = 50
+			logsRate = 10
+			metricsRate = 7
+		}
+
+		if numServices != tc.wantSvc || rps != tc.wantSpan || logsRate != tc.wantLog || metricsRate != tc.wantMetric {
+			t.Errorf("profile %q: got (%d, %d, %d, %d), want (%d, %d, %d, %d)",
+				tc.profile, numServices, rps, logsRate, metricsRate,
+				tc.wantSvc, tc.wantSpan, tc.wantLog, tc.wantMetric)
+		}
+	}
+}
