@@ -20,17 +20,23 @@ type Config struct {
 	DLQPath           string
 	DLQReplayInterval string
 
+	// PprofAddr serves net/http/pprof on a dedicated listener (never the
+	// public mux). Loopback-only by default; empty disables profiling.
+	PprofAddr string
+
 	// Ingestion Filtering
 	IngestMinSeverity      string
 	IngestAllowedServices  string
 	IngestExcludedServices string
 
 	// Storage Filtering. Logs that pass IngestMinSeverity (so they reach the
-	// receiver and feed in-memory consumers like vectordb / GraphRAG) but
-	// fall below StoreMinSeverity are skipped during the DB persist pass —
-	// only the row-write is dropped, not the in-memory enrichment. Empty
-	// (default) means StoreMinSeverity == IngestMinSeverity, i.e. no
-	// behavior change vs. the single-threshold semantics.
+	// receiver and feed in-memory consumers like GraphRAG / Drain) but fall
+	// below StoreMinSeverity are skipped during the DB persist pass — only the
+	// row-write is dropped, not the in-memory enrichment. Defaults to "WARN"
+	// (all drivers): INFO/DEBUG still inform anomaly detection + clustering but
+	// don't grow the DB. Empty falls back to IngestMinSeverity (no second-tier
+	// gate); a value <= IngestMinSeverity is a no-op since the receiver already
+	// drops below that.
 	StoreMinSeverity string
 
 	// DB Connection Pool
@@ -59,6 +65,14 @@ type Config struct {
 	// dedicated DB machines. 0/negative values use defaults.
 	RetentionBatchSize    int
 	RetentionBatchSleepMs int
+
+	// RetentionFullVacuum restores the daily full VACUUM during SQLite
+	// maintenance. Default false: the daily pass runs
+	// PRAGMA incremental_vacuum(10000) instead, because a full VACUUM holds
+	// an exclusive lock for 10-60 minutes on multi-GB files and starves
+	// ingest into a 429 storm. On-demand full VACUUM remains available via
+	// POST /api/admin/vacuum. Ignored on non-SQLite drivers.
+	RetentionFullVacuum bool
 
 	// TSDB
 	TSDBRingBufferDuration string // e.g. "1h"
@@ -129,6 +143,28 @@ type Config struct {
 	// GraphRAG event channel buffer size. Defaults to 10000 if unset or <=0.
 	GraphRAGEventQueueSize int
 
+	// GraphRAGTraceTTL bounds how long spans/traces stay in the in-memory
+	// TraceStore before the refresh tick prunes them. Duration string, e.g.
+	// "1h". Defaults to "1h"; flipped to "30m" on SQLite (the in-memory span
+	// window is the largest GraphRAG heap consumer at 120 services). Anomaly
+	// and investigation paths look back <=5min, so a 30min window is safe.
+	GraphRAGTraceTTL string
+
+	// GraphRAGMaxSpansPerTenant hard-caps the in-memory TraceStore span map
+	// per tenant. At the cap, NEW spans are skipped (counted via
+	// otelcontext_graphrag_events_dropped_total{signal="span_capacity"});
+	// updates to resident spans still apply. The graph is best-effort — the
+	// DB remains the source of truth. 0 = default (500000); negative
+	// disables the cap.
+	GraphRAGMaxSpansPerTenant int
+
+	// GraphRAGTenantIdleTTL evicts a tenant's entire in-memory store slice
+	// after this much time without any ingest event or query. Duration
+	// string, default "24h". The default tenant is never evicted, and an
+	// active tenant is re-created within one refresh tick (60s) from recent
+	// DB spans — eviction is self-healing.
+	GraphRAGTenantIdleTTL string
+
 	// Async ingest pipeline (Phase 1 robustness work). Decouples OTLP Export
 	// from synchronous DB writes. When enabled, Export() returns as soon as
 	// the parsed batch is enqueued; persistence runs on a worker pool.
@@ -139,14 +175,22 @@ type Config struct {
 	//   100% queue       — return RESOURCE_EXHAUSTED so OTLP clients back off
 	IngestAsyncEnabled      bool // default true; opt out via INGEST_ASYNC_ENABLED=false
 	IngestPipelineQueueSize int  // default 50000 batches; per-deployment tunable
-	IngestPipelineWorkers   int  // default 8 worker goroutines
+	// IngestPipelineMaxBytes caps the approximate bytes held by queued
+	// batches. The item-count queue size alone cannot bound memory — one
+	// batch may carry arbitrarily large span/log payloads. At the cap the
+	// pipeline rejects with RESOURCE_EXHAUSTED / HTTP 429 even for priority
+	// (error/slow) batches: a 429 is recoverable, an OOM kill is not.
+	// Default 512MB; SQLite default 128MB (see applyDriverDefaults).
+	IngestPipelineMaxBytes int
+	IngestPipelineWorkers  int // default 8 worker goroutines
 	// IngestPipelinePerTenantCap caps in-flight batches per tenant so a noisy
 	// tenant cannot starve siblings of fresh queue slots when fullness is
-	// below the soft-backpressure threshold. 0 (default) disables — single-
-	// tenant deployments need no cap. Operators on multi-tenant deployments
-	// should set INGEST_PIPELINE_PER_TENANT_CAP to roughly Capacity/N where
-	// N is the expected number of concurrently-active tenants, with some
-	// headroom (e.g. 2× the fair-share value) for short bursts.
+	// below the soft-backpressure threshold. When unset it defaults to ~30% of
+	// the resolved queue size (see Load) so multi-tenant deployments are
+	// protected out of the box; an explicit INGEST_PIPELINE_PER_TENANT_CAP=0
+	// disables the cap for single-tenant deployments. Operators can instead
+	// pin it to roughly Capacity/N where N is the expected number of
+	// concurrently-active tenants, with headroom for short bursts.
 	IngestPipelinePerTenantCap int
 
 	// TLS (HTTP + gRPC). When both paths are set, TLS is enabled on both servers.
@@ -206,7 +250,6 @@ type Config struct {
 	// the cap receive HTTP 503. Sized for the operator's expected dashboard
 	// audience — small for ops dashboards, larger for read-heavy public UIs.
 	WSMaxClients int
-
 	// Aggregate Engine Configuration (Phase 1, accounting only)
 	//
 	// AggregateMode controls how the aggregation engine participates:
@@ -232,11 +275,11 @@ type Config struct {
 	// Per-service caps. Enforcement order: tenant → service → signal sub-cap →
 	// global. These are isolation ceilings, not reservations; sum of per-service
 	// budgets may exceed instance-wide cap.
-	AggregateMaxOperationsPerService        int     // Default 20
-	AggregateMaxTraceSeriesPerService       int     // Default 50
-	AggregateMaxLogTemplatesPerService      int     // Default 10
-	AggregateMaxMetricSeriesPerService      int     // Default 50
-	AggregateSeriesPerTenantFraction        float64 // Default 0 (disabled); range [0, 1]
+	AggregateMaxOperationsPerService   int     // Default 20
+	AggregateMaxTraceSeriesPerService  int     // Default 50
+	AggregateMaxLogTemplatesPerService int     // Default 10
+	AggregateMaxMetricSeriesPerService int     // Default 50
+	AggregateSeriesPerTenantFraction   float64 // Default 0 (disabled); range [0, 1]
 
 	// Baseline configuration for counter temporality tracking.
 	// AggregateMaxProducerBaselinesPerSeries caps the number of baseline
@@ -277,9 +320,10 @@ func Load(customPath string) (*Config, error) {
 		DBDSN:             getEnv("DB_DSN", ""),
 		DLQPath:           getEnv("DLQ_PATH", "./data/dlq"),
 		DLQReplayInterval: getEnv("DLQ_REPLAY_INTERVAL", "5m"),
+		PprofAddr:         getEnv("PPROF_ADDR", "127.0.0.1:6060"),
 
 		IngestMinSeverity:      getEnv("INGEST_MIN_SEVERITY", "INFO"),
-		StoreMinSeverity:       getEnv("STORE_MIN_SEVERITY", ""),
+		StoreMinSeverity:       getEnv("STORE_MIN_SEVERITY", "WARN"),
 		IngestAllowedServices:  getEnv("INGEST_ALLOWED_SERVICES", ""),
 		IngestExcludedServices: getEnv("INGEST_EXCLUDED_SERVICES", ""),
 
@@ -296,6 +340,7 @@ func Load(customPath string) (*Config, error) {
 		HotRetentionDays:      getEnvInt("HOT_RETENTION_DAYS", 7),
 		RetentionBatchSize:    getEnvInt("RETENTION_BATCH_SIZE", 50000),
 		RetentionBatchSleepMs: getEnvInt("RETENTION_BATCH_SLEEP_MS", 1),
+		RetentionFullVacuum:   getEnvBool("RETENTION_FULL_VACUUM", false),
 
 		// TSDB
 		TSDBRingBufferDuration: getEnv("TSDB_RING_BUFFER_DURATION", "1h"),
@@ -333,12 +378,16 @@ func Load(customPath string) (*Config, error) {
 		LogFTSEnabled: parseTruthy(getEnv("LOG_FTS_ENABLED", "")),
 
 		// GraphRAG
-		GraphRAGWorkerCount:    getEnvInt("GRAPHRAG_WORKER_COUNT", 16),
-		GraphRAGEventQueueSize: getEnvInt("GRAPHRAG_EVENT_QUEUE_SIZE", 100000),
+		GraphRAGWorkerCount:       getEnvInt("GRAPHRAG_WORKER_COUNT", 16),
+		GraphRAGEventQueueSize:    getEnvInt("GRAPHRAG_EVENT_QUEUE_SIZE", 100000),
+		GraphRAGTraceTTL:          getEnv("GRAPHRAG_TRACE_TTL", "1h"),
+		GraphRAGMaxSpansPerTenant: getEnvInt("GRAPHRAG_MAX_SPANS_PER_TENANT", 500000),
+		GraphRAGTenantIdleTTL:     getEnv("GRAPHRAG_TENANT_IDLE_TTL", "24h"),
 
 		// Async ingest pipeline
 		IngestAsyncEnabled:         getEnvBool("INGEST_ASYNC_ENABLED", true),
 		IngestPipelineQueueSize:    getEnvInt("INGEST_PIPELINE_QUEUE_SIZE", 50000),
+		IngestPipelineMaxBytes:     getEnvInt("INGEST_PIPELINE_MAX_BYTES", 512<<20),
 		IngestPipelineWorkers:      getEnvInt("INGEST_PIPELINE_WORKERS", 8),
 		IngestPipelinePerTenantCap: getEnvInt("INGEST_PIPELINE_PER_TENANT_CAP", 0),
 
@@ -370,22 +419,32 @@ func Load(customPath string) (*Config, error) {
 		AllowSqliteProd: parseTruthy(getEnv("OTELCONTEXT_ALLOW_SQLITE_PROD", "")),
 
 		// Aggregate Engine Configuration
-		AggregateMode:                         strings.ToLower(strings.TrimSpace(getEnv("AGGREGATE_MODE", "legacy"))),
-		AggregateMaxSeries:                    getEnvInt("AGGREGATE_MAX_SERIES", 6000),
-		AggregateMaxSeriesMetrics:             getEnvInt("AGGREGATE_MAX_SERIES_METRICS", 2400),
-		AggregateMaxSeriesTraces:              getEnvInt("AGGREGATE_MAX_SERIES_TRACES", 2400),
-		AggregateMaxSeriesEdges:               getEnvInt("AGGREGATE_MAX_SERIES_EDGES", 500),
-		AggregateMaxSeriesLogs:                getEnvInt("AGGREGATE_MAX_SERIES_LOGS", 500),
-		AggregateMaxSeriesSystem:              getEnvInt("AGGREGATE_MAX_SERIES_SYSTEM", 200),
-		AggregateMaxOperationsPerService:      getEnvInt("AGGREGATE_MAX_OPERATIONS_PER_SERVICE", 20),
-		AggregateMaxTraceSeriesPerService:     getEnvInt("AGGREGATE_MAX_TRACE_SERIES_PER_SERVICE", 50),
-		AggregateMaxLogTemplatesPerService:    getEnvInt("AGGREGATE_MAX_LOG_TEMPLATES_PER_SERVICE", 10),
-		AggregateMaxMetricSeriesPerService:    getEnvInt("AGGREGATE_MAX_METRIC_SERIES_PER_SERVICE", 50),
-		AggregateSeriesPerTenantFraction:      getEnvFloat("AGGREGATE_SERIES_PER_TENANT_FRACTION", 0),
+		AggregateMode:                          strings.ToLower(strings.TrimSpace(getEnv("AGGREGATE_MODE", "legacy"))),
+		AggregateMaxSeries:                     getEnvInt("AGGREGATE_MAX_SERIES", 6000),
+		AggregateMaxSeriesMetrics:              getEnvInt("AGGREGATE_MAX_SERIES_METRICS", 2400),
+		AggregateMaxSeriesTraces:               getEnvInt("AGGREGATE_MAX_SERIES_TRACES", 2400),
+		AggregateMaxSeriesEdges:                getEnvInt("AGGREGATE_MAX_SERIES_EDGES", 500),
+		AggregateMaxSeriesLogs:                 getEnvInt("AGGREGATE_MAX_SERIES_LOGS", 500),
+		AggregateMaxSeriesSystem:               getEnvInt("AGGREGATE_MAX_SERIES_SYSTEM", 200),
+		AggregateMaxOperationsPerService:       getEnvInt("AGGREGATE_MAX_OPERATIONS_PER_SERVICE", 20),
+		AggregateMaxTraceSeriesPerService:      getEnvInt("AGGREGATE_MAX_TRACE_SERIES_PER_SERVICE", 50),
+		AggregateMaxLogTemplatesPerService:     getEnvInt("AGGREGATE_MAX_LOG_TEMPLATES_PER_SERVICE", 10),
+		AggregateMaxMetricSeriesPerService:     getEnvInt("AGGREGATE_MAX_METRIC_SERIES_PER_SERVICE", 50),
+		AggregateSeriesPerTenantFraction:       getEnvFloat("AGGREGATE_SERIES_PER_TENANT_FRACTION", 0),
 		AggregateMaxProducerBaselinesPerSeries: getEnvInt("AGGREGATE_MAX_PRODUCER_BASELINES_PER_SERIES", 8),
-		AggregateMaxBaselines:                 getEnvInt("AGGREGATE_MAX_BASELINES", 0),
+		AggregateMaxBaselines:                  getEnvInt("AGGREGATE_MAX_BASELINES", 0),
 	}
 	applyDriverDefaults(cfg)
+
+	// Derive a sane per-tenant ingest cap when the operator did not set one.
+	// Run AFTER applyDriverDefaults so it tracks the (possibly SQLite-adjusted)
+	// queue size: ~30% of the queue lets a single tenant burst but stops one
+	// noisy tenant from monopolising every slot at 100–200 services. An explicit
+	// INGEST_PIPELINE_PER_TENANT_CAP=0 is respected as "disabled".
+	if _, set := os.LookupEnv("INGEST_PIPELINE_PER_TENANT_CAP"); !set && cfg.IngestPipelinePerTenantCap == 0 {
+		cfg.IngestPipelinePerTenantCap = cfg.IngestPipelineQueueSize * 30 / 100
+	}
+
 	return cfg, nil
 }
 
@@ -403,36 +462,46 @@ func Load(customPath string) (*Config, error) {
 // "Explicit operator override" is detected via os.LookupEnv (presence)
 // rather than value comparison so that, e.g., DB_MAX_OPEN_CONNS=50 set by
 // hand is still honoured even though it equals the Postgres default.
+// sqliteOverrides is the table of (env-var, apply) pairs that
+// applyDriverDefaults walks when DB_DRIVER=sqlite. Add a row here to
+// introduce a new SQLite-only default; the apply closure is the only place
+// that names the Config field, so the surrounding lookup/skip logic stays
+// in one spot.
+var sqliteOverrides = []struct {
+	envKey string
+	apply  func(*Config)
+}{
+	{"DB_MAX_OPEN_CONNS", func(c *Config) { c.DBMaxOpenConns = 1 }},
+	{"DB_MAX_IDLE_CONNS", func(c *Config) { c.DBMaxIdleConns = 1 }},
+	{"INGEST_PIPELINE_WORKERS", func(c *Config) { c.IngestPipelineWorkers = 2 }},
+	{"INGEST_PIPELINE_QUEUE_SIZE", func(c *Config) { c.IngestPipelineQueueSize = 10000 }},
+	// The SQLite single writer drains slowly, so the ingest queue is the
+	// first structure to bloat — bound it to 128MB instead of 512MB.
+	{"INGEST_PIPELINE_MAX_BYTES", func(c *Config) { c.IngestPipelineMaxBytes = 128 << 20 }},
+	{"METRIC_MAX_CARDINALITY", func(c *Config) { c.MetricMaxCardinality = 3000 }},
+	{"SAMPLING_RATE", func(c *Config) { c.SamplingRate = 0.05 }},
+	{"GRPC_MAX_CONCURRENT_STREAMS", func(c *Config) { c.GRPCMaxConcurrentStreams = 240 }},
+	{"LOG_FTS_ENABLED", func(c *Config) { c.LogFTSEnabled = true }},
+	// Each queued event embeds a storage.Span/Log by value (~0.5–2 KB); the
+	// 100k Postgres default is ~100 MB+ of standing buffer. On SQLite the
+	// single writer starves the workers anyway — drop sooner (metered via
+	// otelcontext_graphrag_events_dropped_total) instead of buffering RAM.
+	{"GRAPHRAG_EVENT_QUEUE_SIZE", func(c *Config) { c.GraphRAGEventQueueSize = 10000 }},
+	// The TraceStore span window dominates GraphRAG heap at 120 services
+	// (~1.5 GB potential at 1h). Anomaly/investigation lookbacks are <=5min,
+	// so halving the window costs nothing they rely on; MCP trace tools fall
+	// through to the DB for older traces.
+	{"GRAPHRAG_TRACE_TTL", func(c *Config) { c.GraphRAGTraceTTL = "30m" }},
+}
+
 func applyDriverDefaults(cfg *Config) {
 	if !strings.EqualFold(cfg.DBDriver, "sqlite") {
 		return
 	}
-	if _, ok := os.LookupEnv("DB_MAX_OPEN_CONNS"); !ok {
-		cfg.DBMaxOpenConns = 1
-	}
-	if _, ok := os.LookupEnv("DB_MAX_IDLE_CONNS"); !ok {
-		cfg.DBMaxIdleConns = 1
-	}
-	if _, ok := os.LookupEnv("INGEST_PIPELINE_WORKERS"); !ok {
-		cfg.IngestPipelineWorkers = 2
-	}
-	if _, ok := os.LookupEnv("INGEST_PIPELINE_QUEUE_SIZE"); !ok {
-		cfg.IngestPipelineQueueSize = 10000
-	}
-	if _, ok := os.LookupEnv("METRIC_MAX_CARDINALITY"); !ok {
-		cfg.MetricMaxCardinality = 3000
-	}
-	if _, ok := os.LookupEnv("STORE_MIN_SEVERITY"); !ok {
-		cfg.StoreMinSeverity = "WARN"
-	}
-	if _, ok := os.LookupEnv("SAMPLING_RATE"); !ok {
-		cfg.SamplingRate = 0.05
-	}
-	if _, ok := os.LookupEnv("GRPC_MAX_CONCURRENT_STREAMS"); !ok {
-		cfg.GRPCMaxConcurrentStreams = 240
-	}
-	if _, ok := os.LookupEnv("LOG_FTS_ENABLED"); !ok {
-		cfg.LogFTSEnabled = true
+	for _, ov := range sqliteOverrides {
+		if _, ok := os.LookupEnv(ov.envKey); !ok {
+			ov.apply(cfg)
+		}
 	}
 }
 
@@ -572,6 +641,12 @@ func (c *Config) Validate() error {
 	}
 	if c.GRPCMaxConcurrentStreams < 1 || c.GRPCMaxConcurrentStreams > 1_000_000 {
 		return fmt.Errorf("GRPC_MAX_CONCURRENT_STREAMS must be between 1 and 1000000, got %d", c.GRPCMaxConcurrentStreams)
+	}
+	// GraphRAG event queue: the channel buffer is allocated up front and each
+	// queued event embeds a Span/Log by value (~0.5-2 KB), so an unbounded env
+	// value is a real OOM lever. 1M buffered events is already ~1-2 GB.
+	if c.GraphRAGEventQueueSize < 1 || c.GraphRAGEventQueueSize > 1_000_000 {
+		return fmt.Errorf("GRAPHRAG_EVENT_QUEUE_SIZE must be between 1 and 1000000, got %d", c.GraphRAGEventQueueSize)
 	}
 	if c.DBMaxOpenConns < 1 {
 		return fmt.Errorf("DB_MAX_OPEN_CONNS must be >= 1, got %d", c.DBMaxOpenConns)

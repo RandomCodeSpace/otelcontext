@@ -11,35 +11,36 @@ import (
 // baseValid returns a Config that passes Validate() — test functions mutate one field at a time.
 func baseValid() *Config {
 	return &Config{
-		HTTPPort:             "8080",
-		GRPCPort:             "4317",
-		DBDriver:             "sqlite",
-		HotRetentionDays:     7,
-		MetricMaxCardinality: 10000,
-		SamplingRate:         1.0,
-		APIRateLimitRPS:      100,
-		DBMaxOpenConns:       50,
-		DBMaxIdleConns:       10,
-		CompressionLevel:     "default",
+		HTTPPort:                 "8080",
+		GRPCPort:                 "4317",
+		DBDriver:                 "sqlite",
+		HotRetentionDays:         7,
+		MetricMaxCardinality:     10000,
+		SamplingRate:             1.0,
+		APIRateLimitRPS:          100,
+		DBMaxOpenConns:           50,
+		DBMaxIdleConns:           10,
+		CompressionLevel:         "default",
 		GRPCMaxRecvMB:            16,
 		GRPCMaxConcurrentStreams: 1000,
-		RetentionBatchSize:    50000,
-		RetentionBatchSleepMs: 1,
+		GraphRAGEventQueueSize:   100000,
+		RetentionBatchSize:       50000,
+		RetentionBatchSleepMs:    1,
 		// Aggregate Engine defaults
-		AggregateMode:                         "legacy",
-		AggregateMaxSeries:                    6000,
-		AggregateMaxSeriesMetrics:             2400,
-		AggregateMaxSeriesTraces:              2400,
-		AggregateMaxSeriesEdges:               500,
-		AggregateMaxSeriesLogs:                500,
-		AggregateMaxSeriesSystem:              200,
-		AggregateMaxOperationsPerService:      20,
-		AggregateMaxTraceSeriesPerService:     50,
-		AggregateMaxLogTemplatesPerService:    10,
-		AggregateMaxMetricSeriesPerService:    50,
-		AggregateSeriesPerTenantFraction:      0,
+		AggregateMode:                          "legacy",
+		AggregateMaxSeries:                     6000,
+		AggregateMaxSeriesMetrics:              2400,
+		AggregateMaxSeriesTraces:               2400,
+		AggregateMaxSeriesEdges:                500,
+		AggregateMaxSeriesLogs:                 500,
+		AggregateMaxSeriesSystem:               200,
+		AggregateMaxOperationsPerService:       20,
+		AggregateMaxTraceSeriesPerService:      50,
+		AggregateMaxLogTemplatesPerService:     10,
+		AggregateMaxMetricSeriesPerService:     50,
+		AggregateSeriesPerTenantFraction:       0,
 		AggregateMaxProducerBaselinesPerSeries: 8,
-		AggregateMaxBaselines:                 0,
+		AggregateMaxBaselines:                  0,
 	}
 }
 
@@ -149,6 +150,30 @@ func TestValidate_TLS_ReadableFilesOK(t *testing.T) {
 	}
 	if !c.TLSEnabled() {
 		t.Fatal("TLSEnabled should be true when both files are set")
+	}
+}
+
+func TestLoad_RetentionFullVacuum(t *testing.T) {
+	// Default: off — the daily SQLite maintenance must not full-VACUUM.
+	t.Setenv("RETENTION_FULL_VACUUM", "")
+	if err := os.Unsetenv("RETENTION_FULL_VACUUM"); err != nil {
+		t.Fatalf("unset: %v", err)
+	}
+	cfg, err := Load("__no_such_env_file__")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.RetentionFullVacuum {
+		t.Fatal("RetentionFullVacuum must default to false")
+	}
+
+	t.Setenv("RETENTION_FULL_VACUUM", "true")
+	cfg, err = Load("__no_such_env_file__")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.RetentionFullVacuum {
+		t.Fatal("RETENTION_FULL_VACUUM=true not loaded")
 	}
 }
 
@@ -323,7 +348,24 @@ func TestLoad_DefaultTenant_FallsBackToDefault(t *testing.T) {
 	}
 }
 
-// Aggregate engine configuration tests follow.
+// TestValidate_GraphRAGEventQueueSize_Bounds: the event channel buffer is
+// allocated up front and each event embeds a Span/Log by value, so the env
+// value must be range-checked (also breaks the CodeQL
+// go/uncontrolled-allocation-size taint path env -> make(chan, n)).
+func TestValidate_GraphRAGEventQueueSize_Bounds(t *testing.T) {
+	for _, bad := range []int{0, -1, 1_000_001} {
+		c := baseValid()
+		c.GraphRAGEventQueueSize = bad
+		if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "GRAPHRAG_EVENT_QUEUE_SIZE") {
+			t.Fatalf("size %d: expected GRAPHRAG_EVENT_QUEUE_SIZE error, got %v", bad, err)
+		}
+	}
+	c := baseValid()
+	c.GraphRAGEventQueueSize = 1_000_000
+	if err := c.Validate(); err != nil {
+		t.Fatalf("size 1000000 should validate: %v", err)
+	}
+}
 
 func TestValidate_AggregateMode_Valid(t *testing.T) {
 	cases := []string{"legacy", "aggregate-shadow", "aggregate"}
