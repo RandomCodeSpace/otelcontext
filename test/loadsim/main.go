@@ -583,6 +583,11 @@ func main() {
 	insecure := flag.Bool("insecure", true, "Use insecure gRPC connection")
 	tenantID := flag.String("tenant-id", "", "x-tenant-id gRPC metadata value (empty = omit)")
 	warmup := flag.Duration("warmup", 5*time.Second, "Stagger window for producer startup")
+	direct := flag.Bool("direct", false, "Use the direct OTLP emission engine (measures per-Export ACK latency; required for the #173 release gates)")
+	settle := flag.Duration("settle", 60*time.Second, "Direct engine: unmeasured settle window before the sustained phase")
+	batchInterval := flag.Duration("batch-interval", 250*time.Millisecond, "Direct engine: per-emitter batch tick")
+	callTimeout := flag.Duration("call-timeout", 30*time.Second, "Direct engine: per-Export deadline")
+	reportPath := flag.String("report", "", "Direct engine: write the JSON latency/throughput report to this path")
 	flag.Parse()
 
 	// Apply profile if set.
@@ -612,6 +617,44 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// Direct engine: one synchronous Export per batch tick, timed. This is the
+	// only path that produces ACK-latency percentiles, and the only one that
+	// can reach 10k points/s (the SDK path sleeps the simulated span duration
+	// in its emit loop). See otlpdirect.go for why.
+	if *direct {
+		sustainedDur := *duration
+		burstDur := time.Duration(0)
+		if burstConfig.multiplier > 0 {
+			burstDur = burstConfig.duration
+		}
+		mul := burstConfig.multiplier
+		if mul <= 0 {
+			mul = 1
+		}
+		cfg := directConfig{
+			endpoint:   *endpoint,
+			tenantID:   *tenantID,
+			insecure:   *insecure,
+			services:   *numServices,
+			spanRate:   float64(*rps),
+			logRate:    float64(*logsRate),
+			metricRate: float64(*metricsRate),
+			interval:   *batchInterval,
+			burstMul:   mul,
+			callTimout: *callTimeout,
+		}
+		fmt.Printf("direct engine: %d services -> %s | per-service %.1f span/s %.1f log/s %.1f metric/s\n",
+			cfg.services, cfg.endpoint, cfg.spanRate, cfg.logRate, cfg.metricRate)
+		fmt.Printf("offered load: %.0f pts/s sustained, %.0f pts/s burst | settle %s, sustained %s, burst %s\n",
+			float64(cfg.services)*(cfg.spanRate+cfg.logRate+cfg.metricRate),
+			float64(cfg.services)*(cfg.spanRate+cfg.logRate+cfg.metricRate)*mul,
+			*settle, sustainedDur, burstDur)
+		if _, err := runDirect(ctx, cfg, *settle, sustainedDur, burstDur, *reportPath); err != nil {
+			log.Fatalf("direct run failed: %v", err)
+		}
+		return
+	}
 
 	// Suppress default OTel global TracerProvider noise.
 	otel.SetTracerProvider(sdktrace.NewTracerProvider())
