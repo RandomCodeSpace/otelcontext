@@ -81,15 +81,88 @@ func (r *Repository) BatchCreateTraces(traces []Trace) error {
 	return createTracesIdempotent(r.db, r.driver, traces)
 }
 
+// traceConflictColumns is the conflict target for the traces uniqueIndex
+// idx_traces_tenant_trace_id on (tenant_id, trace_id).
+var traceConflictColumns = []clause.Column{{Name: "tenant_id"}, {Name: "trace_id"}}
+
 // createTracesIdempotent runs the conflict-tolerant trace insert against an
 // arbitrary *gorm.DB so the same logic is reused inside a transaction by
-// BatchCreateAll. MySQL takes INSERT IGNORE; SQLite/Postgres take
-// ON CONFLICT DO NOTHING via the gorm clause helper.
+// BatchCreateAll.
+//
+// Trace status is UPGRADE-ONLY. A trace row exists once per (tenant, trace);
+// whichever span arrives first seeds its timestamp/duration/service, and those
+// are never rewritten. Status is the exception: an incoming STATUS_CODE_ERROR
+// row must be able to flip an already-persisted UNSET/OK row to ERROR, because
+// the root span (UNSET) frequently lands before the child span that failed.
+// The reverse is forbidden — a persisted ERROR is never downgraded.
+//
+// This is expressed without a dialect-specific CASE/WHERE guard, which neither
+// MySQL's ON DUPLICATE KEY UPDATE nor SQL Server's MERGE translation supports
+// portably: the batch is split by status. Non-error rows keep the existing
+// insert-or-ignore behaviour (so they cannot clobber an ERROR row), and error
+// rows use DoUpdates{status: STATUS_CODE_ERROR} — a conflicting row is only
+// ever assigned ERROR, so the update direction is upgrade-only by construction.
+// Non-error rows are written first so an ERROR row later in the same batch wins.
 func createTracesIdempotent(db *gorm.DB, driver string, traces []Trace) error {
+	if len(traces) == 0 {
+		return nil
+	}
+	healthy, errored := splitTracesByStatus(traces)
+	if len(healthy) > 0 {
+		if err := insertTracesIgnoringConflicts(db, driver, healthy); err != nil {
+			return err
+		}
+	}
+	if len(errored) > 0 {
+		// DoUpdates carries the literal rather than a column reference so the
+		// same clause works on every dialect (no excluded./VALUES()/MERGE alias).
+		if err := db.Clauses(clause.OnConflict{
+			Columns:   traceConflictColumns,
+			DoUpdates: clause.Assignments(map[string]any{"status": StatusCodeError}),
+		}).Create(&errored).Error; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// insertTracesIgnoringConflicts is the original first-writer-wins insert:
+// MySQL takes INSERT IGNORE; SQLite/Postgres/SQL Server take
+// ON CONFLICT DO NOTHING via the gorm clause helper.
+func insertTracesIgnoringConflicts(db *gorm.DB, driver string, traces []Trace) error {
 	if strings.ToLower(driver) == "mysql" {
 		return db.Clauses(clause.Insert{Modifier: "IGNORE"}).Create(&traces).Error
 	}
 	return db.Clauses(clause.OnConflict{DoNothing: true}).Create(&traces).Error
+}
+
+// splitTracesByStatus partitions a batch into non-error and error rows,
+// collapsing duplicates on (tenant_id, trace_id) with error-wins semantics.
+// The in-batch dedup is required as well as useful: Postgres rejects an
+// INSERT ... ON CONFLICT DO UPDATE that would touch the same row twice in one
+// statement.
+func splitTracesByStatus(traces []Trace) (healthy, errored []Trace) {
+	idx := make(map[string]int, len(traces))
+	deduped := make([]Trace, 0, len(traces))
+	for _, t := range traces {
+		key := t.TenantID + "\x00" + t.TraceID
+		if i, seen := idx[key]; seen {
+			if t.Status == StatusCodeError {
+				deduped[i].Status = StatusCodeError
+			}
+			continue
+		}
+		idx[key] = len(deduped)
+		deduped = append(deduped, t)
+	}
+	for _, t := range deduped {
+		if t.Status == StatusCodeError {
+			errored = append(errored, t)
+		} else {
+			healthy = append(healthy, t)
+		}
+	}
+	return healthy, errored
 }
 
 // BatchCreateAll persists traces, spans, and logs in a single DB transaction.
@@ -129,14 +202,13 @@ func (r *Repository) BatchCreateAll(traces []Trace, spans []Span, logs []Log) er
 	})
 }
 
-// CreateTrace inserts a new trace, skipping if it already exists.
+// CreateTrace inserts a new trace, skipping if it already exists — except that
+// an incoming STATUS_CODE_ERROR upgrades an existing non-error row's status
+// (upgrade-only; see createTracesIdempotent for the full rationale).
 // Uniqueness is per idx_traces_tenant_trace_id (tenant_id, trace_id), so the
 // same trace_id across tenants is allowed.
 func (r *Repository) CreateTrace(trace Trace) error {
-	if strings.ToLower(r.driver) == "mysql" {
-		return r.db.Clauses(clause.Insert{Modifier: "IGNORE"}).Create(&trace).Error
-	}
-	return r.db.Clauses(clause.OnConflict{DoNothing: true}).Create(&trace).Error
+	return createTracesIdempotent(r.db, r.driver, []Trace{trace})
 }
 
 // GetTrace returns a trace by ID with its spans and logs, scoped to the tenant on ctx.

@@ -79,6 +79,12 @@ func (ct *CompressedText) Scan(value any) error {
 // tenant.id resource attribute is present on an OTLP request.
 const DefaultTenantID = "default"
 
+// StatusCodeError is the OTLP status string persisted on spans and traces
+// whose status code is STATUS_CODE_ERROR. Trace status is upgrade-only: a
+// trace row may move UNSET/OK -> ERROR, never the reverse (see
+// createTracesIdempotent).
+const StatusCodeError = "STATUS_CODE_ERROR"
+
 // Trace represents a complete distributed trace.
 //
 // Index strategy: single-column tenant_id is redundant — every tenant-scoped
