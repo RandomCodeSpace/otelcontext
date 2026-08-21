@@ -495,8 +495,38 @@ func main() {
 		)
 	}
 
-	// Wire adaptive sampler (only when rate < 1.0 to avoid unnecessary overhead)
-	if cfg.SamplingRate > 0 && cfg.SamplingRate < 1.0 {
+	// Bounded exemplar retention (#176). In AGGREGATE_MODE=aggregate this is
+	// the ONLY raw-retention gate — the adaptive sampler below is skipped
+	// entirely, so SAMPLING_RATE has no effect on what gets persisted (#161).
+	// SAMPLING_LATENCY_THRESHOLD_MS survives as the shared "slow" predicate.
+	if cfg.AggregateMode == aggregate.ModeAggregate {
+		exemplarPolicy := ingest.NewExemplarPolicy(ingest.ExemplarConfig{
+			TracesPerServiceWindow:    cfg.ExemplarTracesPerServiceWindow,
+			TracesGlobalWindow:        cfg.ExemplarTracesGlobalWindow,
+			BytesPerServiceWindow:     int64(cfg.ExemplarBytesPerServiceWindow),
+			BytesGlobalWindow:         int64(cfg.ExemplarBytesGlobalWindow),
+			HealthyRate:               cfg.ExemplarHealthyRate,
+			StratumTopK:               cfg.ExemplarStratumTopK,
+			LatencyThresholdMs:        float64(cfg.SamplingLatencyThresholdMs),
+			LogsErrorPerServiceWindow: cfg.ExemplarLogsErrorPerServiceWindow,
+			LogsWarnEnabled:           cfg.ExemplarLogsWarnEnabled,
+			LogsWarnPerServiceWindow:  cfg.ExemplarLogsWarnPerServiceWindow,
+			MaxSpansPerTrace:          cfg.ExemplarMaxSpansPerTrace,
+			MaxBytesPerTrace:          int64(cfg.ExemplarMaxBytesPerTrace),
+			Metrics:                   metrics,
+		})
+		traceServer.SetExemplarPolicy(exemplarPolicy)
+		logsServer.SetExemplarPolicy(exemplarPolicy)
+		slog.Info("🎚️  Bounded exemplar retention enabled (adaptive sampler retired)",
+			"traces_per_service_window", cfg.ExemplarTracesPerServiceWindow,
+			"traces_global_window", cfg.ExemplarTracesGlobalWindow,
+			"bytes_per_service_window", cfg.ExemplarBytesPerServiceWindow,
+			"bytes_global_window", cfg.ExemplarBytesGlobalWindow,
+			"healthy_rate", cfg.ExemplarHealthyRate,
+			"latency_threshold_ms", cfg.SamplingLatencyThresholdMs,
+		)
+	} else if cfg.SamplingRate > 0 && cfg.SamplingRate < 1.0 {
+		// Wire adaptive sampler (only when rate < 1.0 to avoid unnecessary overhead)
 		sampler := ingest.NewSampler(cfg.SamplingRate, cfg.SamplingAlwaysOnErrors, float64(cfg.SamplingLatencyThresholdMs))
 		traceServer.SetSampler(sampler)
 		slog.Info("🎯 Adaptive trace sampling enabled",
