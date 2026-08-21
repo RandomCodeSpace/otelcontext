@@ -26,6 +26,21 @@ func baseValid() *Config {
 		GraphRAGEventQueueSize:   100000,
 		RetentionBatchSize:       50000,
 		RetentionBatchSleepMs:    1,
+		// Aggregate Engine defaults
+		AggregateMode:                          "legacy",
+		AggregateMaxSeries:                     6000,
+		AggregateMaxSeriesMetrics:              2400,
+		AggregateMaxSeriesTraces:               2400,
+		AggregateMaxSeriesEdges:                500,
+		AggregateMaxSeriesLogs:                 500,
+		AggregateMaxSeriesSystem:               200,
+		AggregateMaxOperationsPerService:       20,
+		AggregateMaxTraceSeriesPerService:      50,
+		AggregateMaxLogTemplatesPerService:     10,
+		AggregateMaxMetricSeriesPerService:     50,
+		AggregateSeriesPerTenantFraction:       0,
+		AggregateMaxProducerBaselinesPerSeries: 8,
+		AggregateMaxBaselines:                  0,
 	}
 }
 
@@ -349,5 +364,272 @@ func TestValidate_GraphRAGEventQueueSize_Bounds(t *testing.T) {
 	c.GraphRAGEventQueueSize = 1_000_000
 	if err := c.Validate(); err != nil {
 		t.Fatalf("size 1000000 should validate: %v", err)
+	}
+}
+
+func TestValidate_AggregateMode_Valid(t *testing.T) {
+	cases := []string{"legacy", "aggregate-shadow", "aggregate"}
+	for _, mode := range cases {
+		c := baseValid()
+		c.AggregateMode = mode
+		if err := c.Validate(); err != nil {
+			t.Errorf("mode %q should be valid, got %v", mode, err)
+		}
+	}
+}
+
+func TestValidate_AggregateMode_Invalid(t *testing.T) {
+	c := baseValid()
+	c.AggregateMode = "invalid-mode"
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "AGGREGATE_MODE") {
+		t.Fatalf("expected AGGREGATE_MODE error, got %v", err)
+	}
+}
+
+func TestValidate_AggregateMaxSeries_LowerBound(t *testing.T) {
+	c := baseValid()
+	c.AggregateMaxSeries = 0
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "AGGREGATE_MAX_SERIES") {
+		t.Fatalf("expected AGGREGATE_MAX_SERIES error, got %v", err)
+	}
+}
+
+func TestValidate_AggregateSeriesSubCaps_LowerBound(t *testing.T) {
+	caps := []struct {
+		name  string
+		field string
+	}{
+		{"AggregateMaxSeriesMetrics", "AGGREGATE_MAX_SERIES_METRICS"},
+		{"AggregateMaxSeriesTraces", "AGGREGATE_MAX_SERIES_TRACES"},
+		{"AggregateMaxSeriesEdges", "AGGREGATE_MAX_SERIES_EDGES"},
+		{"AggregateMaxSeriesLogs", "AGGREGATE_MAX_SERIES_LOGS"},
+		{"AggregateMaxSeriesSystem", "AGGREGATE_MAX_SERIES_SYSTEM"},
+	}
+	for _, tc := range caps {
+		c := baseValid()
+		switch tc.name {
+		case "AggregateMaxSeriesMetrics":
+			c.AggregateMaxSeriesMetrics = 0
+		case "AggregateMaxSeriesTraces":
+			c.AggregateMaxSeriesTraces = 0
+		case "AggregateMaxSeriesEdges":
+			c.AggregateMaxSeriesEdges = 0
+		case "AggregateMaxSeriesLogs":
+			c.AggregateMaxSeriesLogs = 0
+		case "AggregateMaxSeriesSystem":
+			c.AggregateMaxSeriesSystem = 0
+		}
+		if err := c.Validate(); err == nil || !strings.Contains(err.Error(), tc.field) {
+			t.Errorf("field %s = 0 should fail validation, got %v", tc.name, err)
+		}
+	}
+}
+
+func TestValidate_AggregatePerServiceCaps_LowerBound(t *testing.T) {
+	caps := []struct {
+		name  string
+		field string
+	}{
+		{"AggregateMaxOperationsPerService", "AGGREGATE_MAX_OPERATIONS_PER_SERVICE"},
+		{"AggregateMaxTraceSeriesPerService", "AGGREGATE_MAX_TRACE_SERIES_PER_SERVICE"},
+		{"AggregateMaxLogTemplatesPerService", "AGGREGATE_MAX_LOG_TEMPLATES_PER_SERVICE"},
+		{"AggregateMaxMetricSeriesPerService", "AGGREGATE_MAX_METRIC_SERIES_PER_SERVICE"},
+	}
+	for _, tc := range caps {
+		c := baseValid()
+		switch tc.name {
+		case "AggregateMaxOperationsPerService":
+			c.AggregateMaxOperationsPerService = 0
+		case "AggregateMaxTraceSeriesPerService":
+			c.AggregateMaxTraceSeriesPerService = 0
+		case "AggregateMaxLogTemplatesPerService":
+			c.AggregateMaxLogTemplatesPerService = 0
+		case "AggregateMaxMetricSeriesPerService":
+			c.AggregateMaxMetricSeriesPerService = 0
+		}
+		if err := c.Validate(); err == nil || !strings.Contains(err.Error(), tc.field) {
+			t.Errorf("field %s = 0 should fail validation, got %v", tc.name, err)
+		}
+	}
+}
+
+func TestValidate_AggregateTenantFraction_OutOfRange(t *testing.T) {
+	cases := []struct {
+		val     float64
+		wantErr bool
+	}{
+		{-0.1, true},
+		{0.0, false},
+		{0.5, false},
+		{1.0, false},
+		{1.1, true},
+	}
+	for _, tc := range cases {
+		c := baseValid()
+		c.AggregateSeriesPerTenantFraction = tc.val
+		err := c.Validate()
+		if tc.wantErr && err == nil {
+			t.Errorf("fraction %.1f should fail, got nil", tc.val)
+		}
+		if !tc.wantErr && err != nil {
+			t.Errorf("fraction %.1f should pass, got %v", tc.val, err)
+		}
+	}
+}
+
+func TestValidate_AggregateProducerBaselinesPerSeries_LowerBound(t *testing.T) {
+	c := baseValid()
+	c.AggregateMaxProducerBaselinesPerSeries = 0
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "AGGREGATE_MAX_PRODUCER_BASELINES_PER_SERIES") {
+		t.Fatalf("expected error, got %v", err)
+	}
+}
+
+func TestValidate_AggregateMaxBaselines_OverrideValidation(t *testing.T) {
+	c := baseValid()
+	c.AggregateMaxProducerBaselinesPerSeries = 8
+	c.AggregateMaxBaselines = 7 // less than per-series cap
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "AGGREGATE_MAX_BASELINES") {
+		t.Fatalf("expected override validation error, got %v", err)
+	}
+	// Valid override case: >= per-series cap
+	c.AggregateMaxBaselines = 8
+	if err := c.Validate(); err != nil {
+		t.Errorf("override = 8 should be valid, got %v", err)
+	}
+}
+
+func TestValidate_AggregateSubCaps_SumExceedsGlobal(t *testing.T) {
+	c := baseValid()
+	c.AggregateMaxSeries = 1000
+	c.AggregateMaxSeriesMetrics = 2400
+	c.AggregateMaxSeriesTraces = 500
+	c.AggregateMaxSeriesEdges = 501
+	c.AggregateMaxSeriesLogs = 100
+	c.AggregateMaxSeriesSystem = 100
+	// Sum: 2400 + 500 + 501 + 100 + 100 = 3601 > 1000
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "AGGREGATE_MAX_SERIES") {
+		t.Fatalf("expected sum-exceeds error, got %v", err)
+	}
+}
+
+func TestLoad_AggregateDefaults(t *testing.T) {
+	// Unset all aggregate env vars to test defaults
+	vars := []string{
+		"AGGREGATE_MODE",
+		"AGGREGATE_MAX_SERIES",
+		"AGGREGATE_MAX_SERIES_METRICS",
+		"AGGREGATE_MAX_SERIES_TRACES",
+		"AGGREGATE_MAX_SERIES_EDGES",
+		"AGGREGATE_MAX_SERIES_LOGS",
+		"AGGREGATE_MAX_SERIES_SYSTEM",
+		"AGGREGATE_MAX_OPERATIONS_PER_SERVICE",
+		"AGGREGATE_MAX_TRACE_SERIES_PER_SERVICE",
+		"AGGREGATE_MAX_LOG_TEMPLATES_PER_SERVICE",
+		"AGGREGATE_MAX_METRIC_SERIES_PER_SERVICE",
+		"AGGREGATE_SERIES_PER_TENANT_FRACTION",
+		"AGGREGATE_MAX_PRODUCER_BASELINES_PER_SERIES",
+		"AGGREGATE_MAX_BASELINES",
+	}
+	for _, v := range vars {
+		if err := os.Unsetenv(v); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cfg, err := Load("__no_such_env_file__")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if cfg.AggregateMode != "legacy" {
+		t.Errorf("AggregateMode default = %q, want legacy", cfg.AggregateMode)
+	}
+	if cfg.AggregateMaxSeries != 6000 {
+		t.Errorf("AggregateMaxSeries default = %d, want 6000", cfg.AggregateMaxSeries)
+	}
+	if cfg.AggregateMaxSeriesMetrics != 2400 {
+		t.Errorf("AggregateMaxSeriesMetrics default = %d, want 2400", cfg.AggregateMaxSeriesMetrics)
+	}
+	if cfg.AggregateMaxSeriesTraces != 2400 {
+		t.Errorf("AggregateMaxSeriesTraces default = %d, want 2400", cfg.AggregateMaxSeriesTraces)
+	}
+	if cfg.AggregateMaxSeriesEdges != 500 {
+		t.Errorf("AggregateMaxSeriesEdges default = %d, want 500", cfg.AggregateMaxSeriesEdges)
+	}
+	if cfg.AggregateMaxSeriesLogs != 500 {
+		t.Errorf("AggregateMaxSeriesLogs default = %d, want 500", cfg.AggregateMaxSeriesLogs)
+	}
+	if cfg.AggregateMaxSeriesSystem != 200 {
+		t.Errorf("AggregateMaxSeriesSystem default = %d, want 200", cfg.AggregateMaxSeriesSystem)
+	}
+	if cfg.AggregateMaxOperationsPerService != 20 {
+		t.Errorf("AggregateMaxOperationsPerService default = %d, want 20", cfg.AggregateMaxOperationsPerService)
+	}
+	if cfg.AggregateMaxTraceSeriesPerService != 50 {
+		t.Errorf("AggregateMaxTraceSeriesPerService default = %d, want 50", cfg.AggregateMaxTraceSeriesPerService)
+	}
+	if cfg.AggregateMaxLogTemplatesPerService != 10 {
+		t.Errorf("AggregateMaxLogTemplatesPerService default = %d, want 10", cfg.AggregateMaxLogTemplatesPerService)
+	}
+	if cfg.AggregateMaxMetricSeriesPerService != 50 {
+		t.Errorf("AggregateMaxMetricSeriesPerService default = %d, want 50", cfg.AggregateMaxMetricSeriesPerService)
+	}
+	if cfg.AggregateSeriesPerTenantFraction != 0 {
+		t.Errorf("AggregateSeriesPerTenantFraction default = %v, want 0", cfg.AggregateSeriesPerTenantFraction)
+	}
+	if cfg.AggregateMaxProducerBaselinesPerSeries != 8 {
+		t.Errorf("AggregateMaxProducerBaselinesPerSeries default = %d, want 8", cfg.AggregateMaxProducerBaselinesPerSeries)
+	}
+	if cfg.AggregateMaxBaselines != 0 {
+		t.Errorf("AggregateMaxBaselines default = %d, want 0", cfg.AggregateMaxBaselines)
+	}
+}
+
+func TestLoad_AggregateEnvVars(t *testing.T) {
+	t.Setenv("AGGREGATE_MODE", "aggregate-shadow")
+	t.Setenv("AGGREGATE_MAX_SERIES", "5000")
+	t.Setenv("AGGREGATE_MAX_PRODUCER_BASELINES_PER_SERIES", "10")
+	t.Setenv("AGGREGATE_SERIES_PER_TENANT_FRACTION", "0.5")
+
+	cfg, err := Load("__no_such_env_file__")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if cfg.AggregateMode != "aggregate-shadow" {
+		t.Errorf("AggregateMode = %q, want aggregate-shadow", cfg.AggregateMode)
+	}
+	if cfg.AggregateMaxSeries != 5000 {
+		t.Errorf("AggregateMaxSeries = %d, want 5000", cfg.AggregateMaxSeries)
+	}
+	if cfg.AggregateMaxProducerBaselinesPerSeries != 10 {
+		t.Errorf("AggregateMaxProducerBaselinesPerSeries = %d, want 10", cfg.AggregateMaxProducerBaselinesPerSeries)
+	}
+	if cfg.AggregateSeriesPerTenantFraction != 0.5 {
+		t.Errorf("AggregateSeriesPerTenantFraction = %v, want 0.5", cfg.AggregateSeriesPerTenantFraction)
+	}
+}
+
+func TestResolvedAggregateMaxBaselines_Default(t *testing.T) {
+	c := baseValid()
+	c.AggregateMaxSeriesMetrics = 2400
+	c.AggregateMaxProducerBaselinesPerSeries = 8
+	c.AggregateMaxBaselines = 0 // use derived default
+
+	resolved := c.ResolvedAggregateMaxBaselines()
+	expected := 2400 * 8
+	if resolved != expected {
+		t.Errorf("resolved = %d, want %d (2400 × 8)", resolved, expected)
+	}
+}
+
+func TestResolvedAggregateMaxBaselines_Override(t *testing.T) {
+	c := baseValid()
+	c.AggregateMaxBaselines = 10000
+
+	resolved := c.ResolvedAggregateMaxBaselines()
+	if resolved != 10000 {
+		t.Errorf("resolved = %d, want 10000 (explicit override)", resolved)
 	}
 }

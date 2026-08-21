@@ -250,6 +250,47 @@ type Config struct {
 	// the cap receive HTTP 503. Sized for the operator's expected dashboard
 	// audience — small for ops dashboards, larger for read-heavy public UIs.
 	WSMaxClients int
+	// Aggregate Engine Configuration (Phase 1, accounting only)
+	//
+	// AggregateMode controls how the aggregation engine participates:
+	// - "legacy": aggregate engine inactive, use existing TSDB/GraphRAG path only
+	// - "aggregate-shadow": aggregate accounting runs; counts identical to legacy;
+	//   the read path uses legacy TSDB; allows A/B testing before switchover
+	// - "aggregate": aggregate engine is the only active path; legacy TSDB
+	//   aggregation is retired
+	AggregateMode string
+
+	// AggregateMaxSeries is the global budget for materialized active series
+	// across all signals. Active = present in ≥1 mutable window.
+	AggregateMaxSeries int
+
+	// Per-signal sub-caps (materialized active series). These must sum to ≤
+	// AggregateMaxSeries. Sum validation runs at startup.
+	AggregateMaxSeriesMetrics int // Default 2400
+	AggregateMaxSeriesTraces  int // Default 2400
+	AggregateMaxSeriesEdges   int // Default 500
+	AggregateMaxSeriesLogs    int // Default 500
+	AggregateMaxSeriesSystem  int // Default 200
+
+	// Per-service caps. Enforcement order: tenant → service → signal sub-cap →
+	// global. These are isolation ceilings, not reservations; sum of per-service
+	// budgets may exceed instance-wide cap.
+	AggregateMaxOperationsPerService   int     // Default 20
+	AggregateMaxTraceSeriesPerService  int     // Default 50
+	AggregateMaxLogTemplatesPerService int     // Default 10
+	AggregateMaxMetricSeriesPerService int     // Default 50
+	AggregateSeriesPerTenantFraction   float64 // Default 0 (disabled); range [0, 1]
+
+	// Baseline configuration for counter temporality tracking.
+	// AggregateMaxProducerBaselinesPerSeries caps the number of baseline
+	// entries per series (one per producer). Default 8.
+	AggregateMaxProducerBaselinesPerSeries int
+
+	// AggregateMaxBaselines is the global budget for baseline entries.
+	// 0 (default) = derive as AggregateMaxSeriesMetrics ×
+	// AggregateMaxProducerBaselinesPerSeries. Nonzero overrides.
+	// Use ResolvedAggregateMaxBaselines() to get the final value.
+	AggregateMaxBaselines int
 }
 
 func Load(customPath string) (*Config, error) {
@@ -376,6 +417,22 @@ func Load(customPath string) (*Config, error) {
 
 		// Production safety guard for SQLite
 		AllowSqliteProd: parseTruthy(getEnv("OTELCONTEXT_ALLOW_SQLITE_PROD", "")),
+
+		// Aggregate Engine Configuration
+		AggregateMode:                          strings.ToLower(strings.TrimSpace(getEnv("AGGREGATE_MODE", "legacy"))),
+		AggregateMaxSeries:                     getEnvInt("AGGREGATE_MAX_SERIES", 6000),
+		AggregateMaxSeriesMetrics:              getEnvInt("AGGREGATE_MAX_SERIES_METRICS", 2400),
+		AggregateMaxSeriesTraces:               getEnvInt("AGGREGATE_MAX_SERIES_TRACES", 2400),
+		AggregateMaxSeriesEdges:                getEnvInt("AGGREGATE_MAX_SERIES_EDGES", 500),
+		AggregateMaxSeriesLogs:                 getEnvInt("AGGREGATE_MAX_SERIES_LOGS", 500),
+		AggregateMaxSeriesSystem:               getEnvInt("AGGREGATE_MAX_SERIES_SYSTEM", 200),
+		AggregateMaxOperationsPerService:       getEnvInt("AGGREGATE_MAX_OPERATIONS_PER_SERVICE", 20),
+		AggregateMaxTraceSeriesPerService:      getEnvInt("AGGREGATE_MAX_TRACE_SERIES_PER_SERVICE", 50),
+		AggregateMaxLogTemplatesPerService:     getEnvInt("AGGREGATE_MAX_LOG_TEMPLATES_PER_SERVICE", 10),
+		AggregateMaxMetricSeriesPerService:     getEnvInt("AGGREGATE_MAX_METRIC_SERIES_PER_SERVICE", 50),
+		AggregateSeriesPerTenantFraction:       getEnvFloat("AGGREGATE_SERIES_PER_TENANT_FRACTION", 0),
+		AggregateMaxProducerBaselinesPerSeries: getEnvInt("AGGREGATE_MAX_PRODUCER_BASELINES_PER_SERIES", 8),
+		AggregateMaxBaselines:                  getEnvInt("AGGREGATE_MAX_BASELINES", 0),
 	}
 	applyDriverDefaults(cfg)
 
@@ -632,6 +689,66 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	// Aggregate Engine Configuration Validation
+	// No per-driver defaults for aggregate config — all drivers use the same defaults.
+	validAggregateModes := map[string]bool{"legacy": true, "aggregate-shadow": true, "aggregate": true}
+	if !validAggregateModes[c.AggregateMode] {
+		return fmt.Errorf("invalid AGGREGATE_MODE %q: must be one of legacy, aggregate-shadow, aggregate", c.AggregateMode)
+	}
+
+	// Validate global and per-signal caps
+	if c.AggregateMaxSeries < 1 {
+		return fmt.Errorf("AGGREGATE_MAX_SERIES must be >= 1, got %d", c.AggregateMaxSeries)
+	}
+	if c.AggregateMaxSeriesMetrics < 1 {
+		return fmt.Errorf("AGGREGATE_MAX_SERIES_METRICS must be >= 1, got %d", c.AggregateMaxSeriesMetrics)
+	}
+	if c.AggregateMaxSeriesTraces < 1 {
+		return fmt.Errorf("AGGREGATE_MAX_SERIES_TRACES must be >= 1, got %d", c.AggregateMaxSeriesTraces)
+	}
+	if c.AggregateMaxSeriesEdges < 1 {
+		return fmt.Errorf("AGGREGATE_MAX_SERIES_EDGES must be >= 1, got %d", c.AggregateMaxSeriesEdges)
+	}
+	if c.AggregateMaxSeriesLogs < 1 {
+		return fmt.Errorf("AGGREGATE_MAX_SERIES_LOGS must be >= 1, got %d", c.AggregateMaxSeriesLogs)
+	}
+	if c.AggregateMaxSeriesSystem < 1 {
+		return fmt.Errorf("AGGREGATE_MAX_SERIES_SYSTEM must be >= 1, got %d", c.AggregateMaxSeriesSystem)
+	}
+
+	// Validate per-service caps
+	if c.AggregateMaxOperationsPerService < 1 {
+		return fmt.Errorf("AGGREGATE_MAX_OPERATIONS_PER_SERVICE must be >= 1, got %d", c.AggregateMaxOperationsPerService)
+	}
+	if c.AggregateMaxTraceSeriesPerService < 1 {
+		return fmt.Errorf("AGGREGATE_MAX_TRACE_SERIES_PER_SERVICE must be >= 1, got %d", c.AggregateMaxTraceSeriesPerService)
+	}
+	if c.AggregateMaxLogTemplatesPerService < 1 {
+		return fmt.Errorf("AGGREGATE_MAX_LOG_TEMPLATES_PER_SERVICE must be >= 1, got %d", c.AggregateMaxLogTemplatesPerService)
+	}
+	if c.AggregateMaxMetricSeriesPerService < 1 {
+		return fmt.Errorf("AGGREGATE_MAX_METRIC_SERIES_PER_SERVICE must be >= 1, got %d", c.AggregateMaxMetricSeriesPerService)
+	}
+
+	// Validate tenant fraction
+	if c.AggregateSeriesPerTenantFraction < 0 || c.AggregateSeriesPerTenantFraction > 1.0 {
+		return fmt.Errorf("AGGREGATE_SERIES_PER_TENANT_FRACTION must be between 0 and 1, got %f", c.AggregateSeriesPerTenantFraction)
+	}
+
+	// Validate baseline caps
+	if c.AggregateMaxProducerBaselinesPerSeries < 1 {
+		return fmt.Errorf("AGGREGATE_MAX_PRODUCER_BASELINES_PER_SERIES must be >= 1, got %d", c.AggregateMaxProducerBaselinesPerSeries)
+	}
+	if c.AggregateMaxBaselines > 0 && c.AggregateMaxBaselines < c.AggregateMaxProducerBaselinesPerSeries {
+		return fmt.Errorf("AGGREGATE_MAX_BASELINES when nonzero must be >= AGGREGATE_MAX_PRODUCER_BASELINES_PER_SERIES (%d), got %d", c.AggregateMaxProducerBaselinesPerSeries, c.AggregateMaxBaselines)
+	}
+
+	// Sum-of-caps validation: sub-caps must fit under global cap
+	sumSubCaps := c.AggregateMaxSeriesMetrics + c.AggregateMaxSeriesTraces + c.AggregateMaxSeriesEdges + c.AggregateMaxSeriesLogs + c.AggregateMaxSeriesSystem
+	if sumSubCaps > c.AggregateMaxSeries {
+		return fmt.Errorf("sum of AGGREGATE_MAX_SERIES_* caps (%d = %d+%d+%d+%d+%d) must be <= AGGREGATE_MAX_SERIES (%d)", sumSubCaps, c.AggregateMaxSeriesMetrics, c.AggregateMaxSeriesTraces, c.AggregateMaxSeriesEdges, c.AggregateMaxSeriesLogs, c.AggregateMaxSeriesSystem, c.AggregateMaxSeries)
+	}
+
 	return nil
 }
 
@@ -681,4 +798,14 @@ func (c *Config) ValidateDBForEnv() error {
 			"Use DB_DRIVER=postgres, or set OTELCONTEXT_ALLOW_SQLITE_PROD=true to acknowledge")
 	}
 	return nil
+}
+
+// ResolvedAggregateMaxBaselines returns the effective global baseline entry cap.
+// When AggregateMaxBaselines is 0 (default), derives it as AggregateMaxSeriesMetrics ×
+// AggregateMaxProducerBaselinesPerSeries. Nonzero AggregateMaxBaselines overrides.
+func (c *Config) ResolvedAggregateMaxBaselines() int {
+	if c.AggregateMaxBaselines > 0 {
+		return c.AggregateMaxBaselines
+	}
+	return c.AggregateMaxSeriesMetrics * c.AggregateMaxProducerBaselinesPerSeries
 }
