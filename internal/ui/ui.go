@@ -24,7 +24,7 @@ import (
 // `go build` therefore serves no SPA at "/" until the UI is built — release
 // tags carry the real dist so `go install <module>@<tag>` is UI-complete.
 //
-//go:embed static/*
+//go:embed static/* all:dist
 var content embed.FS
 
 type Server struct {
