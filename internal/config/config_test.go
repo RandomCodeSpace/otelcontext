@@ -9,6 +9,22 @@ import (
 )
 
 // baseValid returns a Config that passes Validate() — test functions mutate one field at a time.
+// writeTLSPair writes a throwaway cert/key file pair into a temp dir and
+// returns their paths.
+func writeTLSPair(t *testing.T) (certFile, keyFile string) {
+	t.Helper()
+	dir := t.TempDir()
+	certFile = filepath.Join(dir, "server.crt")
+	keyFile = filepath.Join(dir, "server.key")
+	if err := os.WriteFile(certFile, []byte("cert"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyFile, []byte("key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return certFile, keyFile
+}
+
 func baseValid() *Config {
 	return &Config{
 		HTTPPort:                 "8080",
@@ -51,6 +67,8 @@ func baseValid() *Config {
 		AggregateCommitMaxWaiters:       512,
 		AggregateCommitMaxPendingDeltas: 200000,
 		AggregateFinalizeIntervalSec:    30,
+
+		AggregateMetricDims: make(map[string][]string),
 		// Bounded exemplar retention defaults (#161)
 		ExemplarTracesPerServiceWindow:    25,
 		ExemplarTracesGlobalWindow:        1500,
@@ -155,15 +173,7 @@ func TestValidate_TLS_FilesMustExist(t *testing.T) {
 }
 
 func TestValidate_TLS_ReadableFilesOK(t *testing.T) {
-	dir := t.TempDir()
-	cert := filepath.Join(dir, "server.crt")
-	key := filepath.Join(dir, "server.key")
-	if err := os.WriteFile(cert, []byte("cert"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(key, []byte("key"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	cert, key := writeTLSPair(t)
 	c := baseValid()
 	c.TLSCertFile = cert
 	c.TLSKeyFile = key
@@ -287,15 +297,7 @@ func TestTLSAutoSelfsigned_DefaultCacheDir(t *testing.T) {
 // explicit TLSCertFile + TLSKeyFile win over TLSAutoSelfsigned. The resulting
 // Config must report cert-file mode, not self-signed mode.
 func TestTLSAutoSelfsigned_IgnoredWhenCertFilesSet(t *testing.T) {
-	dir := t.TempDir()
-	cert := filepath.Join(dir, "server.crt")
-	key := filepath.Join(dir, "server.key")
-	if err := os.WriteFile(cert, []byte("cert"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(key, []byte("key"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	cert, key := writeTLSPair(t)
 
 	c := baseValid()
 	c.TLSCertFile = cert
@@ -656,6 +658,75 @@ func TestResolvedAggregateMaxBaselines_Override(t *testing.T) {
 	}
 }
 
+func TestParseAggregateMetricDims_Empty(t *testing.T) {
+	result, err := ParseAggregateMetricDims("")
+	if err != nil {
+		t.Fatalf("ParseAggregateMetricDims: %v", err)
+	}
+	if len(result) != 0 {
+		t.Errorf("empty string should return empty map, got %v", result)
+	}
+}
+
+func TestParseAggregateMetricDims_SingleMetricSingleKey(t *testing.T) {
+	result, err := ParseAggregateMetricDims("http.requests:method")
+	if err != nil {
+		t.Fatalf("ParseAggregateMetricDims: %v", err)
+	}
+	if len(result) != 1 {
+		t.Fatalf("expected 1 metric, got %d", len(result))
+	}
+	keys, ok := result["http.requests"]
+	if !ok {
+		t.Fatalf("metric 'http.requests' not found")
+	}
+	if len(keys) != 1 || keys[0] != "method" {
+		t.Errorf("expected ['method'], got %v", keys)
+	}
+}
+
+func TestParseAggregateMetricDims_SingleMetricMultipleKeys(t *testing.T) {
+	result, err := ParseAggregateMetricDims("http.requests:method,status_code")
+	if err != nil {
+		t.Fatalf("ParseAggregateMetricDims: %v", err)
+	}
+	keys := result["http.requests"]
+	if len(keys) != 2 {
+		t.Fatalf("expected 2 keys, got %d", len(keys))
+	}
+	// Keys should be sorted
+	if keys[0] != "method" || keys[1] != "status_code" {
+		t.Errorf("expected [method, status_code], got %v", keys)
+	}
+}
+
+func TestParseAggregateMetricDims_MultipleMetrics(t *testing.T) {
+	result, err := ParseAggregateMetricDims("http.requests:method,status_code;db.calls:database,operation")
+	if err != nil {
+		t.Fatalf("ParseAggregateMetricDims: %v", err)
+	}
+	if len(result) != 2 {
+		t.Fatalf("expected 2 metrics, got %d", len(result))
+	}
+	if len(result["http.requests"]) != 2 || len(result["db.calls"]) != 2 {
+		t.Errorf("unexpected key counts: %v", result)
+	}
+}
+
+func TestParseAggregateMetricDims_KeysSorted(t *testing.T) {
+	result, err := ParseAggregateMetricDims("metric:zebra,apple,monkey")
+	if err != nil {
+		t.Fatalf("ParseAggregateMetricDims: %v", err)
+	}
+	keys := result["metric"]
+	expected := []string{"apple", "monkey", "zebra"}
+	for i, k := range keys {
+		if k != expected[i] {
+			t.Errorf("key at index %d: got %q, want %q", i, k, expected[i])
+		}
+	}
+}
+
 // --- Bounded exemplar retention (#176) ---
 
 func TestValidate_ExemplarBudgets_LowerBounds(t *testing.T) {
@@ -678,6 +749,122 @@ func TestValidate_ExemplarBudgets_LowerBounds(t *testing.T) {
 		if err := c.Validate(); err == nil || !strings.Contains(err.Error(), tc.field) {
 			t.Errorf("%s should fail validation with %s, got %v", tc.name, tc.field, err)
 		}
+	}
+}
+
+func TestParseAggregateMetricDims_Whitespace(t *testing.T) {
+	result, err := ParseAggregateMetricDims("  metric : key1 , key2  ")
+	if err != nil {
+		t.Fatalf("ParseAggregateMetricDims: %v", err)
+	}
+	keys := result["metric"]
+	if len(keys) != 2 || keys[0] != "key1" || keys[1] != "key2" {
+		t.Errorf("whitespace handling failed: got %v", keys)
+	}
+}
+
+func TestParseAggregateMetricDims_ErrorEmptyMetricName(t *testing.T) {
+	_, err := ParseAggregateMetricDims(":key")
+	if err == nil {
+		t.Fatal("expected error for empty metric name")
+	}
+	if !strings.Contains(err.Error(), "empty metric name") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestParseAggregateMetricDims_ErrorEmptyKeyList(t *testing.T) {
+	_, err := ParseAggregateMetricDims("metric:")
+	if err == nil {
+		t.Fatal("expected error for empty key list")
+	}
+	if !strings.Contains(err.Error(), "empty key list") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestParseAggregateMetricDims_ErrorEmptyKey(t *testing.T) {
+	_, err := ParseAggregateMetricDims("metric:key1,,key2")
+	if err == nil {
+		t.Fatal("expected error for empty key")
+	}
+	if !strings.Contains(err.Error(), "empty key") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestParseAggregateMetricDims_ErrorDuplicateMetric(t *testing.T) {
+	_, err := ParseAggregateMetricDims("metric:key1;metric:key2")
+	if err == nil {
+		t.Fatal("expected error for duplicate metric")
+	}
+	if !strings.Contains(err.Error(), "duplicate metric name") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestParseAggregateMetricDims_ErrorDuplicateKey(t *testing.T) {
+	_, err := ParseAggregateMetricDims("metric:key1,key1")
+	if err == nil {
+		t.Fatal("expected error for duplicate key")
+	}
+	if !strings.Contains(err.Error(), "duplicate key") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestParseAggregateMetricDims_ErrorStraySemicolon(t *testing.T) {
+	_, err := ParseAggregateMetricDims("metric:key1;;metric2:key2")
+	if err == nil {
+		t.Fatal("expected error for stray semicolon")
+	}
+	if !strings.Contains(err.Error(), "stray semicolon") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestParseAggregateMetricDims_ErrorMissingColon(t *testing.T) {
+	_, err := ParseAggregateMetricDims("metric_no_colon")
+	if err == nil {
+		t.Fatal("expected error for missing colon")
+	}
+	if !strings.Contains(err.Error(), "exactly one colon") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestLoad_AggregateMetricDims(t *testing.T) {
+	t.Setenv("AGGREGATE_METRIC_DIMS", "http.requests:method,status_code;db.calls:database")
+
+	cfg, err := Load("__no_such_env_file__")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if len(cfg.AggregateMetricDims) != 2 {
+		t.Fatalf("expected 2 metrics, got %d", len(cfg.AggregateMetricDims))
+	}
+
+	httpKeys := cfg.AggregateMetricDims["http.requests"]
+	if len(httpKeys) != 2 || httpKeys[0] != "method" || httpKeys[1] != "status_code" {
+		t.Errorf("unexpected http.requests keys: %v", httpKeys)
+	}
+
+	dbKeys := cfg.AggregateMetricDims["db.calls"]
+	if len(dbKeys) != 1 || dbKeys[0] != "database" {
+		t.Errorf("unexpected db.calls keys: %v", dbKeys)
+	}
+}
+
+func TestLoad_AggregateMetricDims_InvalidConfig(t *testing.T) {
+	t.Setenv("AGGREGATE_METRIC_DIMS", "metric:")
+
+	_, err := Load("__no_such_env_file__")
+	if err == nil {
+		t.Fatal("expected Load to fail with invalid AGGREGATE_METRIC_DIMS")
+	}
+	if !strings.Contains(err.Error(), "parsing AGGREGATE_METRIC_DIMS") {
+		t.Errorf("unexpected error: %v", err)
 	}
 }
 

@@ -518,6 +518,7 @@ func main() {
 			MaxProducerBaselinesPerSeries: cfg.AggregateMaxProducerBaselinesPerSeries,
 			MaxBaselines:                  cfg.ResolvedAggregateMaxBaselines(),
 			Metrics:                       aggregate.NewPrometheusRecorder(metrics),
+			MetricDims:                    aggregate.DimsConfig(cfg.AggregateMetricDims),
 		})
 		if err != nil {
 			fatal("❌ Aggregate engine configuration rejected", err, "mode", cfg.AggregateMode)
