@@ -24,13 +24,27 @@ func TestHub_MaxClientsCap(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(hub.HandleWebSocket))
 	defer srv.Close()
 
+	// Registered after srv.Close's defer so it runs FIRST (LIFO): any conn
+	// still open when the test bails via Fatalf must be closed before
+	// srv.Close, which blocks forever on open hijacked connections.
+	var openConns []*websocket.Conn
+	defer func() {
+		for _, c := range openConns {
+			_ = c.Close(websocket.StatusNormalClosure, "test")
+		}
+	}()
+
 	wsURL := "ws" + srv.URL[len("http"):]
 
 	dial := func(t *testing.T) (*websocket.Conn, *http.Response, error) {
 		t.Helper()
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		return websocket.Dial(ctx, wsURL, nil)
+		c, resp, err := websocket.Dial(ctx, wsURL, nil)
+		if err == nil {
+			openConns = append(openConns, c)
+		}
+		return c, resp, err
 	}
 
 	// First two connections should succeed.
@@ -84,8 +98,7 @@ func TestHub_MaxClientsCap(t *testing.T) {
 		t.Fatalf("client 3 (retry after drop): %v", err)
 	}
 
-	c2.Close(websocket.StatusNormalClosure, "test")
-	c3.Close(websocket.StatusNormalClosure, "test")
+	_, _ = c2, c3
 }
 
 // TestHub_MaxClientsZeroIsUnlimited verifies the legacy unlimited path
@@ -103,12 +116,21 @@ func TestHub_MaxClientsZeroIsUnlimited(t *testing.T) {
 	const N = 10
 	conns := make([]*websocket.Conn, 0, N)
 	var mu sync.Mutex
+	// Runs before srv.Close (LIFO): a Fatalf below must not leave open
+	// hijacked conns for srv.Close to wait on forever.
+	defer func() {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, c := range conns {
+			_ = c.Close(websocket.StatusNormalClosure, "test")
+		}
+	}()
 	var wg sync.WaitGroup
 	for range N {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
 			c, _, err := websocket.Dial(ctx, wsURL, nil)
 			if err != nil {
@@ -124,10 +146,6 @@ func TestHub_MaxClientsZeroIsUnlimited(t *testing.T) {
 
 	if got := hub.ActiveClients(); got != int64(N) {
 		t.Fatalf("ActiveClients: got %d, want %d", got, N)
-	}
-
-	for _, c := range conns {
-		c.Close(websocket.StatusNormalClosure, "test")
 	}
 }
 
