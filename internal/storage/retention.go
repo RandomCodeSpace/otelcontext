@@ -46,6 +46,17 @@ type RetentionScheduler struct {
 	// skippedRuns increments every time a tick is dropped because running==true.
 	// Test hook; exported via SkippedRuns().
 	skippedRuns atomic.Int64
+
+	// aggregatePurge and aggregateAnalyze are the durable aggregate store's
+	// share of retention (#173). They are plain callbacks rather than a typed
+	// dependency so this package keeps no import of internal/aggregate.
+	//
+	// The aggregate DB never gets a VACUUM: rolling retention there is range
+	// deletes plus WAL free-page reuse by design (#162). ANALYZE rides the
+	// existing daily maintenance tick because it is cheap and the planner
+	// statistics of a table that is written and deleted every hour go stale.
+	aggregatePurge   func(cutoff time.Time) (int64, error)
+	aggregateAnalyze func() error
 }
 
 // NewRetentionScheduler constructs a scheduler but does not start it.
@@ -75,6 +86,34 @@ func (r *RetentionScheduler) SkippedRuns() int64 { return r.skippedRuns.Load() }
 // SetFullVacuum opts the daily SQLite maintenance back into a full VACUUM
 // (wired from RETENTION_FULL_VACUUM). Call before Start; not synchronized.
 func (r *RetentionScheduler) SetFullVacuum(enabled bool) { r.fullVacuum = enabled }
+
+// SetAggregateRetention wires the durable aggregate store into the hourly purge
+// and the daily maintenance pass. purge receives the same age cutoff the
+// relational purge uses and returns how many rows it removed; analyze refreshes
+// the aggregate planner statistics. Either may be nil. Call before Start; not
+// synchronized.
+func (r *RetentionScheduler) SetAggregateRetention(purge func(time.Time) (int64, error), analyze func() error) {
+	r.aggregatePurge = purge
+	r.aggregateAnalyze = analyze
+}
+
+// purgeAggregate runs the aggregate store's share of one retention tick.
+func (r *RetentionScheduler) purgeAggregate(cutoff time.Time) {
+	if r.aggregatePurge == nil {
+		return
+	}
+	start := time.Now()
+	rows, err := r.aggregatePurge(cutoff)
+	if err != nil {
+		slog.Error("retention: aggregate purge failed", "error", err)
+		return
+	}
+	slog.Info("retention: aggregate purge complete",
+		"cutoff", cutoff.Format(time.RFC3339),
+		"rows_deleted", rows,
+		"duration", time.Since(start),
+	)
+}
 
 // sqliteVacuumStatement returns the page-reclaim statement for the daily
 // SQLite maintenance pass. Default is incremental_vacuum: it releases up to
@@ -172,6 +211,10 @@ func (r *RetentionScheduler) runPurge(ctx context.Context) {
 		driver = "sqlite"
 	}
 	cutoff := time.Now().UTC().Add(-time.Duration(r.retentionDays) * 24 * time.Hour)
+
+	// The aggregate store is a separate database file with its own writer, so
+	// its purge never contends with the relational one (ADR 0003).
+	r.purgeAggregate(cutoff)
 
 	// SQLite: single-writer, parallel purges would just contend on the DB lock.
 	if driver == "sqlite" {
@@ -501,6 +544,16 @@ func (r *RetentionScheduler) runMaintenance(ctx context.Context) {
 		}
 		// SQLite maintenance is whole-DB; record a single observation under "all".
 		observe("all", time.Since(start))
+	}
+
+	// Aggregate store: ANALYZE only. No VACUUM, ever (#162) — its retention is
+	// range deletes and free-page reuse, and an exclusive whole-file lock on
+	// the durable-ACK path would stall ingest into a 429 storm.
+	if r.aggregateAnalyze != nil {
+		if err := r.aggregateAnalyze(); err != nil {
+			slog.Error("retention: aggregate analyze failed", "error", err)
+			maintFailed = true
+		}
 	}
 	slog.Info("retention maintenance complete", "driver", driver)
 }
