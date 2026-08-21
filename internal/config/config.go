@@ -291,6 +291,44 @@ type Config struct {
 	// AggregateMaxProducerBaselinesPerSeries. Nonzero overrides.
 	// Use ResolvedAggregateMaxBaselines() to get the final value.
 	AggregateMaxBaselines int
+
+	// Durable aggregate store (Phase 2, #173). Active whenever
+	// AggregateMode != "legacy" — shadow mode persists too, because shadow
+	// IS the durability rehearsal.
+
+	// AggregateDBPath is the aggregate database file (ADR 0003: its own
+	// file, its own WAL, its own PRAGMA stanza — never the main DB).
+	AggregateDBPath string
+
+	// AggregateAllowRebuild permits DESTROYING and recreating the
+	// aggregate-owned tables when the on-disk schema is partial or
+	// version-mismatched. Off by default: v1 has no automatic migrations and
+	// a refused startup is better than silent data loss.
+	AggregateAllowRebuild bool
+
+	// AggregateSynchronous is the aggregate DB's SQLite synchronous mode,
+	// "NORMAL" or "FULL". NORMAL survives process/container death (the ACK
+	// contract of #160); FULL additionally survives host power loss at the
+	// cost of one fsync per group commit.
+	AggregateSynchronous string
+
+	// Group-commit cadence (#160): the first waiter opens a coalescing
+	// window of AggregateCommitCoalesceMs, and the commit fires early once
+	// the batch reaches the delta-count or byte target.
+	AggregateCommitCoalesceMs int
+	AggregateCommitMaxDeltas  int
+	AggregateCommitMaxBytes   int
+
+	// Triple admission bound (#160). A breach returns gRPC
+	// RESOURCE_EXHAUSTED / HTTP 429, never a silent drop and never an
+	// automatic downgrade to bounded-loss ACK.
+	AggregateCommitMaxPendingBytes  int
+	AggregateCommitMaxWaiters       int
+	AggregateCommitMaxPendingDeltas int
+
+	// AggregateFinalizeIntervalSec is how often the writer looks for windows
+	// whose lateness horizon has expired.
+	AggregateFinalizeIntervalSec int
 }
 
 func Load(customPath string) (*Config, error) {
@@ -433,6 +471,18 @@ func Load(customPath string) (*Config, error) {
 		AggregateSeriesPerTenantFraction:       getEnvFloat("AGGREGATE_SERIES_PER_TENANT_FRACTION", 0),
 		AggregateMaxProducerBaselinesPerSeries: getEnvInt("AGGREGATE_MAX_PRODUCER_BASELINES_PER_SERIES", 8),
 		AggregateMaxBaselines:                  getEnvInt("AGGREGATE_MAX_BASELINES", 0),
+
+		// Durable aggregate store (#173)
+		AggregateDBPath:                 strings.TrimSpace(getEnv("AGGREGATE_DB_PATH", "./data/aggregate.db")),
+		AggregateAllowRebuild:           parseTruthy(getEnv("AGGREGATE_ALLOW_REBUILD", "")),
+		AggregateSynchronous:            strings.ToUpper(strings.TrimSpace(getEnv("AGGREGATE_SYNCHRONOUS", "NORMAL"))),
+		AggregateCommitCoalesceMs:       getEnvInt("AGGREGATE_COMMIT_COALESCE_MS", 5),
+		AggregateCommitMaxDeltas:        getEnvInt("AGGREGATE_COMMIT_MAX_DELTAS", 5000),
+		AggregateCommitMaxBytes:         getEnvInt("AGGREGATE_COMMIT_MAX_BYTES", 8*1024*1024),
+		AggregateCommitMaxPendingBytes:  getEnvInt("AGGREGATE_COMMIT_MAX_PENDING_BYTES", 64*1024*1024),
+		AggregateCommitMaxWaiters:       getEnvInt("AGGREGATE_COMMIT_MAX_WAITERS", 512),
+		AggregateCommitMaxPendingDeltas: getEnvInt("AGGREGATE_COMMIT_MAX_PENDING_DELTAS", 200000),
+		AggregateFinalizeIntervalSec:    getEnvInt("AGGREGATE_FINALIZE_INTERVAL_SEC", 30),
 	}
 	applyDriverDefaults(cfg)
 
@@ -741,6 +791,44 @@ func (c *Config) Validate() error {
 	}
 	if c.AggregateMaxBaselines > 0 && c.AggregateMaxBaselines < c.AggregateMaxProducerBaselinesPerSeries {
 		return fmt.Errorf("AGGREGATE_MAX_BASELINES when nonzero must be >= AGGREGATE_MAX_PRODUCER_BASELINES_PER_SERIES (%d), got %d", c.AggregateMaxProducerBaselinesPerSeries, c.AggregateMaxBaselines)
+	}
+
+	// Durable aggregate store validation. Only enforced when the engine runs:
+	// AGGREGATE_MODE=legacy constructs no store and reads none of these.
+	if c.AggregateMode != "legacy" {
+		if c.AggregateDBPath == "" {
+			return fmt.Errorf("AGGREGATE_DB_PATH must not be empty when AGGREGATE_MODE=%s", c.AggregateMode)
+		}
+		if c.AggregateSynchronous != "NORMAL" && c.AggregateSynchronous != "FULL" {
+			return fmt.Errorf("invalid AGGREGATE_SYNCHRONOUS %q: must be NORMAL or FULL", c.AggregateSynchronous)
+		}
+		commitBounds := []struct {
+			name  string
+			value int
+		}{
+			{"AGGREGATE_COMMIT_COALESCE_MS", c.AggregateCommitCoalesceMs},
+			{"AGGREGATE_COMMIT_MAX_DELTAS", c.AggregateCommitMaxDeltas},
+			{"AGGREGATE_COMMIT_MAX_BYTES", c.AggregateCommitMaxBytes},
+			{"AGGREGATE_COMMIT_MAX_PENDING_BYTES", c.AggregateCommitMaxPendingBytes},
+			{"AGGREGATE_COMMIT_MAX_WAITERS", c.AggregateCommitMaxWaiters},
+			{"AGGREGATE_COMMIT_MAX_PENDING_DELTAS", c.AggregateCommitMaxPendingDeltas},
+			{"AGGREGATE_FINALIZE_INTERVAL_SEC", c.AggregateFinalizeIntervalSec},
+		}
+		for _, b := range commitBounds {
+			if b.value < 1 {
+				return fmt.Errorf("%s must be >= 1, got %d", b.name, b.value)
+			}
+		}
+		// A pending bound below the per-commit target would refuse the very
+		// batch the writer is trying to build.
+		if c.AggregateCommitMaxPendingDeltas < c.AggregateCommitMaxDeltas {
+			return fmt.Errorf("AGGREGATE_COMMIT_MAX_PENDING_DELTAS (%d) must be >= AGGREGATE_COMMIT_MAX_DELTAS (%d)",
+				c.AggregateCommitMaxPendingDeltas, c.AggregateCommitMaxDeltas)
+		}
+		if c.AggregateCommitMaxPendingBytes < c.AggregateCommitMaxBytes {
+			return fmt.Errorf("AGGREGATE_COMMIT_MAX_PENDING_BYTES (%d) must be >= AGGREGATE_COMMIT_MAX_BYTES (%d)",
+				c.AggregateCommitMaxPendingBytes, c.AggregateCommitMaxBytes)
+		}
 	}
 
 	// Sum-of-caps validation: sub-caps must fit under global cap

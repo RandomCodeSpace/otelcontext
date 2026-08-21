@@ -1,6 +1,10 @@
 package aggregate
 
-import "github.com/RandomCodeSpace/otelcontext/internal/telemetry"
+import (
+	"time"
+
+	"github.com/RandomCodeSpace/otelcontext/internal/telemetry"
+)
 
 // Metric plumbing. The Prometheus collectors themselves live in
 // internal/telemetry with every other subsystem's metrics — that package owns
@@ -88,4 +92,86 @@ func (r promRecorder) SetActiveSeries(active map[Signal]int) {
 	for sig := SignalTraceOp; sig <= signalMax; sig++ {
 		r.m.AggregateSeriesActive.WithLabelValues(sig.String()).Set(float64(active[sig]))
 	}
+}
+
+// promStoreRecorder bridges the durable store and the group-commit writer onto
+// the platform's Prometheus metrics.
+type promStoreRecorder struct{ m *telemetry.Metrics }
+
+// NewPrometheusStoreMetrics returns a StoreMetrics backed by the platform
+// metrics. A nil *telemetry.Metrics yields a no-op recorder rather than a
+// panic, which is what every store unit test passes.
+func NewPrometheusStoreMetrics(m *telemetry.Metrics) StoreMetrics {
+	if m == nil {
+		return noopStoreMetrics{}
+	}
+	return promStoreRecorder{m: m}
+}
+
+// result renders an error as a metric label value.
+func result(err error) string {
+	if err != nil {
+		return "error"
+	}
+	return "ok"
+}
+
+// RecordCommit implements StoreMetrics.
+func (r promStoreRecorder) RecordCommit(d time.Duration, deltas int, bytes int64, err error) {
+	label := result(err)
+	r.m.AggregateCommitDurationSeconds.WithLabelValues(label).Observe(d.Seconds())
+	r.m.AggregateCommitsTotal.WithLabelValues(label).Inc()
+	r.m.AggregateCommitDeltas.Observe(float64(deltas))
+	if bytes > 0 {
+		r.m.AggregateCommitBytesTotal.Add(float64(bytes))
+	}
+}
+
+// RecordAdmissionRejected implements StoreMetrics.
+func (r promStoreRecorder) RecordAdmissionRejected(bound string) {
+	r.m.AggregateAdmissionRejectedTotal.WithLabelValues(bound).Inc()
+}
+
+// RecordFinalize implements StoreMetrics.
+func (r promStoreRecorder) RecordFinalize(stats FinalizeStats, err error) {
+	r.m.AggregateFinalizeDurationSeconds.Observe(stats.Duration.Seconds())
+	if err != nil {
+		return
+	}
+	if stats.Buckets > 0 {
+		r.m.AggregateFinalizeRowsTotal.WithLabelValues("buckets").Add(float64(stats.Buckets))
+	}
+	if stats.DeltaRows > 0 {
+		r.m.AggregateFinalizeRowsTotal.WithLabelValues("deltas").Add(float64(stats.DeltaRows))
+	}
+}
+
+// RecordPurge implements StoreMetrics.
+func (r promStoreRecorder) RecordPurge(stats PurgeStats, err error) {
+	r.m.AggregatePurgeDurationSeconds.Observe(stats.Duration.Seconds())
+	if err != nil {
+		return
+	}
+	for kind, n := range map[string]int64{
+		"buckets":   stats.Buckets,
+		"deltas":    stats.Deltas,
+		"baselines": stats.Baselines,
+	} {
+		if n > 0 {
+			r.m.AggregatePurgeRowsTotal.WithLabelValues(kind).Add(float64(n))
+		}
+	}
+}
+
+// SetBacklog implements StoreMetrics.
+func (r promStoreRecorder) SetBacklog(rows int64, ageSeconds float64) {
+	r.m.AggregateDeltaLogRows.Set(float64(rows))
+	r.m.AggregateDeltaLogAgeSeconds.Set(ageSeconds)
+}
+
+// RecordRecovery implements StoreMetrics.
+func (r promStoreRecorder) RecordRecovery(d time.Duration, replayed, finalized int) {
+	r.m.AggregateRecoveryDurationSeconds.Set(d.Seconds())
+	r.m.AggregateRecoveryRows.WithLabelValues("replayed").Set(float64(replayed))
+	r.m.AggregateRecoveryRows.WithLabelValues("finalized_windows").Set(float64(finalized))
 }

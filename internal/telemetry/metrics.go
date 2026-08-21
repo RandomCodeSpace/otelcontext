@@ -182,6 +182,40 @@ type Metrics struct {
 	// service. Cheap invariant only (#165): no per-series comparison.
 	AggregateShadowErrorsTotal *prometheus.CounterVec
 
+	// --- Durable aggregate store (#173) ---
+	// AggregateCommitDurationSeconds — group-commit wall time. This IS the
+	// ACK latency floor: an Export cannot return before its commit does.
+	AggregateCommitDurationSeconds *prometheus.HistogramVec
+	// AggregateCommitDeltas — delta rows per group commit. The pre-merge
+	// ratio and the coalescing behaviour both show up here.
+	AggregateCommitDeltas prometheus.Histogram
+	// AggregateCommitsTotal — commits by result (ok|error).
+	AggregateCommitsTotal *prometheus.CounterVec
+	// AggregateCommitBytesTotal — delta payload written to the store.
+	AggregateCommitBytesTotal prometheus.Counter
+	// AggregateAdmissionRejectedTotal — ErrSaturated refusals by the bound
+	// that tripped (bytes|waiters|deltas). Non-zero at sustained load is a
+	// release-gate failure, not a tuning hint.
+	AggregateAdmissionRejectedTotal *prometheus.CounterVec
+	// AggregateFinalizeDurationSeconds — window finalization wall time.
+	AggregateFinalizeDurationSeconds prometheus.Histogram
+	// AggregateFinalizeRowsTotal — rows materialized/deleted by finalization,
+	// by kind (buckets|deltas).
+	AggregateFinalizeRowsTotal *prometheus.CounterVec
+	// AggregatePurgeDurationSeconds — retention purge wall time on the
+	// aggregate DB.
+	AggregatePurgeDurationSeconds prometheus.Histogram
+	// AggregatePurgeRowsTotal — rows purged by kind (buckets|deltas|baselines).
+	AggregatePurgeRowsTotal *prometheus.CounterVec
+	// AggregateDeltaLogRows and AggregateDeltaLogAgeSeconds are the delta-log
+	// backlog health bounds from #160: alert when either climbs.
+	AggregateDeltaLogRows       prometheus.Gauge
+	AggregateDeltaLogAgeSeconds prometheus.Gauge
+	// AggregateRecoveryDurationSeconds and AggregateRecoveryRows describe the
+	// last startup recovery. The gate allows 30s.
+	AggregateRecoveryDurationSeconds prometheus.Gauge
+	AggregateRecoveryRows            *prometheus.GaugeVec
+
 	// Atomic counters for JSON health endpoint (avoids scraping Prometheus)
 	totalIngested  atomic.Int64
 	activeConns    atomic.Int64
@@ -487,6 +521,62 @@ func New() *Metrics {
 		Name: "otelcontext_aggregate_shadow_errors_total",
 		Help: "Errors accounted on the aggregate side, per service. Cheap shadow-mode invariant only.",
 	}, []string{"service"})
+	m.AggregateCommitDurationSeconds = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "otelcontext_aggregate_commit_duration_seconds",
+		Help:    "Group-commit wall time on the aggregate store. This is the floor of OTLP ACK latency under durable ACK.",
+		Buckets: []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5},
+	}, []string{"result"})
+	m.AggregateCommitDeltas = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "otelcontext_aggregate_commit_deltas",
+		Help:    "Delta rows per group commit. Shows the pre-merge ratio and how much coalescing is happening.",
+		Buckets: []float64{1, 10, 50, 100, 500, 1000, 2500, 5000, 10000},
+	})
+	m.AggregateCommitsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "otelcontext_aggregate_commits_total",
+		Help: "Aggregate group commits by result (ok|error).",
+	}, []string{"result"})
+	m.AggregateCommitBytesTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "otelcontext_aggregate_commit_bytes_total",
+		Help: "Approximate delta payload written to the aggregate delta log.",
+	})
+	m.AggregateAdmissionRejectedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "otelcontext_aggregate_admission_rejected_total",
+		Help: "Group-commit admissions refused (RESOURCE_EXHAUSTED / 429), by the bound that tripped: bytes|waiters|deltas.",
+	}, []string{"bound"})
+	m.AggregateFinalizeDurationSeconds = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "otelcontext_aggregate_finalize_duration_seconds",
+		Help:    "Wall time of one window finalization (materialize buckets + delete incorporated deltas).",
+		Buckets: []float64{0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10},
+	})
+	m.AggregateFinalizeRowsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "otelcontext_aggregate_finalize_rows_total",
+		Help: "Rows written or removed by window finalization, by kind (buckets|deltas).",
+	}, []string{"kind"})
+	m.AggregatePurgeDurationSeconds = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "otelcontext_aggregate_purge_duration_seconds",
+		Help:    "Wall time of one retention purge on the aggregate store.",
+		Buckets: []float64{0.01, 0.1, 0.5, 1, 5, 15, 60, 300},
+	})
+	m.AggregatePurgeRowsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "otelcontext_aggregate_purge_rows_total",
+		Help: "Rows purged from the aggregate store by kind (buckets|deltas|baselines).",
+	}, []string{"kind"})
+	m.AggregateDeltaLogRows = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "otelcontext_aggregate_delta_log_rows",
+		Help: "Delta-log rows awaiting window finalization. Sustained growth means the finalizer is falling behind.",
+	})
+	m.AggregateDeltaLogAgeSeconds = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "otelcontext_aggregate_delta_log_age_seconds",
+		Help: "Age of the oldest un-finalized window. Should stay near the window size plus allowed lateness.",
+	})
+	m.AggregateRecoveryDurationSeconds = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "otelcontext_aggregate_recovery_duration_seconds",
+		Help: "Wall time of the last aggregate startup recovery. Readiness is held false for its duration.",
+	})
+	m.AggregateRecoveryRows = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "otelcontext_aggregate_recovery_rows",
+		Help: "Rows handled by the last aggregate startup recovery, by kind (replayed|finalized_windows).",
+	}, []string{"kind"})
 	return m
 }
 

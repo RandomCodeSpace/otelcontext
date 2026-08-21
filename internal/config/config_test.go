@@ -41,6 +41,16 @@ func baseValid() *Config {
 		AggregateSeriesPerTenantFraction:       0,
 		AggregateMaxProducerBaselinesPerSeries: 8,
 		AggregateMaxBaselines:                  0,
+		// Durable aggregate store defaults (#173)
+		AggregateDBPath:                 "./data/aggregate.db",
+		AggregateSynchronous:            "NORMAL",
+		AggregateCommitCoalesceMs:       5,
+		AggregateCommitMaxDeltas:        5000,
+		AggregateCommitMaxBytes:         8 * 1024 * 1024,
+		AggregateCommitMaxPendingBytes:  64 * 1024 * 1024,
+		AggregateCommitMaxWaiters:       512,
+		AggregateCommitMaxPendingDeltas: 200000,
+		AggregateFinalizeIntervalSec:    30,
 	}
 }
 
