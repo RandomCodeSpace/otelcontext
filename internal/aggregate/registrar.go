@@ -33,6 +33,10 @@ type DurableRegistrar struct {
 	pending map[uint32]DictRow
 	limits  map[Kind]int
 	counts  map[dictScope]int
+	// byID is the reverse index used by the read path (Resolver). IDs are
+	// minted from one process-wide counter, so a single flat map is enough:
+	// an ID is unique across every (tenant, kind) scope.
+	byID map[uint32]DictEntry
 }
 
 // NewDurableRegistrar builds a registrar warmed from the store's dictionary so
@@ -45,6 +49,7 @@ func NewDurableRegistrar(store Store, limits map[Kind]int) (*DurableRegistrar, e
 		other:   make(map[dictScope]uint32),
 		pending: make(map[uint32]DictRow),
 		counts:  make(map[dictScope]int),
+		byID:    make(map[uint32]DictEntry),
 	}
 	if len(limits) > 0 {
 		r.limits = make(map[Kind]int, len(limits))
@@ -68,6 +73,7 @@ func NewDurableRegistrar(store Store, limits map[Kind]int) (*DurableRegistrar, e
 		}
 		value := string(row.Value)
 		inner[value] = row.ID
+		r.byID[row.ID] = DictEntry{ID: row.ID, TenantID: row.TenantID, Kind: row.Kind, Value: slices.Clone(row.Value)}
 		if value == OtherValue {
 			r.other[scope] = row.ID
 		} else {
@@ -139,8 +145,20 @@ func (r *DurableRegistrar) mintLocked(scope dictScope, value []byte) (uint32, er
 		r.ids[scope] = inner
 	}
 	inner[string(value)] = id
-	r.pending[id] = DictRow{ID: id, TenantID: scope.tenant, Kind: scope.kind, Value: slices.Clone(value)}
+	row := DictRow{ID: id, TenantID: scope.tenant, Kind: scope.kind, Value: slices.Clone(value)}
+	r.pending[id] = row
+	r.byID[id] = DictEntry(row)
 	return id, nil
+}
+
+// Lookup implements Resolver. The entry is visible as soon as the ID is minted,
+// before the row is durable: a query that resolves a name the next commit will
+// persist is correct, and one that cannot resolve it at all is not.
+func (r *DurableRegistrar) Lookup(id uint32) (DictEntry, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.byID[id]
+	return e, ok
 }
 
 // DrainPending returns the staged rows for inclusion in the next group commit.
@@ -271,4 +289,8 @@ func (r *seriesRegistry) Committed(rows []SeriesRow) {
 
 // compile-time assertion that the durable registrar can replace the in-memory
 // one wherever dict.go expects a Registrar.
-var _ Registrar = (*DurableRegistrar)(nil)
+var (
+	_ Registrar = (*DurableRegistrar)(nil)
+	_ Resolver  = (*DurableRegistrar)(nil)
+	_ Resolver  = (*MemRegistrar)(nil)
+)

@@ -14,13 +14,45 @@ import (
 )
 
 // LiveSnapshot is the data payload pushed to all event WS clients.
+//
+// The identity and coverage fields are ADDITIVE and only populated in
+// aggregate mode; `omitempty` keeps the legacy payload unchanged.
+//
+// A client replaces state by (series, window_start, revision) and RESETS
+// wholesale when Epoch changes: the revision counter restarts at zero on every
+// process generation, so revision alone cannot be trusted across a restart.
 type LiveSnapshot struct {
 	Type       string                     `json:"type"`
 	Dashboard  *storage.DashboardStats    `json:"dashboard"`
 	Traffic    []storage.TrafficPoint     `json:"traffic"`
 	Traces     *storage.TracesResponse    `json:"traces"`
 	ServiceMap *storage.ServiceMapMetrics `json:"service_map"`
+
+	Epoch        string `json:"epoch,omitempty"`
+	Revision     uint64 `json:"revision,omitempty"`
+	Reset        bool   `json:"reset,omitempty"`
+	Coverage     string `json:"coverage,omitempty"`
+	CoverageNote string `json:"coverage_note,omitempty"`
 }
+
+// AggregatePublisher supplies revision-driven snapshots in aggregate mode. It
+// is an interface so the hub needs neither the aggregate engine nor a live
+// store to be tested.
+type AggregatePublisher interface {
+	// Epoch identifies the process generation of Revision.
+	Epoch() string
+	// Revision is the aggregate engine's monotonic revision.
+	Revision() uint64
+	// Snapshot builds the coalesced payload for one service filter (empty
+	// means all services). It is summary, recent traffic, service health and
+	// topology — never the seven-day history.
+	Snapshot(ctx context.Context, service string) *LiveSnapshot
+}
+
+// DefaultPublishFloor is the minimum spacing between aggregate publications.
+// Frozen at 2 s in #164: fast enough to feel live, slow enough that a busy
+// engine cannot turn every commit into a broadcast.
+const DefaultPublishFloor = 2 * time.Second
 
 // clientFilter tracks a client's active service filter.
 // Empty string = all services (no filter).
@@ -48,6 +80,16 @@ type EventHub struct {
 
 	stopOnce sync.Once
 	stopCh   chan struct{}
+
+	// aggPub, when set, switches the hub to revision-driven publication.
+	// Per-event log/metric broadcasts are disabled in that mode: the
+	// coalesced snapshot is the only data message.
+	aggPub       AggregatePublisher
+	publishFloor time.Duration
+	// lastEpoch and lastRev are what was last published to every client.
+	lastEpoch string
+	lastRev   uint64
+	published bool
 }
 
 // NewEventHub creates a new event notification hub.
@@ -65,8 +107,36 @@ func NewEventHub(repo *storage.Repository, onConnect, onDisconnect func()) *Even
 	}
 }
 
+// SetAggregatePublisher switches the hub to revision-driven publication. Pass
+// a zero floor to take DefaultPublishFloor. Call once at startup, before the
+// hub takes connections.
+func (h *EventHub) SetAggregatePublisher(p AggregatePublisher, floor time.Duration) {
+	if p == nil {
+		return
+	}
+	if floor <= 0 {
+		floor = DefaultPublishFloor
+	}
+	h.mu.Lock()
+	h.aggPub = p
+	h.publishFloor = floor
+	h.mu.Unlock()
+}
+
+// aggregatePublisher returns the configured publisher, or nil in legacy mode.
+func (h *EventHub) aggregatePublisher() AggregatePublisher {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.aggPub
+}
+
 // Start begins the periodic flush loops. Call in a goroutine.
 func (h *EventHub) Start(ctx context.Context, snapshotInterval, batchInterval time.Duration) {
+	if h.aggregatePublisher() != nil {
+		h.runAggregate(ctx)
+		return
+	}
+
 	snapshotTicker := time.NewTicker(snapshotInterval)
 	batchTicker := time.NewTicker(batchInterval)
 	defer snapshotTicker.Stop()
@@ -108,16 +178,25 @@ func (h *EventHub) NotifyRefresh() {
 	h.mu.Unlock()
 }
 
-// BroadcastLog adds a log entry to the real-time buffer.
+// BroadcastLog adds a log entry to the real-time buffer. In aggregate mode
+// per-event broadcasts are disabled and this is a no-op: the coalesced
+// revision-driven snapshot is the only data message clients receive.
 func (h *EventHub) BroadcastLog(l LogEntry) {
+	if h.aggregatePublisher() != nil {
+		return
+	}
 	select {
 	case h.logsCh <- l:
 	default:
 	}
 }
 
-// BroadcastMetric adds a metric entry to the real-time buffer.
+// BroadcastMetric adds a metric entry to the real-time buffer. Disabled in
+// aggregate mode, for the same reason as BroadcastLog.
 func (h *EventHub) BroadcastMetric(m MetricEntry) {
+	if h.aggregatePublisher() != nil {
+		return
+	}
 	select {
 	case h.metricsCh <- m:
 	default:
@@ -139,7 +218,9 @@ func (h *EventHub) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	initialService := r.URL.Query().Get("service")
 	h.addClient(conn, initialService)
 
-	// Send immediate snapshot so the client has data right away
+	// Send immediate FULL snapshot so the client has data right away. In
+	// aggregate mode it carries {epoch, revision} and reset=true: a fresh
+	// client has nothing to merge into and must adopt the snapshot whole.
 	h.sendSnapshotTo(conn, initialService)
 
 	// Read loop: client can send {"service":"xxx"} to change filter
@@ -215,7 +296,7 @@ func (h *EventHub) flushSnapshots() {
 	for service := range groups {
 		// Capture
 		g.Go(func() error {
-			snap := h.computeSnapshot(service)
+			snap := h.snapshotFor(service)
 			if snap != nil {
 				snapMu.Lock()
 				snapshotMap[service] = snap
@@ -310,9 +391,12 @@ func (h *EventHub) sendBatch(conn *websocket.Conn, batchType string, data any) {
 
 // sendSnapshotTo sends a snapshot to a single client.
 func (h *EventHub) sendSnapshotTo(conn *websocket.Conn, service string) {
-	snapshot := h.computeSnapshot(service)
+	snapshot := h.snapshotFor(service)
 	if snapshot == nil {
 		return
+	}
+	if h.aggregatePublisher() != nil {
+		snapshot.Reset = true
 	}
 	msg, err := json.Marshal(snapshot)
 	if err != nil {
@@ -321,6 +405,97 @@ func (h *EventHub) sendSnapshotTo(conn *websocket.Conn, service string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	_ = conn.Write(ctx, websocket.MessageText, msg)
+}
+
+// snapshotFor produces the payload for one service filter from whichever
+// source owns the numbers in this mode.
+func (h *EventHub) snapshotFor(service string) *LiveSnapshot {
+	if pub := h.aggregatePublisher(); pub != nil {
+		return pub.Snapshot(context.Background(), service)
+	}
+	return h.computeSnapshot(service)
+}
+
+// runAggregate is the revision-driven publication loop.
+//
+// Publication happens only on a revision (or epoch) change, at most once per
+// publishFloor, with TRAILING-EDGE delivery: the loop re-reads the revision at
+// every tick, so a change that lands inside a spacing interval is published at
+// the end of that interval instead of disappearing for want of a later event.
+func (h *EventHub) runAggregate(ctx context.Context) {
+	h.mu.Lock()
+	floor := h.publishFloor
+	h.mu.Unlock()
+
+	slog.Info("🌐 EventHub started in aggregate mode", "publish_floor", floor)
+
+	tick := time.NewTicker(floor)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			slog.Info("🌐 EventHub stopping via context...")
+			return
+		case <-h.stopCh:
+			slog.Info("🌐 EventHub stopping via signal...")
+			return
+		case <-tick.C:
+			h.publishIfChanged()
+		}
+	}
+}
+
+// publishIfChanged publishes one coalesced snapshot per service filter when
+// the engine's {epoch, revision} identity has moved since the last
+// publication. It is exported behaviour only through the loop; tests drive it
+// directly so the 2 s floor does not become a 2 s test.
+func (h *EventHub) publishIfChanged() {
+	pub := h.aggregatePublisher()
+	if pub == nil {
+		return
+	}
+	epoch, rev := pub.Epoch(), pub.Revision()
+
+	h.mu.Lock()
+	if h.published && h.lastEpoch == epoch && h.lastRev == rev {
+		h.mu.Unlock()
+		return
+	}
+	// An epoch change means the revision counter restarted: clients cannot
+	// merge across it and are told to reset.
+	reset := h.published && h.lastEpoch != epoch
+	h.lastEpoch, h.lastRev, h.published = epoch, rev, true
+	if len(h.clients) == 0 {
+		h.mu.Unlock()
+		return
+	}
+	groups := make(map[string][]*websocket.Conn)
+	for c, cf := range h.clients {
+		groups[cf.service] = append(groups[cf.service], c)
+	}
+	h.mu.Unlock()
+
+	for service, clients := range groups {
+		snap := pub.Snapshot(context.Background(), service)
+		if snap == nil {
+			continue
+		}
+		snap.Reset = reset
+		msg, err := json.Marshal(snap)
+		if err != nil {
+			slog.Error("Event WS marshal failed", "error", err)
+			continue
+		}
+		for _, conn := range clients {
+			writeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			if err := conn.Write(writeCtx, websocket.MessageText, msg); err != nil {
+				slog.Debug("Event WS send failed, removing client", "error", err)
+				h.removeClient(conn)
+				_ = conn.Close(websocket.StatusGoingAway, "write error")
+			}
+			cancel()
+		}
+	}
 }
 
 // computeSnapshot queries the DB for the last 15 minutes of data,

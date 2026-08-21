@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/RandomCodeSpace/otelcontext/internal/aggregate"
 	"github.com/RandomCodeSpace/otelcontext/internal/graphrag"
 	"github.com/RandomCodeSpace/otelcontext/internal/httpconst"
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
@@ -134,9 +135,51 @@ func (s *Server) toolHandler(ctx context.Context, name string, args map[string]a
 		"search_logs":          s.toolSearchLogs,
 	}
 	if fn, ok := dispatch[name]; ok {
-		return fn(ctx, args)
+		return s.withCoverage(fn(ctx, args), toolCoverage[name])
 	}
 	return errorResult(fmt.Sprintf("unknown tool: %s", name))
+}
+
+// toolCoverage records what each tool's numbers are derived from once the
+// aggregate read path is live (#164). Raw-backed tools read tables that hold
+// only retained exemplars; the GraphRAG-backed tools are built from those same
+// exemplars plus complete log-template mining, which is "sampled", not "full".
+//
+// In legacy and shadow modes this map is not consulted at all.
+var toolCoverage = map[string]aggregate.Coverage{
+	"get_anomaly_timeline": aggregate.CoverageSampled,
+	"get_service_map":      aggregate.CoverageSampled,
+	"get_service_health":   aggregate.CoverageSampled,
+	"root_cause_analysis":  aggregate.CoverageSampled,
+	"impact_analysis":      aggregate.CoverageSampled,
+	"trace_graph":          aggregate.CoverageExemplar,
+	"search_logs":          aggregate.CoverageExemplar,
+}
+
+// coverageMeta is the body metadata appended to every successful tool result
+// in aggregate mode.
+type coverageMeta struct {
+	Coverage string `json:"coverage"`
+	Note     string `json:"coverage_note,omitempty"`
+}
+
+// withCoverage appends coverage metadata as an ADDITIONAL content item.
+//
+// Most tool bodies are bare JSON arrays; wrapping one in an envelope to carry a
+// "coverage" field would silently break every client parsing it. An extra
+// content item is additive — a client that ignores it sees exactly the body it
+// saw before, and a client that reads it learns that a missing exemplar is not
+// evidence of absence.
+func (s *Server) withCoverage(res ToolCallResult, c aggregate.Coverage) ToolCallResult {
+	if s == nil || !s.aggregateMode || res.IsError || c == "" {
+		return res
+	}
+	data, err := json.Marshal(coverageMeta{Coverage: string(c), Note: c.Note()})
+	if err != nil {
+		return res
+	}
+	res.Content = append(res.Content, ContentItem{Type: "text", Text: string(data)})
+	return res
 }
 
 // --- Tool implementations ---

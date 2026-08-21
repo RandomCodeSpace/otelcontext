@@ -3,6 +3,7 @@ package aggregate
 import (
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -152,6 +153,16 @@ type Engine struct {
 
 	shards [NumShards]shard
 
+	// own is the ownership record: which windows memory owns, which windows
+	// the store owns, and the process generation the revision counter belongs
+	// to. It is the OUTER lock of the engine — a shard lock is only ever taken
+	// while it is held, never the reverse. See ownership.
+	own ownership
+
+	// store is the durable store used by the read path for finalized windows.
+	// nil (the Phase 1 / test case) means finalized windows are simply gone.
+	store atomic.Pointer[Store]
+
 	applier  atomic.Pointer[Applier]
 	revision atomic.Uint64
 
@@ -163,6 +174,57 @@ type Engine struct {
 type shard struct {
 	mu      sync.Mutex
 	windows map[int64]map[SeriesKey]*AggregateDelta
+}
+
+// ownership answers "who owns this window" for the read path (#164).
+//
+// A window is owned by memory or by the store, never by both and never by
+// neither. Reads of an engine-owned window come exclusively from the shards
+// even when crash-recovery delta rows exist for it; reads of a store-owned
+// window come exclusively from the store. Ownership, not row presence, is the
+// dedup rule.
+//
+// Every transition — a new window appearing, rollover evicting one,
+// finalization handing one to the store — happens under mu together with the
+// shard mutation that implements it, so a concurrent Ownership() can neither
+// omit nor double-count a window. That is why mu is the engine's OUTER lock:
+// a shard mutex may be taken while mu is held, never the other way round.
+type ownership struct {
+	mu sync.RWMutex
+	// mutable is the set of window starts the shards own.
+	mutable map[int64]struct{}
+	// watermark is the newest window start handed to the store. Every window
+	// at or below it is store-owned.
+	watermark int64
+	// epoch identifies this process generation. The revision counter restarts
+	// at zero on every boot, so a consumer that only compared revisions could
+	// mistake a restarted counter for a rollback; the epoch is what makes the
+	// pair {epoch, revision} a total order (#164).
+	epoch string
+}
+
+// Ownership is an atomic snapshot of {mutable set, finalized watermark,
+// revision, epoch}. A query captures one and reads every window through it.
+type Ownership struct {
+	// Epoch is the process generation.
+	Epoch string
+	// Revision is the engine revision at capture time.
+	Revision uint64
+	// Mutable is the memory-owned window starts, oldest first.
+	Mutable []int64
+	// FinalizedWatermark is the newest store-owned window start. Zero means
+	// nothing has been handed over yet.
+	FinalizedWatermark int64
+}
+
+// OwnsInMemory reports whether windowStart is memory-owned in this snapshot.
+func (o Ownership) OwnsInMemory(windowStart int64) bool {
+	for _, w := range o.Mutable {
+		if w == windowStart {
+			return true
+		}
+	}
+	return false
 }
 
 // NewEngine builds an Engine. It fails on a budget that cannot hold — a
@@ -213,6 +275,8 @@ func NewEngine(cfg EngineConfig) (*Engine, error) {
 	for i := range e.shards {
 		e.shards[i].windows = make(map[int64]map[SeriesKey]*AggregateDelta)
 	}
+	e.own.mutable = make(map[int64]struct{})
+	e.own.epoch = newEpoch(cfg.Now())
 	var a Applier = directApplier{e}
 	e.applier.Store(&a)
 	return e, nil
@@ -240,6 +304,104 @@ func (e *Engine) MetricDims() DimsConfig { return e.dims }
 // batch and never decreases, so a consumer can tell "nothing changed" from
 // "changed back to the same numbers" (#163's replacement-by-revision topology).
 func (e *Engine) Revision() uint64 { return e.revision.Load() }
+
+// Epoch returns the process generation identifier. It is stable for the life
+// of the engine and pairs with Revision to give consumers a total order across
+// restarts (#164).
+func (e *Engine) Epoch() string { return e.own.epoch }
+
+// SetStore wires the durable store into the READ path. The write path already
+// reaches the store through the group-commit writer; this is what lets the
+// query facade serve finalized windows. Call it once at startup, before the
+// engine takes traffic.
+func (e *Engine) SetStore(st Store) {
+	if st == nil {
+		return
+	}
+	e.store.Store(&st)
+}
+
+// Store returns the wired durable store, or nil when none is configured.
+func (e *Engine) Store() Store {
+	p := e.store.Load()
+	if p == nil {
+		return nil
+	}
+	return *p
+}
+
+// TenantID resolves a tenant name to its dictionary ID for the read path.
+func (e *Engine) TenantID(name string) uint32 { return e.cache.InternTenant(name) }
+
+// Ownership captures {mutable set, finalized watermark, revision, epoch} in
+// one critical section. Every read path starts here.
+func (e *Engine) Ownership() Ownership {
+	e.own.mu.RLock()
+	defer e.own.mu.RUnlock()
+	return e.ownershipLocked()
+}
+
+// ownershipLocked builds the snapshot. e.own.mu must be held (read or write).
+func (e *Engine) ownershipLocked() Ownership {
+	mutable := make([]int64, 0, len(e.own.mutable))
+	for start := range e.own.mutable {
+		mutable = append(mutable, start)
+	}
+	sort.Slice(mutable, func(i, j int) bool { return mutable[i] < mutable[j] })
+	return Ownership{
+		Epoch:              e.own.epoch,
+		Revision:           e.revision.Load(),
+		Mutable:            mutable,
+		FinalizedWatermark: e.own.watermark,
+	}
+}
+
+// MarkFinalized transitions one window from memory ownership to store
+// ownership. The writer calls it after store.FinalizeWindow has committed, so
+// the handover is exactly as atomic as the transaction that materialized the
+// buckets: a query either sees the window in memory or in the store, never in
+// both and never in neither.
+func (e *Engine) MarkFinalized(windowStart int64) {
+	e.own.mu.Lock()
+	released := e.evictWindowLocked(windowStart)
+	delete(e.own.mutable, windowStart)
+	if windowStart > e.own.watermark {
+		e.own.watermark = windowStart
+	}
+	e.own.mu.Unlock()
+	for _, swk := range released {
+		e.limiter.Release(swk.Key, swk.WindowStart)
+	}
+	if len(released) > 0 {
+		e.seriesDiscarded.Add(uint64(len(released)))
+		e.publishActiveSeries()
+	}
+}
+
+// evictWindowLocked drops one window from every shard and returns the series
+// it released. e.own.mu must be held for writing.
+func (e *Engine) evictWindowLocked(start int64) []SeriesWindowKey {
+	var released []SeriesWindowKey
+	for i := range e.shards {
+		sh := &e.shards[i]
+		sh.mu.Lock()
+		if w, ok := sh.windows[start]; ok {
+			for key := range w {
+				released = append(released, SeriesWindowKey{Key: key, WindowStart: start})
+			}
+			delete(sh.windows, start)
+		}
+		sh.mu.Unlock()
+	}
+	return released
+}
+
+// newEpoch derives a process generation identifier. It only has to differ from
+// the previous generation of the same process lineage, which a boot timestamp
+// in base 36 does without pulling in a UUID dependency.
+func newEpoch(now time.Time) string {
+	return strconv.FormatInt(now.UnixNano(), 36)
+}
 
 // SetApplier replaces the apply path. Phase 2 uses it to insert the
 // group-commit writer between the reducer and the shards.
@@ -366,11 +528,19 @@ func (e *Engine) ApplyCommitted(m DeltaMap) uint64 {
 	}
 	resolved := e.Admit(m)
 
+	// The shard writes and the ownership registration happen inside one
+	// ownership critical section so a concurrent Ownership() never reports a
+	// window as memory-owned before memory holds it, nor the reverse.
+	e.own.mu.Lock()
 	for i := range e.shards {
 		e.applyShard(i, resolved)
 	}
-
+	for swk := range resolved {
+		e.own.mutable[swk.WindowStart] = struct{}{}
+	}
 	rev := e.revision.Add(1)
+	e.own.mu.Unlock()
+
 	e.publishActiveSeries()
 	return rev
 }
@@ -457,6 +627,7 @@ func (e *Engine) Rollover(now time.Time) int {
 	cutoff := now.Unix() - int64(WindowSize/time.Second) - int64(AllowedLateness/time.Second)
 	dropped := 0
 	var released []SeriesWindowKey
+	e.own.mu.Lock()
 	for i := range e.shards {
 		sh := &e.shards[i]
 		sh.mu.Lock()
@@ -472,6 +643,21 @@ func (e *Engine) Rollover(now time.Time) int {
 		}
 		sh.mu.Unlock()
 	}
+	// A window whose lateness horizon expired is no longer memory-owned even
+	// if the writer has not finalized it yet: the shards no longer hold it, so
+	// claiming memory ownership would report zero for a window that has data.
+	// Handing it to the store is the honest transition — the delta rows are
+	// already durable and the next finalize pass materializes them.
+	for start := range e.own.mutable {
+		if start > cutoff {
+			continue
+		}
+		delete(e.own.mutable, start)
+		if start > e.own.watermark {
+			e.own.watermark = start
+		}
+	}
+	e.own.mu.Unlock()
 	for _, swk := range released {
 		e.limiter.Release(swk.Key, swk.WindowStart)
 	}

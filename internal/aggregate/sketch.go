@@ -84,6 +84,17 @@ func NewSketchAtScale(scale uint8) (*Sketch, error) {
 	return &Sketch{scale: scale}, nil
 }
 
+// NewSketchAtScaleUnchecked returns an empty sketch at scale, clamping an
+// out-of-range scale to the platform default. It exists for the read path,
+// which builds a merge target from an already-validated sketch and has no
+// error to return.
+func NewSketchAtScaleUnchecked(scale uint8) *Sketch {
+	if scale > SketchMaxScale {
+		scale = SketchDefaultScale
+	}
+	return &Sketch{scale: scale}
+}
+
 // Scale returns the mapping scale of the sketch.
 func (s *Sketch) Scale() uint8 { return s.scale }
 
