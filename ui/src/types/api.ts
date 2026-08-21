@@ -100,6 +100,9 @@ export interface ServiceMapNode {
   total_traces: number
   error_count: number
   avg_latency_ms: number
+  coverage?: CoverageType
+  coverage_note?: string
+  accuracy?: AccuracyMetadata
 }
 
 /** storage.ServiceMapEdge — a connection between two services. */
@@ -127,6 +130,8 @@ export interface TrafficPoint {
   timestamp: string
   count: number
   error_count: number
+  coverage?: CoverageType
+  coverage_note?: string
 }
 
 /** storage.LatencyPoint — point on the latency heatmap. */
@@ -135,6 +140,8 @@ export interface LatencyPoint {
   timestamp: string
   /** microseconds */
   duration: number
+  coverage?: CoverageType
+  coverage_note?: string
 }
 
 /** storage.ServiceError — error counts per service. */
@@ -143,7 +150,21 @@ export interface ServiceError {
   error_count: number
   total_count: number
   error_rate: number
+  coverage?: CoverageType
+  coverage_note?: string
+  accuracy?: AccuracyMetadata
 }
+
+/** storage.AccuracyMetadata — percentile accuracy bounds. */
+export interface AccuracyMetadata {
+  approximate?: boolean
+  sketch_scale?: number
+  relative_error_bound?: number
+  degraded?: boolean
+}
+
+/** Coverage type: full, sampled, or exemplar. */
+export type CoverageType = 'full' | 'sampled' | 'exemplar'
 
 /** storage.DashboardStats — aggregated dashboard metrics. */
 export interface DashboardStats {
@@ -155,6 +176,9 @@ export interface DashboardStats {
   active_services: number
   p99_latency_ms: number
   top_failing_services: ServiceError[]
+  coverage?: CoverageType
+  coverage_note?: string
+  accuracy?: AccuracyMetadata
 }
 
 // ============================================================================

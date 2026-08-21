@@ -1,0 +1,23 @@
+.badge {
+  display: inline-block;
+  padding: 0.25rem 0.5rem;
+  border-radius: 0.25rem;
+  font-size: 0.75rem;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.full {
+  background-color: var(--tone-ok-bg);
+  color: var(--tone-ok-fg);
+}
+
+.sampled {
+  background-color: var(--tone-warn-bg);
+  color: var(--tone-warn-fg);
+}
+
+.exemplar {
+  background-color: var(--tone-info-bg);
+  color: var(--tone-info-fg);
+}
