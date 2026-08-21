@@ -123,6 +123,40 @@ func createTracesIdempotent(db *gorm.DB, driver string, traces []Trace) error {
 			return err
 		}
 	}
+	return updateTraceTruncation(db, traces)
+}
+
+// updateTraceTruncation stamps the exemplar truncation metadata (#163) onto
+// rows the inserts above may have left untouched.
+//
+// The insert paths are first-writer-wins on everything but status, so a trace
+// whose truncation only becomes known on a later batch would otherwise keep the
+// first batch's NULL forever — and a truncated trace is by definition one with
+// enough spans to arrive across several batches. Truncation counts are
+// cumulative and monotonic, so last-write-wins is the correct direction here.
+//
+// Cost is one UPDATE per truncated trace, which the exemplar budgets bound to a
+// handful per service per window. Rows without a truncation claim (every
+// legacy/shadow-mode row, and every exemplar retained whole) skip this entirely.
+func updateTraceTruncation(db *gorm.DB, traces []Trace) error {
+	for i := range traces {
+		t := &traces[i]
+		if t.Truncated == nil {
+			continue
+		}
+		updates := map[string]any{"truncated": *t.Truncated}
+		if t.RetainedSpanCount != nil {
+			updates["retained_span_count"] = *t.RetainedSpanCount
+		}
+		if t.ObservedSpanCount != nil {
+			updates["observed_span_count"] = *t.ObservedSpanCount
+		}
+		if err := db.Model(&Trace{}).
+			Where("tenant_id = ? AND trace_id = ?", t.TenantID, t.TraceID).
+			Updates(updates).Error; err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

@@ -109,12 +109,25 @@ type Trace struct {
 	// Timestamp is both part of idx_traces_tenant_ts (composite) and retains a
 	// standalone index so range scans on traces across all tenants (e.g.
 	// retention sweeps) still use an index.
-	Timestamp time.Time      `gorm:"index;index:idx_traces_tenant_ts,priority:2" json:"timestamp"`
-	Spans     []Span         `gorm:"foreignKey:TraceID;references:TraceID;constraint:false" json:"spans,omitempty"`
-	Logs      []Log          `gorm:"foreignKey:TraceID;references:TraceID;constraint:false" json:"logs,omitempty"`
-	CreatedAt time.Time      `json:"-"`
-	UpdatedAt time.Time      `json:"-"`
-	DeletedAt gorm.DeletedAt `gorm:"index" json:"-"`
+	Timestamp time.Time `gorm:"index;index:idx_traces_tenant_ts,priority:2" json:"timestamp"`
+	// Exemplar truncation metadata (#163's complete-retained-trace contract,
+	// written by the aggregate-mode exemplar policy in internal/ingest).
+	// All three are nullable and stay NULL on every legacy/shadow-mode row and
+	// on any exemplar retained whole — NULL means "no truncation claim was
+	// made", which is deliberately distinct from truncated=false.
+	//
+	// When Truncated is true the trace was cut off by the per-trace span or
+	// byte bound: RetainedSpanCount spans reached the DB out of
+	// ObservedSpanCount seen. Causal-analysis tools must report partial
+	// coverage for such a trace rather than fabricated certainty.
+	Truncated         *bool          `gorm:"column:truncated" json:"truncated,omitempty"`
+	RetainedSpanCount *int           `gorm:"column:retained_span_count" json:"retained_span_count,omitempty"`
+	ObservedSpanCount *int           `gorm:"column:observed_span_count" json:"observed_span_count,omitempty"`
+	Spans             []Span         `gorm:"foreignKey:TraceID;references:TraceID;constraint:false" json:"spans,omitempty"`
+	Logs              []Log          `gorm:"foreignKey:TraceID;references:TraceID;constraint:false" json:"logs,omitempty"`
+	CreatedAt         time.Time      `json:"-"`
+	UpdatedAt         time.Time      `json:"-"`
+	DeletedAt         gorm.DeletedAt `gorm:"index" json:"-"`
 }
 
 // Span represents a single operation within a trace.
