@@ -187,6 +187,9 @@ func NewWriter(cfg WriterConfig) (*Writer, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The engine's read path serves finalized windows from the store; the
+	// writer is the one place that already holds both.
+	cfg.Engine.SetStore(cfg.Store)
 	return &Writer{
 		cfg:         cfg,
 		store:       cfg.Store,
@@ -470,6 +473,9 @@ func (w *Writer) FinalizeDue(now time.Time) int {
 			slog.Error("aggregate: finalize window failed", "window_start", window, "error", err)
 			continue
 		}
+		// The buckets are committed, so ownership of the window moves to the
+		// store in the same step that evicts it from the shards (#164).
+		w.engine.MarkFinalized(window)
 		w.finalized.Add(1)
 		done++
 	}

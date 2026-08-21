@@ -14,6 +14,7 @@ package views
 import (
 	"time"
 
+	"github.com/RandomCodeSpace/otelcontext/internal/aggregate"
 	"github.com/RandomCodeSpace/otelcontext/internal/graphrag"
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 )
@@ -95,6 +96,10 @@ type ServiceError struct {
 }
 
 // DashboardStats is the aggregated dashboard metric view.
+//
+// The coverage/accuracy/epoch/revision fields are ADDITIVE and only populated
+// in aggregate mode: `omitempty` keeps the legacy payload byte-for-byte what it
+// has always been.
 type DashboardStats struct {
 	TotalTraces        int64          `json:"total_traces"`
 	TotalLogs          int64          `json:"total_logs"`
@@ -104,6 +109,12 @@ type DashboardStats struct {
 	ActiveServices     int64          `json:"active_services"`
 	P99LatencyMs       float64        `json:"p99_latency_ms"`
 	TopFailingServices []ServiceError `json:"top_failing_services"`
+
+	Coverage     string                      `json:"coverage,omitempty"`
+	CoverageNote string                      `json:"coverage_note,omitempty"`
+	Accuracy     *aggregate.AccuracyMetadata `json:"accuracy,omitempty"`
+	Epoch        string                      `json:"epoch,omitempty"`
+	Revision     uint64                      `json:"revision,omitempty"`
 }
 
 // ServiceMapNode is a node on the service topology view.
@@ -123,10 +134,16 @@ type ServiceMapEdge struct {
 	ErrorRate    float64 `json:"error_rate"`
 }
 
-// ServiceMapMetrics is the full topology view.
+// ServiceMapMetrics is the full topology view. Coverage is additive and only
+// populated in aggregate mode.
 type ServiceMapMetrics struct {
 	Nodes []ServiceMapNode `json:"nodes"`
 	Edges []ServiceMapEdge `json:"edges"`
+
+	Coverage     string `json:"coverage,omitempty"`
+	CoverageNote string `json:"coverage_note,omitempty"`
+	Epoch        string `json:"epoch,omitempty"`
+	Revision     uint64 `json:"revision,omitempty"`
 }
 
 // --- GraphRAG views ---
@@ -348,6 +365,74 @@ func DashboardStatsFromModel(s *storage.DashboardStats) DashboardStats {
 		}
 	}
 	return out
+}
+
+// DashboardStatsFromAggregate converts an engine dashboard query into the same
+// view the legacy path produces, plus the additive coverage and accuracy
+// metadata. Field names, units and structure are deliberately identical: a
+// client cannot tell which mode served it except by reading the new fields.
+func DashboardStatsFromAggregate(r *aggregate.DashboardResult) DashboardStats {
+	if r == nil {
+		return DashboardStats{}
+	}
+	acc := r.Accuracy
+	out := DashboardStats{
+		TotalTraces:    r.TotalTraces,
+		TotalLogs:      r.TotalLogs,
+		TotalErrors:    r.TotalErrors,
+		AvgLatencyMs:   r.AvgLatencyMs,
+		ErrorRate:      r.ErrorRate,
+		ActiveServices: r.ActiveServices,
+		// The engine reports microseconds, matching storage.P99Latency; the
+		// view is milliseconds in both modes.
+		P99LatencyMs: r.P99LatencyMicros / 1000.0,
+		Coverage:     string(r.Coverage),
+		CoverageNote: r.Coverage.Note(),
+		Accuracy:     &acc,
+		Epoch:        r.Epoch,
+		Revision:     r.Revision,
+	}
+	if len(r.TopFailing) > 0 {
+		out.TopFailingServices = make([]ServiceError, len(r.TopFailing))
+		for i, s := range r.TopFailing {
+			out.TopFailingServices[i] = ServiceError{
+				ServiceName: s.Service,
+				ErrorCount:  s.ErrorCount,
+				TotalCount:  s.Count,
+				ErrorRate:   s.ErrorRate,
+			}
+		}
+	}
+	return out
+}
+
+// ServiceMapMetricsFromAggregate converts an engine topology query into the
+// topology view. Edges are passed in by the caller because caller/callee
+// identity is not aggregate data — see the handler.
+func ServiceMapMetricsFromAggregate(r *aggregate.TopologyResult, edges []ServiceMapEdge, coverage aggregate.Coverage) ServiceMapMetrics {
+	if r == nil {
+		return ServiceMapMetrics{Nodes: []ServiceMapNode{}, Edges: []ServiceMapEdge{}}
+	}
+	nodes := make([]ServiceMapNode, len(r.Nodes))
+	for i, n := range r.Nodes {
+		nodes[i] = ServiceMapNode{
+			Name:         n.Service,
+			TotalTraces:  n.Count,
+			ErrorCount:   n.ErrorCount,
+			AvgLatencyMs: n.AvgLatencyMs,
+		}
+	}
+	if edges == nil {
+		edges = []ServiceMapEdge{}
+	}
+	return ServiceMapMetrics{
+		Nodes:        nodes,
+		Edges:        edges,
+		Coverage:     string(coverage),
+		CoverageNote: coverage.Note(),
+		Epoch:        r.Epoch,
+		Revision:     r.Revision,
+	}
 }
 
 // ServiceMapMetricsFromModel converts repo topology into the view form.

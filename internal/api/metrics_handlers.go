@@ -1,11 +1,13 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http"
 	"time"
 
+	"github.com/RandomCodeSpace/otelcontext/internal/aggregate"
 	"github.com/RandomCodeSpace/otelcontext/internal/api/views"
 	"github.com/RandomCodeSpace/otelcontext/internal/httpconst"
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
@@ -30,6 +32,27 @@ func (s *Server) handleGetTrafficMetrics(w http.ResponseWriter, r *http.Request)
 
 	serviceNames := r.URL.Query()["service_name"]
 
+	// /api/metrics/traffic returns a BARE ARRAY. Wrapping it in an envelope to
+	// carry coverage would silently break every existing client, so coverage
+	// travels in the response header instead (#164).
+	if s.aggregateReads() {
+		res, err := s.aggregateEngine.QueryBuckets(aggregate.Query{
+			Tenant:   storage.TenantFromContext(r.Context()),
+			Start:    start,
+			End:      end,
+			Services: serviceNames,
+		})
+		if err != nil {
+			slog.Error("Failed to get aggregate traffic metrics", "error", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		setCoverage(w, res.Coverage)
+		w.Header().Set(httpconst.HeaderContentType, httpconst.ContentTypeJSON)
+		_ = json.NewEncoder(w).Encode(trafficPointsFromAggregate(res))
+		return
+	}
+
 	points, err := s.repo.GetTrafficMetrics(r.Context(), start, end, serviceNames)
 	if err != nil {
 		slog.Error("Failed to get traffic metrics", "error", err)
@@ -39,6 +62,21 @@ func (s *Server) handleGetTrafficMetrics(w http.ResponseWriter, r *http.Request)
 
 	w.Header().Set(httpconst.HeaderContentType, httpconst.ContentTypeJSON)
 	_ = json.NewEncoder(w).Encode(points)
+}
+
+// trafficPointsFromAggregate converts engine traffic buckets into the same
+// wire shape the legacy repository produces. Only the bucket WIDTH changes:
+// five-minute aggregate windows instead of one-minute row scans.
+func trafficPointsFromAggregate(res *aggregate.BucketsResult) []storage.TrafficPoint {
+	points := make([]storage.TrafficPoint, 0, len(res.Points))
+	for _, p := range res.Points {
+		points = append(points, storage.TrafficPoint{
+			Timestamp:  p.WindowStart,
+			Count:      p.Count,
+			ErrorCount: p.ErrorCount,
+		})
+	}
+	return points
 }
 
 // handleGetLatencyHeatmap handles GET /api/metrics/latency_heatmap
@@ -66,6 +104,13 @@ func (s *Server) handleGetLatencyHeatmap(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// The heatmap plots individual span durations, which in aggregate mode
+	// exist only as retained exemplars. The endpoint keeps its bare-array
+	// shape and declares that honestly in the header: an empty heatmap is not
+	// evidence that no spans ran.
+	if s.aggregateReads() {
+		setCoverage(w, aggregate.CoverageExemplar)
+	}
 	w.Header().Set(httpconst.HeaderContentType, httpconst.ContentTypeJSON)
 	_ = json.NewEncoder(w).Encode(points)
 }
@@ -104,14 +149,14 @@ func (s *Server) handleGetDashboardStats(w http.ResponseWriter, r *http.Request)
 
 	serviceNames := r.URL.Query()["service_name"]
 
-	stats, err := s.repo.GetDashboardStats(r.Context(), start, end, serviceNames)
+	view, err := s.dashboardView(r, start, end, serviceNames)
 	if err != nil {
 		slog.Error("Failed to get dashboard stats", "error", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	cj, err := newCachedJSON(views.DashboardStatsFromModel(stats))
+	cj, err := newCachedJSON(view)
 	if err != nil {
 		http.Error(w, "failed to encode dashboard stats", http.StatusInternalServerError)
 		return
@@ -120,6 +165,31 @@ func (s *Server) handleGetDashboardStats(w http.ResponseWriter, r *http.Request)
 		s.cache.Set(cacheKey, cj, hotPollCacheTTL)
 	}
 	cj.write(w, r, "MISS")
+}
+
+// dashboardView produces the dashboard payload from whichever source owns the
+// numbers in this mode. In aggregate mode every figure comes from engine
+// queries — no COUNT/AVG/DISTINCT scan of the trace or log tables, and no
+// sqliteP99RowCap sort: the p99 comes from the merged sketch with the accuracy
+// bound that sketch justifies.
+func (s *Server) dashboardView(r *http.Request, start, end time.Time, serviceNames []string) (views.DashboardStats, error) {
+	if s.aggregateReads() {
+		res, err := s.aggregateEngine.QueryDashboard(aggregate.Query{
+			Tenant:   storage.TenantFromContext(r.Context()),
+			Start:    start,
+			End:      end,
+			Services: serviceNames,
+		})
+		if err != nil {
+			return views.DashboardStats{}, err
+		}
+		return views.DashboardStatsFromAggregate(res), nil
+	}
+	stats, err := s.repo.GetDashboardStats(r.Context(), start, end, serviceNames)
+	if err != nil {
+		return views.DashboardStats{}, err
+	}
+	return views.DashboardStatsFromModel(stats), nil
 }
 
 // handleGetServiceMapMetrics handles GET /api/metrics/service-map.
@@ -154,18 +224,67 @@ func (s *Server) handleGetServiceMapMetrics(w http.ResponseWriter, r *http.Reque
 		}
 	}
 
-	metrics, err := s.repo.GetServiceMapMetrics(r.Context(), start, end)
+	resp, err := s.serviceMapView(r, start, end)
 	if err != nil {
 		slog.Error("Failed to get service map metrics", "error", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-
-	resp := views.ServiceMapMetricsFromModel(metrics)
 	s.cache.Set(cacheKey, resp, cacheTTL)
 	w.Header().Set(httpconst.HeaderContentType, httpconst.ContentTypeJSON)
 	w.Header().Set("X-Cache", "MISS")
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// serviceMapView produces the topology payload.
+//
+// In aggregate mode the NODES come from engine queries and are exact for
+// accepted telemetry. The EDGES do not: caller/callee identity is not part of
+// a SeriesKey, so no reducer emits a service-edge series today and the edge
+// metrics come from the GraphRAG topology store, which is fed by retained
+// exemplars. That is why the response is marked "sampled" rather than "full" —
+// the node counts are complete, the edges are not.
+func (s *Server) serviceMapView(r *http.Request, start, end time.Time) (views.ServiceMapMetrics, error) {
+	if !s.aggregateReads() {
+		metrics, err := s.repo.GetServiceMapMetrics(r.Context(), start, end)
+		if err != nil {
+			return views.ServiceMapMetrics{}, err
+		}
+		return views.ServiceMapMetricsFromModel(metrics), nil
+	}
+	res, err := s.aggregateEngine.QueryTopology(aggregate.Query{
+		Tenant: storage.TenantFromContext(r.Context()),
+		Start:  start,
+		End:    end,
+	})
+	if err != nil {
+		return views.ServiceMapMetrics{}, err
+	}
+	return views.ServiceMapMetricsFromAggregate(res, s.topologyEdges(r.Context()), aggregate.CoverageSampled), nil
+}
+
+// topologyEdges reads caller/callee edges out of the GraphRAG service store.
+// The edges themselves are observed for every span before any retention gate,
+// but their call counts and latencies come from retained spans only.
+func (s *Server) topologyEdges(ctx context.Context) []views.ServiceMapEdge {
+	if s.graphRAG == nil {
+		return nil
+	}
+	all := s.graphRAG.AllServiceEdges(ctx)
+	edges := make([]views.ServiceMapEdge, 0, len(all))
+	for _, e := range all {
+		if e.Type != "CALLS" {
+			continue
+		}
+		edges = append(edges, views.ServiceMapEdge{
+			Source:       e.FromID,
+			Target:       e.ToID,
+			CallCount:    e.CallCount,
+			AvgLatencyMs: e.AvgMs,
+			ErrorRate:    e.ErrorRate,
+		})
+	}
+	return edges
 }
 
 // handleGetMetricBuckets handles GET /api/metrics

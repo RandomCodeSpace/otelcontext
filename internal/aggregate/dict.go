@@ -89,6 +89,18 @@ type Registrar interface {
 	OtherID(tenantID uint32, kind Kind) uint32
 }
 
+// Resolver reverses a dictionary ID back to its entry. It is a READ-PATH
+// capability: the ingest hot path never reverses an ID, but the query facade
+// has to turn a SeriesKey back into service, operation and metric names.
+//
+// It is deliberately separate from Registrar so an implementation that cannot
+// reverse (a write-only registrar) stays usable; the Cache degrades to
+// "unresolved" rather than failing the query.
+type Resolver interface {
+	// Lookup returns the entry for id. ok is false when the ID is unknown.
+	Lookup(id uint32) (DictEntry, bool)
+}
+
 // dictScope is the (tenant, kind) namespace of a dictionary entry. Splitting
 // the scope out of the map key lets the value map stay string-keyed, which is
 // what makes the byte-slice lookup path allocation-free.
@@ -209,6 +221,17 @@ func (c *Cache) register(scope dictScope, value []byte) uint32 {
 // series carries the __other__ entry as its NameID.
 func (c *Cache) OtherID(tenantID uint32, kind Kind) uint32 {
 	return c.reg.OtherID(tenantID, kind)
+}
+
+// Lookup reverses a dictionary ID through the underlying registrar. It returns
+// ok=false when the registrar cannot reverse IDs at all, so a caller that only
+// needs presentation names degrades to "unresolved" instead of failing.
+func (c *Cache) Lookup(id uint32) (DictEntry, bool) {
+	res, ok := c.reg.(Resolver)
+	if !ok {
+		return DictEntry{}, false
+	}
+	return res.Lookup(id)
 }
 
 // Len returns the number of cached entries across every scope. Diagnostic only.

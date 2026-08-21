@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/RandomCodeSpace/otelcontext/internal/aggregate"
 	"github.com/RandomCodeSpace/otelcontext/internal/cache"
 	"github.com/RandomCodeSpace/otelcontext/internal/graph"
 	"github.com/RandomCodeSpace/otelcontext/internal/graphrag"
@@ -29,6 +30,13 @@ type Server struct {
 	// imports and lets tests inject deterministic values.
 	dlqSaturation      func() float64
 	pipelineSaturation func() float64
+
+	// aggregateEngine is the aggregate query facade. It is non-nil only in
+	// AGGREGATE_MODE=aggregate: shadow mode writes aggregates but must not
+	// serve them, and legacy mode has no engine at all. Every read migrated
+	// to the engine branches on aggregateReads(), so legacy responses stay
+	// byte-for-byte what they were.
+	aggregateEngine *aggregate.Engine
 
 	// aggregateRecovered reports whether the durable aggregate store has
 	// finished startup recovery. /ready stays 503 until it returns true, so
@@ -72,6 +80,20 @@ func (s *Server) SetDLQSaturationProbe(fn func() float64) {
 func (s *Server) SetPipelineSaturationProbe(fn func() float64) {
 	s.pipelineSaturation = fn
 }
+
+// SetAggregateEngine wires the aggregate query facade into the read path. Pass
+// the engine only in AGGREGATE_MODE=aggregate; a nil engine, or an engine in
+// any other mode, leaves every handler on the legacy path.
+func (s *Server) SetAggregateEngine(e *aggregate.Engine) {
+	if e == nil || e.Mode() != aggregate.ModeAggregate {
+		return
+	}
+	s.aggregateEngine = e
+}
+
+// aggregateReads reports whether this request should be served from the
+// aggregate engine.
+func (s *Server) aggregateReads() bool { return s.aggregateEngine != nil }
 
 // SetAggregateRecoveryProbe registers a callback reporting whether the durable
 // aggregate store has finished replaying its delta log. /ready returns 503
