@@ -6,6 +6,10 @@ import (
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 )
 
+func strAttr(key, value string) *commonpb.KeyValue {
+	return &commonpb.KeyValue{Key: key, Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: value}}}
+}
+
 func TestDimsConfig_Get(t *testing.T) {
 	cfg := DimsConfig{
 		"http.requests":    {"method", "status_code"},
@@ -45,7 +49,7 @@ func TestDimsConfig_ExtractDimensionValues(t *testing.T) {
 
 	t.Run("missing metric", func(t *testing.T) {
 		attrs := []*commonpb.KeyValue{
-			{Key: "method", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "GET"}}},
+			strAttr("method", "GET"),
 		}
 		got := cfg.ExtractDimensionValues("unknown.metric", attrs)
 		if got != nil {
@@ -55,9 +59,9 @@ func TestDimsConfig_ExtractDimensionValues(t *testing.T) {
 
 	t.Run("complete dimensions", func(t *testing.T) {
 		attrs := []*commonpb.KeyValue{
-			{Key: "method", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "POST"}}},
-			{Key: "status_code", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "200"}}},
-			{Key: "ignored_attr", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "value"}}},
+			strAttr("method", "POST"),
+			strAttr("status_code", "200"),
+			strAttr("ignored_attr", "value"),
 		}
 		got := cfg.ExtractDimensionValues("http.requests", attrs)
 		want := []string{"POST", "200"}
@@ -74,7 +78,7 @@ func TestDimsConfig_ExtractDimensionValues(t *testing.T) {
 
 	t.Run("missing dimension key", func(t *testing.T) {
 		attrs := []*commonpb.KeyValue{
-			{Key: "method", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "GET"}}},
+			strAttr("method", "GET"),
 			// status_code is missing
 		}
 		got := cfg.ExtractDimensionValues("http.requests", attrs)
@@ -85,7 +89,7 @@ func TestDimsConfig_ExtractDimensionValues(t *testing.T) {
 
 	t.Run("non-string attribute ignored", func(t *testing.T) {
 		attrs := []*commonpb.KeyValue{
-			{Key: "method", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "GET"}}},
+			strAttr("method", "GET"),
 			{Key: "status_code", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_IntValue{IntValue: 200}}}, // int, not string
 		}
 		got := cfg.ExtractDimensionValues("http.requests", attrs)

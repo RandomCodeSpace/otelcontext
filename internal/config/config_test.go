@@ -9,6 +9,22 @@ import (
 )
 
 // baseValid returns a Config that passes Validate() — test functions mutate one field at a time.
+// writeTLSPair writes a throwaway cert/key file pair into a temp dir and
+// returns their paths.
+func writeTLSPair(t *testing.T) (certFile, keyFile string) {
+	t.Helper()
+	dir := t.TempDir()
+	certFile = filepath.Join(dir, "server.crt")
+	keyFile = filepath.Join(dir, "server.key")
+	if err := os.WriteFile(certFile, []byte("cert"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyFile, []byte("key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return certFile, keyFile
+}
+
 func baseValid() *Config {
 	return &Config{
 		HTTPPort:                 "8080",
@@ -146,15 +162,7 @@ func TestValidate_TLS_FilesMustExist(t *testing.T) {
 }
 
 func TestValidate_TLS_ReadableFilesOK(t *testing.T) {
-	dir := t.TempDir()
-	cert := filepath.Join(dir, "server.crt")
-	key := filepath.Join(dir, "server.key")
-	if err := os.WriteFile(cert, []byte("cert"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(key, []byte("key"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	cert, key := writeTLSPair(t)
 	c := baseValid()
 	c.TLSCertFile = cert
 	c.TLSKeyFile = key
@@ -278,15 +286,7 @@ func TestTLSAutoSelfsigned_DefaultCacheDir(t *testing.T) {
 // explicit TLSCertFile + TLSKeyFile win over TLSAutoSelfsigned. The resulting
 // Config must report cert-file mode, not self-signed mode.
 func TestTLSAutoSelfsigned_IgnoredWhenCertFilesSet(t *testing.T) {
-	dir := t.TempDir()
-	cert := filepath.Join(dir, "server.crt")
-	key := filepath.Join(dir, "server.key")
-	if err := os.WriteFile(cert, []byte("cert"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(key, []byte("key"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	cert, key := writeTLSPair(t)
 
 	c := baseValid()
 	c.TLSCertFile = cert
