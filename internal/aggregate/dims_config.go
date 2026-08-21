@@ -1,10 +1,6 @@
 package aggregate
 
 import (
-	"crypto/md5"
-	"encoding/binary"
-	"sort"
-
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 )
 
@@ -55,29 +51,23 @@ func (d DimsConfig) ExtractDimensionValues(metricName string, attrs []*commonpb.
 	return values
 }
 
-// DimsID computes a stable hash ID for a set of dimension values.
-// The ID is deterministic and consistent across restarts.
-func DimsID(values []string) uint32 {
-	if len(values) == 0 {
+// InternDimValues resolves configured dimension keys and their extracted
+// values to dictionary IDs and returns the DimsID for a SeriesKey via
+// Cache.InternDims. IDs come from the tenant-scoped dictionary, never from
+// hashing: a hash collision would silently merge unrelated series.
+// keys and values must be parallel slices (as returned by
+// ExtractDimensionValues for the configured keys); an empty or mismatched
+// input yields 0, the "no configured dims" sentinel.
+func InternDimValues(c *Cache, tenantID uint32, keys, values []string) uint32 {
+	if len(keys) == 0 || len(keys) != len(values) {
 		return 0
 	}
-	// Sort values for canonical hashing.
-	sorted := make([]string, len(values))
-	copy(sorted, values)
-	sort.Strings(sorted)
-
-	// Hash the concatenated sorted values using MD5 and take the low 32 bits.
-	h := md5.New()
-	for _, v := range sorted {
-		h.Write([]byte(v))
-		h.Write([]byte{0}) // null separator
+	pairs := make([]DimPair, len(keys))
+	for i := range keys {
+		pairs[i] = DimPair{
+			KeyID:   c.Intern(tenantID, KindDimKey, keys[i]),
+			ValueID: c.Intern(tenantID, KindDimValue, values[i]),
+		}
 	}
-	digest := h.Sum(nil)
-	// Use little-endian to match SeriesKey encoding.
-	id := binary.LittleEndian.Uint32(digest[:4])
-	// Ensure non-zero (0 is reserved for "no dimensions").
-	if id == 0 {
-		id = 1
-	}
-	return id
+	return c.InternDims(tenantID, pairs)
 }

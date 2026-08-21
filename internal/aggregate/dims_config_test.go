@@ -8,7 +8,7 @@ import (
 
 func TestDimsConfig_Get(t *testing.T) {
 	cfg := DimsConfig{
-		"http.requests":   {"method", "status_code"},
+		"http.requests":    {"method", "status_code"},
 		"db.query.latency": {"database", "operation"},
 	}
 
@@ -95,40 +95,64 @@ func TestDimsConfig_ExtractDimensionValues(t *testing.T) {
 	})
 }
 
-func TestDimsID(t *testing.T) {
-	t.Run("empty values", func(t *testing.T) {
-		id := DimsID([]string{})
-		if id != 0 {
-			t.Errorf("DimsID([]) = %d, want 0", id)
+func TestInternDimValues(t *testing.T) {
+	newCache := func() *Cache {
+		return NewCache(NewMemRegistrar(nil))
+	}
+
+	t.Run("empty keys", func(t *testing.T) {
+		c := newCache()
+		if id := InternDimValues(c, 1, nil, nil); id != 0 {
+			t.Errorf("InternDimValues(nil) = %d, want 0", id)
+		}
+	})
+
+	t.Run("mismatched lengths", func(t *testing.T) {
+		c := newCache()
+		if id := InternDimValues(c, 1, []string{"method"}, nil); id != 0 {
+			t.Errorf("mismatched lengths = %d, want 0", id)
 		}
 	})
 
 	t.Run("deterministic", func(t *testing.T) {
-		values := []string{"method", "POST", "status_code", "200"}
-		id1 := DimsID(values)
-		id2 := DimsID(values)
-		if id1 != id2 {
-			t.Errorf("DimsID not deterministic: %d vs %d", id1, id2)
+		c := newCache()
+		keys := []string{"method", "status_code"}
+		values := []string{"POST", "200"}
+		id1 := InternDimValues(c, 1, keys, values)
+		id2 := InternDimValues(c, 1, keys, values)
+		if id1 == 0 || id1 != id2 {
+			t.Errorf("not deterministic: %d vs %d", id1, id2)
 		}
 	})
 
-	t.Run("order-independent", func(t *testing.T) {
-		// Different input order should produce same ID (values are re-sorted).
-		values1 := []string{"a", "b", "c"}
-		values2 := []string{"c", "a", "b"}
-		id1 := DimsID(values1)
-		id2 := DimsID(values2)
+	t.Run("pair-order independent", func(t *testing.T) {
+		// The same key=value pairs in a different order canonicalize to the
+		// same tuple and therefore the same ID.
+		c := newCache()
+		id1 := InternDimValues(c, 1, []string{"a", "b"}, []string{"x", "y"})
+		id2 := InternDimValues(c, 1, []string{"b", "a"}, []string{"y", "x"})
 		if id1 != id2 {
-			t.Errorf("DimsID not order-independent: %d vs %d", id1, id2)
+			t.Errorf("pair order changed the ID: %d vs %d", id1, id2)
 		}
 	})
 
-	t.Run("non-zero result", func(t *testing.T) {
-		// The hash must never collide with 0 (reserved).
-		values := []string{"test_value"}
-		id := DimsID(values)
-		if id == 0 {
-			t.Errorf("DimsID returned 0, want non-zero for non-empty values")
+	t.Run("distinct pairings get distinct IDs", func(t *testing.T) {
+		// Same value multiset attached to different keys must NOT collide —
+		// this is exactly what a value-only hash got wrong.
+		c := newCache()
+		id1 := InternDimValues(c, 1, []string{"a", "b"}, []string{"x", "y"})
+		id2 := InternDimValues(c, 1, []string{"a", "b"}, []string{"y", "x"})
+		if id1 == id2 {
+			t.Errorf("distinct key/value pairings collided: %d", id1)
+		}
+	})
+
+	t.Run("tenant scoped", func(t *testing.T) {
+		c := newCache()
+		id1 := InternDimValues(c, 1, []string{"method"}, []string{"GET"})
+		id2 := InternDimValues(c, 2, []string{"method"}, []string{"GET"})
+		if id1 == id2 {
+			t.Errorf("tenants shared a dim tuple ID: %d", id1)
 		}
 	})
 }
