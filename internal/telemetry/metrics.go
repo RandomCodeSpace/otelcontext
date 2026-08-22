@@ -131,6 +131,13 @@ type Metrics struct {
 	// reason="queue_full"        — batch rejected at 100% capacity (client got 429/RESOURCE_EXHAUSTED).
 	// reason="bytes_full"        — batch rejected at the byte cap (even priority batches).
 	IngestPipelineDroppedTotal *prometheus.CounterVec
+	// IngestPipelineDLQTotal — batches handed to the Dead Letter Queue after
+	// the persist transaction failed, instead of being dropped silently.
+	// result="enqueued"      — the complete batch is on disk awaiting replay.
+	// result="enqueue_failed" — the DLQ itself rejected the write (disk full,
+	//                           permissions); the batch IS lost.
+	// result="no_sink"       — no DLQ wired into the pipeline; the batch IS lost.
+	IngestPipelineDLQTotal *prometheus.CounterVec
 
 	// HTTPOTLPThrottledTotal — count of HTTP 429s issued by the OTLP HTTP
 	// receiver when the async ingest pipeline is full. Mirrors the gRPC
@@ -476,6 +483,10 @@ func New() *Metrics {
 			Name: "otelcontext_ingest_pipeline_dropped_total",
 			Help: "Batches dropped by the async ingest pipeline. reason=soft_backpressure (>=90% queue, healthy) or queue_full (100% queue, rejected to client).",
 		}, []string{"signal", "reason"}),
+		IngestPipelineDLQTotal: promauto.NewCounterVec(prometheus.CounterOpts{
+			Name: "otelcontext_ingest_pipeline_dlq_total",
+			Help: "Async ingest batches routed to the DLQ after a persist failure. result=enqueued (durable, awaiting replay), enqueue_failed or no_sink (batch lost).",
+		}, []string{"signal", "result"}),
 
 		// DB pool (Task 7 — visibility for DB_MAX_OPEN_CONNS sizing).
 		DBPoolOpenConnections: promauto.NewGauge(prometheus.GaugeOpts{

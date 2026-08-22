@@ -397,8 +397,9 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 		spans   []storage.Span
 		traces  []storage.Trace
 		logs    []storage.Log
-		hasErr  bool // any span in this slice had STATUS_CODE_ERROR
-		hasSlow bool // any span exceeded latencyThresholdMs
+		tenant  string // tenant this resource resolved to (#194 finding 12)
+		hasErr  bool   // any span in this slice had STATUS_CODE_ERROR
+		hasSlow bool   // any span exceeded latencyThresholdMs
 		// reducer holds this resource batch's aggregate deltas. Reduction is
 		// request-local and lock-free, so each goroutine owns its own reducer
 		// and they are merged once below.
@@ -675,6 +676,7 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 				spans:   localSpans,
 				traces:  localTraces,
 				logs:    localLogs,
+				tenant:  tenantID,
 				hasErr:  localHasErr,
 				hasSlow: localHasSlow,
 				reducer: reducer,
@@ -690,18 +692,19 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 	var spansToInsert []storage.Span
 	var tracesToUpsert []storage.Trace
 	var synthesizedLogs []storage.Log
-	var batchHasErr, batchHasSlow bool
 	var merged *aggregate.Reducer
+	// Rows are additionally grouped by the tenant their resource resolved to
+	// so the pipeline's per-tenant admission cap charges each tenant its own
+	// slot (#194 finding 12). With TRUST_RESOURCE_TENANT off — the default —
+	// every resource in one Export resolves to the same transport tenant and
+	// this collapses to exactly one group, i.e. the previous single-batch
+	// behaviour with Tenant now populated.
+	groups := newTenantGroups()
 	for _, r := range results {
 		spansToInsert = append(spansToInsert, r.spans...)
 		tracesToUpsert = append(tracesToUpsert, r.traces...)
 		synthesizedLogs = append(synthesizedLogs, r.logs...)
-		if r.hasErr {
-			batchHasErr = true
-		}
-		if r.hasSlow {
-			batchHasSlow = true
-		}
+		groups.add(r.tenant, r.traces, r.spans, r.logs, r.hasErr, r.hasSlow)
 		if r.reducer == nil {
 			continue
 		}
@@ -733,21 +736,30 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 	// gRPC RESOURCE_EXHAUSTED so the client backs off rather than
 	// retrying tighter. Soft backpressure drops are silent.
 	if s.pipeline != nil {
-		batch := &Batch{
-			Type:         SignalTraces,
-			Traces:       tracesToUpsert,
-			Spans:        spansToInsert,
-			Logs:         synthesizedLogs,
-			HasError:     batchHasErr,
-			HasSlow:      batchHasSlow,
-			SpanCallback: s.spanCallback,
-			LogCallback:  s.logCallback,
-		}
-		if err := s.pipeline.Submit(batch); err != nil {
-			if errors.Is(err, ErrQueueFull) {
-				return nil, grpcstatus.Errorf(codes.ResourceExhausted, "ingest pipeline at capacity")
+		// One Submit per tenant. On the multi-tenant path (trusted resource
+		// tenancy only) an ErrQueueFull on the Nth group leaves groups 1..N-1
+		// enqueued while the client retries the whole Export; traces and spans
+		// are idempotent on their composite unique indexes, synthesized logs
+		// are not and can duplicate. Charging every tenant to one slot would
+		// mean the cap protects nobody, which is the worse trade.
+		for _, g := range groups.all() {
+			batch := &Batch{
+				Type:         SignalTraces,
+				Tenant:       g.tenant,
+				Traces:       g.traces,
+				Spans:        g.spans,
+				Logs:         g.logs,
+				HasError:     g.hasErr,
+				HasSlow:      g.hasSlow,
+				SpanCallback: s.spanCallback,
+				LogCallback:  s.logCallback,
 			}
-			return nil, err
+			if err := s.pipeline.Submit(batch); err != nil {
+				if errors.Is(err, ErrQueueFull) {
+					return nil, grpcstatus.Errorf(codes.ResourceExhausted, "ingest pipeline at capacity")
+				}
+				return nil, err
+			}
 		}
 		return &coltracepb.ExportTraceServiceResponse{}, nil
 	}
@@ -800,6 +812,9 @@ func (s *LogsServer) Export(ctx context.Context, req *collogspb.ExportLogsServic
 	// slog.Debug("📥 [LOGS] Received Request", "resource_logs", len(req.ResourceLogs))
 
 	logResults := make([][]storage.Log, len(req.ResourceLogs))
+	// Per-resource tenant, parallel to logResults, so the merge below can
+	// charge each tenant its own pipeline admission slot (#194 finding 12).
+	logTenants := make([]string, len(req.ResourceLogs))
 	// One reducer per resource batch (reduction is request-local and not
 	// concurrency-safe); merged into one after the group finishes.
 	reducers := make([]*aggregate.Reducer, len(req.ResourceLogs))
@@ -883,6 +898,7 @@ func (s *LogsServer) Export(ctx context.Context, req *collogspb.ExportLogsServic
 			}
 
 			logResults[idx] = localLogs
+			logTenants[idx] = tenantID
 
 			return nil
 		})
@@ -892,8 +908,12 @@ func (s *LogsServer) Export(ctx context.Context, req *collogspb.ExportLogsServic
 
 	// Merge results after all goroutines complete (no lock contention)
 	var logsToInsert []storage.Log
-	for _, lr := range logResults {
+	// See the TraceServer.Export merge for the grouping rationale; with
+	// TRUST_RESOURCE_TENANT off this yields exactly one group.
+	groups := newTenantGroups()
+	for idx, lr := range logResults {
 		logsToInsert = append(logsToInsert, lr...)
+		groups.add(logTenants[idx], nil, nil, lr, hasPriorityLog(lr), false)
 	}
 
 	// Apply the request's aggregate deltas. This happens before the early
@@ -924,28 +944,24 @@ func (s *LogsServer) Export(ctx context.Context, req *collogspb.ExportLogsServic
 		s.metrics.RecordIngestion(len(logsToInsert))
 	}
 
-	// Detect priority logs — ERROR/FATAL must bypass soft backpressure.
-	var hasErr bool
-	for _, l := range logsToInsert {
-		if l.Severity == "ERROR" || l.Severity == "FATAL" {
-			hasErr = true
-			break
-		}
-	}
-
-	// Async path: hand off to the pipeline.
+	// Async path: hand off to the pipeline, one Submit per tenant. Priority
+	// (ERROR/FATAL bypasses soft backpressure) is now evaluated per tenant
+	// group rather than across the whole Export — see hasPriorityLog.
 	if s.pipeline != nil {
-		batch := &Batch{
-			Type:        SignalLogs,
-			Logs:        logsToInsert,
-			HasError:    hasErr,
-			LogCallback: s.logCallback,
-		}
-		if err := s.pipeline.Submit(batch); err != nil {
-			if errors.Is(err, ErrQueueFull) {
-				return nil, grpcstatus.Errorf(codes.ResourceExhausted, "ingest pipeline at capacity")
+		for _, g := range groups.all() {
+			batch := &Batch{
+				Type:        SignalLogs,
+				Tenant:      g.tenant,
+				Logs:        g.logs,
+				HasError:    g.hasErr,
+				LogCallback: s.logCallback,
 			}
-			return nil, err
+			if err := s.pipeline.Submit(batch); err != nil {
+				if errors.Is(err, ErrQueueFull) {
+					return nil, grpcstatus.Errorf(codes.ResourceExhausted, "ingest pipeline at capacity")
+				}
+				return nil, err
+			}
 		}
 		return &collogspb.ExportLogsServiceResponse{}, nil
 	}
@@ -962,6 +978,80 @@ func (s *LogsServer) Export(ctx context.Context, req *collogspb.ExportLogsServic
 	}
 
 	return &collogspb.ExportLogsServiceResponse{}, nil
+}
+
+// tenantGroup accumulates one Export's rows for a single tenant so the async
+// pipeline can charge that tenant its own per-tenant admission slot.
+type tenantGroup struct {
+	tenant  string
+	traces  []storage.Trace
+	spans   []storage.Span
+	logs    []storage.Log
+	hasErr  bool
+	hasSlow bool
+}
+
+// tenantGroups preserves first-seen tenant order so a single-tenant Export
+// (the default, since TRUST_RESOURCE_TENANT is off) produces exactly one
+// group and the submit loop below behaves identically to the pre-split path.
+type tenantGroups struct {
+	order []string
+	byID  map[string]*tenantGroup
+}
+
+func newTenantGroups() *tenantGroups {
+	return &tenantGroups{byID: make(map[string]*tenantGroup)}
+}
+
+// add folds one resource's rows into its tenant's group. Empty contributions
+// are ignored so resources filtered out by the service allow/deny list never
+// materialize an empty batch.
+func (g *tenantGroups) add(tenant string, traces []storage.Trace, spans []storage.Span, logs []storage.Log, hasErr, hasSlow bool) {
+	if len(traces) == 0 && len(spans) == 0 && len(logs) == 0 {
+		return
+	}
+	grp, ok := g.byID[tenant]
+	if !ok {
+		// First contribution for this tenant adopts the caller's slices
+		// rather than copying them. They are per-resource locals nothing
+		// reads after the merge, so the single-tenant case — the default —
+		// costs no allocation beyond the pre-split path.
+		g.byID[tenant] = &tenantGroup{
+			tenant:  tenant,
+			traces:  traces,
+			spans:   spans,
+			logs:    logs,
+			hasErr:  hasErr,
+			hasSlow: hasSlow,
+		}
+		g.order = append(g.order, tenant)
+		return
+	}
+	grp.traces = append(grp.traces, traces...)
+	grp.spans = append(grp.spans, spans...)
+	grp.logs = append(grp.logs, logs...)
+	grp.hasErr = grp.hasErr || hasErr
+	grp.hasSlow = grp.hasSlow || hasSlow
+}
+
+// all returns the groups in first-seen tenant order.
+func (g *tenantGroups) all() []*tenantGroup {
+	out := make([]*tenantGroup, 0, len(g.order))
+	for _, t := range g.order {
+		out = append(out, g.byID[t])
+	}
+	return out
+}
+
+// hasPriorityLog reports whether any record is ERROR/FATAL, which exempts the
+// batch from soft backpressure.
+func hasPriorityLog(logs []storage.Log) bool {
+	for _, l := range logs {
+		if l.Severity == "ERROR" || l.Severity == "FATAL" {
+			return true
+		}
+	}
+	return false
 }
 
 // Helper to extract service.name from attributes
