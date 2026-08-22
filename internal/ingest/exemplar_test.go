@@ -101,7 +101,7 @@ func offerAll(p *ExemplarPolicy, service string, ts time.Time, offers []exemplar
 			// Real callers always follow an admission with a charge; skipping
 			// it here would leave the byte budget untouched and make the count
 			// tests silently depend on charge-free admission.
-			p.ChargeSpan(in.Tenant, service, o.traceID, ts, 512)
+			p.ReserveSpan(nil, in.Tenant, service, o.traceID, ts, 512)
 		}
 	}
 	return admitted
@@ -291,7 +291,7 @@ func TestExemplarByteBudgetBindsIndependentlyOfCount(t *testing.T) {
 		if !p.AdmitSpan(in) {
 			continue
 		}
-		if p.ChargeSpan(in.Tenant, "checkout", id, ts, spanBytes) {
+		if p.ReserveSpan(nil, in.Tenant, "checkout", id, ts, spanBytes) {
 			charged++
 		}
 	}
@@ -322,7 +322,7 @@ func TestExemplarWarnLogsAreOptIn(t *testing.T) {
 	admitN := func(p *ExemplarPolicy, severity string, n int) int {
 		admitted := 0
 		for i := 0; i < n; i++ {
-			if p.AdmitLog(storage.DefaultTenantID, "checkout", severity, ts, 64) {
+			if p.ReserveLog(nil, storage.DefaultTenantID, "checkout", severity, ts, 64) {
 				admitted++
 			}
 		}
@@ -693,7 +693,7 @@ func TestExemplarConcurrentAdmissionIsRaceFree(t *testing.T) {
 					Operation: fmt.Sprintf("op-%d", i%7), Status: storage.StatusCodeError, Timestamp: ts,
 				}
 				if p.AdmitSpan(in) {
-					p.ChargeSpan(in.Tenant, in.Service, id, ts, 256)
+					p.ReserveSpan(nil, in.Tenant, in.Service, id, ts, 256)
 					p.TraceStats(in.Tenant, in.Service, id, ts)
 				}
 			}

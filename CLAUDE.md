@@ -369,6 +369,10 @@ Key settings in `internal/config/config.go`:
 - `OTEL_EXPORTER_OTLP_ENDPOINT` — enables self-instrumentation (empty = off)
 - `DEFAULT_TENANT` (`default`) — assigned to rows ingested without explicit tenant
 - `HOT_RETENTION_DAYS` (7) — drives `RetentionScheduler`; range 1..36500
+- `EXEMPLAR_RETENTION_DAYS` (2) — separate, shorter retention for the raw exemplar tier in aggregate mode; validated 1..`HOT_RETENTION_DAYS`. See the Data Disk Budget section
+- `EXEMPLAR_BYTES_GLOBAL_WINDOW` (**3 MiB**, was 8 MiB) / `EXEMPLAR_BYTES_PER_SERVICE_WINDOW` (512 KiB) — instance-wide and per-service byte budget per 5-minute window
+- `EXEMPLAR_SYNTH_LOGS_PER_SPAN` (8), `EXEMPLAR_SYNTH_LOGS_PER_TRACE` (64) — count caps on logs synthesized from span events and span status
+- `DATA_DISK_BUDGET_MB` (8192), `DATA_DISK_PATH` (`./data`) — disk watchdog ceiling and the volume it `statfs`-es
 - `SAMPLING_RATE` (1.0), `SAMPLING_ALWAYS_ON_ERRORS` (true), `SAMPLING_LATENCY_THRESHOLD_MS` (500)
 - `METRIC_MAX_CARDINALITY` (10000), `METRIC_MAX_CARDINALITY_PER_TENANT` (0 = unlimited), `API_RATE_LIMIT_RPS` (100). The per-tenant cap is checked first; when set, a noisy tenant cannot exhaust the global pool. Overflow is labeled by tenant via `otelcontext_tsdb_cardinality_overflow_by_tenant_total{tenant_id}` (`__global__` sentinel when the global cap was the trigger).
 - `MCP_ENABLED` (true), `MCP_PATH` (/mcp)
@@ -448,6 +452,97 @@ Failure-mode gauges (prefix `OtelContext_`):
 - `retention_consecutive_failures` — reset to 0 on success; alert when > 3
 - `retention_last_success_timestamp` — Unix seconds; alert when stale relative to the hourly tick
 - `retention_rows_purged_total`, `retention_purge_duration_seconds`, `retention_vacuum_duration_seconds` — throughput and latency
+
+### Data Disk Budget — 8 GiB (#201)
+
+The platform targets a single 8 GiB data volume. The budget is a promise about
+that volume, not about a table, so **enforcement reads `statfs` on
+`DATA_DISK_PATH`** — the only figure that also counts WAL frames, SQLite temp
+files, free pages the file has not handed back, and anything else sharing the
+volume. Per-component file sizes are attribution, never enforcement: a budget
+enforced against summed file sizes reports 60% while `write()` returns ENOSPC.
+
+| Tier | Allocation | Covers |
+|---|---|---|
+| Main relational tier | **4.5 GiB** | Raw trace/span/log exemplars, synthesized logs, investigations and other main-DB metadata, indexes, FTS5, database free pages |
+| `aggregate.db` | **1.5 GiB** | Aggregate buckets, delta log, baselines, identity tables, and their indexes |
+| DLQ | **0.5 GiB** | Existing `DLQ_MAX_DISK_MB` cap |
+| WAL/SHM + temp | **0.5 GiB** | `-wal`/`-shm` sidecars of both databases, SQLite temp files, TLS material, transient maintenance overhead |
+| Headroom | **1 GiB** | Mandatory and unused |
+
+**Unused allocation in one tier does not authorize another tier to consume the
+final 1 GiB.** The seven-day gate (#202) validates these numbers against
+measured high-water marks; it does not quietly reallocate them after a failure.
+
+Gauges: `otelcontext_disk_budget_bytes` (the effective ceiling — min of
+`DATA_DISK_BUDGET_MB` and the usable volume capacity),
+`otelcontext_disk_used_bytes`, `otelcontext_disk_used_ratio`,
+`otelcontext_disk_component_bytes{component}` and
+`otelcontext_disk_component_high_water_bytes{component}` for
+`main_db|aggregate_db|dlq|wal`, `otelcontext_disk_shedding_state`,
+`otelcontext_disk_shedding_transitions_total{from,to}`.
+
+#### Exemplar-tier retention
+
+`EXEMPLAR_RETENTION_DAYS=2` runs a **separate transactional purge** of exemplar
+traces, spans, logs, their FTS rows and expired weak references (spans whose
+trace row is gone), ahead of the `HOT_RETENTION_DAYS` purge on the same hourly
+tick. Trace and span deletes share one transaction per batch, so a reader never
+sees spans whose trace row has already gone. `logs_fts` is content-linked and
+trigger-synced, so index entries die with their rows. Aggregate retention stays
+seven days. Wired only in `AGGREGATE_MODE=aggregate`: in legacy and shadow the
+raw rows ARE the dataset and a two-day purge would be data loss.
+
+Arithmetic behind the 3 MiB default: two days = 576 five-minute windows;
+576 × 3 MiB = 1.69 GiB of charged payload; at the provisional 2× DB/index/FTS
+amplification ≈ 3.38 GiB, leaving ≈ 1.12 GiB of margin inside the 4.5 GiB main
+tier. 4 MiB/window consumes the whole tier under the same optimistic assumption
+— it stays configurable, it is not the default until #202 proves it fits.
+Throughput: `otelcontext_exemplar_rows_purged_total{table}`,
+`otelcontext_exemplar_purge_duration_seconds`.
+
+#### Synthesized-log metering
+
+Every log synthesized from a span event or span status reserves
+`len(body) + len(attributesJSON) + logRowFixedBytes` against its trace's
+per-trace budget AND the shared per-service/global window budgets, under
+`EXEMPLAR_SYNTH_LOGS_PER_SPAN` and `EXEMPLAR_SYNTH_LOGS_PER_TRACE`. They do
+**not** consume the ordinary log-exemplar quota — that budget is for logs a
+client actually sent — but they are not weightless either: a span carrying two
+hundred exception events used to write two hundred rows no budget had ever
+seen. Refusals drop the log, count
+`otelcontext_exemplar_dropped_total{signal="logs",reason}` with
+`synth_per_span|synth_per_trace|budget_bytes`, and stamp the trace `truncated`.
+
+#### Reservation lifecycle (no unconditional refunds)
+
+Bytes are **reserved** before a row is constructed, **committed** when the
+primary queue or the DLQ accepts the batch, and **released** only when the row
+is dropped before submission or permanently lost because both destinations
+refused it. Reserved bytes bind the cap exactly like committed ones. Once a
+submission is accepted the charge is **monotonic for that window**: displacing
+the trace later releases the count slot (a slot is a seat, not a byte) and
+never the bytes — refunding bytes already on disk is how a window writes past
+its cap. `Batch.Reservation` carries the charge to the submit boundary.
+
+#### Staged shedding, hysteresis, and the one ENOSPC exception
+
+| Volume usage | State | Behaviour |
+|---|---|---|
+| ≥ 90% | `errors_only` | Only error trace/log exemplars are admitted; healthy/slow/WARN raw retention off |
+| ≥ 95% | `raw_off` | ALL new raw exemplar admission off, exemplar DLQ fallback closed, immediate expired-exemplar purge + `wal_checkpoint(TRUNCATE)`, `/ready` → 503 |
+
+Hysteresis: recover from `raw_off` only below 90%, from `errors_only` only
+below 85%. A failed `statfs` HOLDS the current state — shedding because a
+syscall failed would be an outage caused by the safety mechanism.
+
+Raw shedding **never** turns a successful aggregate Export into a retryable
+failure. One exception: if the **authoritative** aggregate commit fails with
+`ENOSPC` or `SQLITE_FULL` (`aggregate.IsDiskFull`), the Export MUST fail with
+`RESOURCE_EXHAUSTED`/429 — under the durable-ACK contract a success response
+asserts the deltas are committed, and acknowledging data that was not stored is
+data loss with better branding. Shadow mode is unaffected: there the legacy raw
+path is still the source of truth.
 
 ## Security & Supply Chain
 

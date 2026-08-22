@@ -4,6 +4,7 @@ import (
 	"hash/fnv"
 	"math"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/RandomCodeSpace/otelcontext/internal/aggregate"
@@ -70,6 +71,14 @@ const (
 	exemplarReasonBudgetCount = "budget_count"
 	exemplarReasonBudgetBytes = "budget_bytes"
 	exemplarReasonStratum     = "stratum"
+	// Synthesized-log metering (#201 Q3). Synthesized logs ride a selected
+	// trace and never touch the ordinary log-exemplar quota, so their
+	// refusals need their own reasons or they would be invisible.
+	exemplarReasonSynthPerSpan  = "synth_per_span"
+	exemplarReasonSynthPerTrace = "synth_per_trace"
+	// Disk watchdog shedding (#201 Q5).
+	exemplarReasonShedErrorsOnly = "shed_errors_only"
+	exemplarReasonShedRawOff     = "shed_raw_off"
 )
 
 // ExemplarMetrics is the policy's view of the metric surface. It mirrors the
@@ -129,6 +138,13 @@ type ExemplarConfig struct {
 	MaxSpansPerTrace int   // Default 500
 	MaxBytesPerTrace int64 // Default 256 KiB
 
+	// SynthLogsPerSpan / SynthLogsPerTrace bound the logs synthesized from
+	// span events and span status (#201 Q3). Before this they were
+	// unmetered: a span carrying two hundred exception events wrote two
+	// hundred log rows that no budget had ever seen. Defaults 8 and 64.
+	SynthLogsPerSpan  int
+	SynthLogsPerTrace int
+
 	// WindowSize is the tumbling budget window. Defaults to the aggregate
 	// engine's window so exemplar budgets and aggregate buckets share edges.
 	WindowSize time.Duration
@@ -141,13 +157,15 @@ const (
 	DefaultExemplarTracesPerServiceWindow    = 25
 	DefaultExemplarTracesGlobalWindow        = 1500
 	DefaultExemplarBytesPerServiceWindow     = 512 * 1024
-	DefaultExemplarBytesGlobalWindow         = 8 * 1024 * 1024
+	DefaultExemplarBytesGlobalWindow         = 3 * 1024 * 1024
 	DefaultExemplarHealthyRate               = 0.005
 	DefaultExemplarStratumTopK               = 5
 	DefaultExemplarLogsErrorPerServiceWindow = 50
 	DefaultExemplarLogsWarnPerServiceWindow  = 20
 	DefaultExemplarMaxSpansPerTrace          = 500
 	DefaultExemplarMaxBytesPerTrace          = 256 * 1024
+	DefaultExemplarSynthLogsPerSpan          = 8
+	DefaultExemplarSynthLogsPerTrace         = 64
 )
 
 func (c *ExemplarConfig) applyDefaults() {
@@ -184,6 +202,12 @@ func (c *ExemplarConfig) applyDefaults() {
 	if c.MaxBytesPerTrace <= 0 {
 		c.MaxBytesPerTrace = DefaultExemplarMaxBytesPerTrace
 	}
+	if c.SynthLogsPerSpan <= 0 {
+		c.SynthLogsPerSpan = DefaultExemplarSynthLogsPerSpan
+	}
+	if c.SynthLogsPerTrace <= 0 {
+		c.SynthLogsPerTrace = DefaultExemplarSynthLogsPerTrace
+	}
 	if c.WindowSize <= 0 {
 		c.WindowSize = aggregate.WindowSize
 	}
@@ -196,14 +220,24 @@ func (c *ExemplarConfig) applyDefaults() {
 // complete-retained-trace contract (#163). Only SELECTED traces get one, so the
 // map is bounded by the per-service budget.
 type traceState struct {
-	hash      uint64
-	class     int
-	stratum   string
-	observed  int   // spans of this trace seen by the policy
-	retained  int   // spans actually handed to persistence
-	bytes     int64 // bytes actually handed to persistence
+	hash     uint64
+	class    int
+	stratum  string
+	observed int // spans of this trace seen by the policy
+	retained int // spans actually handed to persistence
+	// bytes is COMMITTED: rows a downstream destination accepted. It never
+	// decreases while the window lives (#201 Q4).
+	bytes int64
+	// reserved is held for rows built but not yet accepted anywhere. It
+	// converts to bytes on commit and evaporates on release.
+	reserved  int64
 	truncated bool
 	evicted   bool // displaced by a better-ranked trace; future spans stop
+	// synthPerSpan / synthTotal meter the logs synthesized from this trace's
+	// spans (#201 Q3). The map is bounded by MaxSpansPerTrace because only
+	// spans that actually synthesized a log get an entry.
+	synthPerSpan map[string]int
+	synthTotal   int
 }
 
 // stratumState holds the top-K smallest hashes selected for one
@@ -218,8 +252,13 @@ type serviceWindow struct {
 	traces  map[string]*traceState
 	strata  map[string]*stratumState
 	perName [exemplarClassCount]int
-	bytes   int64
-	logs    [2]int // [0] = ERROR/FATAL raw logs, [1] = WARN raw logs
+	// bytes is committed, reservedBytes is in flight. Both count against
+	// BytesPerServiceWindow: a reservation that has not committed yet is a
+	// row that is about to be written, and pretending otherwise is how a
+	// budget gets overshot by exactly one Export.
+	bytes         int64
+	reservedBytes int64
+	logs          [2]int // [0] = ERROR/FATAL raw logs, [1] = WARN raw logs
 }
 
 func newServiceWindow() *serviceWindow {
@@ -235,8 +274,9 @@ func (sw *serviceWindow) selectedCount() int {
 
 // globalWindow carries the instance-wide budgets for one window.
 type globalWindow struct {
-	traces int
-	bytes  int64
+	traces   int
+	bytes    int64
+	reserved int64
 }
 
 // windowKey identifies a (tenant, service, window) budget cell. Budgets are
@@ -264,6 +304,11 @@ type ExemplarPolicy struct {
 
 	globalMu sync.Mutex
 	global   map[int64]*globalWindow
+
+	// shed carries the disk watchdog's SheddingState (#201 Q5). Read on every
+	// admission, written rarely by the watchdog goroutine, so an atomic beats
+	// putting the hot path behind another mutex.
+	shed atomic.Int32
 }
 
 const exemplarShardCount = 16
@@ -366,6 +411,20 @@ func (p *ExemplarPolicy) AdmitSpan(in ExemplarSpan) bool {
 	sh.mu.Lock()
 	sw := sh.window(windowKey{tenant: in.Tenant, service: in.Service, window: window})
 
+	// Disk shedding outranks the complete-retained-trace contract (#201 Q5).
+	// At >=90% only error exemplars are admitted; at >=95% none are. A trace
+	// already selected in this window is cut short rather than continued, and
+	// stamped truncated so the persisted data says so instead of implying a
+	// short trace was all there was.
+	if reason, shed := p.shedSpan(class); shed {
+		if st, ok := sw.traces[in.TraceID]; ok && !st.evicted {
+			p.markTruncated(st)
+		}
+		sh.mu.Unlock()
+		p.cfg.Metrics.RecordExemplarDropped("traces", reason)
+		return false
+	}
+
 	// Already decided? Duplicates and later spans of the same trace re-select
 	// the same slot.
 	if st, ok := sw.traces[in.TraceID]; ok {
@@ -457,11 +516,175 @@ func (p *ExemplarPolicy) AdmitSpan(in ExemplarSpan) bool {
 	return true
 }
 
-// ChargeSpan meters the bytes a retained span actually hands to persistence and
+// Reservation lifecycle (#201 Q4).
+//
+// The old model charged bytes the moment a row was built and refunded the
+// global pool on nothing at all, while eviction refunded the count slot. That
+// is unsound in one direction that matters: a refund for bytes a queue had
+// already accepted lets the window write more than its budget, because the
+// refunded bytes are on disk. So:
+//
+//	reserve  before the row is constructed
+//	commit   when the primary queue or the DLQ accepts the batch
+//	release  only when the row is dropped BEFORE submission, or when both
+//	         destinations refused it and it is permanently gone
+//
+// Once a submission is accepted the charge is monotonic for that window. A
+// later, better-ranked trace displacing the selection releases the COUNT slot
+// (a slot is a seat, not a byte) and nothing else.
+//
+// Reservations are not safe for concurrent use. One per per-resource goroutine,
+// merged after the group finishes — which is exactly how Export already
+// structures its work.
+
+// exemplarReservationEntry is one reserved charge. It holds pointers to the
+// budget cells rather than their keys: a window cell can be pruned between
+// reserve and commit, and mutating a detached cell is harmless, whereas
+// re-looking-up a pruned key would silently drop the accounting.
+type exemplarReservationEntry struct {
+	shard *exemplarShard
+	sw    *serviceWindow
+	st    *traceState // nil for client logs, which belong to no selected trace
+	gw    *globalWindow
+	bytes int64
+	// span marks the entry as holding a retained-SPAN slot, so a release hands
+	// that slot back too. Synthesized logs also carry a traceState but never a
+	// span slot; decrementing st.retained for one would understate the
+	// retained/observed counts stamped on the trace row.
+	span bool
+}
+
+// ExemplarReservation accumulates one submission unit's reserved bytes.
+type ExemplarReservation struct {
+	p       *ExemplarPolicy
+	entries []exemplarReservationEntry
+	settled bool
+}
+
+// NewReservation opens a reservation. A nil policy yields a nil reservation,
+// and every method below is nil-safe, so the legacy and shadow paths need no
+// branches.
+func (p *ExemplarPolicy) NewReservation() *ExemplarReservation {
+	if p == nil {
+		return nil
+	}
+	return &ExemplarReservation{p: p}
+}
+
+// Bytes reports the total reserved so far. Diagnostic surface.
+func (r *ExemplarReservation) Bytes() int64 {
+	if r == nil {
+		return 0
+	}
+	var n int64
+	for _, e := range r.entries {
+		n += e.bytes
+	}
+	return n
+}
+
+// Len reports how many rows are reserved.
+func (r *ExemplarReservation) Len() int {
+	if r == nil {
+		return 0
+	}
+	return len(r.entries)
+}
+
+// Merge folds other into r and neutralizes other, so exactly one of them can
+// ever settle the charges.
+func (r *ExemplarReservation) Merge(other *ExemplarReservation) {
+	if r == nil || other == nil || other.settled {
+		return
+	}
+	if r.p == nil {
+		r.p = other.p
+	}
+	r.entries = append(r.entries, other.entries...)
+	other.entries = nil
+	other.settled = true
+}
+
+// Commit converts every reserved byte into a committed byte. Call it exactly
+// when a destination has accepted the rows. Idempotent.
+func (r *ExemplarReservation) Commit() {
+	if r == nil || r.settled || r.p == nil {
+		return
+	}
+	r.settled = true
+	for _, e := range r.entries {
+		r.p.commitEntry(e)
+	}
+	r.entries = nil
+}
+
+// Release gives every reserved byte back. Legitimate only while the rows have
+// NOT been accepted anywhere: dropped before submission, or refused by both the
+// primary queue and the DLQ. Idempotent.
+func (r *ExemplarReservation) Release() {
+	if r == nil || r.settled || r.p == nil {
+		return
+	}
+	r.settled = true
+	for _, e := range r.entries {
+		r.p.releaseEntry(e)
+	}
+	r.entries = nil
+}
+
+// commitEntry moves one charge from reserved to committed.
+func (p *ExemplarPolicy) commitEntry(e exemplarReservationEntry) {
+	e.shard.mu.Lock()
+	e.sw.reservedBytes -= e.bytes
+	e.sw.bytes += e.bytes
+	if e.st != nil {
+		e.st.reserved -= e.bytes
+		e.st.bytes += e.bytes
+	}
+	e.shard.mu.Unlock()
+
+	p.globalMu.Lock()
+	e.gw.reserved -= e.bytes
+	e.gw.bytes += e.bytes
+	p.globalMu.Unlock()
+}
+
+// releaseEntry drops one un-committed charge.
+func (p *ExemplarPolicy) releaseEntry(e exemplarReservationEntry) {
+	e.shard.mu.Lock()
+	e.sw.reservedBytes -= e.bytes
+	if e.st != nil {
+		e.st.reserved -= e.bytes
+		if e.span {
+			e.st.retained--
+		}
+	}
+	e.shard.mu.Unlock()
+
+	p.globalMu.Lock()
+	e.gw.reserved -= e.bytes
+	p.globalMu.Unlock()
+}
+
+// settle files an entry: into res when there is a submission boundary to wait
+// for, straight to committed when there is not. Caller must NOT hold the shard
+// lock.
+func (p *ExemplarPolicy) settle(res *ExemplarReservation, e exemplarReservationEntry) {
+	if res == nil {
+		p.commitEntry(e)
+		return
+	}
+	res.entries = append(res.entries, e)
+}
+
+// ReserveSpan meters the bytes a retained span will hand to persistence and
 // reports whether it fits. A false return means the row must be dropped: the
 // byte budget bound before the count budget did, and the trace is marked
 // truncated so the gap is visible in the persisted data rather than inferred.
-func (p *ExemplarPolicy) ChargeSpan(tenant, service, traceID string, ts time.Time, size int) bool {
+//
+// res may be nil, in which case the charge commits immediately — the caller is
+// asserting it has no submission boundary. Production paths always pass one.
+func (p *ExemplarPolicy) ReserveSpan(res *ExemplarReservation, tenant, service, traceID string, ts time.Time, size int) bool {
 	window := p.windowOf(ts)
 	sh := p.shardFor(service)
 	sh.mu.Lock()
@@ -472,22 +695,25 @@ func (p *ExemplarPolicy) ChargeSpan(tenant, service, traceID string, ts time.Tim
 		return false
 	}
 	n := int64(size)
-	if st.bytes+n > p.cfg.MaxBytesPerTrace || sw.bytes+n > p.cfg.BytesPerServiceWindow {
+	if st.bytes+st.reserved+n > p.cfg.MaxBytesPerTrace || sw.bytes+sw.reservedBytes+n > p.cfg.BytesPerServiceWindow {
 		p.markTruncated(st)
 		sh.mu.Unlock()
 		p.cfg.Metrics.RecordExemplarDropped("traces", exemplarReasonBudgetBytes)
 		return false
 	}
-	if !p.reserveGlobalBytes(window, n) {
+	gw, ok := p.reserveGlobalBytes(window, n)
+	if !ok {
 		p.markTruncated(st)
 		sh.mu.Unlock()
 		p.cfg.Metrics.RecordExemplarDropped("traces", exemplarReasonBudgetBytes)
 		return false
 	}
-	st.bytes += n
+	st.reserved += n
 	st.retained++
-	sw.bytes += n
+	sw.reservedBytes += n
 	sh.mu.Unlock()
+
+	p.settle(res, exemplarReservationEntry{shard: sh, sw: sw, st: st, gw: gw, bytes: n, span: true})
 	return true
 }
 
@@ -527,18 +753,22 @@ func (p *ExemplarPolicy) TraceStats(tenant, service, traceID string, ts time.Tim
 	return ExemplarTraceStats{Truncated: st.truncated, Retained: st.retained, Observed: st.observed}, true
 }
 
-// AdmitLog reports whether a raw log row may be persisted in aggregate mode.
-// INFO/DEBUG are aggregate-only and never raw; ERROR/FATAL get a per-service
-// window budget; WARN is opt-in (#161). Bytes are charged to the same
-// service/global byte budgets as spans — one pool, so a log flood cannot buy
-// itself past the trace budget.
+// ReserveLog reports whether a raw client log row may be persisted in
+// aggregate mode. INFO/DEBUG are aggregate-only and never raw; ERROR/FATAL get
+// a per-service window budget; WARN is opt-in (#161). Bytes are reserved
+// against the same service/global byte budgets as spans — one pool, so a log
+// flood cannot buy itself past the trace budget.
 //
 // size is the variable-length payload (body + serialized attributes); the
 // fixed row overhead is added here so callers do not have to know it.
-func (p *ExemplarPolicy) AdmitLog(tenant, service, severity string, ts time.Time, size int) bool {
+func (p *ExemplarPolicy) ReserveLog(res *ExemplarReservation, tenant, service, severity string, ts time.Time, size int) bool {
 	slot, ok := p.logSlot(severity)
 	if !ok {
 		// Not eligible at all — not an exemplar drop, never was one.
+		return false
+	}
+	if reason, shed := p.shedLog(slot); shed {
+		p.cfg.Metrics.RecordExemplarDropped("logs", reason)
 		return false
 	}
 	budget := p.cfg.LogsErrorPerServiceWindow
@@ -559,29 +789,168 @@ func (p *ExemplarPolicy) AdmitLog(tenant, service, severity string, ts time.Time
 		return false
 	}
 	n := int64(size + logRowFixedBytes)
-	if sw.bytes+n > p.cfg.BytesPerServiceWindow {
+	if sw.bytes+sw.reservedBytes+n > p.cfg.BytesPerServiceWindow {
 		sh.mu.Unlock()
 		p.cfg.Metrics.RecordExemplarDropped("logs", exemplarReasonBudgetBytes)
 		return false
 	}
-	if !p.reserveGlobalBytes(window, n) {
+	gw, ok := p.reserveGlobalBytes(window, n)
+	if !ok {
 		sh.mu.Unlock()
 		p.cfg.Metrics.RecordExemplarDropped("logs", exemplarReasonBudgetBytes)
 		return false
 	}
 	sw.logs[slot]++
-	sw.bytes += n
+	sw.reservedBytes += n
 	sh.mu.Unlock()
+
+	p.settle(res, exemplarReservationEntry{shard: sh, sw: sw, gw: gw, bytes: n})
 	return true
 }
 
-// AllowSynthesizedLog gates logs synthesized from span events / span status.
-// These ride along with a span the policy already admitted and budgeted, so
-// only the severity floor applies — re-budgeting them would punch holes in the
-// complete-retained-trace contract for no bytes saved.
-func (p *ExemplarPolicy) AllowSynthesizedLog(severity string) bool {
-	_, ok := p.logSlot(severity)
-	return ok
+// ReserveSynthesizedLog gates and METERS logs synthesized from span events and
+// span status (#201 Q3).
+//
+// These used to pass on a severity check alone, on the theory that they ride a
+// span the policy had already budgeted. They do ride it — and they are not
+// weightless. A span carrying two hundred exception events wrote two hundred
+// log rows that no budget had ever seen, which is precisely the kind of
+// unmetered write the 4.5 GiB main tier cannot absorb.
+//
+// So a synthesized log now reserves len(body) + len(attributesJSON) +
+// logRowFixedBytes against the selected trace's per-trace budget AND the shared
+// per-service and global window budgets, under its own per-span and per-trace
+// count caps. It does NOT consume the ordinary log-exemplar quota: that budget
+// exists for logs a client sent, and charging synthesized rows against it would
+// silently evict real ones.
+//
+// A refusal drops the log, counts a reasoned drop, and marks the trace
+// truncated so the gap appears in the persisted data.
+func (p *ExemplarPolicy) ReserveSynthesizedLog(res *ExemplarReservation, tenant, service, traceID, spanID, severity string, ts time.Time, size int) bool {
+	slot, ok := p.logSlot(severity)
+	if !ok {
+		// Aggregate-only severity. Never eligible, never a drop.
+		return false
+	}
+	if reason, shed := p.shedLog(slot); shed {
+		p.cfg.Metrics.RecordExemplarDropped("logs", reason)
+		return false
+	}
+
+	window := p.windowOf(ts)
+	sh := p.shardFor(service)
+	sh.mu.Lock()
+	sw := sh.window(windowKey{tenant: tenant, service: service, window: window})
+	st, ok := sw.traces[traceID]
+	if !ok || st.evicted {
+		// Its span is not retained, so the log would be dangling evidence.
+		sh.mu.Unlock()
+		return false
+	}
+	if st.synthTotal >= p.cfg.SynthLogsPerTrace {
+		p.markTruncated(st)
+		sh.mu.Unlock()
+		p.cfg.Metrics.RecordExemplarDropped("logs", exemplarReasonSynthPerTrace)
+		return false
+	}
+	if st.synthPerSpan[spanID] >= p.cfg.SynthLogsPerSpan {
+		p.markTruncated(st)
+		sh.mu.Unlock()
+		p.cfg.Metrics.RecordExemplarDropped("logs", exemplarReasonSynthPerSpan)
+		return false
+	}
+	n := int64(size + logRowFixedBytes)
+	if st.bytes+st.reserved+n > p.cfg.MaxBytesPerTrace || sw.bytes+sw.reservedBytes+n > p.cfg.BytesPerServiceWindow {
+		p.markTruncated(st)
+		sh.mu.Unlock()
+		p.cfg.Metrics.RecordExemplarDropped("logs", exemplarReasonBudgetBytes)
+		return false
+	}
+	gw, ok := p.reserveGlobalBytes(window, n)
+	if !ok {
+		p.markTruncated(st)
+		sh.mu.Unlock()
+		p.cfg.Metrics.RecordExemplarDropped("logs", exemplarReasonBudgetBytes)
+		return false
+	}
+	if st.synthPerSpan == nil {
+		st.synthPerSpan = make(map[string]int, 4)
+	}
+	st.synthPerSpan[spanID]++
+	st.synthTotal++
+	st.reserved += n
+	sw.reservedBytes += n
+	sh.mu.Unlock()
+
+	p.settle(res, exemplarReservationEntry{shard: sh, sw: sw, st: st, gw: gw, bytes: n})
+	return true
+}
+
+// SynthesizedLogEligible is the CHEAP half of ReserveSynthesizedLog: the
+// severity floor plus the shedding ladder, with no locks and no accounting.
+//
+// It exists so the OTLP path can refuse an INFO span event before marshaling
+// its attributes. Passing it is necessary, not sufficient — the caller must
+// still ReserveSynthesizedLog once it knows the row's size, and that call
+// re-checks everything this one did.
+func (p *ExemplarPolicy) SynthesizedLogEligible(severity string) bool {
+	slot, ok := p.logSlot(severity)
+	if !ok {
+		return false
+	}
+	_, shed := p.shedLog(slot)
+	return !shed
+}
+
+// SetShedding publishes the disk watchdog's current state to the policy.
+// Called from the watchdog goroutine; safe on a nil policy.
+func (p *ExemplarPolicy) SetShedding(s storage.SheddingState) {
+	if p == nil {
+		return
+	}
+	p.shed.Store(int32(s))
+}
+
+// Shedding reports the current shedding state. Safe on a nil policy.
+func (p *ExemplarPolicy) Shedding() storage.SheddingState {
+	if p == nil {
+		return storage.SheddingNone
+	}
+	return storage.SheddingState(p.shed.Load())
+}
+
+// DLQDisabled reports whether the exemplar DLQ fallback is closed. True at
+// raw-off: deferring an exemplar to the DLQ at 95% is still writing to the
+// disk that is about to fill (#201 Q5).
+func (p *ExemplarPolicy) DLQDisabled() bool {
+	return p.Shedding() >= storage.SheddingRawOff
+}
+
+// shedSpan applies the shedding ladder to a span's priority class.
+func (p *ExemplarPolicy) shedSpan(class int) (string, bool) {
+	switch p.Shedding() {
+	case storage.SheddingRawOff:
+		return exemplarReasonShedRawOff, true
+	case storage.SheddingErrorsOnly:
+		if class != exemplarClassError {
+			return exemplarReasonShedErrorsOnly, true
+		}
+	}
+	return "", false
+}
+
+// shedLog applies the shedding ladder to a log slot, returning the drop reason
+// when the log must be refused. slot 0 is ERROR/FATAL, slot 1 is WARN.
+func (p *ExemplarPolicy) shedLog(slot int) (string, bool) {
+	switch p.Shedding() {
+	case storage.SheddingRawOff:
+		return exemplarReasonShedRawOff, true
+	case storage.SheddingErrorsOnly:
+		if slot != 0 {
+			return exemplarReasonShedErrorsOnly, true
+		}
+	}
+	return "", false
 }
 
 // logSlot maps a severity onto its raw-retention slot: 0 = ERROR/FATAL,
@@ -723,8 +1092,11 @@ func (p *ExemplarPolicy) evictLocked(sw *serviceWindow, window int64, traceID st
 		}
 	}
 	// The evicted trace keeps its traceState (so its own future spans are
-	// refused deterministically) but returns its global slot; its already
-	// charged bytes are NOT refunded, because those bytes really were written.
+	// refused deterministically) and returns its global COUNT slot. Its bytes
+	// are not touched here in either direction (#201 Q4): committed bytes are
+	// on disk and refunding them would let the window write past its budget,
+	// and reserved bytes belong to rows already handed to the submit path,
+	// which will commit or release them itself.
 	p.releaseGlobalTrace(window)
 	p.cfg.Metrics.RecordExemplarEviction()
 	p.pruneEvictedLocked(sw)
@@ -761,8 +1133,9 @@ func (p *ExemplarPolicy) reserveGlobalTrace(window int64) bool {
 	return true
 }
 
-// releaseGlobalTrace returns one instance-wide slot for the window. Bytes are
-// deliberately not refunded — those bytes really were written.
+// releaseGlobalTrace returns one instance-wide COUNT slot for the window. Bytes
+// are never refunded here: they are settled by the reservation lifecycle, which
+// is the only place that knows whether a destination accepted the row.
 func (p *ExemplarPolicy) releaseGlobalTrace(window int64) {
 	p.globalMu.Lock()
 	defer p.globalMu.Unlock()
@@ -771,16 +1144,22 @@ func (p *ExemplarPolicy) releaseGlobalTrace(window int64) {
 	}
 }
 
-// reserveGlobalBytes takes n bytes from the instance-wide window budget.
-func (p *ExemplarPolicy) reserveGlobalBytes(window int64, n int64) bool {
+// reserveGlobalBytes holds n bytes of the instance-wide window budget and
+// returns the cell holding them, so commit/release can find it again without a
+// map lookup that a window prune could have invalidated.
+//
+// Reserved bytes count against the cap exactly like committed ones. They are
+// rows that are about to be written; treating them as free is how a budget
+// overshoots by one Export per window.
+func (p *ExemplarPolicy) reserveGlobalBytes(window int64, n int64) (*globalWindow, bool) {
 	p.globalMu.Lock()
 	defer p.globalMu.Unlock()
 	gw := p.globalFor(window)
-	if gw.bytes+n > p.cfg.BytesGlobalWindow {
-		return false
+	if gw.bytes+gw.reserved+n > p.cfg.BytesGlobalWindow {
+		return nil, false
 	}
-	gw.bytes += n
-	return true
+	gw.reserved += n
+	return gw, true
 }
 
 // globalFor returns the global cell for a window, pruning older ones. Caller
@@ -818,6 +1197,46 @@ func (p *ExemplarPolicy) SelectedTraces(tenant, service string, ts time.Time) []
 		}
 	}
 	return out
+}
+
+// WindowBytes returns the instance-wide (committed, reserved) bytes for the
+// window containing ts. Test and diagnostic surface: the monotonicity property
+// of #201 Q4 is stated over the committed number.
+func (p *ExemplarPolicy) WindowBytes(ts time.Time) (committed, reserved int64) {
+	window := p.windowOf(ts)
+	p.globalMu.Lock()
+	defer p.globalMu.Unlock()
+	gw, ok := p.global[window]
+	if !ok {
+		return 0, 0
+	}
+	return gw.bytes, gw.reserved
+}
+
+// GlobalTraceSlots returns how many instance-wide trace slots the window
+// containing ts is holding. Test and diagnostic surface.
+func (p *ExemplarPolicy) GlobalTraceSlots(ts time.Time) int {
+	window := p.windowOf(ts)
+	p.globalMu.Lock()
+	defer p.globalMu.Unlock()
+	if gw, ok := p.global[window]; ok {
+		return gw.traces
+	}
+	return 0
+}
+
+// ServiceWindowBytes returns the (committed, reserved) bytes of one
+// (tenant, service, window) budget cell. Test and diagnostic surface.
+func (p *ExemplarPolicy) ServiceWindowBytes(tenant, service string, ts time.Time) (committed, reserved int64) {
+	window := p.windowOf(ts)
+	sh := p.shardFor(service)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	sw, ok := sh.services[windowKey{tenant: tenant, service: service, window: window}]
+	if !ok {
+		return 0, 0
+	}
+	return sw.bytes, sw.reservedBytes
 }
 
 // spanRowBytes estimates the bytes a span row hands to persistence. It counts

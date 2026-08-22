@@ -321,6 +321,33 @@ type Metrics struct {
 	// and causal-analysis tools report partial coverage for them (#163).
 	ExemplarTruncatedTotal prometheus.Counter
 
+	// --- 8 GiB data budget and disk watchdog (#201 Q1/Q5) ---
+	// DiskBudgetBytes — the ENFORCEMENT ceiling actually in effect: the lower
+	// of DATA_DISK_BUDGET_MB and the usable volume capacity. A volume smaller
+	// than the configured budget does not grow because the config says so.
+	DiskBudgetBytes prometheus.Gauge
+	// DiskUsedBytes / DiskUsedRatio — statfs allocation on the data volume and
+	// its fraction of DiskBudgetBytes. This pair, not summed file sizes, is
+	// what the shedding ladder reads.
+	DiskUsedBytes prometheus.Gauge
+	DiskUsedRatio prometheus.Gauge
+	// DiskComponentBytes / DiskComponentHighWaterBytes — per-tier attribution
+	// against the budget table (main_db, aggregate_db, dlq, wal). The
+	// high-water gauge is what the seven-day gate (#202) validates the table
+	// against; the instantaneous gauge alone hides the peak that mattered.
+	DiskComponentBytes          *prometheus.GaugeVec
+	DiskComponentHighWaterBytes *prometheus.GaugeVec
+	// DiskSheddingState — 0 none, 1 errors_only, 2 raw_off.
+	DiskSheddingState prometheus.Gauge
+	// DiskSheddingTransitionsTotal — every state change, labeled from/to.
+	// Flapping is visible here and nowhere else.
+	DiskSheddingTransitionsTotal *prometheus.CounterVec
+	// ExemplarRowsPurgedTotal / ExemplarPurgeDurationSeconds — throughput of
+	// the exemplar-tier purge (EXEMPLAR_RETENTION_DAYS), separate from the
+	// HOT_RETENTION_DAYS counters so the two retentions are distinguishable.
+	ExemplarRowsPurgedTotal      *prometheus.CounterVec
+	ExemplarPurgeDurationSeconds prometheus.Histogram
+
 	// Atomic counters for JSON health endpoint (avoids scraping Prometheus)
 	totalIngested  atomic.Int64
 	activeConns    atomic.Int64
@@ -758,6 +785,43 @@ func New() *Metrics {
 	m.ExemplarTruncatedTotal = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "otelcontext_exemplar_truncated_total",
 		Help: "Retained traces forced past max spans/bytes. Persisted with truncated=true plus retained/observed span counts.",
+	})
+	m.DiskBudgetBytes = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "otelcontext_disk_budget_bytes",
+		Help: "Enforcement ceiling for the data volume: min(DATA_DISK_BUDGET_MB, usable volume capacity).",
+	})
+	m.DiskUsedBytes = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "otelcontext_disk_used_bytes",
+		Help: "statfs allocation on the data volume in bytes.",
+	})
+	m.DiskUsedRatio = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "otelcontext_disk_used_ratio",
+		Help: "Data volume allocation as a fraction of the enforcement ceiling. Shedding starts at 0.90, raw-off at 0.95.",
+	})
+	m.DiskComponentBytes = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "otelcontext_disk_component_bytes",
+		Help: "Per-component disk attribution against the 8 GiB budget table. component=main_db|aggregate_db|dlq|wal.",
+	}, []string{"component"})
+	m.DiskComponentHighWaterBytes = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "otelcontext_disk_component_high_water_bytes",
+		Help: "Highest observed value of otelcontext_disk_component_bytes since process start, by component.",
+	}, []string{"component"})
+	m.DiskSheddingState = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "otelcontext_disk_shedding_state",
+		Help: "Raw-retention shedding level: 0 none, 1 errors_only (>=90%), 2 raw_off (>=95%).",
+	})
+	m.DiskSheddingTransitionsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "otelcontext_disk_shedding_transitions_total",
+		Help: "Disk shedding state changes, labeled by the states moved between.",
+	}, []string{"from", "to"})
+	m.ExemplarRowsPurgedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "otelcontext_exemplar_rows_purged_total",
+		Help: "Rows removed by the exemplar-tier purge (EXEMPLAR_RETENTION_DAYS), by table.",
+	}, []string{"table"})
+	m.ExemplarPurgeDurationSeconds = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "otelcontext_exemplar_purge_duration_seconds",
+		Help:    "Wall time of one exemplar-tier purge pass.",
+		Buckets: prometheus.DefBuckets,
 	})
 	return m
 }

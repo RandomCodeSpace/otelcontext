@@ -483,6 +483,11 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 		// request-local and lock-free, so each goroutine owns its own reducer
 		// and they are merged once below.
 		reducer *aggregate.Reducer
+		// exemplarRes holds the exemplar bytes this resource batch RESERVED
+		// (#201 Q4). Reservations are per-goroutine and merged by tenant
+		// below, then committed when a destination accepts the batch or
+		// released when nothing does.
+		exemplarRes *ExemplarReservation
 	}
 
 	results := make([]batchResult, len(req.ResourceSpans))
@@ -508,6 +513,9 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 			// exactly one Trace row per trace instead of one per span.
 			traceIdx := make(map[string]int)
 			var localHasErr, localHasSlow bool
+			// One reservation per resource batch; nil when no exemplar policy
+			// is wired (legacy/shadow), which every method tolerates.
+			exemplarRes := s.exemplar.NewReservation()
 
 			// Aggregate accounting. One arrival time for the whole Export
 			// request (#160), captured above as `start`.
@@ -611,13 +619,15 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 					}
 					// Byte metering happens here, on the row that is actually
 					// handed to persistence, not on the OTLP wire message —
-					// the byte budget is a budget on what gets written. A
-					// refusal drops this span and marks the trace truncated;
-					// the trace row below still lands so the gap is recorded
-					// in the data rather than left to be inferred.
+					// the byte budget is a budget on what gets written. The
+					// bytes are RESERVED, not charged: they become a charge
+					// when a destination accepts the batch and evaporate if
+					// none does (#201 Q4). A refusal drops this span and marks
+					// the trace truncated; the trace row below still lands so
+					// the gap is recorded in the data rather than inferred.
 					keepSpan := true
 					if s.exemplar != nil {
-						keepSpan = s.exemplar.ChargeSpan(tenantID, serviceName, traceIDHex, startTime, spanRowBytes(&sModel))
+						keepSpan = s.exemplar.ReserveSpan(exemplarRes, tenantID, serviceName, traceIDHex, startTime, spanRowBytes(&sModel))
 					}
 					if keepSpan {
 						localSpans = append(localSpans, sModel)
@@ -678,10 +688,10 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 						if !shouldIngestSeverity(severity, s.minSeverity) {
 							continue
 						}
-						// Aggregate mode: INFO/DEBUG never persist raw (#161).
-						// Only the severity floor applies — these logs belong
-						// to a span the policy already selected and budgeted.
-						if s.exemplar != nil && !s.exemplar.AllowSynthesizedLog(severity) {
+						// Cheap gate before the attribute marshal: an INFO span
+						// event is aggregate-only in aggregate mode and must
+						// not cost a JSON encode to find that out.
+						if s.exemplar != nil && !s.exemplar.SynthesizedLogEligible(severity) {
 							continue
 						}
 
@@ -694,6 +704,19 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 						}
 
 						eventAttrs, _ := json.Marshal(event.Attributes)
+
+						// Aggregate mode: INFO/DEBUG never persist raw (#161),
+						// and every synthesized log that does is METERED
+						// against its trace's per-trace budget and the shared
+						// window budgets (#201 Q3). Riding a selected trace is
+						// not the same as being free.
+						if s.exemplar != nil && !s.exemplar.ReserveSynthesizedLog(
+							exemplarRes, tenantID, serviceName, traceIDHex, spanIDHex, severity,
+							time.Unix(0, int64(event.TimeUnixNano)), // #nosec G115 -- OTLP time in nanos: uint64 source fits int64 until year 2262
+							len(body)+len(eventAttrs),
+						) {
+							continue
+						}
 
 						l := storage.Log{
 							TenantID:       tenantID,
@@ -716,6 +739,16 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 							msg := span.Status.Message
 							if msg == "" {
 								msg = fmt.Sprintf("Span '%s' failed", span.Name)
+							}
+
+							// Metered like the event-derived logs above: the
+							// status fallback is one more row on the same
+							// budget. "{}" is the attributes payload.
+							if s.exemplar != nil && !s.exemplar.ReserveSynthesizedLog(
+								exemplarRes, tenantID, serviceName, traceIDHex, spanIDHex, "ERROR",
+								endTime, len(msg)+len("{}"),
+							) {
+								continue
 							}
 
 							l := storage.Log{
@@ -752,13 +785,14 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 
 			// Store results in pre-allocated slot (no mutex needed)
 			results[idx] = batchResult{
-				spans:   localSpans,
-				traces:  localTraces,
-				logs:    localLogs,
-				tenant:  tenantID,
-				hasErr:  localHasErr,
-				hasSlow: localHasSlow,
-				reducer: reducer,
+				spans:       localSpans,
+				traces:      localTraces,
+				logs:        localLogs,
+				tenant:      tenantID,
+				hasErr:      localHasErr,
+				hasSlow:     localHasSlow,
+				reducer:     reducer,
+				exemplarRes: exemplarRes,
 			}
 
 			return nil
@@ -779,11 +813,15 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 	// this collapses to exactly one group, i.e. the previous single-batch
 	// behaviour with Tenant now populated.
 	groups := newTenantGroups()
+	// Reservations merge along the same tenant boundary the batches do, so one
+	// Submit outcome settles exactly the bytes that Submit carried.
+	reservations := make(map[string]*ExemplarReservation, len(results))
 	for _, r := range results {
 		spansToInsert = append(spansToInsert, r.spans...)
 		tracesToUpsert = append(tracesToUpsert, r.traces...)
 		synthesizedLogs = append(synthesizedLogs, r.logs...)
 		groups.add(r.tenant, r.traces, r.spans, r.logs, r.hasErr, r.hasSlow)
+		mergeReservation(reservations, r.tenant, r.exemplarRes)
 		if r.reducer == nil {
 			continue
 		}
@@ -801,6 +839,10 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 	// it is a no-op here and runs after the submit loop instead; see the
 	// mode-conditional ordering note on applyAggregatePre.
 	if err := applyAggregatePre(s.aggregateEngine, merged); err != nil {
+		// Nothing was submitted, so nothing was written: the reserved bytes
+		// belong back in the window budget (#201 Q4). The client will retry
+		// and reserve them again.
+		releaseReservations(reservations)
 		return nil, err
 	}
 
@@ -836,13 +878,15 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 				HasSlow:      g.hasSlow,
 				SpanCallback: s.spanCallback,
 				LogCallback:  s.logCallback,
+				Reservation:  reservations[g.tenant],
 			})
 		}
 		// Selected raw exemplars for the trace signal are the retained SPANS.
 		// Trace rows are per-trace bookkeeping and synthesized logs were never
 		// sent by the client, so neither is reportable to OTLP (#196).
 		out, err := submitExemplars(s.pipeline, s.metrics, SignalTraces, batches,
-			aggregateACK(s.aggregateEngine), func(b *Batch) int { return len(b.Spans) })
+			aggregateACK(s.aggregateEngine), s.exemplar.DLQDisabled(),
+			func(b *Batch) int { return len(b.Spans) })
 		if err != nil {
 			if errors.Is(err, ErrQueueFull) {
 				return nil, grpcstatus.Errorf(codes.ResourceExhausted, "ingest pipeline at capacity")
@@ -883,6 +927,7 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 	if len(spansToInsert) > 0 {
 		if err := s.repo.BatchCreateSpans(spansToInsert); err != nil {
 			slog.Error("❌ Failed to insert spans", "error", err)
+			releaseReservations(reservations)
 			return nil, err
 		}
 		// Notify GraphRAG of persisted spans
@@ -892,6 +937,12 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 			}
 		}
 	}
+
+	// Synchronous fallback has no queue: the rows are either in the DB by now
+	// or they errored out above (which returns before this point for spans).
+	// Either way the submission boundary has passed, so the reservation
+	// settles here.
+	commitReservations(reservations)
 
 	if len(synthesizedLogs) > 0 {
 		if err := s.repo.BatchCreateLogs(synthesizedLogs); err != nil {
@@ -929,6 +980,8 @@ func (s *LogsServer) Export(ctx context.Context, req *collogspb.ExportLogsServic
 	// One reducer per resource batch (reduction is request-local and not
 	// concurrency-safe); merged into one after the group finishes.
 	reducers := make([]*aggregate.Reducer, len(req.ResourceLogs))
+	// Per-resource exemplar reservations, merged by tenant below (#201 Q4).
+	logReservations := make([]*ExemplarReservation, len(req.ResourceLogs))
 
 	g, _ := errgroup.WithContext(ctx)
 
@@ -944,6 +997,7 @@ func (s *LogsServer) Export(ctx context.Context, req *collogspb.ExportLogsServic
 			tenantID := resolveTenant(ctx, resourceLogs.Resource.Attributes, s.defaultTenant, s.trustResourceTenant)
 
 			localLogs := make([]storage.Log, 0)
+			exemplarRes := s.exemplar.NewReservation()
 
 			var reducer *aggregate.Reducer
 			if s.aggregateEngine != nil {
@@ -989,7 +1043,7 @@ func (s *LogsServer) Export(ctx context.Context, req *collogspb.ExportLogsServic
 					// WARN opt-in, INFO/DEBUG aggregate-only (#161). The
 					// reduction above already accounted every one of them.
 					if s.exemplar != nil {
-						if !s.exemplar.AdmitLog(tenantID, serviceName, severity, timestamp, len(bodyStr)+len(attrs)) {
+						if !s.exemplar.ReserveLog(exemplarRes, tenantID, serviceName, severity, timestamp, len(bodyStr)+len(attrs)) {
 							continue
 						}
 					}
@@ -1010,6 +1064,7 @@ func (s *LogsServer) Export(ctx context.Context, req *collogspb.ExportLogsServic
 
 			logResults[idx] = localLogs
 			logTenants[idx] = tenantID
+			logReservations[idx] = exemplarRes
 
 			return nil
 		})
@@ -1022,9 +1077,11 @@ func (s *LogsServer) Export(ctx context.Context, req *collogspb.ExportLogsServic
 	// See the TraceServer.Export merge for the grouping rationale; with
 	// TRUST_RESOURCE_TENANT off this yields exactly one group.
 	groups := newTenantGroups()
+	reservations := make(map[string]*ExemplarReservation, len(logResults))
 	for idx, lr := range logResults {
 		logsToInsert = append(logsToInsert, lr...)
 		groups.add(logTenants[idx], nil, nil, lr, hasPriorityLog(lr), false)
+		mergeReservation(reservations, logTenants[idx], logReservations[idx])
 	}
 
 	// Apply the request's aggregate deltas. This happens before the early
@@ -1044,10 +1101,14 @@ func (s *LogsServer) Export(ctx context.Context, req *collogspb.ExportLogsServic
 	// Mode-conditional ordering, same contract as TraceServer.Export: pre in
 	// aggregate/legacy, post (after the submit loop) in shadow.
 	if err := applyAggregatePre(s.aggregateEngine, mergedReducer); err != nil {
+		releaseReservations(reservations)
 		return nil, err
 	}
 
 	if len(logsToInsert) == 0 {
+		// No rows means no reservations, but settle explicitly rather than
+		// relying on that: a released empty reservation costs nothing.
+		releaseReservations(reservations)
 		// Nothing raw to submit, so the raw path's outcome is trivially
 		// non-retry and the shadow aggregate applies immediately.
 		if err := applyAggregatePost(s.aggregateEngine, mergedReducer); err != nil {
@@ -1075,12 +1136,14 @@ func (s *LogsServer) Export(ctx context.Context, req *collogspb.ExportLogsServic
 				Logs:        g.logs,
 				HasError:    g.hasErr,
 				LogCallback: s.logCallback,
+				Reservation: reservations[g.tenant],
 			})
 		}
 		// Every log row here came off the wire — the log signal synthesizes
 		// nothing — so the whole batch is selected raw exemplars.
 		out, err := submitExemplars(s.pipeline, s.metrics, SignalLogs, batches,
-			aggregateACK(s.aggregateEngine), func(b *Batch) int { return len(b.Logs) })
+			aggregateACK(s.aggregateEngine), s.exemplar.DLQDisabled(),
+			func(b *Batch) int { return len(b.Logs) })
 		if err != nil {
 			if errors.Is(err, ErrQueueFull) {
 				return nil, grpcstatus.Errorf(codes.ResourceExhausted, "ingest pipeline at capacity")
@@ -1103,8 +1166,10 @@ func (s *LogsServer) Export(ctx context.Context, req *collogspb.ExportLogsServic
 	// Synchronous fallback (preserves original behavior when async is disabled).
 	if err := s.repo.BatchCreateLogs(logsToInsert); err != nil {
 		slog.Error("❌ Failed to insert logs", "error", err)
+		releaseReservations(reservations)
 		return nil, err
 	}
+	commitReservations(reservations)
 	if s.logCallback != nil {
 		for _, l := range logsToInsert {
 			s.logCallback(l)
@@ -1117,6 +1182,34 @@ func (s *LogsServer) Export(ctx context.Context, req *collogspb.ExportLogsServic
 	}
 
 	return &collogspb.ExportLogsServiceResponse{}, nil
+}
+
+// mergeReservation folds one resource batch's exemplar reservation into the
+// per-tenant reservation the matching Batch will carry.
+func mergeReservation(dst map[string]*ExemplarReservation, tenant string, res *ExemplarReservation) {
+	if res == nil || res.Len() == 0 {
+		return
+	}
+	if cur, ok := dst[tenant]; ok {
+		cur.Merge(res)
+		return
+	}
+	dst[tenant] = res
+}
+
+// commitReservations settles every tenant's reservation as written.
+func commitReservations(m map[string]*ExemplarReservation) {
+	for _, r := range m {
+		r.Commit()
+	}
+}
+
+// releaseReservations hands every tenant's reserved bytes back. Only correct
+// when nothing was submitted anywhere.
+func releaseReservations(m map[string]*ExemplarReservation) {
+	for _, r := range m {
+		r.Release()
+	}
 }
 
 // tenantGroup accumulates one Export's rows for a single tenant so the async
