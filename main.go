@@ -646,15 +646,18 @@ func main() {
 
 		// Recovery runs BEFORE the writer starts accepting Exports and before
 		// readiness flips: acknowledged-but-unfinalized deltas go back into the
-		// shards, windows whose lateness expired during downtime finalize, and
-		// durable baselines are seeded.
+		// shards, windows whose lateness expired during downtime finalize,
+		// durable baselines are seeded, and the topology projection is rebuilt
+		// over AGGREGATE_TOPOLOGY_RESTORE_HORIZON so a restart does not erase
+		// the recent service map (#194 finding 15).
 		aggRecovery = aggregate.NewRecoveryGate()
-		recoveryStats, err := aggregate.Recover(aggStore, aggEngine, aggWriter, time.Now())
+		recoveryStats, err := aggregate.Recover(aggStore, aggEngine, aggWriter, time.Now(),
+			aggregate.RecoverOptions{TopologyHorizon: cfg.AggregateTopologyRestoreHorizon})
 		if err != nil {
 			fatal("❌ Aggregate store recovery failed", err, "path", cfg.AggregateDBPath)
 		}
 		aggregate.LogRecovery(recoveryStats, cfg.AggregateDBPath)
-		aggStoreMetr.RecordRecovery(recoveryStats.Duration, recoveryStats.ReplayedRows, recoveryStats.FinalizedWindows)
+		aggStoreMetr.RecordRecovery(recoveryStats)
 
 		aggEngine.SetApplier(aggWriter)
 		aggWriter.Start()

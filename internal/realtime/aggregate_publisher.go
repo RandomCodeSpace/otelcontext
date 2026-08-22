@@ -19,9 +19,6 @@ type EnginePublisher struct {
 	engine *aggregate.Engine
 	// window is how far back the coalesced payload reaches.
 	window time.Duration
-	// edges supplies caller/callee topology, which is not aggregate data.
-	// nil is allowed and yields a node-only topology.
-	edges func(ctx context.Context) []storage.ServiceMapEdge
 	// tenant scopes the queries when the caller's context carries none. Since
 	// the handshake gate pins one tenant per socket, ctx normally decides; this
 	// stays the fallback for an unauthenticated (development) deployment.
@@ -37,7 +34,11 @@ type EnginePublisherConfig struct {
 	Window time.Duration
 	// Tenant scopes every query. Empty takes storage.DefaultTenantID.
 	Tenant string
-	// Edges supplies topology edges. Optional.
+	// Edges is IGNORED since #194 finding 15: topology edges come from the
+	// engine's own service-edge series, read in the same query as the nodes.
+	// The field remains so existing wiring compiles.
+	//
+	// Deprecated: supply nothing; QueryTopology carries the edges.
 	Edges func(ctx context.Context) []storage.ServiceMapEdge
 }
 
@@ -56,7 +57,6 @@ func NewEnginePublisher(cfg EnginePublisherConfig) *EnginePublisher {
 	return &EnginePublisher{
 		engine: cfg.Engine,
 		window: cfg.Window,
-		edges:  cfg.Edges,
 		tenant: cfg.Tenant,
 	}
 }
@@ -91,9 +91,11 @@ func (p *EnginePublisher) Snapshot(ctx context.Context, service string) *LiveSna
 		Revision: p.engine.Revision(),
 	}
 
-	// Topology edges are exemplar-fed, so the coalesced payload as a whole is
-	// "sampled": the counts are exact, the edges are not.
-	coverage := aggregate.CoverageSampled
+	// Nodes and edges are both engine-sourced and read over the same range
+	// (#194 finding 15), so the payload carries the engine's own coverage
+	// instead of the blanket "sampled" the exemplar-fed edge side-channel
+	// forced on it.
+	coverage := aggregate.CoverageFull
 	snap.Coverage = string(coverage)
 	snap.CoverageNote = coverage.Note()
 
@@ -140,7 +142,7 @@ func (p *EnginePublisher) Snapshot(ctx context.Context, service string) *LiveSna
 	if topo, err := p.engine.QueryTopology(q); err == nil {
 		sm := &storage.ServiceMapMetrics{
 			Nodes: make([]storage.ServiceMapNode, 0, len(topo.Nodes)),
-			Edges: []storage.ServiceMapEdge{},
+			Edges: make([]storage.ServiceMapEdge, 0, len(topo.Edges)),
 		}
 		for _, n := range topo.Nodes {
 			sm.Nodes = append(sm.Nodes, storage.ServiceMapNode{
@@ -150,10 +152,14 @@ func (p *EnginePublisher) Snapshot(ctx context.Context, service string) *LiveSna
 				AvgLatencyMs: n.AvgLatencyMs,
 			})
 		}
-		if p.edges != nil {
-			if e := p.edges(ctx); len(e) > 0 {
-				sm.Edges = e
-			}
+		for _, e := range topo.Edges {
+			sm.Edges = append(sm.Edges, storage.ServiceMapEdge{
+				Source:       e.Source,
+				Target:       e.Target,
+				CallCount:    e.CallCount,
+				AvgLatencyMs: e.AvgLatencyMs,
+				ErrorRate:    e.ErrorRate,
+			})
 		}
 		snap.ServiceMap = sm
 	} else {

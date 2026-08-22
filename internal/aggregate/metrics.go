@@ -236,8 +236,14 @@ func (r promStoreRecorder) RecordGC(stats GCStats, err error) {
 }
 
 // RecordRecovery implements StoreMetrics.
-func (r promStoreRecorder) RecordRecovery(d time.Duration, replayed, finalized int) {
-	r.m.AggregateRecoveryDurationSeconds.Set(d.Seconds())
-	r.m.AggregateRecoveryRows.WithLabelValues("replayed").Set(float64(replayed))
-	r.m.AggregateRecoveryRows.WithLabelValues("finalized_windows").Set(float64(finalized))
+func (r promStoreRecorder) RecordRecovery(stats RecoveryStats) {
+	r.m.AggregateRecoveryDurationSeconds.Set(stats.Duration.Seconds())
+	for class, n := range map[string]int{
+		"replayed":                  stats.ReplayedRows,
+		"finalized_windows":         stats.FinalizedWindows,
+		"topology_restored_rows":    stats.RestoredTopologyRows,
+		"topology_restored_windows": stats.RestoredTopologyWindows,
+	} {
+		r.m.AggregateRecoveryRows.WithLabelValues(class).Set(float64(n))
+	}
 }

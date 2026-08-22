@@ -19,9 +19,17 @@ import (
 //  3. Durable cumulative baselines are seeded into the tracker, so the first
 //     cumulative point after a restart converts instead of re-seeding.
 //
-// FINALIZED HISTORY NEVER HYDRATES INTO RAM. Only the delta log is read, and
-// only for windows still inside the mutable set — the bucket table is a read
-// path, not a startup path.
+// FINALIZED HISTORY NEVER HYDRATES INTO THE SHARDS. Only the delta log is
+// replayed, and only for windows still inside the mutable set.
+//
+// There is exactly ONE bounded exception, and it stops short of the shards:
+// step 4 rebuilds the engine's TOPOLOGY PROJECTION over a configured horizon
+// (#194 finding 15). Without it a restart erases the recent service map —
+// every node, edge and metric baseline — until enough new telemetry arrives to
+// re-derive one, while the numbers those entities describe are sitting in the
+// bucket table. The exception is bounded three ways: a horizon, a row cap, and
+// the projection's own retention cutoff. It writes to the projection only, so
+// no finalized window can re-enter the mutable set through it.
 //
 // Readiness is held false until this completes. A process that answers /ready
 // while its shards are half-populated would serve numbers that are wrong in a
@@ -38,6 +46,17 @@ type RecoveryStats struct {
 	ReplayedSeries int
 	// SeededBaselines counts cumulative baselines restored.
 	SeededBaselines int
+	// RestoredTopologyRows counts the durable rows the topology restore read:
+	// finalized bucket rows inside the horizon plus the replayed mutable rows,
+	// which are in the shards but not in the projection.
+	RestoredTopologyRows int
+	// RestoredTopologyWindows counts the (series, window) pairs that actually
+	// LANDED in the projection. It is lower than RestoredTopologyRows whenever
+	// the projection's cutoff or one of its caps refused a row.
+	RestoredTopologyWindows int
+	// RestoredTopologyTruncated reports that the row cap cut the horizon
+	// short. The restored topology is real but incomplete at its oldest end.
+	RestoredTopologyTruncated bool
 	// SkippedSeries counts delta rows whose series id no longer resolves —
 	// structurally impossible while registration and first delta share a
 	// transaction, so a non-zero value here is a corruption signal.
@@ -45,6 +64,31 @@ type RecoveryStats struct {
 	// Duration is the wall time of the whole recovery.
 	Duration time.Duration
 }
+
+// RecoverOptions configures the parts of recovery that are policy rather than
+// correctness. The zero value is the pre-#194 behaviour: replay only.
+type RecoverOptions struct {
+	// TopologyHorizon is how much FINALIZED history is rebuilt into the
+	// engine's topology projection. Zero disables the restore; anything past
+	// the projection's own horizon is clamped down to it, because a window the
+	// projection would prune on arrival is not worth reading.
+	TopologyHorizon time.Duration
+	// TopologyMaxRows caps the finalized rows one restore may read. Zero takes
+	// DefaultTopologyRestoreMaxRows. It is the second bound on startup cost:
+	// the horizon says how far back, this says how much.
+	TopologyMaxRows int
+}
+
+// DefaultTopologyRestoreMaxRows caps the finalized rows a topology restore
+// reads. At the default series budget a 30-minute horizon is six windows of at
+// most a few thousand series, so the cap is headroom rather than a routine
+// truncation — and when it does bind, it is reported, not hidden.
+const DefaultTopologyRestoreMaxRows = 20000
+
+// topologyRestoreSignals are the durable signals the projection is built from.
+// Log series are absent on purpose: the projection holds no log entities, so
+// reading them would be startup cost with no restored fact to show for it.
+var topologyRestoreSignals = []Signal{SignalTraceOp, SignalServiceEdge, SignalMetric}
 
 // RecoveryGate reports whether startup recovery has completed. The readiness
 // probe holds /ready at 503 until Done() is true.
@@ -72,7 +116,7 @@ func (g *RecoveryGate) Complete() {
 
 // Recover replays the durable store into the engine. It must run before the
 // writer starts accepting Exports and before readiness flips.
-func Recover(store Store, engine *Engine, w *Writer, now time.Time) (RecoveryStats, error) {
+func Recover(store Store, engine *Engine, w *Writer, now time.Time, opts RecoverOptions) (RecoveryStats, error) {
 	start := time.Now()
 	var stats RecoveryStats
 	if store == nil || engine == nil {
@@ -109,8 +153,99 @@ func Recover(store Store, engine *Engine, w *Writer, now time.Time) (RecoverySta
 	}
 	stats.SeededBaselines = seeded
 
+	// 4. Rebuild the topology projection over the configured finalized
+	//    horizon. It runs LAST because it reads what step 1 finalized, and it
+	//    touches no shard.
+	if err := restoreTopology(store, engine, w, now, rows, opts, &stats); err != nil {
+		return stats, err
+	}
+
 	stats.Duration = time.Since(start)
 	return stats, nil
+}
+
+// restoreTopology rebuilds the engine's topology projection from durable rows.
+//
+// Two sources, one fold. The finalized buckets inside the horizon are the part
+// that #194 finding 15 is about; the mutable delta rows step 2 replayed are
+// added because they are back in the SHARDS but not in the PROJECTION, and a
+// topology that stopped at the finalized watermark would show a hole between
+// the horizon and now.
+//
+// Nothing here writes to a shard, and the projection's retention cutoff still
+// applies — which is why the count reported is what the fold accepted, not
+// what the store returned.
+func restoreTopology(
+	store Store,
+	engine *Engine,
+	w *Writer,
+	now time.Time,
+	mutable []DeltaRow,
+	opts RecoverOptions,
+	stats *RecoveryStats,
+) error {
+	horizon := opts.TopologyHorizon
+	if horizon <= 0 {
+		return nil
+	}
+	if projected := engine.TopologyHorizon(); horizon > projected {
+		horizon = projected
+	}
+	limit := opts.TopologyMaxRows
+	if limit <= 0 {
+		limit = DefaultTopologyRestoreMaxRows
+	}
+	page, err := store.ReadFinalizedSince(WindowStart(now.Add(-horizon)), topologyRestoreSignals, limit)
+	if err != nil {
+		return fmt.Errorf("aggregate recovery: read finalized topology: %w", err)
+	}
+	rows := make([]DeltaRow, 0, len(page.Buckets)+len(mutable))
+	for _, b := range page.Buckets {
+		if b.Delta == nil {
+			continue
+		}
+		rows = append(rows, DeltaRow{SeriesID: b.SeriesID, WindowStart: b.WindowStart, Delta: b.Delta})
+	}
+	rows = append(rows, mutable...)
+	stats.RestoredTopologyRows = len(rows)
+	stats.RestoredTopologyTruncated = page.Truncated
+	if len(rows) == 0 {
+		return nil
+	}
+
+	keys, err := seriesKeys(store, w, distinctSeriesIDs(rows))
+	if err != nil {
+		return err
+	}
+	ids := make(map[SeriesWindowKey]topoIdentity, len(rows))
+	deltas := make(DeltaMap, len(rows))
+	for _, row := range rows {
+		key, ok := keys[row.SeriesID]
+		if !ok {
+			continue
+		}
+		id, ok := engine.topoIdentityFor(key)
+		if !ok {
+			continue
+		}
+		swk := SeriesWindowKey{Key: key, WindowStart: row.WindowStart}
+		if cur, ok := deltas[swk]; ok {
+			// Structurally unreachable — both sources are unique per
+			// (series, window) and cover disjoint windows — but merging into
+			// a FRESH delta rather than in place is what keeps it harmless if
+			// it ever happens: the mutable deltas are the same pointers the
+			// shards already hold.
+			merged := &AggregateDelta{}
+			merged.Merge(cur)
+			merged.Merge(row.Delta)
+			deltas[swk] = merged
+			continue
+		}
+		deltas[swk] = row.Delta
+		ids[swk] = id
+	}
+	stats.RestoredTopologyWindows = engine.RestoreTopology(ids, deltas)
+	return nil
 }
 
 // finalizeExpired finalizes every window whose lateness horizon expired.
@@ -246,9 +381,17 @@ func LogRecovery(stats RecoveryStats, path string) {
 		"replayed_rows", stats.ReplayedRows,
 		"replayed_series_windows", stats.ReplayedSeries,
 		"seeded_baselines", stats.SeededBaselines,
+		"restored_topology_rows", stats.RestoredTopologyRows,
+		"restored_topology_windows", stats.RestoredTopologyWindows,
+		"restored_topology_truncated", stats.RestoredTopologyTruncated,
 		"unresolved_series", stats.SkippedSeries,
 		"duration", stats.Duration,
 	)
+	if stats.RestoredTopologyTruncated {
+		slog.Warn("aggregate recovery: topology restore hit its row cap — the oldest part of the horizon was not restored",
+			"restored_rows", stats.RestoredTopologyRows,
+		)
+	}
 	if stats.SkippedSeries > 0 {
 		slog.Error("aggregate recovery: delta rows referenced unknown series — the store may be corrupt",
 			"rows", stats.SkippedSeries)

@@ -1,7 +1,6 @@
 package api
 
 import (
-	"context"
 	"encoding/json"
 	"log/slog"
 	"math"
@@ -248,12 +247,12 @@ func (s *Server) handleGetServiceMapMetrics(w http.ResponseWriter, r *http.Reque
 
 // serviceMapView produces the topology payload.
 //
-// In aggregate mode the NODES come from engine queries and are exact for
-// accepted telemetry. The EDGES do not: caller/callee identity is not part of
-// a SeriesKey, so no reducer emits a service-edge series today and the edge
-// metrics come from the GraphRAG topology store, which is fed by retained
-// exemplars. That is why the response is marked "sampled" rather than "full" —
-// the node counts are complete, the edges are not.
+// In aggregate mode BOTH halves come from one engine query over one tenant and
+// one range (#194 finding 15). Edges used to be supplemented from the GraphRAG
+// topology store — a different range, a different retention rule, exemplar-fed
+// counts — and the response said "sampled" to cover for it. The service-edge
+// series the reducer emits made that side-channel unnecessary, so the coverage
+// the engine reports is the coverage the response carries.
 func (s *Server) serviceMapView(r *http.Request, start, end time.Time) (views.ServiceMapMetrics, error) {
 	if !s.aggregateReads() {
 		metrics, err := s.repo.GetServiceMapMetrics(r.Context(), start, end)
@@ -270,31 +269,7 @@ func (s *Server) serviceMapView(r *http.Request, start, end time.Time) (views.Se
 	if err != nil {
 		return views.ServiceMapMetrics{}, err
 	}
-	return views.ServiceMapMetricsFromAggregate(res, s.topologyEdges(r.Context()), aggregate.CoverageSampled), nil
-}
-
-// topologyEdges reads caller/callee edges out of the GraphRAG service store.
-// The edges themselves are observed for every span before any retention gate,
-// but their call counts and latencies come from retained spans only.
-func (s *Server) topologyEdges(ctx context.Context) []views.ServiceMapEdge {
-	if s.graphRAG == nil {
-		return nil
-	}
-	all := s.graphRAG.AllServiceEdges(ctx)
-	edges := make([]views.ServiceMapEdge, 0, len(all))
-	for _, e := range all {
-		if e.Type != "CALLS" {
-			continue
-		}
-		edges = append(edges, views.ServiceMapEdge{
-			Source:       e.FromID,
-			Target:       e.ToID,
-			CallCount:    e.CallCount,
-			AvgLatencyMs: e.AvgMs,
-			ErrorRate:    e.ErrorRate,
-		})
-	}
-	return edges
+	return views.ServiceMapMetricsFromAggregate(res), nil
 }
 
 // handleGetMetricBuckets handles GET /api/metrics

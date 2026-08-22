@@ -241,6 +241,41 @@ type topoIdentity struct {
 
 type topoPair struct{ a, b string }
 
+// topoIdentityFor derives the projection identity of a DURABLE series.
+//
+// The fold path never reverses a dictionary ID — the reducer records the
+// identity strings alongside the delta. Startup restore has no reducer to ask,
+// so it reverses IDs here, which is safe for exactly the reason the fold path
+// could not rely on: by the time recovery runs, the durable dictionary is
+// warm. A series whose names no longer resolve is refused rather than folded
+// under an invented name.
+func (e *Engine) topoIdentityFor(key SeriesKey) (topoIdentity, bool) {
+	var kind topoKind
+	switch key.Signal {
+	case SignalTraceOp:
+		kind = topoTrace
+	case SignalServiceEdge:
+		kind = topoEdge
+	case SignalMetric:
+		kind = topoMetric
+	default:
+		return topoIdentity{}, false
+	}
+	tenant := e.nameByID(key.TenantID)
+	a := e.nameByID(key.ServiceID)
+	if tenant == "" || a == "" {
+		return topoIdentity{}, false
+	}
+	b := e.nameByID(key.NameID)
+	if b == "" && kind != topoTrace {
+		// An edge with no callee and a metric with no name are not facts.
+		// A trace series with an unresolvable operation still describes its
+		// service, so it folds as a service-only observation.
+		return topoIdentity{}, false
+	}
+	return topoIdentity{Kind: kind, Tenant: tenant, A: a, B: b}, true
+}
+
 type topoWindowState struct {
 	count      uint64
 	errors     uint64
@@ -314,12 +349,18 @@ func newTopologyProjection(cfg TopologyConfig, epoch uint64) *topologyProjection
 // fold merges one reduced Export request into the projection. revision is the
 // engine revision the deltas were applied under; a tenant's snapshot revision
 // advances only when one of its facts actually landed.
-func (p *topologyProjection) fold(now time.Time, revision uint64, ids map[SeriesWindowKey]topoIdentity, deltas DeltaMap) {
+//
+// It returns how many (series, window) deltas actually landed. The count is
+// what the startup restore reports: a row read from the store but dropped by
+// the retention cutoff or a projection cap was not restored, and saying it was
+// would make the restore counter a lie.
+func (p *topologyProjection) fold(now time.Time, revision uint64, ids map[SeriesWindowKey]topoIdentity, deltas DeltaMap) int {
 	if len(ids) == 0 {
-		return
+		return 0
 	}
 	cutoff := p.retainCutoff(now)
 
+	folded := 0
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	touched := make(map[*tenantTopology]struct{}, 1)
@@ -338,12 +379,14 @@ func (p *topologyProjection) fold(now time.Time, revision uint64, ids map[Series
 		}
 		if p.foldOne(tt, id, swk.WindowStart, d) {
 			touched[tt] = struct{}{}
+			folded++
 		}
 	}
 	for tt := range touched {
 		tt.revision = revision
 		p.pruneTenantLocked(tt, cutoff)
 	}
+	return folded
 }
 
 func (p *topologyProjection) retainCutoff(now time.Time) int64 {
