@@ -298,6 +298,15 @@ func main() {
 				return fmt.Errorf("DLQ replay metrics unmarshal failed: %w", err)
 			}
 			return repo.BatchCreateMetrics(metrics)
+		case ingest.DLQBatchType:
+			// Whole async-pipeline batch (#194 finding 11). Replayed through
+			// BatchCreateAll so the Trace->Span->Log FK ordering and the
+			// single-transaction atomicity of the primary path are preserved.
+			var payload ingest.DLQBatchPayload
+			if err := json.Unmarshal(envelope.Data, &payload); err != nil {
+				return fmt.Errorf("DLQ replay batch unmarshal failed: %w", err)
+			}
+			return repo.BatchCreateAll(payload.Traces, payload.Spans, payload.Logs)
 		default:
 			return fmt.Errorf("DLQ replay: unknown type %q", envelope.Type)
 		}
@@ -702,6 +711,10 @@ func main() {
 			MaxBytes: int64(cfg.IngestPipelineMaxBytes),
 		})
 		ingestPipeline.SetPerTenantCap(cfg.IngestPipelinePerTenantCap)
+		// Persist-failure sink. Without this a BatchCreateAll rollback drops
+		// the batch on the floor; with it the whole batch lands on disk and
+		// the replay worker re-runs it (#194 finding 11).
+		ingestPipeline.SetDLQ(dlq)
 
 		// Second-tier severity gate. Empty STORE_MIN_SEVERITY means "use the
 		// same threshold as INGEST_MIN_SEVERITY" — i.e. behavior is identical

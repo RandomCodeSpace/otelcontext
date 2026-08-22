@@ -49,7 +49,11 @@ Tenant identity flows into the request context on every write and read:
 - **gRPC:** `x-tenant-id` metadata key (see `internal/ingest/otlp.go`).
 - **OTLP resource attribute:** `tenant.id` on the resource overrides the header/metadata.
 
-When none are present, `DEFAULT_TENANT` (default `"default"`) is assigned. Every row in the relational DB carries a `tenant_id` column; every read method in `internal/storage/` scopes by the tenant in the request context (`Where("tenant_id = ?", tenant)`). Retention (`RetentionScheduler`) is **cross-tenant** — it purges by age, not by tenant.
+When none are present, `DEFAULT_TENANT` (default `"default"`) is assigned. The
+resolved tenant is stamped on every async-pipeline `Batch`, so
+`INGEST_PIPELINE_PER_TENANT_CAP` charges each tenant its own admission slot.
+When `OTLP_TRUST_RESOURCE_TENANT=true` and one Export carries resources for
+several tenants, the Export is split into one batch per tenant. Every row in the relational DB carries a `tenant_id` column; every read method in `internal/storage/` scopes by the tenant in the request context (`Where("tenant_id = ?", tenant)`). Retention (`RetentionScheduler`) is **cross-tenant** — it purges by age, not by tenant.
 
 ## Storage Architecture
 
@@ -154,6 +158,20 @@ Uses typed envelopes for all data types:
 {"type": "logs|spans|traces|metrics", "data": [...]}
 ```
 Legacy format (raw `[]storage.Log` JSON) is supported for backward compatibility.
+
+A fifth envelope type carries a whole failed async-pipeline batch, whose `data`
+is an object rather than an array so the three signal slices replay through a
+single `BatchCreateAll` transaction (preserving Trace→Span→Log FK ordering):
+```json
+{"type": "batch", "data": {"tenant": "...", "signal": "traces|logs", "traces": [...], "spans": [...], "logs": [...]}}
+```
+`Pipeline.SetDLQ()` wires the sink; without it a `BatchCreateAll` failure still
+drops the batch (pre-existing behaviour). Outcomes are counted on
+`otelcontext_ingest_pipeline_dlq_total{signal,result}` —
+`result=enqueued` (durable, awaiting replay), `enqueue_failed` or `no_sink`
+(batch lost). Replay is **at-least-once**: traces and spans collapse duplicates
+on their composite unique indexes, logs have no stable OTLP identifier and can
+duplicate on replay.
 
 ## Shutdown Order
 

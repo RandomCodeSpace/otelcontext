@@ -99,6 +99,39 @@ func (b *Batch) Priority() bool { return b.HasError || b.HasSlow }
 // HTTP 429 with a Retry-After hint so OTLP clients back off cleanly.
 var ErrQueueFull = errors.New("ingest pipeline at capacity")
 
+// DLQBatchType is the `type` discriminator of the typed DLQ envelope used
+// for a whole failed pipeline batch. It extends the existing
+// {"type":"logs|spans|traces|metrics","data":[...]} family with a fifth
+// shape whose `data` is an object rather than an array, because the three
+// signal slices of one Batch must be replayed through a single
+// BatchCreateAll transaction to preserve the Trace->Span->Log FK ordering
+// the pipeline enforces on the primary path.
+const DLQBatchType = "batch"
+
+// DLQBatchPayload is the `data` member of a DLQBatchType envelope.
+type DLQBatchPayload struct {
+	Tenant string          `json:"tenant,omitempty"`
+	Signal string          `json:"signal,omitempty"`
+	Traces []storage.Trace `json:"traces,omitempty"`
+	Spans  []storage.Span  `json:"spans,omitempty"`
+	Logs   []storage.Log   `json:"logs,omitempty"`
+}
+
+// DLQBatchEnvelope is the on-disk form of a batch the pipeline could not
+// persist. main.go's replay handler decodes it and re-runs BatchCreateAll.
+type DLQBatchEnvelope struct {
+	Type string          `json:"type"`
+	Data DLQBatchPayload `json:"data"`
+}
+
+// BatchSink is the slice of the Dead Letter Queue the Pipeline depends on.
+// *queue.DeadLetterQueue satisfies it. Declaring it here (rather than
+// importing internal/queue) keeps the package layering one-directional and
+// lets tests inject a fake without touching the filesystem.
+type BatchSink interface {
+	Enqueue(batch any) error
+}
+
 // PipelineConfig holds the tunables for a Pipeline.
 type PipelineConfig struct {
 	Capacity      int     // total queue depth across all signal types
@@ -182,6 +215,8 @@ type Pipeline struct {
 	rejectedBytes   atomic.Int64
 	processFailures atomic.Int64
 	tenantDropped   atomic.Int64
+	dlqEnqueued     atomic.Int64
+	dlqFailed       atomic.Int64
 
 	// inFlightBytes tracks the approxBytes() sum of every batch currently
 	// in the queue or being processed. Reserved in Submit before the
@@ -206,6 +241,11 @@ type Pipeline struct {
 	// IngestMinSeverity at the receiver is also persisted.
 	storeMinSeverity int
 	storeFiltered    atomic.Int64
+
+	// dlq receives batches whose persist transaction failed. Nil (the
+	// default) keeps the historical behaviour — log, count, drop — which is
+	// what the pipeline's own tests rely on.
+	dlq BatchSink
 
 	stopCh chan struct{}
 	once   sync.Once
@@ -288,6 +328,22 @@ func (p *Pipeline) SetPerTenantCap(n int) {
 		n = 0
 	}
 	p.perTenantCap = n
+}
+
+// SetDLQ wires the Dead Letter Queue that receives batches whose persist
+// transaction failed. Without it the pipeline logs the failure and drops the
+// batch (the pre-#194 behaviour, still the default so tests and the
+// synchronous fallback path are unaffected).
+//
+// Replay is at-least-once, not exactly-once. Traces and spans collapse
+// duplicates on their composite unique indexes, so replaying an
+// already-persisted batch is a no-op for them; logs have no stable OTLP
+// identifier and a replay after a partially-visible commit can duplicate log
+// rows. That trade is deliberate — losing the batch outright is worse.
+//
+// Startup-only — call before Start().
+func (p *Pipeline) SetDLQ(sink BatchSink) {
+	p.dlq = sink
 }
 
 // SetStoreMinSeverity configures the second-tier severity gate applied at
@@ -455,6 +511,8 @@ func (p *Pipeline) Stats() PipelineStats {
 		RejectedFull:    p.rejectedFull.Load(),
 		RejectedBytes:   p.rejectedBytes.Load(),
 		ProcessFailures: p.processFailures.Load(),
+		DLQEnqueued:     p.dlqEnqueued.Load(),
+		DLQFailed:       p.dlqFailed.Load(),
 		StoreFiltered:   p.storeFiltered.Load(),
 		QueueDepth:      len(p.queue),
 		Capacity:        p.cfg.Capacity,
@@ -471,6 +529,8 @@ type PipelineStats struct {
 	RejectedFull    int64
 	RejectedBytes   int64 // batches rejected because the byte cap was exceeded
 	ProcessFailures int64
+	DLQEnqueued     int64 // failed batches durably handed to the DLQ
+	DLQFailed       int64 // failed batches the DLQ itself refused (data lost)
 	StoreFiltered   int64 // logs dropped by STORE_MIN_SEVERITY at persist time
 	QueueDepth      int
 	Capacity        int
@@ -571,6 +631,10 @@ func (p *Pipeline) process(b *Batch) {
 	if err := p.writer.BatchCreateAll(b.Traces, b.Spans, logsToPersist); err != nil {
 		slog.Error("ingest pipeline: BatchCreateAll failed", "error", err)
 		p.processFailures.Add(1)
+		// Hand the complete rolled-back batch to the DLQ rather than
+		// dropping it. logsToPersist (not b.Logs) is what the transaction
+		// attempted, so the store-severity gate is not re-litigated on replay.
+		p.toDLQ(b, logsToPersist)
 		return
 	}
 
@@ -610,4 +674,46 @@ func (p *Pipeline) observeDrop(t SignalType, reason string) {
 		return
 	}
 	p.metrics.IngestPipelineDroppedTotal.WithLabelValues(signalLabel(t), reason).Inc()
+}
+
+// toDLQ serializes a failed batch into the typed DLQ envelope and enqueues it.
+// Every outcome is counted on otelcontext_ingest_pipeline_dlq_total so a
+// silent loss is impossible to miss: result=enqueued means the batch is
+// durable, anything else means it is gone.
+func (p *Pipeline) toDLQ(b *Batch, logs []storage.Log) {
+	if p.dlq == nil {
+		p.observeDLQ(b.Type, "no_sink")
+		return
+	}
+	env := DLQBatchEnvelope{
+		Type: DLQBatchType,
+		Data: DLQBatchPayload{
+			Tenant: b.Tenant,
+			Signal: signalLabel(b.Type),
+			Traces: b.Traces,
+			Spans:  b.Spans,
+			Logs:   logs,
+		},
+	}
+	if err := p.dlq.Enqueue(env); err != nil {
+		slog.Error("ingest pipeline: DLQ enqueue failed, batch lost",
+			"error", err,
+			"signal", signalLabel(b.Type),
+			"traces", len(b.Traces),
+			"spans", len(b.Spans),
+			"logs", len(logs),
+		)
+		p.dlqFailed.Add(1)
+		p.observeDLQ(b.Type, "enqueue_failed")
+		return
+	}
+	p.dlqEnqueued.Add(1)
+	p.observeDLQ(b.Type, "enqueued")
+}
+
+func (p *Pipeline) observeDLQ(t SignalType, result string) {
+	if p.metrics == nil || p.metrics.IngestPipelineDLQTotal == nil {
+		return
+	}
+	p.metrics.IngestPipelineDLQTotal.WithLabelValues(signalLabel(t), result).Inc()
 }
