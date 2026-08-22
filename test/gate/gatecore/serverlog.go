@@ -10,10 +10,12 @@ import (
 // Reading the server's startup-recovery summary out of its log.
 //
 // This exists because of a real gap: internal/aggregate publishes only
-// recovery DURATION and two row counts to Prometheus
-// (otelcontext_aggregate_recovery_duration_seconds, ..._recovery_rows{kind}).
-// SkippedSeries — the corruption signal the contract gates on at zero — and
-// SeededBaselines have no gauge at all. The only place they surface is the
+// recovery DURATION and four row classes to Prometheus
+// (otelcontext_aggregate_recovery_duration_seconds, ..._recovery_rows{kind}
+// for replayed, finalized_windows, topology_restored_rows and
+// topology_restored_windows). promStoreRecorder.RecordRecovery is handed the
+// whole RecoveryStats and publishes none of SkippedSeries — the corruption
+// signal the contract gates on at zero — or SeededBaselines. The only place they surface is the
 // slog line emitted by aggregate.LogRecovery, so the gate parses the server's
 // own stdout. The gap is recorded in the report; it is not papered over.
 

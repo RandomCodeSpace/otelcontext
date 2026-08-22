@@ -340,10 +340,12 @@ func (g *gate) preflightDisk() error {
 // something main does not expose. They are re-stated in the report so a reader
 // never has to guess why a number came from a log line.
 func (g *gate) recordKnownGaps() {
-	g.note("internal/aggregate publishes only recovery duration and two row counts " +
-		"(otelcontext_aggregate_recovery_duration_seconds, otelcontext_aggregate_recovery_rows{kind}). " +
-		"RecoveryStats.SkippedSeries — the corruption signal this gate asserts at zero — and " +
-		"SeededBaselines have no Prometheus gauge, so the gate parses the server's own slog line.")
+	g.note("internal/aggregate publishes only recovery duration and four row classes " +
+		"(otelcontext_aggregate_recovery_duration_seconds, otelcontext_aggregate_recovery_rows{kind} " +
+		"for replayed, finalized_windows, topology_restored_rows, topology_restored_windows). " +
+		"promStoreRecorder.RecordRecovery receives the whole RecoveryStats but publishes none of " +
+		"SkippedSeries — the corruption signal this gate asserts at zero — or SeededBaselines, " +
+		"so the gate parses the server's own slog line.")
 	g.note("The aggregate query API carries no `truncated` field: internal/aggregate pages every " +
 		"store read to completion, so truncation never reaches the wire on /api/metrics/*. " +
 		"Completeness there is asserted via the coverage marker and exact window coverage; the " +

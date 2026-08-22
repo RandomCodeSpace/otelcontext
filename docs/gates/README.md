@@ -85,7 +85,7 @@ The comparison also skips the crash run's first and last windows: a window share
 
 ### Coverage is asserted per surface, not globally
 
-`/api/metrics/traffic` and `/api/metrics/dashboard` are wholly aggregate-derived and must declare `full`. `/api/metrics/service-map` must declare **`sampled`**: its nodes come from the aggregate topology but its caller/callee edges come from the exemplar-backed graph, and the handler says so deliberately. A gate that demanded `full` everywhere would be demanding a lie, so the expectation is a string per surface in `test/gate/gate.config.json`, not a global flag.
+Each aggregate-backed surface declares the coverage its own answer earned, and the gate asserts that exact string rather than a blanket `full`. `/api/metrics/traffic`, `/api/metrics/dashboard` and `/api/metrics/service-map` all answer wholly from the engine and must declare `full`. The expectation is `expect_coverage` per surface in `test/gate/gate.config.json`, not a global flag, so a handler that ever downgrades its marker for an honest reason is a one-line config change here instead of a reason to loosen the gate.
 
 ### The main-tier projection
 
@@ -97,7 +97,7 @@ If a logical charged-bytes counter is configured, it is used **only** to report 
 
 The gate records, in every report, the places where the contract asks for something the platform does not expose. As of the tooling landing:
 
-- `RecoveryStats.SkippedSeries` — the corruption signal gated at zero — and `SeededBaselines` have **no Prometheus gauge**. Only `otelcontext_aggregate_recovery_duration_seconds` and `otelcontext_aggregate_recovery_rows{kind}` are published, so the gate parses the server's own slog line for the rest.
+- `RecoveryStats.SkippedSeries` — the corruption signal gated at zero — and `SeededBaselines` have **no Prometheus gauge**. Only `otelcontext_aggregate_recovery_duration_seconds` and `otelcontext_aggregate_recovery_rows{kind}` (four classes: `replayed`, `finalized_windows`, `topology_restored_rows`, `topology_restored_windows`) are published. `promStoreRecorder.RecordRecovery` receives the whole `RecoveryStats` and publishes neither field, so the gate parses the server's own slog line for the rest.
 - The aggregate query API carries **no `truncated` field**: the engine pages every store read to completion, so truncation never reaches the wire on `/api/metrics/*`. Completeness there is asserted through the coverage marker and exact window coverage; the literal `truncated=false` check applies where the field exists (exemplar-backed responses).
 - `test/aggprefill` reports windows, bucket rows and delta rows, but **not per-window observation totals**, so the prefill tier's exact scalar check is window coverage rather than span-count equality.
 - There is **no process-resident-memory collector**; memory evidence is cgroup `memory.peak` / `memory.events`, with `/proc/<pid>/status` `VmHWM` secondary.

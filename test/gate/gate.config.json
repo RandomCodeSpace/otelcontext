@@ -118,7 +118,7 @@
         "path": "/api/metrics/service-map",
         "range": "seven_day",
         "per_window": false,
-        "expect_coverage": "sampled",
+        "expect_coverage": "full",
         "scalar_keys": null
       },
       {

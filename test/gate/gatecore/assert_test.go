@@ -349,27 +349,43 @@ func shortSpanSamples() []DiskSample {
 }
 
 func TestCoverageExpectationIsPerSurface(t *testing.T) {
-	// /api/metrics/service-map returns aggregate nodes with exemplar-derived
-	// edges and honestly declares "sampled". A gate that demanded "full"
-	// everywhere would be demanding a lie.
+	// The coverage check compares against the per-surface expectation, not a
+	// hardcoded "full". A handler that legitimately declares something else
+	// must be satisfiable by a config change rather than by loosening the
+	// gate, so the mechanism is proved with a non-"full" expectation.
+	r := passingResult()
+	r.Queries.Checks = append(r.Queries.Checks,
+		QueryCheck{
+			Name: "honest_sampled", URL: "/api/metrics/sampled-surface", Status: 200,
+			Coverage: "sampled", CoverageSource: "body", CoverageExpected: "sampled", BodyBytes: 400,
+		},
+		QueryCheck{
+			Name: "downgraded", URL: "/api/metrics/traffic", Status: 200,
+			Coverage: "sampled", CoverageSource: "body", CoverageExpected: "full", BodyBytes: 400,
+		},
+	)
+	r.Finalize()
+	if a := assertionByID(t, r, "query.api.honest_sampled.coverage"); !a.Pass {
+		t.Errorf("a surface declaring exactly what the contract expects of it failed: %+v", a)
+	}
+	if a := assertionByID(t, r, "query.api.downgraded.coverage"); a.Pass {
+		t.Errorf("a surface that silently downgraded its coverage marker passed: %+v", a)
+	}
+}
+
+func TestServiceMapExpectationTracksTheHandler(t *testing.T) {
+	// Nodes and edges both come from one engine topology query now that the
+	// GraphRAG side-channel is retired, so a complete service-map answer
+	// declares "full". This pins the config to the handler; if the handler
+	// changes its marker again, this is where it is noticed.
 	var svcMap APICheck
 	for _, c := range DefaultAPIChecks() {
 		if c.Name == "service_map_seven_day" {
 			svcMap = c
 		}
 	}
-	if svcMap.ExpectCoverage != "sampled" {
-		t.Errorf("service-map expected coverage = %q, want sampled", svcMap.ExpectCoverage)
-	}
-
-	r := passingResult()
-	r.Queries.Checks = append(r.Queries.Checks, QueryCheck{
-		Name: "service_map_seven_day", URL: "/api/metrics/service-map", Status: 200,
-		Coverage: "sampled", CoverageSource: "body", CoverageExpected: "sampled", BodyBytes: 400,
-	})
-	r.Finalize()
-	if a := assertionByID(t, r, "query.api.service_map_seven_day.coverage"); !a.Pass {
-		t.Errorf("a surface declaring exactly what the contract expects of it failed: %+v", a)
+	if svcMap.ExpectCoverage != "full" {
+		t.Errorf("service-map expected coverage = %q, want full", svcMap.ExpectCoverage)
 	}
 }
 

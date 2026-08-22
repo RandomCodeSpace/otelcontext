@@ -150,11 +150,11 @@ type APICheck struct {
 	// ExpectCoverage is the aggregate coverage marker this surface must
 	// declare. Empty records whatever arrived without gating on it.
 	//
-	// It is a string rather than a "must be full" flag because not every
-	// aggregate-backed surface can honestly claim full coverage:
-	// /api/metrics/service-map returns aggregate-derived NODES alongside
-	// exemplar-derived EDGES and correctly declares "sampled". Demanding
-	// "full" there would be demanding a lie.
+	// It is a string rather than a "must be full" flag because a surface
+	// declares whatever coverage its own answer earned, and the honest
+	// declaration is not always "full". Encoding the expectation per
+	// surface means a handler that legitimately downgrades its marker is
+	// a config change here, not a gate that demands a lie.
 	ExpectCoverage string `json:"expect_coverage"`
 	// ScalarKeys are top-level numeric fields recorded from an object
 	// response.
@@ -260,11 +260,11 @@ func DefaultAPIChecks() []APICheck {
 				"requests", "request_errors", "spans", "span_errors", "p99_latency_ms"},
 		},
 		{
-			// Nodes are aggregate-derived, edges come from the exemplar-backed
-			// topology, and the handler says so. "sampled" is the honest
-			// declaration here, so it is what the gate asserts.
+			// Nodes and edges both come from one engine topology query since
+			// the GraphRAG side-channel was retired, so the engine's own
+			// coverage stands and a complete answer declares "full".
 			Name: "service_map_seven_day", Path: "/api/metrics/service-map", Range: "seven_day",
-			ExpectCoverage: "sampled",
+			ExpectCoverage: "full",
 		},
 		{Name: "stats", Path: "/api/stats", Range: "none"},
 		{Name: "ready", Path: "/ready", Range: "none"},
