@@ -700,13 +700,16 @@ func Load(customPath string) (*Config, error) {
 		// readiness should say "stop sending" before clients are being refused,
 		// not while they are.
 		ReadyMaxAdmissionRatio: getEnvFloat("READY_MAX_ADMISSION_RATIO", 0.9),
-		// 2.25 GiB is aggregate.db's share of the 8 GiB data budget (#201 Q1,
-		// rebalanced 2026-08-22 after the seven-day gate measured 2.08 GiB at
-		// full-density occupancy with the v4 histogram columns).
+		// The aggregate tier allocation is 2.25 GiB (#201 Q1, rebalanced
+		// 2026-08-22 after the gate measured 2.08 GiB at full density). The
+		// probe budget is deliberately 2560 so the 0.90 warn ratio trips at
+		// 0.9 x 2560 MB = 2304 MB — exactly the tier boundary. Full-density
+		// steady state (~0.92 of the tier) is legitimate and must not flip
+		// readiness; crossing the tier allocation must.
 		// The disk watchdog enforces the VOLUME; this enforces the tier, so a
 		// runaway aggregate file is visible before it eats another tier's
 		// allocation and takes the whole volume past 95% with it.
-		ReadyAggregateDiskBudgetMB: getEnvInt("READY_AGGREGATE_DISK_BUDGET_MB", 2304),
+		ReadyAggregateDiskBudgetMB: getEnvInt("READY_AGGREGATE_DISK_BUDGET_MB", 2560),
 		ReadyMaxAggregateDiskRatio: getEnvFloat("READY_MAX_AGGREGATE_DISK_RATIO", 0.9),
 	}
 

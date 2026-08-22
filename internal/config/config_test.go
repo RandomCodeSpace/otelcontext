@@ -1034,8 +1034,8 @@ func TestLoad_ReadinessThresholdDefaults(t *testing.T) {
 	if cfg.ReadyMaxAdmissionRatio != 0.9 {
 		t.Errorf("READY_MAX_ADMISSION_RATIO = %v, want 0.9", cfg.ReadyMaxAdmissionRatio)
 	}
-	if cfg.ReadyAggregateDiskBudgetMB != 2304 {
-		t.Errorf("READY_AGGREGATE_DISK_BUDGET_MB = %d, want 2304", cfg.ReadyAggregateDiskBudgetMB)
+	if cfg.ReadyAggregateDiskBudgetMB != 2560 {
+		t.Errorf("READY_AGGREGATE_DISK_BUDGET_MB = %d, want 2560", cfg.ReadyAggregateDiskBudgetMB)
 	}
 	if cfg.ReadyMaxAggregateDiskRatio != 0.9 {
 		t.Errorf("READY_MAX_AGGREGATE_DISK_RATIO = %v, want 0.9", cfg.ReadyMaxAggregateDiskRatio)

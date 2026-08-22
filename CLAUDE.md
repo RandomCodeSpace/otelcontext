@@ -701,7 +701,7 @@ Thresholds (`0` disables that probe):
 | `READY_MAX_FINALIZE_FAILURE_STREAK` | 3 | Same shape, on the finalizer. |
 | `READY_MAX_ADMISSION_RATIO` | 0.9 | Below the 0.95 the DLQ/pipeline probes use: the writer's admission bound is what turns an Export into `RESOURCE_EXHAUSTED`, so readiness says "stop sending" before clients are refused, not while they are. |
 | `READY_MAX_DELTA_LOG_AGE_S` | 1800 | 2× (`WindowSize` 5m + `AllowedLateness` 10m). A window is finalizable 900s after it opens, so a healthy oldest entry tops out just past 900s plus one finalize tick. |
-| `READY_AGGREGATE_DISK_BUDGET_MB` | 2304 | `aggregate.db`'s share of the 8 GiB data budget (#201 Q1). The disk watchdog enforces the **volume**; this enforces the **tier**, so a runaway aggregate file is visible before it eats another tier's allocation. |
+| `READY_AGGREGATE_DISK_BUDGET_MB` | 2560 | `aggregate.db`'s share of the 8 GiB data budget (#201 Q1). The disk watchdog enforces the **volume**; this enforces the **tier**, so a runaway aggregate file is visible before it eats another tier's allocation. |
 | `READY_MAX_AGGREGATE_DISK_RATIO` | 0.9 | Warn inside the tier before the volume-level ladder starts shedding. |
 
 ## Security & Supply Chain
