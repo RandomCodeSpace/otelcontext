@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/RandomCodeSpace/otelcontext/internal/authn"
 	"github.com/RandomCodeSpace/otelcontext/internal/config"
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 )
@@ -133,25 +134,29 @@ func TestTenantMiddleware_MissingHeaderUsesDefault(t *testing.T) {
 	}
 }
 
-// TestTenantMiddleware_DoesNotOverwritePinnedTenant verifies that when
-// TenantKeyAuth.Middleware has already pinned a tenant onto the context (the
-// per-tenant API-key path), the subsequent TenantMiddleware pass-through does
-// NOT overwrite it with the client-supplied X-Tenant-ID header.
+// TestTenantMiddleware_DoesNotOverwritePinnedTenant verifies that when AuthGate
+// has already pinned a tenant onto the context (the per-tenant API-key path),
+// the subsequent TenantMiddleware pass-through does NOT overwrite it with the
+// client-supplied X-Tenant-ID header.
 //
 // This is the regression test for the middleware-ordering bypass:
 //
-//	TenantKeyAuth.Middleware(auth "alpha-key" → pins "alpha")
+//	AuthGate(auth "alpha-key" → pins "alpha")
 //	  → TenantMiddleware(reads X-Tenant-ID: "beta" → must NOT overwrite)
 //	    → handler (must see "alpha")
 func TestTenantMiddleware_DoesNotOverwritePinnedTenant(t *testing.T) {
 	// Build per-tenant key auth: key "alpha-key" → tenant "alpha".
-	auth := NewTenantKeyAuth(map[string]string{"alpha-key": "alpha"})
+	store, err := authn.NewKeyStoreFromMap(map[string]string{"alpha-key": "alpha"})
+	if err != nil {
+		t.Fatalf("NewKeyStoreFromMap: %v", err)
+	}
+	auth := authn.NewAuthenticator("", store, false)
 
 	cfg := &config.Config{DefaultTenant: "default"}
 	tc := &tenantCapture{}
 
-	// Compose: TenantKeyAuth wraps TenantMiddleware wraps handler.
-	h := auth.Middleware("/mcp", TenantMiddleware(cfg)(tc.handler()))
+	// Compose: AuthGate wraps TenantMiddleware wraps handler.
+	h := AuthGate(AuthGateOptions{Auth: auth, MCPPath: "/mcp"}, TenantMiddleware(cfg)(tc.handler()))
 
 	req := httptest.NewRequest(http.MethodGet, "/api/logs", nil)
 	req.Header.Set("Authorization", "Bearer alpha-key")

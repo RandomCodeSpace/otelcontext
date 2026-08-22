@@ -1,165 +1,102 @@
 package api
 
 import (
-	"bufio"
-	"crypto/subtle"
-	"fmt"
+	"context"
 	"net/http"
-	"os"
-	"strings"
-	"sync"
 
+	"github.com/RandomCodeSpace/otelcontext/internal/authn"
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 )
 
-// LoadTenantKeys parses a tenant-keys file where each non-empty,
-// non-comment line is a `key=tenant` pair. The returned map is
-// keyed by bearer token (value=tenant ID) so an authenticated
-// request can be scoped to the key's bound tenant regardless of
-// any client-asserted X-Tenant-ID header.
+// DefaultExternalTenantHeader is the dedicated identity header a front proxy
+// injects when AUTH_TRUST_EXTERNAL=true. It is deliberately NOT X-Tenant-ID:
+// that header stays client-controlled and untrusted, so a proxy that forgets
+// to strip inbound copies of the dedicated header fails visibly rather than
+// silently promoting client input to an identity.
+const DefaultExternalTenantHeader = "X-OtelContext-Tenant"
+
+// AuthGateOptions configures the HTTP authentication middleware.
+type AuthGateOptions struct {
+	// Auth resolves bearer tokens. A disabled Authenticator makes the gate a
+	// pass-through — authentication arrives with configuration, not by default.
+	Auth *authn.Authenticator
+	// MCPPath is used by IsProtectedPath to gate the MCP endpoint.
+	MCPPath string
+	// ExternalTenantHeader overrides DefaultExternalTenantHeader.
+	ExternalTenantHeader string
+}
+
+func (o AuthGateOptions) externalHeader() string {
+	if o.ExternalTenantHeader != "" {
+		return o.ExternalTenantHeader
+	}
+	return DefaultExternalTenantHeader
+}
+
+// AuthGate authenticates /api/*, /v1/*, and the MCP endpoint.
 //
-// File format (YAML/INI-friendly, also accepts plain `key=tenant`):
+// Two credential classes, one gate:
 //
-//	# one mapping per line, comments start with '#'
-//	5f4dcc3b5aa765d61d8327deb882cf99=acme
-//	c20ad4d76fe97759aa27a0c99bff6710=beta
+//   - The operator key (API_KEY) authenticates and nothing more. Tenant
+//     resolution keeps its historical precedence — X-Tenant-ID header, then
+//     the OTLP resource attribute where trusted, then DEFAULT_TENANT — so an
+//     API_KEY-only deployment behaves exactly as it did before this middleware
+//     existed.
+//   - A tenant key (API_TENANT_KEYS_FILE) authenticates AND binds. The bound
+//     tenant is pinned onto the request context and a client-supplied
+//     X-Tenant-ID is ignored and counted, never honoured.
 //
-// Whitespace around tokens is ignored; duplicate keys return an error
-// so misconfiguration fails loud at startup.
-func LoadTenantKeys(path string) (map[string]string, error) {
-	if path == "" {
-		return nil, nil
-	}
-	f, err := os.Open(path) // #nosec G304 -- operator-supplied config path
-	if err != nil {
-		return nil, fmt.Errorf("tenant keys file %q: %w", path, err)
-	}
-	defer func() { _ = f.Close() }()
-
-	out := make(map[string]string)
-	sc := bufio.NewScanner(f)
-	line := 0
-	for sc.Scan() {
-		line++
-		raw := strings.TrimSpace(sc.Text())
-		if raw == "" || strings.HasPrefix(raw, "#") {
-			continue
-		}
-		// Accept both `key=tenant` and `key: tenant` (YAML-ish).
-		sep := "="
-		if !strings.Contains(raw, "=") && strings.Contains(raw, ":") {
-			sep = ":"
-		}
-		parts := strings.SplitN(raw, sep, 2)
-		if len(parts) != 2 {
-			return nil, fmt.Errorf("tenant keys file %q line %d: expected `key=tenant`, got %q", path, line, raw)
-		}
-		key := strings.TrimSpace(parts[0])
-		tenant := strings.TrimSpace(parts[1])
-		if key == "" || tenant == "" {
-			return nil, fmt.Errorf("tenant keys file %q line %d: empty key or tenant", path, line)
-		}
-		if _, dup := out[key]; dup {
-			return nil, fmt.Errorf("tenant keys file %q line %d: duplicate key", path, line)
-		}
-		out[key] = tenant
-	}
-	if err := sc.Err(); err != nil {
-		return nil, fmt.Errorf("tenant keys file %q: %w", path, err)
-	}
-	if len(out) == 0 {
-		return nil, fmt.Errorf("tenant keys file %q: no entries found", path)
-	}
-	return out, nil
-}
-
-// TenantKeyAuth holds a key→tenant map loaded from APITenantKeysFile and
-// exposes middleware that both authenticates AND pins the tenant onto the
-// request context. When enabled it OVERRIDES any X-Tenant-ID header — callers
-// cannot cross tenants by swapping headers.
-type TenantKeyAuth struct {
-	mu      sync.RWMutex
-	entries map[string]string // key → tenant
-}
-
-// NewTenantKeyAuth constructs a TenantKeyAuth from a pre-loaded map.
-// nil or empty disables the layer; callers should fall back to the shared
-// API_KEY path in that case.
-func NewTenantKeyAuth(entries map[string]string) *TenantKeyAuth {
-	cp := make(map[string]string, len(entries))
-	for k, v := range entries {
-		cp[k] = v
-	}
-	return &TenantKeyAuth{entries: cp}
-}
-
-// Enabled reports whether per-tenant keys are configured.
-func (a *TenantKeyAuth) Enabled() bool {
-	if a == nil {
-		return false
-	}
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-	return len(a.entries) > 0
-}
-
-// Lookup returns the tenant bound to the given bearer key, using a
-// constant-time compare against every entry so mismatches don't leak via
-// timing.
-func (a *TenantKeyAuth) Lookup(key string) (string, bool) {
-	if a == nil || key == "" {
-		return "", false
-	}
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-	got := []byte(key)
-	var matchedTenant string
-	var matched int
-	for k, tenant := range a.entries {
-		// subtle.ConstantTimeCompare requires equal length; guard before call.
-		if len(got) == len(k) && subtle.ConstantTimeCompare(got, []byte(k)) == 1 {
-			matchedTenant = tenant
-			matched = 1
-		}
-	}
-	if matched == 1 {
-		return matchedTenant, true
-	}
-	return "", false
-}
-
-// Middleware returns an http.Handler wrapper that requires an
-// `Authorization: Bearer <key>` header present in the tenant-keys map.
-// On success the matched tenant is pinned onto the request context via
-// storage.WithTenantContext, overriding any client-supplied X-Tenant-ID.
-// On mismatch (including missing header) it returns 401.
-//
-// Public paths (IsProtectedPath == false) pass through unchanged so UI
-// assets and health probes remain reachable without credentials.
-func (a *TenantKeyAuth) Middleware(mcpPath string, next http.Handler) http.Handler {
-	if !a.Enabled() {
+// When AUTH_TRUST_EXTERNAL=true and no bearer credential is presented, the
+// proxy-injected identity header supplies a bound principal.
+func AuthGate(o AuthGateOptions, next http.Handler) http.Handler {
+	if !o.Auth.Enabled() {
 		return next
 	}
+	extHeader := o.externalHeader()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !IsProtectedPath(r.URL.Path, mcpPath) {
+		if !IsProtectedPath(r.URL.Path, o.MCPPath) {
 			next.ServeHTTP(w, r)
 			return
 		}
-		auth := r.Header.Get("Authorization")
-		const prefix = "Bearer "
-		if !strings.HasPrefix(auth, prefix) {
-			writeUnauthorized(w)
-			return
-		}
-		got := strings.TrimPrefix(auth, prefix)
-		tenant, ok := a.Lookup(got)
+		principal, reason, ok := authenticateHTTP(o.Auth, r, extHeader)
 		if !ok {
+			recordAuthFailure(reason)
 			writeUnauthorized(w)
 			return
 		}
-		// Pin tenant onto ctx. This OVERRIDES any X-Tenant-ID header a
-		// caller may have set, closing the cross-tenant read vector.
-		ctx := storage.WithTenantContext(r.Context(), tenant)
-		next.ServeHTTP(w, r.WithContext(ctx))
+		next.ServeHTTP(w, r.WithContext(bindPrincipal(r, principal)))
 	})
+}
+
+// authenticateHTTP resolves the principal for one request: bearer credential
+// first, proxy-injected identity only when no bearer credential was presented
+// at all. A presented-but-invalid credential is always a 401, even under
+// AUTH_TRUST_EXTERNAL — otherwise a bad key would silently downgrade into
+// whatever the header claimed.
+func authenticateHTTP(a *authn.Authenticator, r *http.Request, extHeader string) (authn.Principal, string, bool) {
+	token, reason := authn.TokenFromAuthorization(r.Header.Get("Authorization"))
+	if token == "" {
+		if reason == authn.ReasonMissingCredential {
+			if p, ok := a.ExternalPrincipal(r.Header.Get(extHeader)); ok {
+				return p, "", true
+			}
+		}
+		return authn.Principal{}, reason, false
+	}
+	return a.AuthenticateToken(token)
+}
+
+// bindPrincipal stashes the principal on the request context and, for bound
+// principals, pins the tenant so every downstream repository read and ingest
+// write is scoped to it. Contradicting client assertions are counted here —
+// this is the only place on the HTTP surface that sees both.
+func bindPrincipal(r *http.Request, p authn.Principal) context.Context {
+	ctx := authn.WithPrincipal(r.Context(), p)
+	if !p.Bound() {
+		return ctx
+	}
+	if asserted := r.Header.Get(TenantHeader); asserted != "" && storage.SanitizeTenantID(asserted) != p.Tenant {
+		authn.RecordConflict("http", "header")
+	}
+	return storage.WithTenantContext(ctx, p.Tenant)
 }

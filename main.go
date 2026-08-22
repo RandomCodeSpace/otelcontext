@@ -17,6 +17,7 @@ import (
 	"github.com/RandomCodeSpace/otelcontext/internal/aggregate"
 	"github.com/RandomCodeSpace/otelcontext/internal/ai"
 	"github.com/RandomCodeSpace/otelcontext/internal/api"
+	"github.com/RandomCodeSpace/otelcontext/internal/authn"
 	"github.com/RandomCodeSpace/otelcontext/internal/config"
 	"github.com/RandomCodeSpace/otelcontext/internal/graph"
 	"github.com/RandomCodeSpace/otelcontext/internal/graphrag"
@@ -151,6 +152,18 @@ func main() {
 	cfg.GuardSelfInstrumentation()
 	if err := cfg.ValidateDBForEnv(); err != nil {
 		fatal("DB/Env validation", err)
+	}
+	// Authenticated tenant identity (#194 blockers 7 + 8). Loaded once, at
+	// startup: swapping the key file is an explicit restart, never a live
+	// reload, and the process keeps only SHA-256 digests of the keys.
+	tenantKeys, err := authn.LoadKeyStore(cfg.APITenantKeysFile)
+	if err != nil {
+		fatal("load tenant keys file", err, "path", cfg.APITenantKeysFile)
+	}
+	authenticator := authn.NewAuthenticator(cfg.APIKey, tenantKeys, cfg.AuthTrustExternal)
+	authnMetrics := telemetry.NewAuthnMetrics()
+	authn.ConflictHook = func(surface, reason string) {
+		authnMetrics.TenantConflictsTotal.WithLabelValues(surface, reason).Inc()
 	}
 	if strings.EqualFold(cfg.DBDriver, "sqlite") {
 		slog.Warn("SQLite driver in use. Auto-tuned defaults survive ~50-120 services " +
@@ -331,6 +344,7 @@ func main() {
 	})
 	hub.SetDevMode(cfg.DevMode)
 	hub.SetMaxClients(cfg.WSMaxClients)
+	hub.SetOriginPolicy(cfg.EnforceWSOrigin(), api.WSAllowedOriginHosts(cfg.WSAllowedOrigins))
 	hub.SetWSMetrics(
 		func(msgType string) { metrics.WSMessagesSent.WithLabelValues(msgType).Inc() },
 		func() { metrics.WSSlowClientsRemoved.Inc() },
@@ -344,6 +358,8 @@ func main() {
 		metrics.IncrementActiveConns,
 		metrics.DecrementActiveConns,
 	)
+	eventHub.SetMaxClients(cfg.WSMaxClients)
+	eventHub.SetOriginPolicy(cfg.EnforceWSOrigin(), api.WSAllowedOriginHosts(cfg.WSAllowedOrigins))
 	// The hub is STARTED further down, after the aggregate engine exists: in
 	// AGGREGATE_MODE=aggregate its publication loop is revision-driven and
 	// needs the publisher wired before the first tick.
@@ -781,6 +797,7 @@ func main() {
 	logHandler := func(l storage.Log) {
 		start := time.Now()
 		eventHub.BroadcastLog(realtime.LogEntry{
+			Tenant:         l.TenantID,
 			ID:             l.ID,
 			TraceID:        l.TraceID,
 			SpanID:         l.SpanID,
@@ -824,6 +841,7 @@ func main() {
 
 	metricsServer.SetMetricCallback(func(m tsdb.RawMetric) {
 		eventHub.BroadcastMetric(realtime.MetricEntry{
+			Tenant:      m.TenantID,
 			Name:        m.Name,
 			ServiceName: m.ServiceName,
 			Value:       m.Value,
@@ -912,6 +930,28 @@ func main() {
 			metricsUnaryInterceptor(metrics),
 		),
 	}
+	// OTLP gRPC authentication. Installed only when a credential source is
+	// configured, so an unauthenticated development deployment is untouched.
+	// Auth runs AFTER the metrics interceptor so rejected calls still show up
+	// in the request counters.
+	if authUnary, authStream := ingest.NewGRPCAuthInterceptors(ingest.GRPCAuthOptions{
+		Auth:                      authenticator,
+		ExternalTenantMetadataKey: cfg.AuthExternalTenantHeader,
+		OnAuthFailure: func(reason string) {
+			authnMetrics.GRPCAuthFailuresTotal.WithLabelValues(reason).Inc()
+		},
+	}); authUnary != nil {
+		grpcOpts = append(grpcOpts,
+			grpc.ChainUnaryInterceptor(authUnary),
+			grpc.ChainStreamInterceptor(authStream),
+		)
+		slog.Info("🔑 gRPC OTLP authentication enabled",
+			"tenant_keys", authenticator.TenantKeyCount(),
+			"operator_key", cfg.APIKey != "",
+			"trust_external", cfg.AuthTrustExternal)
+	} else {
+		slog.Warn("🔓 gRPC OTLP unauthenticated — tenant identity is client-controlled; set API_KEY or API_TENANT_KEYS_FILE")
+	}
 	slog.Info("📡 gRPC server tuned",
 		"max_recv_mb", recvBytes,
 		"max_concurrent_streams", streams,
@@ -938,7 +978,14 @@ func main() {
 	coltracepb.RegisterTraceServiceServer(grpcServer, traceServer)
 	collogspb.RegisterLogsServiceServer(grpcServer, logsServer)
 	colmetricspb.RegisterMetricsServiceServer(grpcServer, metricsServer)
-	reflection.Register(grpcServer)
+	// Reflection enumerates every service and message type to an
+	// unauthenticated peer, so production defaults to off. GRPC_REFLECTION=true
+	// re-enables it explicitly.
+	if cfg.GRPCReflectionEnabled() {
+		reflection.Register(grpcServer)
+	} else {
+		slog.Info("🔒 gRPC reflection disabled (APP_ENV=production) — set GRPC_REFLECTION=true to re-enable")
+	}
 
 	go func() {
 		slog.Info("📡 gRPC OTLP receiver started", "port", cfg.GRPCPort)
@@ -999,23 +1046,39 @@ func main() {
 		metrics.APIAuthFailuresTotal.WithLabelValues(reason).Inc()
 	}
 
-	// Authentication. Per-tenant keys (if configured) take precedence over the
-	// shared API key — they enforce tenant boundaries at the auth layer rather
-	// than trusting a client-supplied X-Tenant-ID header.
+	// Authentication (HTTP + WebSocket). One authenticator serves every
+	// surface: the operator key authenticates, a tenant key authenticates AND
+	// binds the tenant, and a proxy-injected identity binds it too when the
+	// operator has accepted the AUTH_TRUST_EXTERNAL deployment contract.
+	httpHandler = api.WebSocketGate(api.WSGateOptions{
+		Auth:                 authenticator,
+		DefaultTenant:        cfg.DefaultTenant,
+		AllowedOrigins:       cfg.WSAllowedOrigins,
+		EnforceOrigin:        cfg.EnforceWSOrigin(),
+		ExternalTenantHeader: cfg.AuthExternalTenantHeader,
+	}, httpHandler)
+	httpHandler = api.AuthGate(api.AuthGateOptions{
+		Auth:                 authenticator,
+		MCPPath:              cfg.MCPPath,
+		ExternalTenantHeader: cfg.AuthExternalTenantHeader,
+	}, httpHandler)
 	switch {
-	case cfg.APITenantKeysFile != "":
-		entries, err := api.LoadTenantKeys(cfg.APITenantKeysFile)
-		if err != nil {
-			fatal("load tenant keys file", err, "path", cfg.APITenantKeysFile)
-		}
-		tka := api.NewTenantKeyAuth(entries)
-		httpHandler = tka.Middleware(cfg.MCPPath, httpHandler)
-		slog.Info("🔑 Per-tenant API key authentication enabled", "tenants", len(entries))
+	case authenticator.HasTenantKeys():
+		slog.Info("🔑 Per-tenant bearer authentication enabled",
+			"keys", authenticator.TenantKeyCount(),
+			"tenants", len(authenticator.Tenants()),
+			"operator_key", cfg.APIKey != "")
 	case cfg.APIKey != "":
-		httpHandler = api.APIKeyGate(cfg.APIKey, cfg.MCPPath, httpHandler)
 		slog.Info("🔑 API key authentication enabled (shared key)")
+	case cfg.AuthTrustExternal:
+		slog.Warn("🔑 Authentication delegated to the front proxy (AUTH_TRUST_EXTERNAL=true) — the deployment contract in CLAUDE.md is mandatory",
+			"identity_header", cfg.AuthExternalTenantHeader)
 	default:
 		slog.Warn("API authentication disabled — set API_KEY or API_TENANT_KEYS_FILE for production")
+	}
+	if cfg.EnforceWSOrigin() {
+		slog.Info("🔒 WebSocket origin policy enforced",
+			"allowed_origins", cfg.WSAllowedOrigins, "same_host_only", len(cfg.WSAllowedOrigins) == 0)
 	}
 
 	httpHandler = api.MetricsMiddleware(metrics, httpHandler)

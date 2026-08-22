@@ -227,11 +227,41 @@ type Config struct {
 	OTLPTrustResourceTenant bool
 
 	// APITenantKeysFile, when non-empty, switches API auth from a single
-	// shared API_KEY into per-tenant bearer tokens. The file contains one
-	// `key=tenant` pair per line; the matched key's tenant OVERRIDES any
-	// X-Tenant-ID header so callers cannot cross tenants. Empty = disabled
-	// (legacy shared-key mode remains available for single-tenant dev).
+	// shared API_KEY into per-tenant bearer tokens. JSON or YAML, chosen by
+	// extension, mapping bearer key to tenant ID (several keys may map to one
+	// tenant). Loaded once at startup; the process holds only SHA-256 digests.
+	// A matched key's tenant BINDS the request — client-supplied X-Tenant-ID,
+	// gRPC metadata, and OTLP `tenant.id` resource attributes are ignored and
+	// counted. Empty = disabled (shared-key mode remains for single-tenant dev).
 	APITenantKeysFile string
+
+	// AuthTrustExternal turns on proxy-injected identity: the value of
+	// AuthExternalTenantHeader is trusted as an authenticated tenant. It is
+	// an authentication BYPASS unless the front proxy authenticates callers,
+	// strips inbound copies of that header, and the application ports are
+	// unreachable except through it — see CLAUDE.md's Authentication section.
+	AuthTrustExternal bool
+
+	// AuthExternalTenantHeader is the dedicated identity header (and gRPC
+	// metadata key, lower-cased) honoured only when AuthTrustExternal is set.
+	// Deliberately distinct from X-Tenant-ID, which stays client-controlled.
+	AuthExternalTenantHeader string
+
+	// WSAllowedOrigins is the WebSocket origin allowlist. Entries may be full
+	// origins ("https://app.example.com") or bare hosts. Empty means
+	// same-host only. Enforced when authentication is enabled or in
+	// production; ignored in an unauthenticated development deployment.
+	WSAllowedOrigins []string
+
+	// GRPCReflection controls gRPC server reflection. Defaults to true outside
+	// production and false in production — reflection enumerates every service
+	// and message type to an unauthenticated peer.
+	GRPCReflection bool
+
+	// AllowInsecureGRPC waives the production requirement for TLS and
+	// authentication on the OTLP gRPC listener. Explicit acknowledgement that
+	// telemetry crosses the network unprotected and unauthenticated.
+	AllowInsecureGRPC bool
 
 	// DevMode disables origin checks for WebSocket and enables dev-friendly defaults.
 	// Derived from APP_ENV == "development".
@@ -484,6 +514,13 @@ func Load(customPath string) (*Config, error) {
 		OTLPTrustResourceTenant: parseTruthy(getEnv("OTLP_TRUST_RESOURCE_TENANT", "")),
 		APITenantKeysFile:       getEnv("API_TENANT_KEYS_FILE", ""),
 
+		// Authenticated tenant identity (HTTP / WebSocket / gRPC)
+		AuthTrustExternal:        parseTruthy(getEnv("AUTH_TRUST_EXTERNAL", "")),
+		AuthExternalTenantHeader: getEnv("AUTH_EXTERNAL_TENANT_HEADER", "X-OtelContext-Tenant"),
+		WSAllowedOrigins:         splitCSV(getEnv("WS_ALLOWED_ORIGINS", "")),
+		GRPCReflection:           getEnvBool("GRPC_REFLECTION", env != "production"),
+		AllowInsecureGRPC:        parseTruthy(getEnv("OTELCONTEXT_ALLOW_INSECURE_GRPC", "")),
+
 		// gRPC server tuning
 		GRPCMaxRecvMB:            getEnvInt("GRPC_MAX_RECV_MB", 16),
 		GRPCMaxConcurrentStreams: getEnvInt("GRPC_MAX_CONCURRENT_STREAMS", 1000),
@@ -645,6 +682,26 @@ func parseTruthy(v string) bool {
 	return false
 }
 
+// splitCSV splits a comma-separated env var into trimmed, non-empty entries.
+// Returns nil (not an empty slice) for an unset or blank value so callers can
+// test the "unset" case with len().
+func splitCSV(v string) []string {
+	if strings.TrimSpace(v) == "" {
+		return nil
+	}
+	parts := strings.Split(v, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 func getEnvBool(key string, fallback bool) bool {
 	if v, exists := os.LookupEnv(key); exists {
 		if b, err := strconv.ParseBool(v); err == nil {
@@ -772,6 +829,28 @@ func (c *Config) Validate() error {
 	// tenant's data, which is almost never what a multi-tenant install wants.
 	if c.APITenantKeysFile == "" && c.DefaultTenant != "" && c.DefaultTenant != "default" {
 		log.Printf("⚠️  API_TENANT_KEYS_FILE is empty but DEFAULT_TENANT=%q — shared API_KEY permits any holder to read any tenant's data. Set API_TENANT_KEYS_FILE to enforce per-tenant auth.", c.DefaultTenant)
+	}
+
+	// Authenticated tenant identity.
+	if c.AuthTrustExternal {
+		if err := validateHeaderToken(c.AuthExternalTenantHeader); err != nil {
+			return fmt.Errorf("AUTH_EXTERNAL_TENANT_HEADER: %w", err)
+		}
+		if strings.EqualFold(c.AuthExternalTenantHeader, "X-Tenant-ID") {
+			return fmt.Errorf("AUTH_EXTERNAL_TENANT_HEADER must not be X-Tenant-ID — that header stays client-controlled; use a dedicated header your proxy strips and re-injects")
+		}
+	}
+
+	// Production fail-closed: the OTLP gRPC listener must be both protected in
+	// transport and authenticated. Two waivers, each named in the refusal so
+	// the operator knows exactly which acknowledgement they are making.
+	if c.IsProduction() && !c.AuthTrustExternal && !c.AllowInsecureGRPC {
+		if !c.TLSEnabled() {
+			return fmt.Errorf("APP_ENV=production requires transport protection on the OTLP gRPC listener: set TLS_CERT_FILE/TLS_KEY_FILE, or TLS_AUTO_SELFSIGNED=true, or waive with AUTH_TRUST_EXTERNAL=true (proxy-terminated TLS) or OTELCONTEXT_ALLOW_INSECURE_GRPC=true")
+		}
+		if !c.AuthEnabled() {
+			return fmt.Errorf("APP_ENV=production requires authentication on the OTLP gRPC listener: set API_KEY or API_TENANT_KEYS_FILE, or waive with AUTH_TRUST_EXTERNAL=true (proxy-authenticated identity) or OTELCONTEXT_ALLOW_INSECURE_GRPC=true")
+		}
 	}
 
 	// TLS: both paths must be set together, and both files must exist & be readable.
@@ -925,6 +1004,44 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("sum of AGGREGATE_MAX_SERIES_* caps (%d = %d+%d+%d+%d+%d) must be <= AGGREGATE_MAX_SERIES (%d)", sumSubCaps, c.AggregateMaxSeriesMetrics, c.AggregateMaxSeriesTraces, c.AggregateMaxSeriesEdges, c.AggregateMaxSeriesLogs, c.AggregateMaxSeriesSystem, c.AggregateMaxSeries)
 	}
 
+	return nil
+}
+
+// IsProduction reports whether APP_ENV names the production environment.
+func (c *Config) IsProduction() bool { return strings.EqualFold(c.Env, "production") }
+
+// AuthEnabled reports whether any credential source is configured: the shared
+// operator key, a per-tenant key file, or a trusted front proxy.
+func (c *Config) AuthEnabled() bool {
+	return c.APIKey != "" || c.APITenantKeysFile != "" || c.AuthTrustExternal
+}
+
+// EnforceWSOrigin reports whether the WebSocket origin policy applies. It does
+// as soon as authentication is configured, and always in production — an
+// unauthenticated development deployment keeps today's permissive behaviour.
+func (c *Config) EnforceWSOrigin() bool { return c.AuthEnabled() || c.IsProduction() }
+
+// GRPCReflectionEnabled reports whether to register gRPC server reflection.
+// Production defaults to off; GRPC_REFLECTION=true re-enables it explicitly.
+func (c *Config) GRPCReflectionEnabled() bool { return c.GRPCReflection }
+
+// validateHeaderToken checks that a header name is a legal HTTP field name.
+// Anything else would be silently unreachable at runtime.
+func validateHeaderToken(name string) error {
+	if strings.TrimSpace(name) == "" {
+		return fmt.Errorf("must not be empty")
+	}
+	if name != strings.TrimSpace(name) {
+		return fmt.Errorf("must not have leading or trailing whitespace")
+	}
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case strings.ContainsRune("-_.", r):
+		default:
+			return fmt.Errorf("invalid character %q in header name", r)
+		}
+	}
 	return nil
 }
 

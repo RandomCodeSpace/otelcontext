@@ -117,6 +117,7 @@ func (s *Server) handleGetLogInsight(w http.ResponseWriter, r *http.Request) {
 // BroadcastLog sends a log entry to the buffered WebSocket hub.
 func (s *Server) BroadcastLog(l storage.Log) {
 	s.hub.Broadcast(realtime.LogEntry{
+		Tenant:         l.TenantID,
 		ID:             l.ID,
 		TraceID:        l.TraceID,
 		SpanID:         l.SpanID,

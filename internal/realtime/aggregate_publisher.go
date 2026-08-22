@@ -22,8 +22,9 @@ type EnginePublisher struct {
 	// edges supplies caller/callee topology, which is not aggregate data.
 	// nil is allowed and yields a node-only topology.
 	edges func(ctx context.Context) []storage.ServiceMapEdge
-	// tenant scopes the queries. The WebSocket protocol carries no tenant, so
-	// this is the default tenant, exactly as the legacy snapshot path assumed.
+	// tenant scopes the queries when the caller's context carries none. Since
+	// the handshake gate pins one tenant per socket, ctx normally decides; this
+	// stays the fallback for an unauthenticated (development) deployment.
 	tenant string
 }
 
@@ -75,7 +76,14 @@ func (p *EnginePublisher) Snapshot(ctx context.Context, service string) *LiveSna
 	if service != "" {
 		services = []string{service}
 	}
-	q := aggregate.Query{Tenant: p.tenant, Start: start, End: now, Services: services}
+	// The socket's authenticated tenant travels on ctx and outranks the
+	// configured fallback — otherwise every tenant's dashboard would be served
+	// the same tenant's numbers.
+	tenant := p.tenant
+	if storage.HasTenantContext(ctx) {
+		tenant = storage.TenantFromContext(ctx)
+	}
+	q := aggregate.Query{Tenant: tenant, Start: start, End: now, Services: services}
 
 	snap := &LiveSnapshot{
 		Type:     "live_snapshot",

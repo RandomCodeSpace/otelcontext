@@ -6,8 +6,10 @@ import (
 	"log/slog"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/RandomCodeSpace/otelcontext/internal/authn"
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 	"github.com/coder/websocket"
 	"golang.org/x/sync/errgroup"
@@ -54,9 +56,55 @@ type AggregatePublisher interface {
 // engine cannot turn every commit into a broadcast.
 const DefaultPublishFloor = 2 * time.Second
 
-// clientFilter tracks a client's active service filter.
-// Empty string = all services (no filter).
+// eventClientQueue bounds how many undelivered messages a single event-WS
+// client may hold. Overflow disconnects the client rather than dropping
+// messages silently: the log/metric batches are incremental, so a gap is
+// indistinguishable from "nothing happened" and would quietly lie to the
+// dashboard. A reconnect re-seeds with a full snapshot.
+const eventClientQueue = 256
+
+// clientFilter tracks a client's active service filter and its immutable
+// tenant scope.
+//
+// service is client-selectable (empty = all services). tenant is NOT: it is
+// fixed at handshake time from the authenticated principal and there is no
+// protocol message that can change it. Empty tenant means authentication is
+// not configured (development), in which case the socket sees everything —
+// exactly as it did before per-tenant scoping existed.
 type clientFilter struct {
+	conn    *websocket.Conn
+	send    chan []byte
+	service string
+	tenant  string
+	closed  atomic.Bool
+}
+
+// matches reports whether an entry belongs to this client's scope.
+func (cf *clientFilter) matches(tenant, service string) bool {
+	if cf.tenant != "" && cf.tenant != tenant {
+		return false
+	}
+	return cf.service == "" || cf.service == service
+}
+
+// enqueue hands a message to the client's writer goroutine. It reports false
+// when the queue is full — the caller then disconnects the client.
+func (cf *clientFilter) enqueue(msg []byte) bool {
+	if cf.closed.Load() {
+		return false
+	}
+	select {
+	case cf.send <- msg:
+		return true
+	default:
+		return false
+	}
+}
+
+// scopeKey identifies one snapshot audience: a tenant plus a service filter.
+// Snapshots are computed once per key, not once per client.
+type scopeKey struct {
+	tenant  string
 	service string
 }
 
@@ -71,6 +119,20 @@ type EventHub struct {
 	mu      sync.Mutex
 	clients map[*websocket.Conn]*clientFilter
 	pending bool
+
+	// maxClients caps simultaneous event-WS connections (WS_MAX_CLIENTS).
+	// 0 = unlimited (legacy default). Past the cap the handshake is refused
+	// with 503 before the upgrade, so a connection flood cannot exhaust file
+	// descriptors or per-client queue memory.
+	maxClients  int
+	clientCount atomic.Int64
+
+	// Origin policy, mirroring Hub. Enforcement is on when authentication is
+	// enabled or APP_ENV=production.
+	enforceOrigin bool
+	originHosts   []string
+
+	writerWg sync.WaitGroup
 
 	// Real-time batching
 	logsCh       chan LogEntry
@@ -203,27 +265,95 @@ func (h *EventHub) BroadcastMetric(m MetricEntry) {
 	}
 }
 
+// SetMaxClients caps simultaneous event-WS connections. 0 disables the cap.
+// Call once at startup, before the hub takes traffic.
+func (h *EventHub) SetMaxClients(n int) {
+	if n < 0 {
+		n = 0
+	}
+	h.maxClients = n
+}
+
+// SetOriginPolicy configures WebSocket origin enforcement — see
+// Hub.SetOriginPolicy. Call once at startup.
+func (h *EventHub) SetOriginPolicy(enforce bool, allowedHosts []string) {
+	h.enforceOrigin = enforce
+	h.originHosts = append([]string(nil), allowedHosts...)
+}
+
+// ActiveClients reports currently-connected event-WS clients.
+func (h *EventHub) ActiveClients() int64 { return h.clientCount.Load() }
+
 // HandleWebSocket upgrades an HTTP request to a WebSocket connection,
 // registers it as an event client, and listens for filter messages.
+//
+// The connection is scoped to exactly one tenant, taken from the principal the
+// handshake gate authenticated. Writes are serialized through one bounded
+// queue and one writer goroutine per client, so a stalled reader can neither
+// block the snapshot loop nor grow without bound.
 func (h *EventHub) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
+	if h.maxClients > 0 {
+		if n := h.clientCount.Add(1); n > int64(h.maxClients) {
+			h.clientCount.Add(-1)
+			slog.Warn("Event WS connection rejected: max-clients cap reached",
+				"max_clients", h.maxClients, "current", n-1)
+			http.Error(w, "WebSocket connections at capacity, retry later", http.StatusServiceUnavailable)
+			return
+		}
+	} else {
+		h.clientCount.Add(1)
+	}
+	counted := true
+	releaseSlot := func() {
+		if counted {
+			counted = false
+			h.clientCount.Add(-1)
+		}
+	}
+
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		InsecureSkipVerify: true,
+		// Origin verification is skipped only while the policy is off, which
+		// is the unauthenticated development default. Production and every
+		// authenticated deployment enforce WS_ALLOWED_ORIGINS (empty list =
+		// same host).
+		InsecureSkipVerify: !h.enforceOrigin,
+		OriginPatterns:     h.originHosts,
+		Subprotocols:       []string{authn.WSSubprotocol},
 	})
 	if err != nil {
+		releaseSlot()
 		slog.Error("Event WS accept failed", "error", err)
 		return
 	}
 
 	// Check for initial service filter from query params
 	initialService := r.URL.Query().Get("service")
-	h.addClient(conn, initialService)
+	cf := h.addClient(conn, initialService, connTenantScope(r))
+
+	h.writerWg.Add(1)
+	go func() { // #nosec G118 -- long-lived WS writer goroutine outlives the HTTP request intentionally
+		defer h.writerWg.Done()
+		defer releaseSlot()
+		for msg := range cf.send {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			err := conn.Write(ctx, websocket.MessageText, msg)
+			cancel()
+			if err != nil {
+				slog.Debug("Event WS send failed", "error", err)
+				h.removeClient(conn)
+				_ = conn.Close(websocket.StatusGoingAway, "write error")
+				return
+			}
+		}
+	}()
 
 	// Send immediate FULL snapshot so the client has data right away. In
 	// aggregate mode it carries {epoch, revision} and reset=true: a fresh
 	// client has nothing to merge into and must adopt the snapshot whole.
-	h.sendSnapshotTo(conn, initialService)
+	h.sendSnapshotTo(cf)
 
-	// Read loop: client can send {"service":"xxx"} to change filter
+	// Read loop: client can send {"service":"xxx"} to change filter. The
+	// tenant scope is not negotiable and is deliberately absent here.
 	for {
 		_, msg, readErr := conn.Read(r.Context())
 		if readErr != nil {
@@ -241,22 +371,48 @@ func (h *EventHub) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	_ = conn.Close(websocket.StatusNormalClosure, "bye")
 }
 
-func (h *EventHub) addClient(c *websocket.Conn, service string) {
+func (h *EventHub) addClient(c *websocket.Conn, service, tenant string) *clientFilter {
+	cf := &clientFilter{
+		conn:    c,
+		send:    make(chan []byte, eventClientQueue),
+		service: service,
+		tenant:  tenant,
+	}
 	h.mu.Lock()
-	h.clients[c] = &clientFilter{service: service}
+	h.clients[c] = cf
 	h.mu.Unlock()
 	if h.onConn != nil {
 		h.onConn()
 	}
+	return cf
 }
 
 func (h *EventHub) removeClient(c *websocket.Conn) {
 	h.mu.Lock()
+	cf, ok := h.clients[c]
 	delete(h.clients, c)
 	h.mu.Unlock()
+	if !ok {
+		return
+	}
+	// Closing the queue is what stops the writer goroutine; the CAS guard
+	// makes every removal path idempotent.
+	if cf.closed.CompareAndSwap(false, true) {
+		close(cf.send)
+	}
 	if h.onDisc != nil {
 		h.onDisc()
 	}
+}
+
+// deliver enqueues one message, disconnecting a client whose queue is full.
+func (h *EventHub) deliver(cf *clientFilter, msg []byte) {
+	if cf.enqueue(msg) {
+		return
+	}
+	slog.Warn("Event WS client removed: write queue full", "queue", eventClientQueue)
+	h.removeClient(cf.conn)
+	_ = cf.conn.Close(websocket.StatusPolicyViolation, "client too slow")
 }
 
 func (h *EventHub) updateClientFilter(c *websocket.Conn, service string) {
@@ -267,7 +423,10 @@ func (h *EventHub) updateClientFilter(c *websocket.Conn, service string) {
 	h.mu.Unlock()
 }
 
-// flushSnapshots computes per-service snapshots in parallel and pushes to matching clients.
+// flushSnapshots computes per-scope snapshots in parallel and pushes them to
+// matching clients. A scope is (tenant, service filter): two clients on
+// different tenants never share a computed snapshot, so a snapshot cannot
+// carry another tenant's rows.
 func (h *EventHub) flushSnapshots() {
 	h.mu.Lock()
 	if !h.pending {
@@ -280,26 +439,20 @@ func (h *EventHub) flushSnapshots() {
 		h.mu.Unlock()
 		return
 	}
-
-	// Group clients by service filter
-	groups := make(map[string][]*websocket.Conn)
-	for c, cf := range h.clients {
-		groups[cf.service] = append(groups[cf.service], c)
-	}
+	groups := h.groupByScopeLocked()
 	h.mu.Unlock()
 
 	// Compute snapshots in parallel using errgroup
-	g, ctx := errgroup.WithContext(context.Background())
-	snapshotMap := make(map[string]*LiveSnapshot)
+	g, _ := errgroup.WithContext(context.Background())
+	snapshotMap := make(map[scopeKey]*LiveSnapshot)
 	var snapMu sync.Mutex
 
-	for service := range groups {
-		// Capture
+	for scope := range groups {
 		g.Go(func() error {
-			snap := h.snapshotFor(service)
+			snap := h.snapshotFor(scope)
 			if snap != nil {
 				snapMu.Lock()
-				snapshotMap[service] = snap
+				snapshotMap[scope] = snap
 				snapMu.Unlock()
 			}
 			return nil
@@ -311,40 +464,44 @@ func (h *EventHub) flushSnapshots() {
 	}
 
 	// Broadcast memoized snapshots to matching clients
-	for service, clients := range groups {
-		snap, ok := snapshotMap[service]
+	for scope, clients := range groups {
+		snap, ok := snapshotMap[scope]
 		if !ok {
 			continue
 		}
-
 		msg, err := json.Marshal(snap)
 		if err != nil {
 			slog.Error("Event WS marshal failed", "error", err)
 			continue
 		}
-
-		for _, conn := range clients {
-			writeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-			if err := conn.Write(writeCtx, websocket.MessageText, msg); err != nil {
-				slog.Debug("Event WS send failed, removing client", "error", err)
-				h.removeClient(conn)
-				_ = conn.Close(websocket.StatusGoingAway, "write error")
-			}
-			cancel()
+		for _, cf := range clients {
+			h.deliver(cf, msg)
 		}
 	}
 }
 
-// flushBatches flushes buffered logs and metrics to clients, respecting filters.
+// groupByScopeLocked buckets connected clients by (tenant, service). Callers
+// must hold h.mu.
+func (h *EventHub) groupByScopeLocked() map[scopeKey][]*clientFilter {
+	groups := make(map[scopeKey][]*clientFilter, len(h.clients))
+	for _, cf := range h.clients {
+		k := scopeKey{tenant: cf.tenant, service: cf.service}
+		groups[k] = append(groups[k], cf)
+	}
+	return groups
+}
+
+// flushBatches flushes buffered logs and metrics to clients, respecting each
+// client's tenant scope first and its service filter second.
 func (h *EventHub) flushBatches() {
 	h.mu.Lock()
 	logs := h.logBuffer
 	h.logBuffer = make([]LogEntry, 0, 100)
 	metrics := h.metricBuffer
 	h.metricBuffer = make([]MetricEntry, 0, 100)
-	clients := make(map[*websocket.Conn]*clientFilter)
-	for c, cf := range h.clients {
-		clients[c] = cf
+	clients := make([]*clientFilter, 0, len(h.clients))
+	for _, cf := range h.clients {
+		clients = append(clients, cf)
 	}
 	h.mu.Unlock()
 
@@ -352,11 +509,11 @@ func (h *EventHub) flushBatches() {
 		return
 	}
 
-	for conn, filter := range clients {
+	for _, cf := range clients {
 		// 1. Filter Logs
 		clientLogs := make([]LogEntry, 0)
 		for _, l := range logs {
-			if filter.service == "" || filter.service == l.ServiceName {
+			if cf.matches(l.Tenant, l.ServiceName) {
 				clientLogs = append(clientLogs, l)
 			}
 		}
@@ -364,34 +521,33 @@ func (h *EventHub) flushBatches() {
 		// 2. Filter Metrics
 		clientMetrics := make([]MetricEntry, 0)
 		for _, m := range metrics {
-			if filter.service == "" || filter.service == m.ServiceName {
+			if cf.matches(m.Tenant, m.ServiceName) {
 				clientMetrics = append(clientMetrics, m)
 			}
 		}
 
 		// 3. Send Batches
 		if len(clientLogs) > 0 {
-			h.sendBatch(conn, "logs", clientLogs)
+			h.sendBatch(cf, "logs", clientLogs)
 		}
 		if len(clientMetrics) > 0 {
-			h.sendBatch(conn, "metrics", clientMetrics)
+			h.sendBatch(cf, "metrics", clientMetrics)
 		}
 	}
 }
 
-func (h *EventHub) sendBatch(conn *websocket.Conn, batchType string, data any) {
-	msg, _ := json.Marshal(HubBatch{Type: batchType, Data: data})
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	if err := conn.Write(ctx, websocket.MessageText, msg); err != nil {
-		h.removeClient(conn)
-		_ = conn.Close(websocket.StatusGoingAway, "write error")
+func (h *EventHub) sendBatch(cf *clientFilter, batchType string, data any) {
+	msg, err := json.Marshal(HubBatch{Type: batchType, Data: data})
+	if err != nil {
+		slog.Error("Event WS marshal failed", "error", err, "type", batchType)
+		return
 	}
+	h.deliver(cf, msg)
 }
 
 // sendSnapshotTo sends a snapshot to a single client.
-func (h *EventHub) sendSnapshotTo(conn *websocket.Conn, service string) {
-	snapshot := h.snapshotFor(service)
+func (h *EventHub) sendSnapshotTo(cf *clientFilter) {
+	snapshot := h.snapshotFor(scopeKey{tenant: cf.tenant, service: cf.service})
 	if snapshot == nil {
 		return
 	}
@@ -402,18 +558,21 @@ func (h *EventHub) sendSnapshotTo(conn *websocket.Conn, service string) {
 	if err != nil {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	_ = conn.Write(ctx, websocket.MessageText, msg)
+	h.deliver(cf, msg)
 }
 
-// snapshotFor produces the payload for one service filter from whichever
-// source owns the numbers in this mode.
-func (h *EventHub) snapshotFor(service string) *LiveSnapshot {
-	if pub := h.aggregatePublisher(); pub != nil {
-		return pub.Snapshot(context.Background(), service)
+// snapshotFor produces the payload for one scope from whichever source owns
+// the numbers in this mode. The tenant travels on the context, which is what
+// scopes both the repository queries and the aggregate publisher.
+func (h *EventHub) snapshotFor(scope scopeKey) *LiveSnapshot {
+	ctx := context.Background()
+	if scope.tenant != "" {
+		ctx = storage.WithTenantContext(ctx, scope.tenant)
 	}
-	return h.computeSnapshot(service)
+	if pub := h.aggregatePublisher(); pub != nil {
+		return pub.Snapshot(ctx, scope.service)
+	}
+	return h.computeSnapshot(ctx, scope.service)
 }
 
 // runAggregate is the revision-driven publication loop.
@@ -469,14 +628,11 @@ func (h *EventHub) publishIfChanged() {
 		h.mu.Unlock()
 		return
 	}
-	groups := make(map[string][]*websocket.Conn)
-	for c, cf := range h.clients {
-		groups[cf.service] = append(groups[cf.service], c)
-	}
+	groups := h.groupByScopeLocked()
 	h.mu.Unlock()
 
-	for service, clients := range groups {
-		snap := pub.Snapshot(context.Background(), service)
+	for scope, clients := range groups {
+		snap := h.snapshotFor(scope)
 		if snap == nil {
 			continue
 		}
@@ -486,21 +642,21 @@ func (h *EventHub) publishIfChanged() {
 			slog.Error("Event WS marshal failed", "error", err)
 			continue
 		}
-		for _, conn := range clients {
-			writeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			if err := conn.Write(writeCtx, websocket.MessageText, msg); err != nil {
-				slog.Debug("Event WS send failed, removing client", "error", err)
-				h.removeClient(conn)
-				_ = conn.Close(websocket.StatusGoingAway, "write error")
-			}
-			cancel()
+		for _, cf := range clients {
+			h.deliver(cf, msg)
 		}
 	}
 }
 
 // computeSnapshot queries the DB for the last 15 minutes of data,
 // optionally filtered by a single service name.
-func (h *EventHub) computeSnapshot(service string) *LiveSnapshot {
+func (h *EventHub) computeSnapshot(ctx context.Context, service string) *LiveSnapshot {
+	if h.repo == nil {
+		// No relational source wired (aggregate-only wiring, or a socket-layer
+		// test): there is nothing to snapshot, and every query below would
+		// dereference a nil repository.
+		return nil
+	}
 	now := time.Now()
 	start := now.Add(-15 * time.Minute)
 
@@ -510,11 +666,6 @@ func (h *EventHub) computeSnapshot(service string) *LiveSnapshot {
 	}
 
 	snapshot := &LiveSnapshot{Type: "live_snapshot"}
-
-	// WebSocket snapshots are not tenant-scoped in the current protocol;
-	// use the default-tenant context so repo query helpers behave the same as
-	// a single-tenant install.
-	ctx := context.Background()
 
 	if stats, err := h.repo.GetDashboardStats(ctx, start, now, serviceNames); err == nil {
 		snapshot.Dashboard = stats
@@ -538,5 +689,16 @@ func (h *EventHub) computeSnapshot(service string) *LiveSnapshot {
 func (h *EventHub) Stop() {
 	h.stopOnce.Do(func() {
 		close(h.stopCh)
+		// Close every client queue so the writer goroutines exit; without
+		// this an idle client keeps one goroutine parked on its channel.
+		h.mu.Lock()
+		for c, cf := range h.clients {
+			delete(h.clients, c)
+			if cf.closed.CompareAndSwap(false, true) {
+				close(cf.send)
+			}
+		}
+		h.mu.Unlock()
+		h.writerWg.Wait()
 	})
 }
