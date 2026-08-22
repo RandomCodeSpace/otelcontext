@@ -365,33 +365,56 @@ func main() {
 	// needs the publisher wired before the first tick.
 	ctxEvents, cancelEvents := context.WithCancel(context.Background())
 
-	// 4c. Initialize TSDB Aggregator + Ring Buffer
-	tsdbAgg := tsdb.NewAggregator(repo, 30*time.Second)
-	if cfg.MetricMaxCardinality > 0 || cfg.MetricMaxCardinalityPerTenant > 0 {
-		tsdbAgg.SetCardinalityLimit(cfg.MetricMaxCardinality, cfg.MetricMaxCardinalityPerTenant, func(tenantID string) {
-			// Maintain the legacy unlabeled counter for back-compat dashboards
-			// AND emit the labeled by-tenant counter for fairness diagnostics.
-			metrics.TSDBCardinalityOverflow.Inc()
-			if metrics.TSDBCardinalityOverflowByTenant != nil {
-				metrics.TSDBCardinalityOverflowByTenant.WithLabelValues(tenantID).Inc()
-			}
-		})
-		slog.Info("📈 TSDB cardinality limits configured",
-			"global_max", cfg.MetricMaxCardinality,
-			"per_tenant_max", cfg.MetricMaxCardinalityPerTenant,
+	// 4c. Initialize TSDB Aggregator + Ring Buffer.
+	//
+	// Retired outright in AGGREGATE_MODE=aggregate (#194 finding 10). There the
+	// aggregate engine owns every metric read, so the ring buffer, the 30s
+	// flush into metric_buckets, the per-point RawMetric allocation and the
+	// metric callback are all pure waste on the hot path. Legacy keeps the path
+	// because it IS the metric store; shadow keeps it because shadow's whole
+	// job is running both paths side by side.
+	legacyTSDB := legacyMetricPath(cfg.AggregateMode)
+	var (
+		tsdbAgg *tsdb.Aggregator
+		ringBuf *tsdb.RingBuffer
+	)
+	ctxTSDB, cancelTSDB := context.WithCancel(context.Background())
+	if legacyTSDB {
+		tsdbAgg = tsdb.NewAggregator(repo, 30*time.Second)
+		if cfg.MetricMaxCardinality > 0 || cfg.MetricMaxCardinalityPerTenant > 0 {
+			tsdbAgg.SetCardinalityLimit(cfg.MetricMaxCardinality, cfg.MetricMaxCardinalityPerTenant, func(tenantID string) {
+				// Maintain the legacy unlabeled counter for back-compat dashboards
+				// AND emit the labeled by-tenant counter for fairness diagnostics.
+				metrics.TSDBCardinalityOverflow.Inc()
+				if metrics.TSDBCardinalityOverflowByTenant != nil {
+					metrics.TSDBCardinalityOverflowByTenant.WithLabelValues(tenantID).Inc()
+				}
+			})
+			slog.Info("📈 TSDB cardinality limits configured",
+				"global_max", cfg.MetricMaxCardinality,
+				"per_tenant_max", cfg.MetricMaxCardinalityPerTenant,
+			)
+		}
+		tsdbAgg.SetMetrics(
+			func() { metrics.TSDBIngestTotal.Inc() },
+			func() { metrics.TSDBBatchesDropped.Inc() },
+		)
+		ringBuf = tsdb.NewRingBuffer(120, 30*time.Second, cfg.MetricMaxCardinality, metrics.TSDBRingSeriesRejected.Inc)
+		tsdbAgg.SetRingBuffer(ringBuf)
+		slog.Info("📈 TSDB ring buffer attached (120 slots × 30s = 1h retention)")
+
+		go tsdbAgg.Start(ctxTSDB)
+		slog.Info("📈 TSDB Aggregator started (30s window)")
+	} else {
+		// Nothing can move these counters once the aggregator is gone, and a
+		// TSDB-specific cardinality gauge frozen at 0 reads as "no overflow"
+		// rather than "no TSDB". The aggregate engine publishes its own caps
+		// (#200/#201); these are unregistered so no scrape can confuse them.
+		metrics.DisableTSDBCollectors()
+		slog.Info("📈 Legacy TSDB aggregator and ring buffer disabled (AGGREGATE_MODE=aggregate)",
+			"note", "metric reads are served by the aggregate engine; TSDB metrics unregistered",
 		)
 	}
-	tsdbAgg.SetMetrics(
-		func() { metrics.TSDBIngestTotal.Inc() },
-		func() { metrics.TSDBBatchesDropped.Inc() },
-	)
-	ringBuf := tsdb.NewRingBuffer(120, 30*time.Second, cfg.MetricMaxCardinality, metrics.TSDBRingSeriesRejected.Inc)
-	tsdbAgg.SetRingBuffer(ringBuf)
-	slog.Info("📈 TSDB ring buffer attached (120 slots × 30s = 1h retention)")
-
-	ctxTSDB, cancelTSDB := context.WithCancel(context.Background())
-	go tsdbAgg.Start(ctxTSDB)
-	slog.Info("📈 TSDB Aggregator started (30s window)")
 
 	// 4e. Initialize In-Memory Service Graph (rebuilds from spans every 30s)
 	svcGraph := graph.New(func(since time.Time) ([]graph.SpanRow, error) {
@@ -492,6 +515,8 @@ func main() {
 	// 7. Initialize OTLP Ingestion (gRPC)
 	traceServer := ingest.NewTraceServer(repo, metrics, cfg)
 	logsServer := ingest.NewLogsServer(repo, metrics, cfg)
+	// tsdbAgg is nil in aggregate mode: MetricsServer then skips the RawMetric
+	// build entirely (see exportNumberPoints).
 	metricsServer := ingest.NewMetricsServer(repo, metrics, tsdbAgg, cfg)
 
 	// Aggregate engine + durable store (AGGREGATE_MODE != legacy). The reducer
@@ -945,17 +970,24 @@ func main() {
 		})
 	}
 
-	metricsServer.SetMetricCallback(func(m tsdb.RawMetric) {
-		eventHub.BroadcastMetric(realtime.MetricEntry{
-			Tenant:      m.TenantID,
-			Name:        m.Name,
-			ServiceName: m.ServiceName,
-			Value:       m.Value,
-			Timestamp:   m.Timestamp,
-			Attributes:  m.Attributes,
+	// Per-point metric fan-out. Not wired in aggregate mode: the event hub
+	// publishes from the engine snapshot instead (BroadcastMetric is already a
+	// no-op behind the aggregate publisher) and GraphRAG replaces its metric
+	// nodes per topology revision, so processMetric would discard every event
+	// after paying for the channel hop and the RawMetric allocation.
+	if legacyTSDB {
+		metricsServer.SetMetricCallback(func(m tsdb.RawMetric) {
+			eventHub.BroadcastMetric(realtime.MetricEntry{
+				Tenant:      m.TenantID,
+				Name:        m.Name,
+				ServiceName: m.ServiceName,
+				Value:       m.Value,
+				Timestamp:   m.Timestamp,
+				Attributes:  m.Attributes,
+			})
+			graphRAG.OnMetricIngested(m)
 		})
-		graphRAG.OnMetricIngested(m)
-	})
+	}
 
 	// Update DLQ size metric periodically. Tied to appCtx so the goroutine
 	// exits before dlq.Stop() — otherwise it keeps polling Size()/DiskBytes()
@@ -1264,7 +1296,9 @@ func main() {
 				edg.WithLabelValues("trace").Set(float64(c.TraceEdges))
 				edg.WithLabelValues("signal").Set(float64(c.SignalEdges))
 				edg.WithLabelValues("anomaly").Set(float64(c.AnomalyEdges))
-				metrics.TSDBRingSeriesActive.Set(float64(ringBuf.MetricCount()))
+				if ringBuf != nil {
+					metrics.TSDBRingSeriesActive.Set(float64(ringBuf.MetricCount()))
+				}
 				metrics.DrainTemplatesActive.Set(float64(graphRAG.DrainTemplateCount()))
 			}
 		}
@@ -1353,7 +1387,9 @@ func main() {
 	aiService.Stop()
 
 	// 3. Stop processing engines (TSDB flush, graph, GraphRAG)
-	tsdbAgg.Stop()
+	if tsdbAgg != nil {
+		tsdbAgg.Stop()
+	}
 	cancelTSDB()
 	cancelGraph()
 	graphRAG.Stop()
@@ -1583,3 +1619,14 @@ func sqliteMainDBPath(cfg *config.Config) string {
 	}
 	return cfg.DBDSN
 }
+
+// legacyMetricPath reports whether the legacy metric path — the TSDB
+// aggregator, its ring buffer, the 30s flush into metric_buckets and the
+// per-point metric callback — is constructed for a given AGGREGATE_MODE.
+//
+// Only AGGREGATE_MODE=aggregate retires it (#194 finding 10). Legacy has no
+// other metric store, and shadow's entire purpose is running both paths at
+// once and comparing them, so both keep it. It is a function rather than an
+// inline comparison so the wiring decision is assertable without booting the
+// process.
+func legacyMetricPath(mode string) bool { return mode != aggregate.ModeAggregate }

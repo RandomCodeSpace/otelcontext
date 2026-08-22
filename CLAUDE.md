@@ -67,7 +67,7 @@ is positive-only at scale 4.
 
 | Point type | Aggregate handling |
 |---|---|
-| `NumberDataPoint` (Gauge, Sum) | Gauge-like or baseline-converted per the temporality model. Also feeds the TSDB ring and the real-time bypass. |
+| `NumberDataPoint` (Gauge, Sum) | Gauge-like or baseline-converted per the temporality model. In legacy and shadow it also feeds the TSDB ring and the real-time bypass; in `AGGREGATE_MODE=aggregate` neither exists and no `tsdb.RawMetric` is built at all. |
 | `HistogramDataPoint` (delta) | Bucket counts folded as **weighted** synthetic observations at each finite positive bucket's geometric midpoint — one sketch add per bucket, never one per count. |
 | `ExponentialHistogramDataPoint` (delta) | Exact index transfer. Scale > 4 downscales by shifting indexes; scale 0–3 downscales the accumulating sketch to the source scale; `zero_count` folds into the zero bucket. |
 | `SummaryDataPoint` | **Wholly unsupported.** Producer-chosen quantiles cannot be merged across series or windows. |
@@ -127,6 +127,55 @@ population statistics and accuracy metadata; v5 added `aggregate_log_template`
 (durable log-template miner state) plus the `dict_id_high_watermark` /
 `series_id_high_watermark` meta keys. An older file cannot be migrated — start
 an older binary or set `AGGREGATE_ALLOW_REBUILD=true`.
+
+### Legacy TSDB retirement in aggregate mode (#194 finding 10)
+
+`AGGREGATE_MODE=aggregate` constructs **no** `tsdb.Aggregator`, **no**
+`tsdb.RingBuffer` and **no** metric callback. `main.go` gates all three on
+`legacyMetricPath(cfg.AggregateMode)`, which is false only for pure aggregate
+mode — legacy has no other metric store, and shadow's entire job is running both
+paths side by side.
+
+Consequences, all deliberate:
+
+- `MetricsServer.exportNumberPoints` skips the `tsdb.RawMetric` build (and its
+  per-point attribute map) when neither a TSDB aggregator nor a metric callback
+  is wired. The aggregate reducer still sees every point.
+- Nothing writes the `metric_buckets` table. The rows are not read in aggregate
+  mode either; `RetentionScheduler` keeps purging whatever an earlier legacy run
+  left behind.
+- `GraphRAG.OnMetricIngested` is not called. Metric nodes were already replaced
+  per topology revision in aggregate mode, so the callback was paying for a
+  channel hop and an allocation to have `processMetric` discard the event.
+- `EventHub.BroadcastMetric` is not called. The aggregate publisher already
+  short-circuited it; the coalesced revision-driven snapshot is the live feed.
+- The TSDB-specific Prometheus collectors are **unregistered** at startup via
+  `Metrics.DisableTSDBCollectors()`: `OtelContext_tsdb_ingest_total`,
+  `_tsdb_flush_duration_seconds`, `_tsdb_batches_dropped_total`,
+  `_tsdb_cardinality_overflow_total`,
+  `otelcontext_tsdb_cardinality_overflow_by_tenant_total`,
+  `otelcontext_tsdb_ring_series_active`, `otelcontext_tsdb_ring_series_rejected_total`.
+  A cardinality counter frozen at 0 reads as "no overflow" rather than "no
+  TSDB". The aggregate engine publishes its own admission and cardinality caps
+  (#200/#201) and must not be shadowed by dead series. `METRIC_MAX_CARDINALITY`
+  therefore has no effect in aggregate mode.
+
+**Metric read endpoints in aggregate mode.** Both are served from the engine's
+topology projection (`Engine.TopologySnapshot`), not from `metric_buckets`:
+
+| Endpoint | Aggregate-mode source | What changes |
+|---|---|---|
+| `GET /api/metrics?name=…` | Topology projection metric windows | Same bare-array shape and `time_bucket ASC` ordering. Bucket **width** is the engine's 5-minute window, not 30s. `id` is `0` and `attributes_json` is empty — an aggregate window has no row identity and the projection keys metrics by `(service, name)` only. |
+| `GET /api/metadata/metrics` | Distinct names in the projection | Same sorted bare array. |
+
+Both stamp the `OtelContext-Data-Coverage` header. `/api/metrics` is `full` when
+the requested range sits inside the retained horizon and no projection cap fired,
+`sampled` otherwise. `/api/metadata/metrics` is **always** `sampled`: the
+projection retains a bounded recent horizon (the mutable windows plus
+`TopologySnapshot.Horizon`, 30m by default) while the legacy answer spanned
+`HOT_RETENTION_DAYS`, so a metric that stopped reporting an hour ago is simply
+absent. History older than that horizon is unavailable in aggregate mode — it is
+reported as reduced coverage, never as a flat line.
 
 ### Aggregate identity lifecycle (#200)
 
@@ -193,7 +242,7 @@ Observability: `otelcontext_aggregate_gc_runs_total{result}`,
 | Layer | Package | Purpose |
 |-------|---------|---------|
 | GraphRAG (in-memory) | `internal/graphrag/` | Layered graph: 4 typed stores, error chains, root cause analysis, anomaly detection |
-| Time Series (in-memory) | `internal/tsdb/` | Ring buffer, sliding windows, pre-computed percentiles |
+| Time Series (in-memory) | `internal/tsdb/` | Ring buffer, sliding windows, pre-computed percentiles. **Not constructed in `AGGREGATE_MODE=aggregate`** — the aggregate engine owns metric storage and reads there (#194 finding 10). |
 | Graph (in-memory, legacy) | `internal/graph/` | Simple service topology — **being replaced by GraphRAG** |
 | Relational (persistent) | `internal/storage/` | GORM-based, multi-DB, single source of truth. Driven by `RetentionScheduler` (hourly batched purge + daily VACUUM/ANALYZE). `logs.body` is plain TEXT. **Log search**: SQLite FTS5 (`logs_fts`, porter+unicode61, ordered by `bm25()`, AFTER INSERT/DELETE/UPDATE triggers) is the default path — `LOG_FTS_ENABLED` defaults to `true` when `DB_DRIVER=sqlite` and `false` otherwise. Operators who want the ~30% disk savings can set `LOG_FTS_ENABLED=false` and reclaim the FTS table + indexes via `POST /api/admin/drop_fts`. Postgres uses `pg_trgm` GIN on `logs.body` and `logs.service_name`. `AttributesJSON` and `AIInsight` remain `CompressedText`. The `search_logs` MCP tool and the API `/api/logs?q=…` filter are clamped to the **last 24 hours** to bound the LIKE-fallback worst case. The `vectordb` package (TF-IDF semantic search) was removed on 2026-05-24 alongside the `find_similar_logs` MCP tool — `data/vectordb.snapshot` is left on disk for operators to delete by hand. |
 
@@ -250,6 +299,10 @@ TraceServer.Export() → DB persist → spanCallback → GraphRAG.OnSpanIngested
 LogsServer.Export()  → DB persist → logCallback  → GraphRAG.OnLogIngested()
 MetricsServer.Export() → TSDB    → metricCallback → GraphRAG.OnMetricIngested()
 ```
+
+In `AGGREGATE_MODE=aggregate` the metric line does not exist: no TSDB, no
+`metricCallback`, no `tsdb.RawMetric`. Metric state reaches GraphRAG through the
+engine's topology snapshot instead.
 
 **Pre-sample topology observer** (`internal/graphrag/topology_observer.go`): `TraceServer.Export()` also calls `GraphRAG.ObserveSpanTopology()` for **every** received span *before* the sampler's keep/drop decision, so cross-service CALLS edges are recorded independent of `SAMPLING_RATE`. Without it, an edge formed only when both the caller and callee spans survived sampling (~`rate²` joint probability), so at low sampling the service map showed nodes but almost no edges/flow. The observer is existence-only (`ServiceStore.EnsureService`/`EnsureCallEdge` create with zeroed aggregates, no-op if present) so the sampled path stays the **sole** source of CallCount/latency/error-rate; it's bounded by a per-tenant spanID→service LRU (cap 100k) + per-pair dedup (memory ≈ #service-pairs) and never touches TraceStore/eventCh, so the SQLite OOM-survival bounds are unaffected.
 
@@ -311,7 +364,7 @@ duplicate on replay.
 Proper LIFO ordering to prevent data loss:
 1. gRPC `GracefulStop()` + HTTP `Shutdown()` — stop ingestion
 2. WebSocket Hub + Event Hub + AI Service — stop real-time
-3. TSDB + Graph + GraphRAG — stop processing
+3. TSDB + Graph + GraphRAG — stop processing (TSDB is nil and skipped in aggregate mode)
 4. DLQ — stop replay
 5. RetentionScheduler `Stop()` — halt purge/maintenance ticks
 6. DB `Close()` — close database last
@@ -344,7 +397,7 @@ internal/
   realtime/     # WebSocket hub + event streaming
   storage/      # GORM repository, models, migrations, Close() method, SQLite PRAGMA stanza
   telemetry/    # Prometheus metrics + health (19 metrics)
-  tsdb/         # Time series aggregator + ring buffer (lock-free Windows())
+  tsdb/         # Time series aggregator + ring buffer (lock-free Windows()) — legacy/shadow only
   ui/           # Embedded React frontend
 ui/             # React frontend (Vite + token CSS Modules, no UI framework)
 test/           # Microservice simulation (7 services)
@@ -374,7 +427,7 @@ Key settings in `internal/config/config.go`:
 - `EXEMPLAR_SYNTH_LOGS_PER_SPAN` (8), `EXEMPLAR_SYNTH_LOGS_PER_TRACE` (64) — count caps on logs synthesized from span events and span status
 - `DATA_DISK_BUDGET_MB` (8192), `DATA_DISK_PATH` (`./data`) — disk watchdog ceiling and the volume it `statfs`-es
 - `SAMPLING_RATE` (1.0), `SAMPLING_ALWAYS_ON_ERRORS` (true), `SAMPLING_LATENCY_THRESHOLD_MS` (500)
-- `METRIC_MAX_CARDINALITY` (10000), `METRIC_MAX_CARDINALITY_PER_TENANT` (0 = unlimited), `API_RATE_LIMIT_RPS` (100). The per-tenant cap is checked first; when set, a noisy tenant cannot exhaust the global pool. Overflow is labeled by tenant via `otelcontext_tsdb_cardinality_overflow_by_tenant_total{tenant_id}` (`__global__` sentinel when the global cap was the trigger).
+- `METRIC_MAX_CARDINALITY` (10000), `METRIC_MAX_CARDINALITY_PER_TENANT` (0 = unlimited), `API_RATE_LIMIT_RPS` (100). The per-tenant cap is checked first; when set, a noisy tenant cannot exhaust the global pool. Overflow is labeled by tenant via `otelcontext_tsdb_cardinality_overflow_by_tenant_total{tenant_id}` (`__global__` sentinel when the global cap was the trigger). **Both caps are TSDB-only and inert in `AGGREGATE_MODE=aggregate`**, where the collectors are unregistered and the aggregate engine's own caps apply.
 - `MCP_ENABLED` (true), `MCP_PATH` (/mcp)
 - `MCP_MAX_CONCURRENT` (32), `MCP_CALL_TIMEOUT_MS` (30000), `MCP_CACHE_TTL_MS` (5000) — MCP HTTP streamable robustness. Counting semaphore gates concurrent `tools/call` (JSON-RPC `-32000` past the cap), per-call deadlines abort runaway handlers (JSON-RPC `-32001`), and a 5s TTL cache memoizes the cheap in-memory GraphRAG tools (`get_service_map`, `impact_analysis`, `root_cause_analysis`, `get_anomaly_timeline`, `get_service_health`). SSE GET sends a `: keep-alive\n\n` comment every 25s to keep the stream alive across reverse-proxy idle timeouts. Set any to 0 to disable.
 - `LOG_FTS_ENABLED` — when truthy (`true`/`yes`/`on`/`1`), provisions the SQLite FTS5 `logs_fts` virtual table + sync triggers at startup; when false, log-search uses a 24h-clamped LIKE fallback. **Defaults to `true` when `DB_DRIVER=sqlite`** (BM25 is dramatically faster than LIKE on the kept `search_logs` MCP tool) and `false` otherwise. Toggle off and reclaim the ~30% disk overhead via `POST /api/admin/drop_fts` (refused while the flag is on). The vectordb-backed semantic-search path was removed on 2026-05-24.
@@ -402,7 +455,7 @@ So a 100+ service deployment on SQLite survives without OOM, `config.Load()` ove
 | `INGEST_PIPELINE_MAX_BYTES` | 128 MB | 512 MB | Item count alone cannot bound queue memory; one batch may carry MBs of spans/logs. |
 | `GRAPHRAG_EVENT_QUEUE_SIZE` | 10000 | 100000 | Each queued event embeds a Span/Log by value (~0.5–2 KB); buffer less, drop sooner (metered). |
 | `GRAPHRAG_TRACE_TTL` | 30m | 1h | The in-memory span window is the largest legitimate GraphRAG consumer; anomaly/investigation lookbacks are ≤5min. |
-| `METRIC_MAX_CARDINALITY` | 3000 | 10000 | Bound the in-memory TSDB series map. |
+| `METRIC_MAX_CARDINALITY` | 3000 | 10000 | Bound the in-memory TSDB series map (no effect in aggregate mode). |
 | `SAMPLING_RATE` | 0.05 | 1.0 | Errors and slow spans are always kept by `SAMPLING_ALWAYS_ON_ERRORS`. |
 | `GRPC_MAX_CONCURRENT_STREAMS` | 240 | 1000 | ~2 streams per service at 120 services with headroom. |
 | `LOG_FTS_ENABLED` | `true` | n/a | FTS5 BM25 is dramatically faster than LIKE on the kept `search_logs` path. |
