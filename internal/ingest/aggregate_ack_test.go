@@ -170,15 +170,14 @@ func counterAt(t *testing.T, v *prometheus.CounterVec, labels ...string) float64
 	return testutil.ToFloat64(c)
 }
 
-// --- acceptance 1: aggregate mode, raw queue full -> deferred to DLQ ---------
-
-func TestAggregateMode_QueueFull_DefersToDLQAndSucceeds(t *testing.T) {
-	const spans = 3
-	now := time.Now().UTC()
-	m := ackTestMetrics("defer")
-	sink := &captureDLQ{}
+// exportSaturatedTraces wires a TraceServer over a saturated pipeline with
+// sink, exports `spans` error spans in aggregate mode, asserts the Export
+// succeeded with the aggregate counted exactly once, and returns the
+// populated partial_success plus the metrics for further assertions.
+func exportSaturatedTraces(t *testing.T, name string, sink BatchSink, spans int, now time.Time) (*coltracepb.ExportTraceServiceResponse, *telemetry.Metrics) {
+	t.Helper()
+	m := ackTestMetrics(name)
 	p := saturatedPipeline(t, m, sink)
-
 	eng := ackEngine(t, aggregate.ModeAggregate, now)
 	srv := NewTraceServer(nil, m, aggTestConfig())
 	srv.SetPipeline(p)
@@ -188,17 +187,25 @@ func TestAggregateMode_QueueFull_DefersToDLQAndSucceeds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Export must succeed once the aggregate commit landed: %v", err)
 	}
-
-	// Aggregate counted exactly once — the whole point of the contract.
-	if count, _ := eng.Snapshot().Totals(aggregate.SignalTraceOp); count != spans {
+	if count, _ := eng.Snapshot().Totals(aggregate.SignalTraceOp); count != uint64(spans) {
 		t.Fatalf("aggregate count = %d, want %d (exactly one contribution)", count, spans)
 	}
+	if resp.GetPartialSuccess() == nil {
+		t.Fatal("partial_success not populated")
+	}
+	return resp, m
+}
+
+// --- acceptance 1: aggregate mode, raw queue full -> deferred to DLQ ---------
+
+func TestAggregateMode_QueueFull_DefersToDLQAndSucceeds(t *testing.T) {
+	const spans = 3
+	now := time.Now().UTC()
+	sink := &captureDLQ{}
+	resp, m := exportSaturatedTraces(t, "defer", sink, spans, now)
 
 	// partial_success is a zero-rejected warning, not a rejection.
 	ps := resp.GetPartialSuccess()
-	if ps == nil {
-		t.Fatal("partial_success not populated on a deferred Export")
-	}
 	if ps.RejectedSpans != 0 {
 		t.Errorf("rejected_spans = %d, want 0 — the aggregate accepted every span", ps.RejectedSpans)
 	}
@@ -249,24 +256,8 @@ func TestAggregateMode_QueueFullAndDLQRefuses_SucceedsWithCountedLoss(t *testing
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			m := ackTestMetrics(tc.name)
-			p := saturatedPipeline(t, m, tc.sink)
-			eng := ackEngine(t, aggregate.ModeAggregate, now)
-			srv := NewTraceServer(nil, m, aggTestConfig())
-			srv.SetPipeline(p)
-			srv.SetAggregateEngine(eng)
-
-			resp, err := srv.Export(context.Background(), ackErrorSpanRequest(spans, now))
-			if err != nil {
-				t.Fatalf("Export must still succeed when the DLQ refuses: %v", err)
-			}
-			if count, _ := eng.Snapshot().Totals(aggregate.SignalTraceOp); count != spans {
-				t.Fatalf("aggregate count = %d, want %d", count, spans)
-			}
+			resp, m := exportSaturatedTraces(t, tc.name, tc.sink, spans, now)
 			ps := resp.GetPartialSuccess()
-			if ps == nil {
-				t.Fatal("partial_success not populated on a lost Export")
-			}
 			want := fmt.Sprintf("aggregate data accepted; %d selected raw exemplars could not be retained", spans)
 			if ps.ErrorMessage != want {
 				t.Errorf("error_message = %q, want %q", ps.ErrorMessage, want)

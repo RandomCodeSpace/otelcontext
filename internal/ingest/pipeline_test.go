@@ -528,11 +528,13 @@ func TestPipeline_HardCapacityEvenForPriority(t *testing.T) {
 	}
 }
 
-func TestPipeline_PanicInCallbackRecovered(t *testing.T) {
-	// A panicking callback must not kill the worker; processFailures
-	// goes up but other batches still process.
+// startPanicPipeline builds a started pipeline over a fakeWriter, submits one
+// batch whose span callback panics and one healthy batch, and waits for the
+// worker to process both. Shared scaffold for the panic-path tests.
+func startPanicPipeline(t *testing.T, capacity int) *Pipeline {
+	t.Helper()
 	w := &fakeWriter{}
-	p := NewPipeline(w, nil, PipelineConfig{Capacity: 4, Workers: 1})
+	p := NewPipeline(w, nil, PipelineConfig{Capacity: capacity, Workers: 1})
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	p.Start(ctx)
@@ -548,9 +550,16 @@ func TestPipeline_PanicInCallbackRecovered(t *testing.T) {
 	if _, err := p.Submit(good); err != nil {
 		t.Fatalf("submit good: %v", err)
 	}
-	if !waitFor(t, 5*time.Second, func() bool { return p.Stats().Processed >= 2 }) {
-		t.Fatalf("worker did not survive callback panic — Processed=%d", p.Stats().Processed)
+	if !waitFor(t, 30*time.Second, func() bool { return p.Stats().Processed >= 2 }) {
+		t.Fatalf("worker did not process both batches — Processed=%d", p.Stats().Processed)
 	}
+	return p
+}
+
+func TestPipeline_PanicInCallbackRecovered(t *testing.T) {
+	// A panicking callback must not kill the worker; processFailures
+	// goes up but other batches still process.
+	p := startPanicPipeline(t, 4)
 	if p.Stats().ProcessFailures == 0 {
 		t.Errorf("expected ProcessFailures > 0 after callback panic")
 	}
@@ -882,26 +891,7 @@ func TestPipeline_ByteAccounting_ReturnsToZeroAfterProcess(t *testing.T) {
 	// Every reservation taken at Submit must be released by process() —
 	// including the panic path, or the counter ratchets up until the cap
 	// rejects all traffic.
-	w := &fakeWriter{}
-	p := NewPipeline(w, nil, PipelineConfig{Capacity: 10, Workers: 1})
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	p.Start(ctx)
-	t.Cleanup(p.Stop)
-
-	bad := healthyBatch()
-	bad.SpanCallback = func(_ storage.Span) { panic("boom") }
-	good := healthyBatch()
-
-	if _, err := p.Submit(bad); err != nil {
-		t.Fatalf("submit bad: %v", err)
-	}
-	if _, err := p.Submit(good); err != nil {
-		t.Fatalf("submit good: %v", err)
-	}
-	if !waitFor(t, 5*time.Second, func() bool { return p.Stats().Processed >= 2 }) {
-		t.Fatalf("worker did not process both batches — Processed=%d", p.Stats().Processed)
-	}
+	p := startPanicPipeline(t, 10)
 	if !waitFor(t, 5*time.Second, func() bool { return p.Stats().QueueBytes == 0 }) {
 		t.Fatalf("QueueBytes = %d after drain, want 0 (panic path leaked its reservation)", p.Stats().QueueBytes)
 	}

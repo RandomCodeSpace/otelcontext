@@ -22,7 +22,10 @@ type pipelineHarness struct {
 	pipeline *Pipeline
 }
 
-func newPipelineHarness(t *testing.T, cap, workers int) *pipelineHarness {
+// newIngestTestRepo builds an in-memory sqlite repository plus trace and log
+// servers over it — the scaffold shared by the pipeline e2e and HTTP
+// backpressure harnesses.
+func newIngestTestRepo(t *testing.T) (*storage.Repository, *TraceServer, *LogsServer) {
 	t.Helper()
 	db, err := storage.NewDatabase("sqlite", ":memory:")
 	if err != nil {
@@ -37,8 +40,12 @@ func newPipelineHarness(t *testing.T, cap, workers int) *pipelineHarness {
 		IngestMinSeverity:          "DEBUG",
 		SamplingLatencyThresholdMs: 500,
 	}
-	traces := NewTraceServer(repo, nil, cfg)
-	logs := NewLogsServer(repo, nil, cfg)
+	return repo, NewTraceServer(repo, nil, cfg), NewLogsServer(repo, nil, cfg)
+}
+
+func newPipelineHarness(t *testing.T, cap, workers int) *pipelineHarness {
+	t.Helper()
+	repo, traces, logs := newIngestTestRepo(t)
 
 	pl := NewPipeline(repo, nil, PipelineConfig{Capacity: cap, Workers: workers, SoftThreshold: 0.9})
 	if workers > 0 {
