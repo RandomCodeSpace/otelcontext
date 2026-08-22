@@ -287,7 +287,13 @@ func (e *Engine) plan(q Query, visit visitFunc) (Ownership, Selector, bool, erro
 		return own, sel, false, fmt.Errorf("%w: [%s,%s) is not a bounded forward range",
 			ErrSelectorUnbounded, q.Start.Format(time.RFC3339), q.End.Format(time.RFC3339))
 	}
-	tenantID := e.cache.InternTenant(q.Tenant)
+	tenantID, tenantOK := e.cache.InternTenant(q.Tenant)
+	if !tenantOK {
+		// A tenant name the write path would refuse cannot own data. Minting
+		// an ID for it here would also let an unbounded stream of junk tenant
+		// names in a query string grow the dictionary (#200 Q3).
+		return own, sel, false, fmt.Errorf("%w: tenant identity rejected", ErrSelectorUnbounded)
+	}
 	start := WindowStart(q.Start)
 	end := WindowStart(q.End.Add(WindowSize - time.Second))
 	if end <= start {

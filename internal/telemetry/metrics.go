@@ -278,6 +278,31 @@ type Metrics struct {
 	// last startup recovery. The gate allows 30s.
 	AggregateRecoveryDurationSeconds prometheus.Gauge
 	AggregateRecoveryRows            *prometheus.GaugeVec
+
+	// --- Aggregate identity lifecycle (#200) ---
+	// AggregateGCRunsTotal — identity garbage-collection passes by result
+	// (ok|error). A pass that fails leaves memory untouched, so a rising
+	// error count is disk growth, not corruption.
+	AggregateGCRunsTotal *prometheus.CounterVec
+	// AggregateGCDurationSeconds — GC wall time by phase. phase="mark" is the
+	// lock-free scan; phase="barrier" is the part that serializes with the
+	// group commit and is therefore the only one inside the ACK budget.
+	AggregateGCDurationSeconds *prometheus.HistogramVec
+	// AggregateGCSweptTotal — identity rows deleted by GC, by table.
+	AggregateGCSweptTotal *prometheus.CounterVec
+	// AggregateGCRetained — identity rows the last pass kept, by table. The
+	// ratio against the swept counter is what says whether the dictionary has
+	// reached a steady state.
+	AggregateGCRetained *prometheus.GaugeVec
+	// AggregateIdentityOverflowTotal — identities routed to __other__ by an
+	// identity BOUND rather than by a series cap, labeled by dictionary kind
+	// and the bound that tripped (length|count).
+	AggregateIdentityOverflowTotal *prometheus.CounterVec
+	// AggregateTenantRejectedTotal — points DROPPED because their tenant
+	// identity was refused. The tenant namespace never collapses into a
+	// shared __other__, so this is a drop, not a degradation: alert on any
+	// sustained value.
+	AggregateTenantRejectedTotal *prometheus.CounterVec
 	// --- Bounded exemplar retention (AGGREGATE_MODE=aggregate) ---
 	// ExemplarEligibleTotal — telemetry that qualified for raw retention,
 	// per signal and priority class. Eligible is not retained: the gap between
@@ -693,6 +718,31 @@ func New() *Metrics {
 		Name: "otelcontext_aggregate_recovery_rows",
 		Help: "Rows handled by the last aggregate startup recovery, by kind (replayed|finalized_windows).",
 	}, []string{"kind"})
+	m.AggregateGCRunsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "otelcontext_aggregate_gc_runs_total",
+		Help: "Aggregate identity garbage-collection passes by result (ok|error).",
+	}, []string{"result"})
+	m.AggregateGCDurationSeconds = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "otelcontext_aggregate_gc_duration_seconds",
+		Help:    "Identity GC wall time by phase: mark is the lock-free scan, barrier is the part that serializes with the group commit.",
+		Buckets: []float64{0.001, 0.01, 0.05, 0.1, 0.5, 1, 5, 15, 60},
+	}, []string{"phase"})
+	m.AggregateGCSweptTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "otelcontext_aggregate_gc_swept_total",
+		Help: "Identity rows deleted by aggregate GC, by table (aggregate_series|aggregate_dict|aggregate_log_template).",
+	}, []string{"table"})
+	m.AggregateGCRetained = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "otelcontext_aggregate_gc_retained",
+		Help: "Identity rows the last aggregate GC pass retained, by table.",
+	}, []string{"table"})
+	m.AggregateIdentityOverflowTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "otelcontext_aggregate_identity_overflow_total",
+		Help: "Identities routed to __other__ by an identity bound, by dictionary kind and bound (length|count).",
+	}, []string{"kind", "bound"})
+	m.AggregateTenantRejectedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "otelcontext_aggregate_tenant_rejected_total",
+		Help: "Points dropped because the tenant identity was refused (over-length, empty, or past the tenant cap). Tenants are never collapsed into __other__.",
+	}, []string{"signal"})
 	m.ExemplarEligibleTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "otelcontext_exemplar_eligible_total",
 		Help: "Telemetry eligible for raw exemplar retention, by signal and priority class (error|slow|healthy|warn). Eligible is not retained.",

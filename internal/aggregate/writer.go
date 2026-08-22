@@ -159,11 +159,18 @@ type Writer struct {
 	reg    *DurableRegistrar
 	series *seriesRegistry
 
+	miner *TemplateMiner
+
 	submissions chan *submission
-	stop        chan struct{}
-	stopOnce    sync.Once
-	wg          sync.WaitGroup
-	closed      atomic.Bool
+	// barriers carries identity-maintenance work onto the writer goroutine
+	// (#200 Q2). Running it here is what makes "no group commit interleaves
+	// with an identity delete" structural: there is one commit goroutine and
+	// the barrier IS that goroutine.
+	barriers chan *barrierRequest
+	stop     chan struct{}
+	stopOnce sync.Once
+	wg       sync.WaitGroup
+	closed   atomic.Bool
 
 	// admission counters, guarded by mu.
 	mu            sync.Mutex
@@ -200,9 +207,76 @@ func NewWriter(cfg WriterConfig) (*Writer, error) {
 		engine:      cfg.Engine,
 		reg:         cfg.Registrar,
 		series:      series,
+		miner:       cfg.Engine.Miner(),
 		submissions: make(chan *submission, cfg.MaxWaiters),
+		barriers:    make(chan *barrierRequest),
 		stop:        make(chan struct{}),
 	}, nil
+}
+
+// barrierRequest is one unit of identity-maintenance work to run between
+// commits.
+type barrierRequest struct {
+	fn   func()
+	done chan struct{}
+}
+
+// RunBarrier implements Barrier. It parks fn on the commit goroutine, so no
+// group commit is in flight while it runs and none can start until it returns.
+//
+// fn must be bounded: every Export waiting on the writer is waiting on it too.
+// The collector honours that by keeping its full table scan OUTSIDE the
+// barrier and passing only the revalidate-fence-delete tail in here.
+func (w *Writer) RunBarrier(fn func()) error {
+	if fn == nil {
+		return nil
+	}
+	if w.closed.Load() {
+		return ErrStoreClosed
+	}
+	req := &barrierRequest{fn: fn, done: make(chan struct{})}
+	select {
+	case w.barriers <- req:
+	case <-w.stop:
+		return ErrStoreClosed
+	}
+	<-req.done
+	return nil
+}
+
+// CollectIdentities runs one identity garbage-collection pass. It is the entry
+// point retention's daily maintenance tick calls.
+func (w *Writer) CollectIdentities() (GCStats, error) {
+	return Collect(GCConfig{
+		Store:     w.store,
+		Registrar: w.reg,
+		Cache:     w.engine.Cache(),
+		Miner:     w.miner,
+		Engine:    w.engine,
+		Series:    w.series,
+		Barrier:   w,
+		Metrics:   w.cfg.Metrics,
+	})
+}
+
+// SaveTemplateStats writes the miner's dirty non-identity counters. Identity
+// mutations do NOT come through here — they ride the group commit — so a lost
+// batch costs a count that the next line restores.
+func (w *Writer) SaveTemplateStats() {
+	if w.miner == nil {
+		return
+	}
+	gcs, ok := w.store.(GCStore)
+	if !ok {
+		return
+	}
+	rows := w.miner.DrainDirtyStats()
+	if len(rows) == 0 {
+		return
+	}
+	if err := gcs.SaveTemplateStats(rows); err != nil {
+		slog.Warn("aggregate: template statistics write failed", "error", err, "rows", len(rows))
+	}
 }
 
 // Start launches the commit loop and, unless disabled, the finalize loop.
@@ -223,6 +297,10 @@ func (w *Writer) Stop() {
 		close(w.stop)
 	})
 	w.wg.Wait()
+	// Final best-effort statistics save, after the loops are gone so nothing
+	// races the writer lock. Identity is already durable — it rode the group
+	// commits — so this only saves counters.
+	w.SaveTemplateStats()
 }
 
 // Stats returns a snapshot of the writer counters.
@@ -323,6 +401,9 @@ func (w *Writer) commitLoop() {
 		case <-w.stop:
 			w.drain()
 			return
+		case req := <-w.barriers:
+			req.fn()
+			close(req.done)
 		case s := <-w.submissions:
 			w.collectAndCommit(s)
 		}
@@ -416,6 +497,13 @@ func (w *Writer) commit(batch []*submission) {
 	if w.reg != nil {
 		gb.Dicts = w.reg.DrainPending()
 	}
+	// Identity-critical miner mutations ride the same transaction as the
+	// delta that used the resulting identity (#200 Q4). A periodic snapshot
+	// alone would let a crash acknowledge a bucket whose NameID the reloaded
+	// miner has never heard of.
+	if w.miner != nil {
+		gb.Templates = w.miner.DrainPending()
+	}
 
 	err := w.store.CommitGroup(gb)
 	w.commits.Add(1)
@@ -434,6 +522,9 @@ func (w *Writer) commit(batch []*submission) {
 	w.series.Committed(gb.Series)
 	if w.reg != nil {
 		w.reg.Committed(gb.Dicts)
+	}
+	if w.miner != nil {
+		w.miner.Committed(gb.Templates)
 	}
 
 	// Commit-then-apply: the shards only ever see committed state.
@@ -463,6 +554,8 @@ func (w *Writer) finalizeLoop() {
 		case <-tick.C:
 			w.FinalizeDue(w.cfg.Now())
 			w.publishBacklog(w.cfg.Now())
+			// Non-identity template counters take the cheap periodic path.
+			w.SaveTemplateStats()
 		}
 	}
 }
@@ -534,6 +627,7 @@ func estimateDeltaBytes(m DeltaMap) int64 {
 var (
 	_ Applier         = (*Writer)(nil)
 	_ FailableApplier = (*Writer)(nil)
+	_ Barrier         = (*Writer)(nil)
 )
 
 // Writer construction errors.

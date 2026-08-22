@@ -162,7 +162,8 @@ func newQueryFixture(t *testing.T) *queryFixture {
 	t.Helper()
 	now := mustTime(t, "2026-08-21T12:02:00Z")
 	e := testEngine(t, now)
-	return &queryFixture{engine: e, now: now, tenantID: e.TenantID("default")}
+	tenantID, _ := e.TenantID("default")
+	return &queryFixture{engine: e, now: now, tenantID: tenantID}
 }
 
 // traceKey builds a trace-operation series key for a named service.

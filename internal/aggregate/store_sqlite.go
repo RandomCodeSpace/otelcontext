@@ -8,9 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -46,11 +48,14 @@ const (
 	// defaultBusyTimeoutMs bounds how long a statement waits on the writer
 	// lock before erroring, matching the main DB's stanza.
 	defaultBusyTimeoutMs = 5000
-	// maxDictRows and maxSeriesRows bound the startup warm-up loads. Both are
-	// far above the #158 caps; they exist so a corrupted or hostile file
-	// cannot make startup allocate without bound.
-	maxDictRows   = 2_000_000
-	maxSeriesRows = 500_000
+	// maxTemplateRows bounds the startup log-template warm-up. The
+	// per-partition cap times a sane partition count sits orders of magnitude
+	// below it; it exists so a corrupted file cannot make startup allocate
+	// without bound.
+	maxTemplateRows = 200_000
+	// sweepChunk bounds how many IDs go into one DELETE ... IN (...) so a
+	// sweep never compiles a statement with a hundred thousand parameters.
+	sweepChunk = 500
 	// purgeWindowsPerPass bounds how many windows one PurgeBefore call
 	// deletes, so retention never opens an unbounded transaction.
 	purgeWindowsPerPass = 4096
@@ -64,6 +69,7 @@ var aggregateTables = []string{
 	"aggregate_baseline",
 	"aggregate_buckets",
 	"aggregate_delta_log",
+	"aggregate_log_template",
 	"aggregate_series",
 	"aggregate_dict",
 	"aggregate_meta",
@@ -413,6 +419,30 @@ func schemaDDL() []string {
 			value REAL NOT NULL,
 			PRIMARY KEY (series_id, producer_id)
 		) WITHOUT ROWID`,
+
+		// Durable log-template miner state (#200 Q4). The primary key IS the
+		// dictionary ID minted for the template, which is also the NameID of
+		// every log series that used it: one identity, three tables, no
+		// second ID space to keep in step.
+		//
+		// There is no sample column, deliberately. Raw log bodies are a
+		// credential and PII sink; exemplars already carry the raw line for
+		// the cases that need one.
+		`CREATE TABLE IF NOT EXISTS aggregate_log_template (
+			template_id INTEGER PRIMARY KEY,
+			tenant TEXT NOT NULL,
+			service TEXT NOT NULL,
+			pattern_version INTEGER NOT NULL,
+			tokens TEXT NOT NULL,
+			seq INTEGER NOT NULL,
+			is_other INTEGER NOT NULL,
+			alias_of INTEGER NOT NULL,
+			hit_count INTEGER NOT NULL,
+			first_ts INTEGER NOT NULL,
+			last_ts INTEGER NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_aggregate_log_template_partition
+			ON aggregate_log_template (tenant, service)`,
 	}
 }
 
@@ -523,6 +553,10 @@ func (s *SQLiteStore) createSchema() error {
 		{"sketch_codec_version", fmt.Sprint(SketchEncodingVersion)},
 		{"store_uuid", uuid},
 		{"created_at", time.Now().UTC().Format(time.RFC3339)},
+		// The watermarks start at 1 — the first ID either allocator may mint,
+		// since 0 is the "none" sentinel. They only ever increase (#200 Q1).
+		{MetaDictWatermark, "1"},
+		{MetaSeriesWatermark, "1"},
 	}
 	for _, kv := range meta {
 		if _, err := tx.Exec(`INSERT OR REPLACE INTO aggregate_meta (key, value) VALUES (?, ?)`, kv[0], kv[1]); err != nil {
@@ -654,6 +688,15 @@ func (s *SQLiteStore) commitGroup(b *GroupBatch) (int64, error) {
 		return 0, err
 	}
 	if err := upsertBaselines(tx, b.Baselines); err != nil {
+		return 0, err
+	}
+	if err := upsertTemplates(tx, b.Templates); err != nil {
+		return 0, err
+	}
+	// The high-watermarks ride the same transaction as the rows whose IDs
+	// they cover. Stamping them afterwards would leave a window in which a
+	// committed row names an ID the next boot is free to mint again (#200 Q1).
+	if err := bumpWatermarks(tx, b); err != nil {
 		return 0, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -1451,10 +1494,40 @@ func (s *SQLiteStore) ResolveSeries(ids []SeriesID) ([]SeriesInfo, error) {
 
 // LoadDict implements Store.
 func (s *SQLiteStore) LoadDict(max int) ([]DictRow, error) {
-	if max <= 0 || max > maxDictRows {
-		max = maxDictRows
+	return scanDictRows(s.reader, dictLimit(max))
+}
+
+// LoadSeries implements Store.
+func (s *SQLiteStore) LoadSeries(max int) ([]SeriesRow, error) {
+	return scanSeriesRows(s.reader, seriesLimit(max))
+}
+
+// dictLimit and seriesLimit clamp a caller's row limit to one row past the
+// supported bound. The extra row is what lets a caller distinguish "the whole
+// table" from "as much of it as fit", which a bare LIMIT cannot (#200 Q3).
+func dictLimit(max int) int {
+	if max <= 0 || max > MaxDictRows+1 {
+		return MaxDictRows + 1
 	}
-	rows, err := s.reader.Query(`SELECT id, tenant_id, kind, value FROM aggregate_dict LIMIT ?`, max)
+	return max
+}
+
+func seriesLimit(max int) int {
+	if max <= 0 || max > MaxSeriesRows+1 {
+		return MaxSeriesRows + 1
+	}
+	return max
+}
+
+// queryer is the read surface shared by the pool and a read transaction, so
+// the identity scans can run either standalone or inside one snapshot.
+type queryer interface {
+	Query(query string, args ...any) (*sql.Rows, error)
+}
+
+// scanDictRows reads the dictionary table through q.
+func scanDictRows(q queryer, limit int) ([]DictRow, error) {
+	rows, err := q.Query(`SELECT id, tenant_id, kind, value FROM aggregate_dict ORDER BY id LIMIT ?`, limit)
 	if err != nil {
 		return nil, fmt.Errorf("aggregate store: load dict: %w", err)
 	}
@@ -1480,14 +1553,11 @@ func (s *SQLiteStore) LoadDict(max int) ([]DictRow, error) {
 	return out, rows.Err()
 }
 
-// LoadSeries implements Store.
-func (s *SQLiteStore) LoadSeries(max int) ([]SeriesRow, error) {
-	if max <= 0 || max > maxSeriesRows {
-		max = maxSeriesRows
-	}
-	rows, err := s.reader.Query(
+// scanSeriesRows reads the series table through q.
+func scanSeriesRows(q queryer, limit int) ([]SeriesRow, error) {
+	rows, err := q.Query(
 		`SELECT id, tenant_id, service_id, name_id, dims_id, signal, status_class, http_class, method, span_kind, severity
-		 FROM aggregate_series LIMIT ?`, max)
+		 FROM aggregate_series ORDER BY id LIMIT ?`, limit)
 	if err != nil {
 		return nil, fmt.Errorf("aggregate store: load series: %w", err)
 	}
@@ -1687,5 +1757,366 @@ func producerFromBytes(b []byte) ProducerID {
 	return ProducerID(v)
 }
 
-// compile-time assertion that the SQLite store satisfies the interface.
-var _ Store = (*SQLiteStore)(nil)
+// compile-time assertion that the SQLite store satisfies the contract.
+var (
+	_ Store          = (*SQLiteStore)(nil)
+	_ WatermarkStore = (*SQLiteStore)(nil)
+	_ GCStore        = (*SQLiteStore)(nil)
+)
+
+// --- identity persistence and GC (#200) -------------------------------------
+
+// upsertTemplates writes the identity-critical half of the log-template miner
+// state. It rides the same transaction as the delta that used the identity.
+//
+// The pattern is written only when this row's pattern_version is at least the
+// stored one, so a re-offered row from a failed commit can never roll a newer
+// generalization backwards.
+func upsertTemplates(tx *sql.Tx, rows []TemplateRow) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	stmt, err := tx.Prepare(`INSERT INTO aggregate_log_template
+		(template_id, tenant, service, pattern_version, tokens, seq, is_other, alias_of, hit_count, first_ts, last_ts)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?)
+		ON CONFLICT(template_id) DO UPDATE SET
+			pattern_version = excluded.pattern_version,
+			tokens          = excluded.tokens,
+			alias_of        = excluded.alias_of,
+			hit_count       = MAX(hit_count, excluded.hit_count),
+			last_ts         = MAX(last_ts, excluded.last_ts)
+		WHERE excluded.pattern_version >= aggregate_log_template.pattern_version`)
+	if err != nil {
+		return fmt.Errorf("aggregate store: prepare template upsert: %w", err)
+	}
+	defer func() { _ = stmt.Close() }()
+	for _, r := range rows {
+		if _, err := stmt.Exec(
+			int64(r.ID), r.Tenant, r.Service, int64(r.PatternVersion), r.Tokens,
+			// #nosec G115 -- partition-local ordinal, bounded by the per-service cap
+			int64(r.Seq), boolToInt(r.IsOther), int64(r.AliasOf),
+			// #nosec G115 -- a hit count large enough to wrap int64 is not reachable
+			int64(r.Count), r.FirstSeen, r.LastSeen,
+		); err != nil {
+			return fmt.Errorf("aggregate store: upsert template %d: %w", r.ID, err)
+		}
+	}
+	return nil
+}
+
+// clampUint64 reads a counter column that this package only ever writes as a
+// uint64. A negative value means the file was hand-edited or corrupted; zero
+// is the honest reading, and it costs a count rather than an identity.
+func clampUint64(n int64) uint64 {
+	if n < 0 {
+		return 0
+	}
+	return uint64(n)
+}
+
+// boolToInt renders a bool as SQLite's 0/1.
+func boolToInt(b bool) int64 {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// bumpWatermarks raises the persisted identity high-watermarks to cover every
+// ID this batch made durable. They never decrease.
+func bumpWatermarks(tx *sql.Tx, b *GroupBatch) error {
+	var dictWM, seriesWM int64
+	for _, r := range b.Dicts {
+		if int64(r.ID)+1 > dictWM {
+			dictWM = int64(r.ID) + 1
+		}
+	}
+	for _, r := range b.Templates {
+		if int64(r.ID)+1 > dictWM {
+			dictWM = int64(r.ID) + 1
+		}
+	}
+	for _, r := range b.Series {
+		if int64(r.ID)+1 > seriesWM {
+			seriesWM = int64(r.ID) + 1
+		}
+	}
+	for _, kv := range []struct {
+		key   string
+		value int64
+	}{{MetaDictWatermark, dictWM}, {MetaSeriesWatermark, seriesWM}} {
+		if kv.value <= 0 {
+			continue
+		}
+		if _, err := tx.Exec(`INSERT INTO aggregate_meta (key, value) VALUES (?, ?)
+			ON CONFLICT(key) DO UPDATE SET value = excluded.value
+			WHERE CAST(excluded.value AS INTEGER) > CAST(aggregate_meta.value AS INTEGER)`,
+			kv.key, strconv.FormatInt(kv.value, 10)); err != nil {
+			return fmt.Errorf("aggregate store: bump %s: %w", kv.key, err)
+		}
+	}
+	return nil
+}
+
+// Watermarks implements WatermarkStore.
+func (s *SQLiteStore) Watermarks() (uint32, SeriesID, error) {
+	var dictWM, seriesWM int64
+	for _, spec := range []struct {
+		key string
+		dst *int64
+	}{{MetaDictWatermark, &dictWM}, {MetaSeriesWatermark, &seriesWM}} {
+		var raw sql.NullString
+		err := s.reader.QueryRow(`SELECT value FROM aggregate_meta WHERE key = ?`, spec.key).Scan(&raw)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			continue
+		case err != nil:
+			return 0, 0, fmt.Errorf("aggregate store: read %s: %w", spec.key, err)
+		}
+		if !raw.Valid {
+			continue
+		}
+		n, convErr := strconv.ParseInt(strings.TrimSpace(raw.String), 10, 64)
+		if convErr != nil || n < 0 {
+			return 0, 0, &SchemaError{Reason: "missing_meta", Detail: spec.key + " is not a non-negative integer"}
+		}
+		*spec.dst = n
+	}
+	if dictWM > int64(math.MaxUint32) {
+		return 0, 0, &SchemaError{Reason: "missing_meta", Detail: MetaDictWatermark + " exceeds the uint32 dictionary ID space"}
+	}
+	// #nosec G115 -- bounded by the MaxUint32 check directly above
+	return uint32(dictWM), SeriesID(seriesWM), nil
+}
+
+// GCSnapshot implements GCStore. Every scan runs inside ONE deferred read
+// transaction, which in WAL mode pins a single snapshot of the file for its
+// whole life — the reference set and the identity tables therefore describe
+// the same instant. No writer lock is taken: a commit may land during the
+// scan, and the barrier's revalidation is what accounts for it.
+func (s *SQLiteStore) GCSnapshot() (*GCSnapshot, error) {
+	tx, err := s.reader.BeginTx(context.Background(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("aggregate store: begin gc snapshot: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	snap := &GCSnapshot{Referenced: make(map[SeriesID]struct{}, 1024)}
+	for _, q := range []string{
+		`SELECT DISTINCT series_id FROM aggregate_buckets`,
+		`SELECT DISTINCT series_id FROM aggregate_delta_log`,
+		`SELECT DISTINCT series_id FROM aggregate_baseline`,
+	} {
+		if err := collectSeriesIDs(tx, q, snap.Referenced); err != nil {
+			return nil, err
+		}
+	}
+	if snap.Series, err = scanSeriesRows(tx, MaxSeriesRows+1); err != nil {
+		return nil, err
+	}
+	if len(snap.Series) > MaxSeriesRows {
+		return nil, &PreloadError{Table: "aggregate_series", Rows: len(snap.Series), Max: MaxSeriesRows}
+	}
+	if snap.Dict, err = scanDictRows(tx, MaxDictRows+1); err != nil {
+		return nil, err
+	}
+	if len(snap.Dict) > MaxDictRows {
+		return nil, &PreloadError{Table: "aggregate_dict", Rows: len(snap.Dict), Max: MaxDictRows}
+	}
+	if snap.Templates, err = scanTemplateRows(tx, maxTemplateRows+1); err != nil {
+		return nil, err
+	}
+	return snap, nil
+}
+
+// collectSeriesIDs folds one series-id projection into dst.
+func collectSeriesIDs(q queryer, query string, dst map[SeriesID]struct{}) error {
+	rows, err := q.Query(query)
+	if err != nil {
+		return fmt.Errorf("aggregate store: scan series references: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return fmt.Errorf("aggregate store: scan series references: %w", err)
+		}
+		dst[SeriesID(id)] = struct{}{}
+	}
+	return rows.Err()
+}
+
+// LoadTemplates implements GCStore.
+func (s *SQLiteStore) LoadTemplates(max int) ([]TemplateRow, error) {
+	return scanTemplateRows(s.reader, templateLimit(max))
+}
+
+// templateLimit clamps a template row limit to one past the supported bound.
+func templateLimit(max int) int {
+	if max <= 0 || max > maxTemplateRows+1 {
+		return maxTemplateRows + 1
+	}
+	return max
+}
+
+// scanTemplateRows reads the log-template table through q.
+func scanTemplateRows(q queryer, limit int) ([]TemplateRow, error) {
+	rows, err := q.Query(`SELECT template_id, tenant, service, pattern_version, tokens,
+		seq, is_other, alias_of, hit_count, first_ts, last_ts
+		FROM aggregate_log_template ORDER BY template_id LIMIT ?`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("aggregate store: load templates: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []TemplateRow
+	for rows.Next() {
+		var (
+			r                                          TemplateRow
+			id, version, seq, isOther, alias, hitCount int64
+		)
+		if err := rows.Scan(&id, &r.Tenant, &r.Service, &version, &r.Tokens,
+			&seq, &isOther, &alias, &hitCount, &r.FirstSeen, &r.LastSeen); err != nil {
+			return nil, fmt.Errorf("aggregate store: load templates: %w", err)
+		}
+		// #nosec G115 -- every id column is written from a uint32 by this
+		// package and nothing else writes the table.
+		r.ID, r.PatternVersion, r.AliasOf = uint32(id), uint32(version), uint32(alias)
+		r.Seq, r.Count = clampUint64(seq), clampUint64(hitCount)
+		r.IsOther = isOther != 0
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("aggregate store: load templates: %w", err)
+	}
+	if len(out) > maxTemplateRows {
+		return nil, &PreloadError{Table: "aggregate_log_template", Rows: len(out), Max: maxTemplateRows}
+	}
+	return out, nil
+}
+
+// SaveTemplateStats implements GCStore. Statistics only: it never creates a
+// row, so a template swept between the dirty mark and this write stays swept.
+func (s *SQLiteStore) SaveTemplateStats(rows []TemplateStatRow) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	s.lockWriter()
+	defer s.unlockWriter()
+	tx, err := s.writer.Begin()
+	if err != nil {
+		return fmt.Errorf("aggregate store: begin template stats: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	stmt, err := tx.Prepare(`UPDATE aggregate_log_template
+		SET hit_count = ?, first_ts = ?, last_ts = ? WHERE template_id = ?`)
+	if err != nil {
+		return fmt.Errorf("aggregate store: prepare template stats: %w", err)
+	}
+	defer func() { _ = stmt.Close() }()
+	for _, r := range rows {
+		// #nosec G115 -- a hit count large enough to wrap int64 is not reachable
+		if _, err := stmt.Exec(int64(r.Count), r.FirstSeen, r.LastSeen, int64(r.ID)); err != nil {
+			return fmt.Errorf("aggregate store: template stats %d: %w", r.ID, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("aggregate store: commit template stats: %w", err)
+	}
+	committed = true
+	return nil
+}
+
+// SweepIdentities implements GCStore: one transaction, series first, then the
+// dictionary rows the swept series released, then the template rows those
+// dictionary IDs backed.
+//
+// The order matters for exactly one reason: a crash between two transactions
+// could leave a series row naming a deleted dictionary ID. Inside one
+// transaction there is no such window, and the ordering is kept anyway so the
+// intent survives a future implementation that cannot span tables.
+func (s *SQLiteStore) SweepIdentities(series []SeriesID, dict []uint32, templates []uint32) (SweepStats, error) {
+	var stats SweepStats
+	if len(series) == 0 && len(dict) == 0 && len(templates) == 0 {
+		return stats, nil
+	}
+	start := time.Now()
+	s.lockWriter()
+	defer s.unlockWriter()
+	tx, err := s.writer.Begin()
+	if err != nil {
+		return stats, fmt.Errorf("aggregate store: begin sweep: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	seriesIDs := make([]int64, len(series))
+	for i, id := range series {
+		seriesIDs[i] = int64(id)
+	}
+	dictIDs := make([]int64, len(dict))
+	for i, id := range dict {
+		dictIDs[i] = int64(id)
+	}
+	templateIDs := make([]int64, len(templates))
+	for i, id := range templates {
+		templateIDs[i] = int64(id)
+	}
+	// The DELETE prefixes are literals, not composed from identifiers: SQLite
+	// cannot bind a table name, so the only safe way to vary one is not to.
+	for _, step := range []struct {
+		what   string
+		prefix string
+		ids    []int64
+		dst    *int64
+	}{
+		{"aggregate_series", `DELETE FROM aggregate_series WHERE id IN (`, seriesIDs, &stats.Series},
+		{"aggregate_dict", `DELETE FROM aggregate_dict WHERE id IN (`, dictIDs, &stats.Dict},
+		{"aggregate_log_template", `DELETE FROM aggregate_log_template WHERE template_id IN (`, templateIDs, &stats.Templates},
+	} {
+		n, err := deleteByID(tx, step.what, step.prefix, step.ids)
+		if err != nil {
+			return stats, err
+		}
+		*step.dst = n
+	}
+	if err := tx.Commit(); err != nil {
+		return stats, fmt.Errorf("aggregate store: commit sweep: %w", err)
+	}
+	committed = true
+	stats.Duration = time.Since(start)
+	return stats, nil
+}
+
+// deleteByID removes rows by primary key in bounded chunks. prefix is a
+// literal "DELETE FROM <table> WHERE <col> IN (" and what names the table for
+// error messages only.
+func deleteByID(tx *sql.Tx, what, prefix string, ids []int64) (int64, error) {
+	var total int64
+	for start := 0; start < len(ids); start += sweepChunk {
+		end := start + sweepChunk
+		if end > len(ids) {
+			end = len(ids)
+		}
+		chunk := ids[start:end]
+		args := make([]any, len(chunk))
+		for i, id := range chunk {
+			args[i] = id
+		}
+		res, err := tx.Exec(prefix+placeholders(len(chunk))+`)`, args...)
+		if err != nil {
+			return total, fmt.Errorf("aggregate store: sweep %s: %w", what, err)
+		}
+		if n, err := res.RowsAffected(); err == nil {
+			total += n
+		}
+	}
+	return total, nil
+}

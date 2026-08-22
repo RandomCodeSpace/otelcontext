@@ -122,10 +122,71 @@ they are excluded from aggregates and reported on the lateness counters, but a
 retry would not change their fate. Legacy mode (`AGGREGATE_MODE=legacy`) has no
 aggregate accounting to be honest about and leaves the response unchanged.
 
-Aggregate store schema is **v4**: eight `hist_*` columns carry the population
-statistics and accuracy metadata. A v3 file cannot be migrated (the columns
-have no derivable values) — start an older binary or set
-`AGGREGATE_ALLOW_REBUILD=true`.
+Aggregate store schema is **v5**: v4 added the eight `hist_*` columns carrying
+population statistics and accuracy metadata; v5 added `aggregate_log_template`
+(durable log-template miner state) plus the `dict_id_high_watermark` /
+`series_id_high_watermark` meta keys. An older file cannot be migrated — start
+an older binary or set `AGGREGATE_ALLOW_REBUILD=true`.
+
+### Aggregate identity lifecycle (#200)
+
+The dictionary and series tables were append-only. They are not any more.
+
+**Dictionary/series GC.** A mark-and-sweep pass runs on the **daily**
+maintenance tick (`RetentionScheduler`, wired from `main.go` next to
+`aggStore.Analyze`; `AGGREGATE_GC_ENABLED=false` disables it). The **mark**
+phase reads the reference set (`aggregate_buckets`, `aggregate_delta_log`,
+`aggregate_baseline`) and all three identity tables inside **one deferred read
+transaction** on the read pool — no writer lock, so a daily full scan can never
+become an ACK-latency incident. Marking is transitive: surviving series mark
+their tenant/service/name/dim-tuple IDs, surviving dim tuples mark the dim-key
+and dim-value IDs encoded inside them, and miner templates plus persisted alias
+records mark **both ends** of every alias, followed transitively through
+retired chains. The **sweep** phase runs through the writer's
+identity-maintenance barrier (`Writer.RunBarrier`, executed on the commit
+goroutine): revalidate candidates against durable, active, pending and staged
+references → fence survivors from new lookup → delete series, then dict, then
+template rows in **one** transaction → remove forward and reverse map entries
+only after the commit. A failed delete releases the fence and changes nothing
+in memory. `internal/aggregate/gc.go`.
+
+**High-watermarks, not MAX(id)+1.** `aggregate_meta` carries
+`dict_id_high_watermark` and `series_id_high_watermark`, bumped inside the same
+transaction as the rows they cover and never decreasing. ID allocation reseeds
+from them: once GC can delete the highest ID, `MAX(id)+1` would re-mint a number
+a finalized bucket or an alias row still names.
+
+**Miner persistence.** `aggregate_log_template` holds tenant/service partition,
+stable template ID (which IS the `log_template` dictionary ID and IS the log
+series `NameID`), versioned token pattern, alias target, partition sequence and
+the overflow flag. Identity-critical mutations — new templates, pattern
+generalizations, alias changes — are staged into `GroupBatch.Templates` and
+commit **atomically with the delta that used the identity**; a periodic
+snapshot alone lets acknowledged identity state vanish in a crash. Counters
+(`hit_count`, `first_ts`, `last_ts`) take the cheap periodic dirty write plus a
+best-effort save at shutdown. **Raw log samples are never persisted** —
+credential/PII sink; exemplars already carry the raw line. Reload
+(`aggregate.RestoreMiner`) rebuilds partitions and prefix trees in `main.go`
+**before** recovery and before ingest starts.
+
+**Identity bounds.** Every non-tenant dictionary value carries an encoded-length
+cap (`AGGREGATE_MAX_VALUE_BYTES`, default 512); over-length identities route to
+`__other__` and are **never truncated**. Service, dim-key, dim-value and
+dim-tuple namespaces now carry both per-tenant and instance-wide count caps.
+The tenant namespace is different: an over-length, empty, or over-cap tenant is
+**REJECTED** — the point is refused and counted on
+`otelcontext_aggregate_tenant_rejected_total`, never collapsed into a shared
+`__other__` tenant, because a shared overflow tenant is exactly the cross-tenant
+merge the cap exists to prevent. Startup identity preloads ask for `limit+1` and
+fail with a `*PreloadError` when the table exceeds the supported bound, instead
+of truncating the load in silence.
+
+Observability: `otelcontext_aggregate_gc_runs_total{result}`,
+`otelcontext_aggregate_gc_duration_seconds{phase=mark|barrier}`,
+`otelcontext_aggregate_gc_swept_total{table}`,
+`otelcontext_aggregate_gc_retained{table}`,
+`otelcontext_aggregate_identity_overflow_total{kind,bound}`,
+`otelcontext_aggregate_tenant_rejected_total{signal}`.
 
 ## Storage Architecture
 

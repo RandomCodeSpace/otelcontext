@@ -45,7 +45,34 @@ import (
 // population statistics and its accuracy metadata (#199). A v3 file has no
 // column to put them in and no way to reconstruct them, so the same
 // rebuild-or-downgrade choice applies.
-const StoreSchemaVersion = 4
+//
+// v5 added aggregate_log_template — the durable log-template miner state —
+// plus the dict_id/series_id high-watermark meta keys that dictionary GC
+// requires (#200). A v4 file has neither, and a binary that started GC against
+// a MAX(id)+1 reseed could re-mint an ID a finalized bucket still names, so the
+// fail-closed policy stands: run an older binary or accept the rebuild.
+const StoreSchemaVersion = 5
+
+// Meta keys that carry monotonically increasing identity high-watermarks
+// (#200 Q1). MAX(id)+1 stopped being a safe reseed the moment GC could delete
+// the highest ID, so allocation comes from these instead.
+const (
+	MetaDictWatermark   = "dict_id_high_watermark"
+	MetaSeriesWatermark = "series_id_high_watermark"
+)
+
+// MaxDictRows and MaxSeriesRows bound the startup identity warm-up. They are
+// far above the #158 caps; they exist so a corrupted or hostile file cannot
+// make startup allocate without bound. Exceeding one fails startup with a
+// *PreloadError rather than truncating the load in silence (#200 Q3).
+//
+// Declared as var (not const) for the same reason MaxReadRows is: a test has
+// to exercise the fail-fast path without seeding two million rows through a
+// race-instrumented SQLite. Nothing outside a test may assign them.
+var (
+	MaxDictRows   = 2_000_000
+	MaxSeriesRows = 500_000
+)
 
 // Store errors.
 var (
@@ -173,11 +200,124 @@ type GroupBatch struct {
 	Series    []SeriesRow
 	Deltas    []DeltaRow
 	Baselines []BaselineRow
+	// Templates are identity-critical log-template mutations: a new template,
+	// a pattern generalization, or an alias change (#200 Q4). They ride the
+	// same transaction as the delta that used the resulting identity, because
+	// a 15-minute snapshot alone lets acknowledged identity state vanish in a
+	// crash — the bucket would survive naming a template ID that the reloaded
+	// miner has never heard of.
+	Templates []TemplateRow
 }
 
 // Empty reports whether the batch would commit nothing.
 func (b *GroupBatch) Empty() bool {
-	return len(b.Dicts) == 0 && len(b.Series) == 0 && len(b.Deltas) == 0 && len(b.Baselines) == 0
+	return len(b.Dicts) == 0 && len(b.Series) == 0 && len(b.Deltas) == 0 &&
+		len(b.Baselines) == 0 && len(b.Templates) == 0
+}
+
+// TemplateRow is one durable log-template record (#200 Q4).
+//
+// It carries exactly what a reload needs to rebuild the prefix tree, resolve a
+// historical template ID, and re-enforce the per-partition cap. It carries NO
+// raw log sample: the miner keeps one in memory for diagnostics, and persisting
+// it would turn the aggregate file into a credential and PII sink for the sake
+// of a field exemplars already provide.
+type TemplateRow struct {
+	// ID is the immutable surrogate template identity — the same uint32 the
+	// log_template dictionary minted, and the NameID of every log series that
+	// used it.
+	ID uint32
+	// Tenant and Service name the partition. They are the strings, not
+	// dictionary IDs: the miner is keyed by them and a reload must rebuild
+	// its partitions before any dictionary lookup is warm.
+	Tenant, Service string
+	// PatternVersion increments on every generalization of Tokens. It makes a
+	// stale periodic stats write unable to overwrite a newer pattern.
+	PatternVersion uint32
+	// Tokens is the token pattern, NUL-joined. Tokens never contain
+	// whitespace (the tokenizer splits on it) and never contain NUL.
+	Tokens string
+	// Seq is the partition-local creation ordinal. Convergence keeps the
+	// lower one, so it has to survive a restart or two restarts could pick
+	// different survivors for the same pair.
+	Seq uint64
+	// IsOther marks the partition's pre-created overflow identity.
+	IsOther bool
+	// AliasOf is the surviving template this ID forwards to, or 0.
+	AliasOf uint32
+	// Count, FirstSeen and LastSeen are the non-identity statistics. They are
+	// refreshed by the periodic dirty-partition write, not by the identity
+	// commit path.
+	Count               uint64
+	FirstSeen, LastSeen int64
+}
+
+// TemplateStatRow is the non-identity half of a template: the counters a
+// periodic dirty-partition write refreshes. Losing one costs a count, not an
+// identity, so it does not need to ride a group commit.
+type TemplateStatRow struct {
+	ID                  uint32
+	Count               uint64
+	FirstSeen, LastSeen int64
+}
+
+// SweepStats is the outcome of one identity sweep.
+type SweepStats struct {
+	// Series, Dict and Templates count deleted rows per table.
+	Series, Dict, Templates int64
+	// Duration is the wall time of the delete transaction.
+	Duration time.Duration
+}
+
+// WatermarkStore is the optional Store capability that carries the identity
+// high-watermarks. It is separate from Store so an implementation predating
+// #200 still satisfies Store; the registrars degrade to MAX(id)+1 without it,
+// which is correct exactly as long as nothing collects.
+type WatermarkStore interface {
+	// Watermarks returns the persisted dictionary and series high-watermarks:
+	// the next ID each allocator may mint. Zero means "not yet stamped".
+	Watermarks() (uint32, SeriesID, error)
+}
+
+// GCSnapshot is one consistent read of every identity table, taken inside a
+// single read transaction (#200 Q1).
+//
+// One transaction, not four queries: a series marked live from the bucket scan
+// and a dictionary row read a moment later have to describe the same instant.
+// Read them separately and a commit landing in between makes a brand-new
+// series invisible to the reference set while its brand-new name is visible to
+// the candidate set — and GC deletes the name of a series that exists.
+type GCSnapshot struct {
+	// Referenced is every series ID named by aggregate_buckets,
+	// aggregate_delta_log or aggregate_baseline.
+	Referenced map[SeriesID]struct{}
+	// Series, Dict and Templates are the identity tables themselves.
+	Series    []SeriesRow
+	Dict      []DictRow
+	Templates []TemplateRow
+}
+
+// GCStore is the Store capability the dictionary/series collector needs. It is
+// separate from Store for the same reason WatermarkStore is.
+type GCStore interface {
+	// GCSnapshot reads the reference set and all three identity tables inside
+	// ONE read transaction. It runs on the READ pool, without the writer
+	// lock: the full scan is the part of GC that must never become an
+	// ACK-latency incident.
+	GCSnapshot() (*GCSnapshot, error)
+
+	// LoadTemplates returns every durable log-template row, capped at max.
+	LoadTemplates(max int) ([]TemplateRow, error)
+
+	// SweepIdentities deletes the given series, dictionary and template rows
+	// in ONE transaction, series first. It runs under the writer lock. A
+	// partial sweep is never observable: either every row named here is gone
+	// or none of them are.
+	SweepIdentities(series []SeriesID, dict []uint32, templates []uint32) (SweepStats, error)
+
+	// SaveTemplateStats refreshes the non-identity template counters. Rows
+	// whose template no longer exists are ignored, not created.
+	SaveTemplateStats(rows []TemplateStatRow) error
 }
 
 // SeriesInfo is a series' durable identity, resolved back from its ID.
@@ -462,6 +602,8 @@ type StoreMetrics interface {
 	// RecordRecovery publishes the startup recovery duration and how many
 	// delta rows were replayed.
 	RecordRecovery(d time.Duration, replayed int, finalized int)
+	// RecordGC publishes one identity garbage-collection pass.
+	RecordGC(stats GCStats, err error)
 }
 
 // noopStoreMetrics is the default when no metrics are wired.
@@ -473,6 +615,7 @@ func (noopStoreMetrics) RecordFinalize(FinalizeStats, error)           {}
 func (noopStoreMetrics) RecordPurge(PurgeStats, error)                 {}
 func (noopStoreMetrics) SetBacklog(int64, float64)                     {}
 func (noopStoreMetrics) RecordRecovery(time.Duration, int, int)        {}
+func (noopStoreMetrics) RecordGC(GCStats, error)                       {}
 
 // MutableSince returns the oldest window start still inside the mutable set at
 // now: the current window minus the lateness horizon. Everything strictly older
