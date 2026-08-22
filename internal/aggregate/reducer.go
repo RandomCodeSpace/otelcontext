@@ -3,6 +3,8 @@ package aggregate
 import (
 	"strings"
 	"time"
+
+	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 )
 
 // Request-local reduction.
@@ -49,6 +51,10 @@ type ReducerStats struct {
 	// StaleCumulative counts cumulative points ignored as stale or duplicate
 	// against their baseline (#166 case 1).
 	StaleCumulative uint64
+	// DimsRejected counts metric points whose configured dimension tuple was
+	// refused from series identity because an attribute value had no scalar
+	// rendering (#199 Q4). The point is still aggregated, under DimsID 0.
+	DimsRejected uint64
 	// ErrorsByService counts errors per service — the cheap invariant #165
 	// asks for on the aggregate side, and nothing more expensive.
 	ErrorsByService map[string]uint64
@@ -63,6 +69,7 @@ func (s *ReducerStats) merge(other *ReducerStats) {
 		s.Accepted[i] += other.Accepted[i]
 	}
 	s.StaleCumulative += other.StaleCumulative
+	s.DimsRejected += other.DimsRejected
 	for svc, n := range other.ErrorsByService {
 		if s.ErrorsByService == nil {
 			s.ErrorsByService = make(map[string]uint64, len(other.ErrorsByService))
@@ -129,6 +136,10 @@ type MetricInput struct {
 	Monotonic   bool
 	// Resource carries the stable identity used to derive the ProducerID.
 	Resource ResourceIdentity
+	// Attributes are the RAW OTLP point attributes. The configured dimension
+	// tuple is extracted from them here, against a request-local scratch, so
+	// the hot path never allocates a per-point map (#199 Q4).
+	Attributes []*commonpb.KeyValue
 }
 
 // Reducer collapses one Export request into deltas.
@@ -143,6 +154,10 @@ type Reducer struct {
 	// a restart the durable dictionary is warm but the intern cache is empty,
 	// so a reverse lookup would silently render an unnamed topology.
 	ids map[SeriesWindowKey]topoIdentity
+	// dims is the request-local dimension-extraction scratch (#199 Q4). It is
+	// allocated on the first configured metric point and reused for every
+	// point in the request.
+	dims *dimScratch
 }
 
 // NewReducer returns a reducer for one Export request. arrival is the single
@@ -380,6 +395,156 @@ func (r *Reducer) ReduceLog(in LogInput) {
 	}
 }
 
+// dimsIDFor resolves the DimsID of one metric point from its attributes.
+//
+// Missing any configured key yields 0, the "no configured dims" sentinel and
+// the existing all-or-nothing contract. The scan allocates no per-point map:
+// the configured tuple is bounded, so a request-local scratch holds it.
+func (r *Reducer) dimsIDFor(tenantID uint32, metricName string, attrs []*commonpb.KeyValue) uint32 {
+	keys := r.eng.dims.Get(metricName)
+	if len(keys) == 0 {
+		return 0
+	}
+	if r.dims == nil {
+		r.dims = &dimScratch{}
+	}
+	values, rejected, ok := r.dims.resolve(keys, attrs)
+	if rejected {
+		r.stats.DimsRejected++
+	}
+	if !ok {
+		return 0
+	}
+	return InternDimValues(r.eng.cache, tenantID, keys, values)
+}
+
+// metricSeriesKey builds the metric SeriesKey for one point, including its
+// configured dimension tuple. It is shared by every metric point shape so the
+// three of them cannot drift apart on identity (#199 Q4).
+func (r *Reducer) metricSeriesKey(tenantID uint32, service, name string, attrs []*commonpb.KeyValue) SeriesKey {
+	return SeriesKey{
+		TenantID:  tenantID,
+		ServiceID: r.eng.cache.Intern(tenantID, KindService, service),
+		NameID:    r.eng.cache.Intern(tenantID, KindMetricName, name),
+		DimsID:    r.dimsIDFor(tenantID, name, attrs),
+		Signal:    SignalMetric,
+	}
+}
+
+// MetricPointOutcome is the reducer's verdict on one metric data point.
+type MetricPointOutcome uint8
+
+// MetricPointOutcome values.
+const (
+	// MetricPointAccepted means the point contributed to a delta.
+	MetricPointAccepted MetricPointOutcome = iota
+	// MetricPointExcluded means the point fell outside the mutable-window horizon.
+	// It is counted as late or future, NOT as an OTLP rejection: the client
+	// sent well-formed telemetry and retrying would not help.
+	MetricPointExcluded
+	// MetricPointRejectedTemporality means a histogram point arrived with a
+	// temporality the GA engine does not support (#199 Q3).
+	MetricPointRejectedTemporality
+	// MetricPointRejectedMalformed means the point violates the OTLP data model.
+	MetricPointRejectedMalformed
+)
+
+// MetricPointResult reports what the reducer did with one metric data point,
+// so the OTLP Export path can build an honest partial-success response.
+type MetricPointResult struct {
+	Outcome MetricPointOutcome
+	// Reason is the metric label for a rejection, "" when accepted.
+	Reason string
+	// Err carries the validation failure behind PointRejectedMalformed.
+	Err error
+	// SketchDropped reports that the point's scalars were accepted but its
+	// percentiles suppressed, and DropReason says why. This is NOT a
+	// rejection: the point still contributes count, sum, min and max.
+	SketchDropped bool
+	DropReason    SketchDropReason
+}
+
+// Rejected reports whether the point must be counted in
+// ExportMetricsPartialSuccess.rejected_data_points.
+func (r MetricPointResult) Rejected() bool {
+	return r.Outcome == MetricPointRejectedTemporality || r.Outcome == MetricPointRejectedMalformed
+}
+
+// Rejection reasons reported to OTLP clients.
+const (
+	// ReasonCumulativeTemporality — GA aggregates delta-temporality
+	// histograms only; see CLAUDE.md for the collector-side conversion.
+	ReasonCumulativeTemporality = "cumulative_temporality"
+	// ReasonUnspecifiedTemporality — a histogram with no temporality set is
+	// not interpretable either way.
+	ReasonUnspecifiedTemporality = "unspecified_temporality"
+	// ReasonMalformedPoint — the point violates the OTLP data model.
+	ReasonMalformedPoint = "malformed_point"
+	// ReasonUnsupportedType — the point type has no aggregate model at all
+	// (Summary).
+	ReasonUnsupportedType = "unsupported_type"
+)
+
+// checkHistogramTemporality enforces the #199 Q3 contract: GA aggregates
+// delta-temporality histogram points only. A cumulative histogram is refused
+// COMPLETELY -- it does not contribute a count, and it is reported to the
+// client as a rejected data point so nobody builds a dashboard on a number
+// that silently is not there.
+func checkHistogramTemporality(t Temporality) (MetricPointResult, bool) {
+	switch t {
+	case TemporalityDelta:
+		return MetricPointResult{}, true
+	case TemporalityCumulative:
+		return MetricPointResult{Outcome: MetricPointRejectedTemporality, Reason: ReasonCumulativeTemporality}, false
+	default:
+		return MetricPointResult{Outcome: MetricPointRejectedTemporality, Reason: ReasonUnspecifiedTemporality}, false
+	}
+}
+
+// reduceFold folds an already-validated histogram fold into its series.
+func (r *Reducer) reduceFold(c HistogramCommon, fold HistogramFold) MetricPointResult {
+	window, ok := r.admitPoint(SignalMetric, c.Timestamp)
+	if !ok {
+		return MetricPointResult{Outcome: MetricPointExcluded}
+	}
+	tenantID := r.eng.cache.InternTenant(c.Tenant)
+	key := r.metricSeriesKey(tenantID, c.Service, c.Name, c.Attributes)
+	r.delta(key, window).ObserveHistogram(fold)
+	r.identify(key, window, topoIdentity{Kind: topoMetric, Tenant: c.Tenant, A: c.Service, B: c.Name})
+	r.stats.Accepted[SignalMetric]++
+	return MetricPointResult{
+		Outcome:       MetricPointAccepted,
+		SketchDropped: fold.PercentilesUnavailable,
+		DropReason:    fold.DropReason,
+	}
+}
+
+// ReduceHistogramPoint folds one OTLP explicit-bounds Histogram data point
+// (#199 Q2).
+func (r *Reducer) ReduceHistogramPoint(in HistogramInput) MetricPointResult {
+	if res, ok := checkHistogramTemporality(in.Temporality); !ok {
+		return res
+	}
+	fold, err := FoldHistogram(in)
+	if err != nil {
+		return MetricPointResult{Outcome: MetricPointRejectedMalformed, Reason: ReasonMalformedPoint, Err: err}
+	}
+	return r.reduceFold(in.HistogramCommon, fold)
+}
+
+// ReduceExponentialHistogramPoint folds one OTLP ExponentialHistogram data
+// point (#199 Q1).
+func (r *Reducer) ReduceExponentialHistogramPoint(in ExponentialHistogramInput) MetricPointResult {
+	if res, ok := checkHistogramTemporality(in.Temporality); !ok {
+		return res
+	}
+	fold, err := FoldExponentialHistogram(in)
+	if err != nil {
+		return MetricPointResult{Outcome: MetricPointRejectedMalformed, Reason: ReasonMalformedPoint, Err: err}
+	}
+	return r.reduceFold(in.HistogramCommon, fold)
+}
+
 // ReduceMetricPoint folds one metric data point into its metric series,
 // applying the #166 aggregation model for its temporality and monotonicity.
 func (r *Reducer) ReduceMetricPoint(in MetricInput) {
@@ -388,12 +553,7 @@ func (r *Reducer) ReduceMetricPoint(in MetricInput) {
 		return
 	}
 	tenantID := r.eng.cache.InternTenant(in.Tenant)
-	key := SeriesKey{
-		TenantID:  tenantID,
-		ServiceID: r.eng.cache.Intern(tenantID, KindService, in.Service),
-		NameID:    r.eng.cache.Intern(tenantID, KindMetricName, in.Name),
-		Signal:    SignalMetric,
-	}
+	key := r.metricSeriesKey(tenantID, in.Service, in.Name, in.Attributes)
 
 	switch {
 	// Gauges and cumulative non-monotonic sums (UpDownCounter): gauge-like,

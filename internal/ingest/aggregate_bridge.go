@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/RandomCodeSpace/otelcontext/internal/aggregate"
@@ -330,4 +332,185 @@ func aggregateTemporality(m *metricspb.Metric) (aggregate.Temporality, bool) {
 		}
 	}
 	return aggregate.TemporalityUnspecified, false
+}
+
+// --- OTLP metric completeness (#199) -----------------------------------------
+
+// otlpDataPointNoRecordedValue is DATA_POINT_FLAGS_NO_RECORDED_VALUE_MASK. A
+// point carrying it asserts that no value was recorded in the interval; it is
+// neither accepted nor rejected, because there is nothing to account for.
+const otlpDataPointNoRecordedValue uint32 = 1
+
+// OTLP point-type labels for the unsupported/rejection counters.
+const (
+	pointTypeHistogram    = "histogram"
+	pointTypeExpHistogram = "exponential_histogram"
+	pointTypeSummary      = "summary"
+)
+
+// otlpTemporality maps an OTLP AggregationTemporality onto the engine's enum.
+// Unlike aggregateTemporality it is not Sum-specific: histogram points carry
+// their temporality on the enclosing Histogram/ExponentialHistogram message.
+func otlpTemporality(t metricspb.AggregationTemporality) aggregate.Temporality {
+	switch t {
+	case metricspb.AggregationTemporality_AGGREGATION_TEMPORALITY_DELTA:
+		return aggregate.TemporalityDelta
+	case metricspb.AggregationTemporality_AGGREGATION_TEMPORALITY_CUMULATIVE:
+		return aggregate.TemporalityCumulative
+	default:
+		return aggregate.TemporalityUnspecified
+	}
+}
+
+// histogramCommonFields builds the identity and scalar payload shared by both
+// histogram point shapes. Optional sum/min/max arrive as proto pointers and
+// their presence is carried explicitly: a missing min is not a min of zero,
+// and treating it as one would claim the population is non-negative.
+func histogramCommonFields(
+	tenant, service, name string,
+	res aggregate.ResourceIdentity,
+	temporality aggregate.Temporality,
+	attrs []*commonpb.KeyValue,
+	timeNanos, startNanos uint64,
+	count uint64,
+	sum, minV, maxV *float64,
+) aggregate.HistogramCommon {
+	c := aggregate.HistogramCommon{
+		Tenant:      tenant,
+		Service:     service,
+		Name:        name,
+		Resource:    res,
+		Timestamp:   time.Unix(0, int64(timeNanos)),  // #nosec G115 -- OTLP nanos fit int64 until year 2262
+		StartTime:   time.Unix(0, int64(startNanos)), // #nosec G115 -- OTLP nanos fit int64 until year 2262
+		Temporality: temporality,
+		Attributes:  attrs,
+		Count:       count,
+	}
+	if sum != nil {
+		c.Sum, c.HasSum = *sum, true
+	}
+	if minV != nil {
+		c.Min, c.HasMin = *minV, true
+	}
+	if maxV != nil {
+		c.Max, c.HasMax = *maxV, true
+	}
+	return c
+}
+
+// aggregateHistogramInput converts one OTLP HistogramDataPoint.
+func aggregateHistogramInput(
+	tenant, service, name string,
+	res aggregate.ResourceIdentity,
+	temporality aggregate.Temporality,
+	p *metricspb.HistogramDataPoint,
+) aggregate.HistogramInput {
+	return aggregate.HistogramInput{
+		HistogramCommon: histogramCommonFields(tenant, service, name, res, temporality,
+			p.Attributes, p.TimeUnixNano, p.StartTimeUnixNano, p.Count, p.Sum, p.Min, p.Max),
+		Bounds:       p.ExplicitBounds,
+		BucketCounts: p.BucketCounts,
+	}
+}
+
+// aggregateExpHistogramInput converts one OTLP ExponentialHistogramDataPoint.
+func aggregateExpHistogramInput(
+	tenant, service, name string,
+	res aggregate.ResourceIdentity,
+	temporality aggregate.Temporality,
+	p *metricspb.ExponentialHistogramDataPoint,
+) aggregate.ExponentialHistogramInput {
+	return aggregate.ExponentialHistogramInput{
+		HistogramCommon: histogramCommonFields(tenant, service, name, res, temporality,
+			p.Attributes, p.TimeUnixNano, p.StartTimeUnixNano, p.Count, p.Sum, p.Min, p.Max),
+		Scale:     p.Scale,
+		ZeroCount: p.ZeroCount,
+		Positive:  expBuckets(p.Positive),
+		Negative:  expBuckets(p.Negative),
+	}
+}
+
+// expBuckets converts one side of an exponential histogram.
+func expBuckets(b *metricspb.ExponentialHistogramDataPoint_Buckets) aggregate.ExpBuckets {
+	if b == nil {
+		return aggregate.ExpBuckets{}
+	}
+	return aggregate.ExpBuckets{Offset: b.Offset, Counts: b.BucketCounts}
+}
+
+// metricRejectKey identifies one (point type, reason) pair in the partial
+// success accounting.
+type metricRejectKey struct{ kind, reason string }
+
+// metricRejections accumulates the metric data points one Export refused, so
+// the response can report an exact rejected_data_points count with a bounded
+// message naming the types and reasons (#199 Q5).
+//
+// Late and future points are deliberately NOT counted here. They are excluded
+// from aggregates and reported on the lateness counters, but the client sent
+// well-formed telemetry and a retry would not change the outcome; calling that
+// a rejection would train operators to ignore the field that matters.
+type metricRejections struct {
+	total  uint64
+	counts map[metricRejectKey]uint64
+}
+
+// add records n rejected points of one type and reason.
+func (m *metricRejections) add(kind, reason string, n uint64) {
+	if n == 0 {
+		return
+	}
+	if m.counts == nil {
+		m.counts = make(map[metricRejectKey]uint64, 4)
+	}
+	m.counts[metricRejectKey{kind: kind, reason: reason}] += n
+	m.total += n
+}
+
+// maxRejectionReasons bounds how many distinct (type, reason) pairs the
+// response message names. The COUNT is always exact; only the prose is capped,
+// because an error message is not a log sink.
+const maxRejectionReasons = 6
+
+// message renders the bounded human-readable summary.
+func (m *metricRejections) message() string {
+	if m.total == 0 {
+		return ""
+	}
+	keys := make([]metricRejectKey, 0, len(m.counts))
+	for k := range m.counts {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if m.counts[keys[i]] != m.counts[keys[j]] {
+			return m.counts[keys[i]] > m.counts[keys[j]]
+		}
+		if keys[i].kind != keys[j].kind {
+			return keys[i].kind < keys[j].kind
+		}
+		return keys[i].reason < keys[j].reason
+	})
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "%d metric data points were not aggregated and must not be retried:", m.total)
+	for i, k := range keys {
+		if i == maxRejectionReasons {
+			fmt.Fprintf(&sb, " (+%d more reasons)", len(keys)-i)
+			break
+		}
+		fmt.Fprintf(&sb, " %s/%s=%d", k.kind, k.reason, m.counts[k])
+	}
+	return sb.String()
+}
+
+// record folds one reducer verdict into the rejection accounting and the
+// telemetry counters.
+func (m *metricRejections) record(metrics *telemetry.Metrics, kind string, res aggregate.MetricPointResult) {
+	if res.Rejected() {
+		m.add(kind, res.Reason, 1)
+		metrics.RecordMetricUnsupported(kind, res.Reason, 1)
+		return
+	}
+	if res.SketchDropped {
+		metrics.RecordMetricSketchDropped(res.DropReason.String())
+	}
 }

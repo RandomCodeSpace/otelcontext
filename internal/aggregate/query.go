@@ -80,6 +80,50 @@ type AccuracyMetadata struct {
 	// Degraded reports that the merged sketch collapsed or saturated, which
 	// puts estimates in the affected range OUTSIDE RelativeErrorBound.
 	Degraded bool `json:"degraded,omitempty"`
+
+	// --- OTLP histogram provenance (#199) ---
+	//
+	// A bare Degraded=true does not describe a folded source histogram: an
+	// explicit-bounds histogram imports its own bucket width as error, and an
+	// unbounded +Inf bucket is not an error bound at all but a missing tail.
+	// Both are named here rather than collapsed into one boolean.
+
+	// SourceBucketError is the worst-case relative error imported from the
+	// SOURCE histogram's bucket widths, as a fraction. Zero for a native
+	// sketch and for exponential histograms, whose index transfer is exact.
+	// When non-zero it, not RelativeErrorBound, is the number that dominates.
+	SourceBucketError float64 `json:"source_bucket_error,omitempty"`
+	// UnboundedTail reports that observations landed in the source
+	// histogram's +Inf bucket. A quantile that falls there is a LOWER BOUND
+	// (>= UnboundedTailBound), never an estimate.
+	UnboundedTail      bool    `json:"unbounded_tail,omitempty"`
+	UnboundedTailBound float64 `json:"unbounded_tail_bound,omitempty"`
+	// PercentilesUnavailable suppresses every quantile: the sketch does not
+	// describe the whole distribution. PercentilesUnavailableReason names why
+	// (negative_observations, scale_out_of_range, no_finite_boundaries).
+	PercentilesUnavailable       bool   `json:"percentiles_unavailable,omitempty"`
+	PercentilesUnavailableReason string `json:"percentiles_unavailable_reason,omitempty"`
+}
+
+// AccuracyFromHistogramDelta derives the accuracy metadata of a folded OTLP
+// histogram distribution. It layers the source histogram's provenance on top
+// of the merged sketch's own bound, so a caller cannot read a 2.17% error
+// bound off a distribution whose source buckets were a decade wide.
+func AccuracyFromHistogramDelta(d *AggregateDelta) AccuracyMetadata {
+	if d == nil {
+		return AccuracyFromSketch(nil)
+	}
+	acc := AccuracyFromSketch(d.Sketch)
+	acc.SourceBucketError = d.HistogramSourceError
+	if d.HistogramFlags&HistUnboundedTail != 0 {
+		acc.UnboundedTail = true
+		acc.UnboundedTailBound = d.HistogramTailBound
+	}
+	if d.HistogramFlags&HistPercentilesUnavailable != 0 {
+		acc.PercentilesUnavailable = true
+		acc.PercentilesUnavailableReason = histReason(d.HistogramFlags).String()
+	}
+	return acc
 }
 
 // AccuracyFromSketch derives the accuracy metadata of a merged sketch. A nil

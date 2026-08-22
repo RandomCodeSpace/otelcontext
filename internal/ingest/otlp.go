@@ -302,6 +302,9 @@ func (s *MetricsServer) Export(ctx context.Context, req *colmetricspb.ExportMetr
 	if s.aggregateEngine != nil {
 		reducer = s.aggregateEngine.NewReducer(start)
 	}
+	// rejected accumulates the points aggregate accounting refused, for the
+	// OTLP partial-success response (#199 Q5).
+	var rejected metricRejections
 
 	for _, resourceMetrics := range req.ResourceMetrics {
 		serviceName := getServiceName(resourceMetrics.Resource.Attributes)
@@ -319,66 +322,53 @@ func (s *MetricsServer) Export(ctx context.Context, req *colmetricspb.ExportMetr
 
 		for _, scopeMetrics := range resourceMetrics.ScopeMetrics {
 			for _, m := range scopeMetrics.Metrics {
-				var points []*metricspb.NumberDataPoint
-
-				// Extract points based on metric type
-				switch m.Data.(type) {
+				switch data := m.Data.(type) {
 				case *metricspb.Metric_Gauge:
-					points = m.GetGauge().DataPoints
+					s.exportNumberPoints(reducer, m, data.Gauge.GetDataPoints(), serviceName, tenantID, producerIdentity)
 				case *metricspb.Metric_Sum:
-					points = m.GetSum().DataPoints
-				}
-
-				for _, p := range points {
-					var val float64
-					if p.Value != nil {
-						switch v := p.Value.(type) {
-						case *metricspb.NumberDataPoint_AsDouble:
-							val = v.AsDouble
-						case *metricspb.NumberDataPoint_AsInt:
-							val = float64(v.AsInt)
+					s.exportNumberPoints(reducer, m, data.Sum.GetDataPoints(), serviceName, tenantID, producerIdentity)
+				case *metricspb.Metric_Histogram:
+					// Distribution points have no legacy consumer: the TSDB
+					// ring buffer holds scalars only. They exist for aggregate
+					// accounting, so nothing runs in legacy mode and nothing
+					// is reported rejected there either — the aggregate
+					// contract is what promises to account for them (#199).
+					if reducer == nil {
+						continue
+					}
+					temporality := otlpTemporality(data.Histogram.GetAggregationTemporality())
+					for _, p := range data.Histogram.GetDataPoints() {
+						if p == nil || p.Flags&otlpDataPointNoRecordedValue != 0 {
+							continue
 						}
+						res := reducer.ReduceHistogramPoint(aggregateHistogramInput(
+							tenantID, serviceName, m.Name, producerIdentity, temporality, p))
+						rejected.record(s.metrics, pointTypeHistogram, res)
 					}
-
-					raw := tsdb.RawMetric{
-						Name:        m.Name,
-						ServiceName: serviceName,
-						Value:       val,
-						Timestamp:   time.Unix(0, int64(p.TimeUnixNano)), // #nosec G115 -- OTLP time in nanos: uint64 source fits int64 until year 2262
-						Attributes:  make(map[string]any),
-						TenantID:    tenantID,
+				case *metricspb.Metric_ExponentialHistogram:
+					if reducer == nil {
+						continue
 					}
-
-					// Convert attributes to map for TSDB grouping
-					for _, kv := range p.Attributes {
-						raw.Attributes[kv.Key] = kv.Value.String()
+					temporality := otlpTemporality(data.ExponentialHistogram.GetAggregationTemporality())
+					for _, p := range data.ExponentialHistogram.GetDataPoints() {
+						if p == nil || p.Flags&otlpDataPointNoRecordedValue != 0 {
+							continue
+						}
+						res := reducer.ReduceExponentialHistogramPoint(aggregateExpHistogramInput(
+							tenantID, serviceName, m.Name, producerIdentity, temporality, p))
+						rejected.record(s.metrics, pointTypeExpHistogram, res)
 					}
-
-					// 0. Aggregate accounting, ahead of every other consumer.
-					if reducer != nil {
-						temporality, monotonic := aggregateTemporality(m)
-						reducer.ReduceMetricPoint(aggregate.MetricInput{
-							Tenant:      tenantID,
-							Service:     serviceName,
-							Name:        m.Name,
-							Value:       val,
-							Timestamp:   raw.Timestamp,
-							StartTime:   time.Unix(0, int64(p.StartTimeUnixNano)), // #nosec G115 -- OTLP time in nanos: uint64 source fits int64 until year 2262
-							Temporality: temporality,
-							Monotonic:   monotonic,
-							Resource:    producerIdentity,
-						})
+				case *metricspb.Metric_Summary:
+					// Summary is wholly unsupported (#199 Q5). It carries
+					// producer-chosen quantiles that cannot be merged across
+					// series or windows, so there is no honest way to fold it
+					// into a sketch. Every point is counted and reported.
+					if reducer == nil {
+						continue
 					}
-
-					// 1. Process via TSDB Aggregator (for storage)
-					if s.aggregator != nil {
-						s.aggregator.Ingest(raw)
-					}
-
-					// 2. Real-time bypass (for live charts)
-					if s.metricCallback != nil {
-						s.metricCallback(raw)
-					}
+					n := uint64(len(data.Summary.GetDataPoints()))
+					rejected.add(pointTypeSummary, aggregate.ReasonUnsupportedType, n)
+					s.metrics.RecordMetricUnsupported(pointTypeSummary, aggregate.ReasonUnsupportedType, len(data.Summary.GetDataPoints()))
 				}
 			}
 		}
@@ -395,7 +385,85 @@ func (s *MetricsServer) Export(ctx context.Context, req *colmetricspb.ExportMetr
 		s.metrics.RecordIngestion(1)
 	}
 
-	return &colmetricspb.ExportMetricsServiceResponse{}, nil
+	resp := &colmetricspb.ExportMetricsServiceResponse{}
+	if rejected.total > 0 {
+		// Export SUCCEEDS: every accepted point is committed. The rejected
+		// count is exact and the client must not retry it — a retry replays
+		// the same unsupported points to the same refusal. A zero here is
+		// reserved for warning-only responses where everything was accepted,
+		// so it is never written on this branch (#199 Q5).
+		resp.PartialSuccess = &colmetricspb.ExportMetricsPartialSuccess{
+			RejectedDataPoints: int64(rejected.total), // #nosec G115 -- bounded by the request's point count
+			ErrorMessage:       rejected.message(),
+		}
+	}
+	return resp, nil
+}
+
+// exportNumberPoints handles the Gauge and Sum data points of one metric: the
+// aggregate reduction, the TSDB ring buffer and the real-time bypass, in that
+// order. It is a method rather than a closure so the histogram branches above
+// stay flat and the loop body is not duplicated per instrument type.
+func (s *MetricsServer) exportNumberPoints(
+	reducer *aggregate.Reducer,
+	m *metricspb.Metric,
+	points []*metricspb.NumberDataPoint,
+	serviceName, tenantID string,
+	producerIdentity aggregate.ResourceIdentity,
+) {
+	for _, p := range points {
+		if p == nil {
+			continue
+		}
+		var val float64
+		switch v := p.Value.(type) {
+		case *metricspb.NumberDataPoint_AsDouble:
+			val = v.AsDouble
+		case *metricspb.NumberDataPoint_AsInt:
+			val = float64(v.AsInt)
+		}
+
+		raw := tsdb.RawMetric{
+			Name:        m.Name,
+			ServiceName: serviceName,
+			Value:       val,
+			Timestamp:   time.Unix(0, int64(p.TimeUnixNano)), // #nosec G115 -- OTLP time in nanos: uint64 source fits int64 until year 2262
+			Attributes:  make(map[string]any),
+			TenantID:    tenantID,
+		}
+
+		// Convert attributes to map for TSDB grouping
+		for _, kv := range p.Attributes {
+			raw.Attributes[kv.Key] = kv.Value.String()
+		}
+
+		// 0. Aggregate accounting, ahead of every other consumer.
+		if reducer != nil {
+			temporality, monotonic := aggregateTemporality(m)
+			reducer.ReduceMetricPoint(aggregate.MetricInput{
+				Tenant:      tenantID,
+				Service:     serviceName,
+				Name:        m.Name,
+				Value:       val,
+				Timestamp:   raw.Timestamp,
+				StartTime:   time.Unix(0, int64(p.StartTimeUnixNano)), // #nosec G115 -- OTLP time in nanos: uint64 source fits int64 until year 2262
+				Temporality: temporality,
+				Monotonic:   monotonic,
+				Resource:    producerIdentity,
+				Attributes:  p.Attributes,
+			})
+		}
+
+		// 1. Process via TSDB Aggregator (for storage)
+		if s.aggregator != nil {
+			s.aggregator.Ingest(raw)
+		}
+
+		// 2. Real-time bypass (for live charts)
+		if s.metricCallback != nil {
+			s.metricCallback(raw)
+		}
+	}
 }
 
 // Export handles incoming OTLP trace data.

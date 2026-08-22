@@ -40,7 +40,12 @@ import (
 // kind of every span it summarised are long gone. Backfilling zeros would make
 // every historical window read "0 requests, N spans", which is worse than an
 // operator-acknowledged rebuild, so the fail-closed policy stands unchanged.
-const StoreSchemaVersion = 3
+//
+// v4 added the eight hist_* columns that carry an OTLP histogram point's
+// population statistics and its accuracy metadata (#199). A v3 file has no
+// column to put them in and no way to reconstruct them, so the same
+// rebuild-or-downgrade choice applies.
+const StoreSchemaVersion = 4
 
 // Store errors.
 var (

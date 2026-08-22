@@ -91,6 +91,7 @@ func (r promRecorder) RecordReduction(stats ReducerStats, deltas map[Signal]uint
 			r.m.AggregateShadowErrorsTotal.WithLabelValues(service).Add(float64(n))
 		}
 	}
+	r.m.RecordMetricDimsRejected(DimsRejectUnsupportedValue, stats.DimsRejected)
 }
 
 // RecordOverflow implements MetricsRecorder.

@@ -1,6 +1,8 @@
 package aggregate
 
 import (
+	"strconv"
+
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 )
 
@@ -70,4 +72,110 @@ func InternDimValues(c *Cache, tenantID uint32, keys, values []string) uint32 {
 		}
 	}
 	return c.InternDims(tenantID, pairs)
+}
+
+// --- hot-path dimension extraction (#199 Q4) ---------------------------------
+//
+// ExtractDimensionValues above allocates a map[string]string per call. That is
+// fine for the config-time helper it was written as and unacceptable per metric
+// data point: configured dimensions are BOUNDED (an operator lists a handful of
+// keys per metric), so a point's tuple resolves against a request-local scratch
+// with no map, no per-point slice and one string allocation only for a non-string
+// attribute value that has to be rendered.
+
+// MaxDimensionKeys bounds one metric's configured dimension tuple. A tuple
+// longer than this is refused from identity rather than silently truncated.
+const MaxDimensionKeys = 16
+
+// DimsRejectUnsupportedValue is the metric label for an attribute value that
+// has no canonical scalar rendering (array, kvlist, bytes). The point is still
+// aggregated -- under DimsID 0, the "no configured dims" sentinel.
+const DimsRejectUnsupportedValue = "unsupported_value_type"
+
+// dimScratch is one Export request's reusable dimension-extraction workspace.
+// It is owned by a Reducer, which is request-local and single-goroutine, so no
+// synchronization is needed and no allocation survives the request.
+type dimScratch struct {
+	vals  [MaxDimensionKeys]string
+	found [MaxDimensionKeys]bool
+	buf   []byte
+}
+
+// resolve extracts the configured tuple for keys out of attrs.
+//
+// It returns ok=false when any configured key is absent or carries an empty
+// value -- the all-or-nothing contract, which exists because a partial tuple is
+// a different series wearing the same name. rejected=true additionally reports
+// that a key WAS present but its value had no scalar rendering, which is worth
+// a counter: the operator configured a dimension that can never bind.
+func (s *dimScratch) resolve(keys []string, attrs []*commonpb.KeyValue) (vals []string, rejected, ok bool) {
+	n := len(keys)
+	if n == 0 || n > MaxDimensionKeys {
+		return nil, false, false
+	}
+	for i := 0; i < n; i++ {
+		s.vals[i] = ""
+		s.found[i] = false
+	}
+	remaining := n
+	for _, kv := range attrs {
+		if kv == nil || kv.Value == nil || remaining == 0 {
+			continue
+		}
+		idx := -1
+		for i := 0; i < n; i++ {
+			if !s.found[i] && keys[i] == kv.Key {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			continue
+		}
+		v, scalar := s.scalarValue(kv.Value)
+		if !scalar {
+			return nil, true, false
+		}
+		if v == "" {
+			// An empty value cannot be interned: the dictionary refuses a
+			// zero-length identity, and every empty value in a namespace would
+			// collide. Treat it as absent.
+			continue
+		}
+		s.vals[idx] = v
+		s.found[idx] = true
+		remaining--
+	}
+	if remaining != 0 {
+		return nil, false, false
+	}
+	return s.vals[:n], false, true
+}
+
+// scalarValue renders an OTLP attribute value as its canonical dimension
+// string. String, int, bool and double values are supported; array, kvlist and
+// bytes values are not -- they have no stable canonical rendering, and hashing
+// one into identity would make the series depend on element order.
+func (s *dimScratch) scalarValue(v *commonpb.AnyValue) (string, bool) {
+	switch tv := v.Value.(type) {
+	case *commonpb.AnyValue_StringValue:
+		return tv.StringValue, true
+	case *commonpb.AnyValue_IntValue:
+		s.buf = strconv.AppendInt(s.buf[:0], tv.IntValue, 10)
+		return string(s.buf), true
+	case *commonpb.AnyValue_BoolValue:
+		if tv.BoolValue {
+			return "true", true
+		}
+		return "false", true
+	case *commonpb.AnyValue_DoubleValue:
+		s.buf = strconv.AppendFloat(s.buf[:0], tv.DoubleValue, 'g', -1, 64)
+		return string(s.buf), true
+	case nil:
+		// An AnyValue with no value set is an absent attribute, not a
+		// rejection.
+		return "", true
+	default:
+		return "", false
+	}
 }

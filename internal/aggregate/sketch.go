@@ -156,6 +156,55 @@ func (s *Sketch) Observe(value float64) {
 	s.add(sketchIndex(value, s.scale), 1)
 }
 
+// ObserveN records n observations of the same value. It is the weighted form
+// of Observe and exists for histogram folding (#199): a source bucket holding
+// a million counts must cost one bin add, never a million calls to Observe.
+//
+// ObserveN never allocates.
+func (s *Sketch) ObserveN(value float64, n uint64) {
+	if n == 0 || math.IsNaN(value) || math.IsInf(value, 0) {
+		return
+	}
+	s.count += n
+	s.sum += value * float64(n)
+	if value <= 0 {
+		s.zeroCount += n
+		return
+	}
+	s.add(sketchIndex(value, s.scale), n)
+}
+
+// ObserveZero records n observations that belong in the zero bucket. It is the
+// landing slot for an OTLP exponential histogram's zero_count, which by
+// definition holds values at (or within zero_threshold of) zero and has no
+// representation in the log mapping.
+func (s *Sketch) ObserveZero(n uint64) {
+	if n == 0 {
+		return
+	}
+	s.count += n
+	s.zeroCount += n
+}
+
+// ObserveBucket records n observations already resolved to a bucket index in
+// THIS sketch's mapping. It is the exact-transfer primitive for OTLP
+// exponential histograms, whose bucket indexes use the identical
+// (base^i, base^(i+1)] convention: no value is reconstructed, so no mapping
+// error is introduced beyond the source histogram's own bucket width.
+//
+// The sketch's running sum is advanced by the bucket's representative value
+// times n. That makes Sum() an ESTIMATE for bucket-folded observations; the
+// authoritative sum of a histogram point is carried separately on the delta
+// (AggregateDelta.HistogramSum) and never derived from here.
+func (s *Sketch) ObserveBucket(index int32, n uint64) {
+	if n == 0 {
+		return
+	}
+	s.count += n
+	s.sum += sketchValue(index, s.scale) * float64(n)
+	s.add(index, n)
+}
+
 // Quantile returns the estimated q-quantile of the observed values, for q in
 // [0,1]. An empty sketch returns 0; an out-of-range or NaN q returns NaN.
 //
