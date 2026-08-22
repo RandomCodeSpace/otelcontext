@@ -383,11 +383,13 @@ func (w *Writer) commit(batch []*submission) {
 	// Admission against the cardinality budget happens BEFORE the write so the
 	// row that becomes durable carries the same identity the shards will hold.
 	// Doing it after the commit would let the store accumulate series the
-	// in-memory caps already rejected.
-	resolved := w.engine.Admit(merged)
+	// in-memory caps already rejected. It is a RESERVATION, not a charge:
+	// exactly one of CommitAdmission or RollbackAdmission settles it below, so
+	// a commit that never lands cannot keep eating cardinality budget (#194).
+	plan := w.engine.PlanAdmission(merged)
 
-	gb := &GroupBatch{Deltas: make([]DeltaRow, 0, len(resolved))}
-	for swk, d := range resolved {
+	gb := &GroupBatch{Deltas: make([]DeltaRow, 0, len(plan.Resolved))}
+	for swk, d := range plan.Resolved {
 		gb.Deltas = append(gb.Deltas, DeltaRow{
 			SeriesID:    w.series.Resolve(swk.Key),
 			WindowStart: swk.WindowStart,
@@ -419,9 +421,12 @@ func (w *Writer) commit(batch []*submission) {
 	w.commits.Add(1)
 	if err != nil {
 		w.commitErrors.Add(1)
-		// Nothing became durable: put the baselines back so the next commit
-		// carries them, and leave the staged registrations staged.
-		w.engine.Baselines().Redirty(dirty)
+		// Nothing became durable, so nothing may keep the resources the write
+		// would have justified: release the cardinality reservation, hand the
+		// drained baselines back the increase this batch was carrying, and
+		// leave the staged registrations staged.
+		w.engine.RollbackAdmission(plan)
+		w.engine.Baselines().Rollback(dirty)
 		w.finish(batch, commitResult{revision: w.engine.Revision(), err: err})
 		return
 	}
@@ -432,7 +437,7 @@ func (w *Writer) commit(batch []*submission) {
 	}
 
 	// Commit-then-apply: the shards only ever see committed state.
-	rev := w.engine.ApplyCommitted(resolved)
+	rev := w.engine.CommitAdmission(plan)
 	w.finish(batch, commitResult{revision: rev})
 }
 

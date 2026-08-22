@@ -188,6 +188,12 @@ type Admission struct {
 	Overflowed bool
 	// Reason names the cap that triggered overflow.
 	Reason OverflowReason
+	// Reserved reports that THIS call created (Key, window) presence, and so
+	// that a matching Release is the exact undo. It is false when the pair was
+	// already present, which is what lets a rolled-back group commit release
+	// only the occupancy it charged and never occupancy an earlier committed
+	// batch is still using (#194 blocker 3).
+	Reserved bool
 }
 
 // LimiterStats is a snapshot of Limiter occupancy.
@@ -271,16 +277,16 @@ func (l *Limiter) Admit(key SeriesKey, window int64) Admission {
 	if l.windows[key] > 0 {
 		// Already active in another mutable window: it holds budget already.
 		l.addLocked(key, window, false)
-		return Admission{Key: key}
+		return Admission{Key: key, Reserved: true}
 	}
 	if reason := l.checkLocked(key); reason != OverflowNone {
 		l.overflowCounts[reason]++
 		other := l.overflowKey(key)
-		l.admitOverflowLocked(other, window)
-		return Admission{Key: other, Overflowed: true, Reason: reason}
+		reserved := l.admitOverflowLocked(other, window)
+		return Admission{Key: other, Overflowed: true, Reason: reason, Reserved: reserved}
 	}
 	l.addLocked(key, window, false)
-	return Admission{Key: key}
+	return Admission{Key: key, Reserved: true}
 }
 
 // checkLocked applies the frozen enforcement order and returns the first cap
@@ -339,11 +345,14 @@ func (l *Limiter) checkLocked(key SeriesKey) OverflowReason {
 // active log series against a 500 sub-cap the wave-5 run measured (#173). The
 // reserve is reported through OverflowSeriesBySignal instead, so its cost is
 // visible without being laundered through a bounded-looking number.
-func (l *Limiter) admitOverflowLocked(other SeriesKey, window int64) {
+// It returns whether this call created the presence, so a rolled-back commit
+// can release exactly what it reserved.
+func (l *Limiter) admitOverflowLocked(other SeriesKey, window int64) bool {
 	if _, ok := l.present[SeriesWindowKey{Key: other, WindowStart: window}]; ok {
-		return
+		return false
 	}
 	l.addLocked(other, window, true)
+	return true
 }
 
 // addLocked records presence of key in window and, on the series' first window,
