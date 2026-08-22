@@ -95,7 +95,7 @@ func newHTTPBackpressureHarness(t *testing.T) *httpBackpressureHarness {
 	// backpressure and lands in the channel — capacity 1, so the channel is
 	// now full. Subsequent priority submits hit ErrQueueFull (the channel-
 	// full path); healthy submits would still be silently soft-dropped.
-	if err := pl.Submit(&Batch{
+	if _, err := pl.Submit(&Batch{
 		Type:     SignalTraces,
 		Tenant:   "default",
 		Traces:   []storage.Trace{{TraceID: "x", ServiceName: "svc"}},

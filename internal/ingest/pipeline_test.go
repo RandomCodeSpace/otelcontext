@@ -134,7 +134,7 @@ func waitFor(t *testing.T, timeout time.Duration, pred func() bool) bool {
 
 func TestPipeline_NilBatch_NoOp(t *testing.T) {
 	p := NewPipeline(&fakeWriter{}, nil, PipelineConfig{Capacity: 10, Workers: 1})
-	if err := p.Submit(nil); err != nil {
+	if _, err := p.Submit(nil); err != nil {
 		t.Fatalf("Submit(nil) returned %v, want nil", err)
 	}
 	if got := p.Stats().Enqueued; got != 0 {
@@ -145,7 +145,7 @@ func TestPipeline_NilBatch_NoOp(t *testing.T) {
 func TestPipeline_EmptyBatch_NoOp(t *testing.T) {
 	p := NewPipeline(&fakeWriter{}, nil, PipelineConfig{Capacity: 10, Workers: 1})
 	empty := &Batch{Type: SignalTraces, Tenant: "t"}
-	if err := p.Submit(empty); err != nil {
+	if _, err := p.Submit(empty); err != nil {
 		t.Fatalf("Submit(empty) returned %v, want nil", err)
 	}
 	if got := p.Stats().Enqueued; got != 0 {
@@ -158,7 +158,7 @@ func TestPipeline_AcceptsBelowSoftThreshold(t *testing.T) {
 	// Workers=0 means nothing drains; depth grows monotonically.
 	p := NewPipeline(&fakeWriter{}, nil, PipelineConfig{Capacity: 10, Workers: 0, SoftThreshold: 0.9})
 	for range 9 {
-		if err := p.Submit(healthyBatch()); err != nil {
+		if _, err := p.Submit(healthyBatch()); err != nil {
 			t.Fatalf("submit below soft threshold returned %v, want nil", err)
 		}
 	}
@@ -174,12 +174,12 @@ func TestPipeline_DropsHealthyAtSoftThreshold(t *testing.T) {
 	// stayed at 9.
 	p := NewPipeline(&fakeWriter{}, nil, PipelineConfig{Capacity: 10, Workers: 0, SoftThreshold: 0.9})
 	for range 9 {
-		if err := p.Submit(healthyBatch()); err != nil {
+		if _, err := p.Submit(healthyBatch()); err != nil {
 			t.Fatalf("priming submit failed: %v", err)
 		}
 	}
 	// Now at exactly 9/10 = 0.9 fullness — soft backpressure engages.
-	if err := p.Submit(healthyBatch()); err != nil {
+	if _, err := p.Submit(healthyBatch()); err != nil {
 		t.Fatalf("dropped submit returned err %v, want nil (silent drop)", err)
 	}
 	stats := p.Stats()
@@ -196,9 +196,9 @@ func TestPipeline_PriorityBatchesBypassSoftBackpressure(t *testing.T) {
 	// enqueue, not drop, because errors are diagnostic-critical.
 	p := NewPipeline(&fakeWriter{}, nil, PipelineConfig{Capacity: 10, Workers: 0, SoftThreshold: 0.9})
 	for range 9 {
-		_ = p.Submit(healthyBatch())
+		_, _ = p.Submit(healthyBatch())
 	}
-	if err := p.Submit(errorBatch()); err != nil {
+	if _, err := p.Submit(errorBatch()); err != nil {
 		t.Fatalf("priority submit returned %v, want nil (errors must pass soft backpressure)", err)
 	}
 	stats := p.Stats()
@@ -215,11 +215,11 @@ func TestPipeline_RejectsAtHardCapacity(t *testing.T) {
 	// then submit one more priority batch — must return ErrQueueFull.
 	p := NewPipeline(&fakeWriter{}, nil, PipelineConfig{Capacity: 5, Workers: 0, SoftThreshold: 0.9})
 	for range 5 {
-		if err := p.Submit(errorBatch()); err != nil {
+		if _, err := p.Submit(errorBatch()); err != nil {
 			t.Fatalf("priming priority submit failed: %v", err)
 		}
 	}
-	err := p.Submit(errorBatch())
+	_, err := p.Submit(errorBatch())
 	if !errors.Is(err, ErrQueueFull) {
 		t.Fatalf("hard-capacity submit returned %v, want ErrQueueFull", err)
 	}
@@ -241,7 +241,7 @@ func TestPipeline_PreservesInsertionOrder(t *testing.T) {
 	p.Start(ctx)
 	t.Cleanup(p.Stop)
 
-	if err := p.Submit(healthyBatch()); err != nil {
+	if _, err := p.Submit(healthyBatch()); err != nil {
 		t.Fatalf("submit: %v", err)
 	}
 	// Sync on the assertion target — the per-signal call sequence — rather
@@ -278,7 +278,7 @@ func TestPipeline_CallbacksFireAfterPersistence(t *testing.T) {
 	b.SpanCallback = func(_ storage.Span) { spanHits.Add(1) }
 	b.LogCallback = func(_ storage.Log) { logHits.Add(1) }
 
-	if err := p.Submit(b); err != nil {
+	if _, err := p.Submit(b); err != nil {
 		t.Fatalf("submit: %v", err)
 	}
 	if !waitFor(t, 5*time.Second, func() bool { return spanHits.Load() == 1 && logHits.Load() == 1 }) {
@@ -299,7 +299,7 @@ func runFailureSkipsCheck(t *testing.T, w *fakeWriter, forbidden ...string) {
 	p.Start(ctx)
 	t.Cleanup(p.Stop)
 
-	if err := p.Submit(healthyBatch()); err != nil {
+	if _, err := p.Submit(healthyBatch()); err != nil {
 		t.Fatalf("submit: %v", err)
 	}
 	if !waitFor(t, 5*time.Second, func() bool { return p.Stats().ProcessFailures > 0 }) {
@@ -337,7 +337,7 @@ func TestPipeline_DrainsOnStop(t *testing.T) {
 	w := &fakeWriter{}
 	p := NewPipeline(w, nil, PipelineConfig{Capacity: 50, Workers: 2})
 	for range 20 {
-		_ = p.Submit(healthyBatch())
+		_, _ = p.Submit(healthyBatch())
 	}
 	// Start AFTER submitting so the queue is pre-loaded — exercises the
 	// drain path in worker().
@@ -372,7 +372,7 @@ func TestPipeline_ConcurrentSubmit(t *testing.T) {
 	for range 100 {
 		wg.Go(func() {
 			for range 50 {
-				_ = p.Submit(healthyBatch())
+				_, _ = p.Submit(healthyBatch())
 			}
 		})
 	}
@@ -426,14 +426,14 @@ func TestPipeline_PerTenantCap_DropsExcessHealthy(t *testing.T) {
 	}
 
 	for range 3 {
-		if err := p.Submit(mkBatch("a")); err != nil {
+		if _, err := p.Submit(mkBatch("a")); err != nil {
 			t.Fatalf("submit under cap: %v", err)
 		}
 	}
-	if err := p.Submit(mkBatch("a")); err != nil {
+	if _, err := p.Submit(mkBatch("a")); err != nil {
 		t.Fatalf("4th submit returned err %v, want nil (silent drop)", err)
 	}
-	if err := p.Submit(mkBatch("b")); err != nil {
+	if _, err := p.Submit(mkBatch("b")); err != nil {
 		t.Fatalf("tenant b under its cap should not be affected: %v", err)
 	}
 
@@ -462,7 +462,7 @@ func TestPipeline_PerTenantCap_PriorityBypasses(t *testing.T) {
 	}
 
 	for range 5 {
-		if err := p.Submit(mkErr("noisy")); err != nil {
+		if _, err := p.Submit(mkErr("noisy")); err != nil {
 			t.Fatalf("priority submit blocked by tenant cap: %v", err)
 		}
 	}
@@ -494,7 +494,7 @@ func TestPipeline_PerTenantCap_ReleasedAfterProcess(t *testing.T) {
 	}
 
 	// First batch fills the cap.
-	if err := p.Submit(mk()); err != nil {
+	if _, err := p.Submit(mk()); err != nil {
 		t.Fatalf("submit 1: %v", err)
 	}
 	// Wait for the worker to drain it (and release the slot). The test
@@ -504,7 +504,7 @@ func TestPipeline_PerTenantCap_ReleasedAfterProcess(t *testing.T) {
 		t.Fatalf("worker did not process first batch")
 	}
 	// Second batch must succeed because the slot was released.
-	if err := p.Submit(mk()); err != nil {
+	if _, err := p.Submit(mk()); err != nil {
 		t.Fatalf("submit 2 after release: %v", err)
 	}
 	if !waitFor(t, 30*time.Second, func() bool { return p.Stats().Processed == 2 }) {
@@ -520,9 +520,9 @@ func TestPipeline_HardCapacityEvenForPriority(t *testing.T) {
 	// caller is responsible for translating into RESOURCE_EXHAUSTED so
 	// the OTLP client retries; better than silently losing errors.
 	p := NewPipeline(&fakeWriter{}, nil, PipelineConfig{Capacity: 2, Workers: 0, SoftThreshold: 0.9})
-	_ = p.Submit(errorBatch())
-	_ = p.Submit(errorBatch())
-	err := p.Submit(errorBatch())
+	_, _ = p.Submit(errorBatch())
+	_, _ = p.Submit(errorBatch())
+	_, err := p.Submit(errorBatch())
 	if !errors.Is(err, ErrQueueFull) {
 		t.Fatalf("hard cap with priority: got %v, want ErrQueueFull", err)
 	}
@@ -542,10 +542,10 @@ func TestPipeline_PanicInCallbackRecovered(t *testing.T) {
 	bad.SpanCallback = func(_ storage.Span) { panic("boom") }
 	good := healthyBatch()
 
-	if err := p.Submit(bad); err != nil {
+	if _, err := p.Submit(bad); err != nil {
 		t.Fatalf("submit bad: %v", err)
 	}
-	if err := p.Submit(good); err != nil {
+	if _, err := p.Submit(good); err != nil {
 		t.Fatalf("submit good: %v", err)
 	}
 	if !waitFor(t, 5*time.Second, func() bool { return p.Stats().Processed >= 2 }) {
@@ -588,7 +588,7 @@ func TestPipeline_StoreMinSeverity_DropsBelowThresholdFromPersist(t *testing.T) 
 		},
 		LogCallback: cb,
 	}
-	if err := p.Submit(b); err != nil {
+	if _, err := p.Submit(b); err != nil {
 		t.Fatalf("submit: %v", err)
 	}
 
@@ -659,7 +659,7 @@ func TestPipeline_StoreMinSeverity_Disabled_PersistsAllLogs(t *testing.T) {
 			{Body: "err-row", Severity: "ERROR"},
 		},
 	}
-	if err := p.Submit(b); err != nil {
+	if _, err := p.Submit(b); err != nil {
 		t.Fatalf("submit: %v", err)
 	}
 	if !waitFor(t, 5*time.Second, func() bool { return p.Stats().Processed >= 1 }) {
@@ -763,14 +763,14 @@ func TestPipeline_ByteCap_RejectsEvenPriority(t *testing.T) {
 
 	first := fatLogBatch(700 * 1024)
 	first.HasError = true
-	if err := p.Submit(first); err != nil {
+	if _, err := p.Submit(first); err != nil {
 		t.Fatalf("first fat batch under the cap rejected: %v", err)
 	}
 	firstSize := first.approxBytes()
 
 	second := fatLogBatch(700 * 1024)
 	second.HasError = true
-	if err := p.Submit(second); !errors.Is(err, ErrQueueFull) {
+	if _, err := p.Submit(second); !errors.Is(err, ErrQueueFull) {
 		t.Fatalf("over-cap priority submit returned %v, want ErrQueueFull", err)
 	}
 
@@ -792,7 +792,7 @@ func TestPipeline_ByteCap_SingleOversizedBatchRejected(t *testing.T) {
 	p := NewPipeline(&fakeWriter{}, nil, PipelineConfig{Capacity: 100, Workers: 0, MaxBytes: 1 << 20})
 	b := fatLogBatch(2 << 20)
 	b.HasError = true
-	if err := p.Submit(b); !errors.Is(err, ErrQueueFull) {
+	if _, err := p.Submit(b); !errors.Is(err, ErrQueueFull) {
 		t.Fatalf("oversized submit returned %v, want ErrQueueFull", err)
 	}
 	if got := p.Stats().QueueBytes; got != 0 {
@@ -809,10 +809,10 @@ func TestPipeline_ByteCap_ReleasesTenantSlotOnReject(t *testing.T) {
 	p.SetPerTenantCap(1)
 
 	fat := fatLogBatch(2 << 20) // healthy → reserves the tenant slot first
-	if err := p.Submit(fat); !errors.Is(err, ErrQueueFull) {
+	if _, err := p.Submit(fat); !errors.Is(err, ErrQueueFull) {
 		t.Fatalf("oversized submit returned %v, want ErrQueueFull", err)
 	}
-	if err := p.Submit(healthyBatch()); err != nil {
+	if _, err := p.Submit(healthyBatch()); err != nil {
 		t.Fatalf("follow-up submit after byte rejection: %v", err)
 	}
 	if got := p.TenantDropped(); got != 0 {
@@ -828,10 +828,10 @@ func TestPipeline_ChannelFull_ReleasesBytes(t *testing.T) {
 	// same way it undoes the tenant slot.
 	p := NewPipeline(&fakeWriter{}, nil, PipelineConfig{Capacity: 1, Workers: 0})
 	first := errorBatch()
-	if err := p.Submit(first); err != nil {
+	if _, err := p.Submit(first); err != nil {
 		t.Fatalf("priming submit: %v", err)
 	}
-	if err := p.Submit(errorBatch()); !errors.Is(err, ErrQueueFull) {
+	if _, err := p.Submit(errorBatch()); !errors.Is(err, ErrQueueFull) {
 		t.Fatalf("channel-full submit returned %v, want ErrQueueFull", err)
 	}
 	if got, want := p.Stats().QueueBytes, first.approxBytes(); got != want {
@@ -846,11 +846,11 @@ func TestPipeline_SoftDropViaByteFullness(t *testing.T) {
 	p := NewPipeline(&fakeWriter{}, nil, PipelineConfig{Capacity: 1000, Workers: 0, SoftThreshold: 0.9, MaxBytes: 1 << 20})
 	fat := fatLogBatch(950 * 1024) // priority → bypasses the soft check itself
 	fat.HasError = true
-	if err := p.Submit(fat); err != nil {
+	if _, err := p.Submit(fat); err != nil {
 		t.Fatalf("priming fat priority submit: %v", err)
 	}
 
-	if err := p.Submit(healthyBatch()); err != nil {
+	if _, err := p.Submit(healthyBatch()); err != nil {
 		t.Fatalf("soft-dropped submit returned %v, want nil (silent drop)", err)
 	}
 	stats := p.Stats()
@@ -867,10 +867,10 @@ func TestPipeline_ByteAccounting_ReservedWhileQueued(t *testing.T) {
 	// enqueued batches' estimates.
 	p := NewPipeline(&fakeWriter{}, nil, PipelineConfig{Capacity: 10, Workers: 0})
 	b1, b2 := healthyBatch(), fatLogBatch(4096)
-	if err := p.Submit(b1); err != nil {
+	if _, err := p.Submit(b1); err != nil {
 		t.Fatalf("submit 1: %v", err)
 	}
-	if err := p.Submit(b2); err != nil {
+	if _, err := p.Submit(b2); err != nil {
 		t.Fatalf("submit 2: %v", err)
 	}
 	if got, want := p.Stats().QueueBytes, b1.approxBytes()+b2.approxBytes(); got != want {
@@ -893,10 +893,10 @@ func TestPipeline_ByteAccounting_ReturnsToZeroAfterProcess(t *testing.T) {
 	bad.SpanCallback = func(_ storage.Span) { panic("boom") }
 	good := healthyBatch()
 
-	if err := p.Submit(bad); err != nil {
+	if _, err := p.Submit(bad); err != nil {
 		t.Fatalf("submit bad: %v", err)
 	}
-	if err := p.Submit(good); err != nil {
+	if _, err := p.Submit(good); err != nil {
 		t.Fatalf("submit good: %v", err)
 	}
 	if !waitFor(t, 5*time.Second, func() bool { return p.Stats().Processed >= 2 }) {
@@ -917,7 +917,7 @@ func TestPipeline_QueueBytesGaugeTracksReservations(t *testing.T) {
 	p := NewPipeline(&fakeWriter{}, m, PipelineConfig{Capacity: 10, Workers: 1})
 
 	b := healthyBatch()
-	if err := p.Submit(b); err != nil {
+	if _, err := p.Submit(b); err != nil {
 		t.Fatalf("submit: %v", err)
 	}
 	if got, want := testutil.ToFloat64(g), float64(b.approxBytes()); got != want {
@@ -943,7 +943,7 @@ func TestPipeline_ByteAccounting_ReleasedOnWriterFailure(t *testing.T) {
 	p.Start(ctx)
 	t.Cleanup(p.Stop)
 
-	if err := p.Submit(healthyBatch()); err != nil {
+	if _, err := p.Submit(healthyBatch()); err != nil {
 		t.Fatalf("submit: %v", err)
 	}
 	if !waitFor(t, 5*time.Second, func() bool { return p.Stats().ProcessFailures >= 1 }) {

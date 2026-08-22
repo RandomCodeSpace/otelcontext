@@ -715,11 +715,13 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 		merged.MergeFrom(r.reducer)
 	}
 
-	// Apply the request's aggregate deltas before the persist decision: the
-	// aggregate path has already accepted this telemetry, and a downstream
-	// queue rejection must not retroactively unaccount it. Under durable ACK
-	// this blocks until the group commit lands.
-	if err := applyAggregate(s.aggregateEngine, merged); err != nil {
+	// Apply the request's aggregate deltas. In aggregate mode this runs
+	// BEFORE the persist decision — the aggregate path has already accepted
+	// this telemetry and a downstream queue rejection must not retroactively
+	// unaccount it — and blocks until the group commit lands. In shadow mode
+	// it is a no-op here and runs after the submit loop instead; see the
+	// mode-conditional ordering note on applyAggregatePre.
+	if err := applyAggregatePre(s.aggregateEngine, merged); err != nil {
 		return nil, err
 	}
 
@@ -742,8 +744,10 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 		// are idempotent on their composite unique indexes, synthesized logs
 		// are not and can duplicate. Charging every tenant to one slot would
 		// mean the cap protects nobody, which is the worse trade.
-		for _, g := range groups.all() {
-			batch := &Batch{
+		all := groups.all()
+		batches := make([]*Batch, 0, len(all))
+		for _, g := range all {
+			batches = append(batches, &Batch{
 				Type:         SignalTraces,
 				Tenant:       g.tenant,
 				Traces:       g.traces,
@@ -753,15 +757,36 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 				HasSlow:      g.hasSlow,
 				SpanCallback: s.spanCallback,
 				LogCallback:  s.logCallback,
+			})
+		}
+		// Selected raw exemplars for the trace signal are the retained SPANS.
+		// Trace rows are per-trace bookkeeping and synthesized logs were never
+		// sent by the client, so neither is reportable to OTLP (#196).
+		out, err := submitExemplars(s.pipeline, s.metrics, SignalTraces, batches,
+			aggregateACK(s.aggregateEngine), func(b *Batch) int { return len(b.Spans) })
+		if err != nil {
+			if errors.Is(err, ErrQueueFull) {
+				return nil, grpcstatus.Errorf(codes.ResourceExhausted, "ingest pipeline at capacity")
 			}
-			if err := s.pipeline.Submit(batch); err != nil {
-				if errors.Is(err, ErrQueueFull) {
-					return nil, grpcstatus.Errorf(codes.ResourceExhausted, "ingest pipeline at capacity")
-				}
-				return nil, err
+			return nil, err
+		}
+		// Shadow mode: the raw path has now reached a non-retry outcome, so
+		// the shadow aggregate may be applied — exactly once per successful
+		// Export attempt.
+		if err := applyAggregatePost(s.aggregateEngine, merged); err != nil {
+			return nil, err
+		}
+		resp := &coltracepb.ExportTraceServiceResponse{}
+		if out.warn() {
+			// Zero rejected records: the authoritative aggregate accepted
+			// every span the client sent. OTLP permits a zero-rejected
+			// partial_success as a warning, and clients must not retry it.
+			resp.PartialSuccess = &coltracepb.ExportTracePartialSuccess{
+				RejectedSpans: 0,
+				ErrorMessage:  out.message(),
 			}
 		}
-		return &coltracepb.ExportTraceServiceResponse{}, nil
+		return resp, nil
 	}
 
 	// Synchronous fallback (s.pipeline == nil). Preserves the original
@@ -800,6 +825,13 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 				s.logCallback(l)
 			}
 		}
+	}
+
+	// Shadow mode, synchronous fallback: the raw writes above are the source
+	// of truth and every retryable failure has already returned, so this is
+	// the same non-retry point the async path applies the shadow aggregate at.
+	if err := applyAggregatePost(s.aggregateEngine, merged); err != nil {
+		return nil, err
 	}
 
 	return &coltracepb.ExportTraceServiceResponse{}, nil
@@ -930,11 +962,18 @@ func (s *LogsServer) Export(ctx context.Context, req *collogspb.ExportLogsServic
 		}
 		mergedReducer.MergeFrom(r)
 	}
-	if err := applyAggregate(s.aggregateEngine, mergedReducer); err != nil {
+	// Mode-conditional ordering, same contract as TraceServer.Export: pre in
+	// aggregate/legacy, post (after the submit loop) in shadow.
+	if err := applyAggregatePre(s.aggregateEngine, mergedReducer); err != nil {
 		return nil, err
 	}
 
 	if len(logsToInsert) == 0 {
+		// Nothing raw to submit, so the raw path's outcome is trivially
+		// non-retry and the shadow aggregate applies immediately.
+		if err := applyAggregatePost(s.aggregateEngine, mergedReducer); err != nil {
+			return nil, err
+		}
 		return &collogspb.ExportLogsServiceResponse{}, nil
 	}
 
@@ -948,22 +987,38 @@ func (s *LogsServer) Export(ctx context.Context, req *collogspb.ExportLogsServic
 	// (ERROR/FATAL bypasses soft backpressure) is now evaluated per tenant
 	// group rather than across the whole Export — see hasPriorityLog.
 	if s.pipeline != nil {
-		for _, g := range groups.all() {
-			batch := &Batch{
+		all := groups.all()
+		batches := make([]*Batch, 0, len(all))
+		for _, g := range all {
+			batches = append(batches, &Batch{
 				Type:        SignalLogs,
 				Tenant:      g.tenant,
 				Logs:        g.logs,
 				HasError:    g.hasErr,
 				LogCallback: s.logCallback,
+			})
+		}
+		// Every log row here came off the wire — the log signal synthesizes
+		// nothing — so the whole batch is selected raw exemplars.
+		out, err := submitExemplars(s.pipeline, s.metrics, SignalLogs, batches,
+			aggregateACK(s.aggregateEngine), func(b *Batch) int { return len(b.Logs) })
+		if err != nil {
+			if errors.Is(err, ErrQueueFull) {
+				return nil, grpcstatus.Errorf(codes.ResourceExhausted, "ingest pipeline at capacity")
 			}
-			if err := s.pipeline.Submit(batch); err != nil {
-				if errors.Is(err, ErrQueueFull) {
-					return nil, grpcstatus.Errorf(codes.ResourceExhausted, "ingest pipeline at capacity")
-				}
-				return nil, err
+			return nil, err
+		}
+		if err := applyAggregatePost(s.aggregateEngine, mergedReducer); err != nil {
+			return nil, err
+		}
+		resp := &collogspb.ExportLogsServiceResponse{}
+		if out.warn() {
+			resp.PartialSuccess = &collogspb.ExportLogsPartialSuccess{
+				RejectedLogRecords: 0,
+				ErrorMessage:       out.message(),
 			}
 		}
-		return &collogspb.ExportLogsServiceResponse{}, nil
+		return resp, nil
 	}
 
 	// Synchronous fallback (preserves original behavior when async is disabled).
@@ -975,6 +1030,11 @@ func (s *LogsServer) Export(ctx context.Context, req *collogspb.ExportLogsServic
 		for _, l := range logsToInsert {
 			s.logCallback(l)
 		}
+	}
+
+	// Shadow mode, synchronous fallback — see TraceServer.Export.
+	if err := applyAggregatePost(s.aggregateEngine, mergedReducer); err != nil {
+		return nil, err
 	}
 
 	return &collogspb.ExportLogsServiceResponse{}, nil

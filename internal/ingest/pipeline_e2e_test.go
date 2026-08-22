@@ -142,7 +142,7 @@ func TestPipelineE2E_PriorityBatchProtected(t *testing.T) {
 	// healthy (drop) and priority (must still enqueue) batches.
 	h := newPipelineHarness(t, 10, 0)
 	for range 9 {
-		_ = h.pipeline.Submit(healthyBatch())
+		_, _ = h.pipeline.Submit(healthyBatch())
 	}
 
 	// Healthy at >=90% should drop silently.
