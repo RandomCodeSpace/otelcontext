@@ -239,6 +239,7 @@ func newSeedFixture(t *testing.T) *seedFixture {
 	if err != nil {
 		t.Fatalf("begin seed tx: %v", err)
 	}
+	defer func() { _ = tx.Rollback() }()
 	seedSeries(t, tx, series)
 	insertRows(t, tx, "aggregate_buckets", bucketIDs, bucketWindows, bucketDeltas)
 	insertRows(t, tx, "aggregate_delta_log", deltaIDs, deltaWindows, deltaDeltas)
@@ -491,6 +492,7 @@ func TestPercentilePathReadsEverySketchBearingRow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin seed tx: %v", err)
 	}
+	defer func() { _ = tx.Rollback() }()
 	seedSeries(t, tx, series)
 	insertRows(t, tx, "aggregate_buckets", bucketIDs, bucketWins, bucketDeltas)
 	insertRows(t, tx, "aggregate_delta_log", deltaIDs, deltaWins, deltaDeltas)
