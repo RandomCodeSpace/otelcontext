@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"math"
 	"net/http"
+	"sort"
 	"time"
 
 	"github.com/RandomCodeSpace/otelcontext/internal/aggregate"
@@ -312,6 +314,18 @@ func (s *Server) handleGetMetricBuckets(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// Aggregate mode has no metric_buckets rows to read: the legacy TSDB that
+	// wrote them is not started (#194 finding 10). The series come from the
+	// engine's topology projection instead.
+	if s.aggregateReads() {
+		snap := s.aggregateEngine.TopologySnapshot(storage.TenantFromContext(r.Context()))
+		buckets, coverage := metricBucketsFromTopology(snap, name, serviceName, start, end)
+		setCoverage(w, coverage)
+		w.Header().Set(httpconst.HeaderContentType, httpconst.ContentTypeJSON)
+		_ = json.NewEncoder(w).Encode(buckets)
+		return
+	}
+
 	buckets, err := s.repo.GetMetricBuckets(r.Context(), start, end, serviceName, name)
 	if err != nil {
 		slog.Error("Failed to get metric buckets", "error", err)
@@ -323,9 +337,107 @@ func (s *Server) handleGetMetricBuckets(w http.ResponseWriter, r *http.Request) 
 	_ = json.NewEncoder(w).Encode(views.MetricBucketsFromModels(buckets))
 }
 
+// metricBucketsFromTopology projects a tenant's aggregate topology snapshot
+// into the /api/metrics wire shape. The contract is unchanged — same fields,
+// same bare array, same time_bucket ASC ordering — but two properties of the
+// data differ and neither is hidden from the caller:
+//
+//   - Bucket WIDTH is the engine's five-minute window, not the TSDB's 30s.
+//   - HISTORY reaches back only as far as the projection retains (the mutable
+//     set plus TopologySnapshot.Horizon), not HOT_RETENTION_DAYS. A request
+//     reaching further back is reported as sampled coverage, never as full.
+//
+// ID is 0: an aggregate window has no row identity. AttributesJSON is empty:
+// the projection keys metric series by (service, name) only, so there are no
+// grouped attributes to restate. Both fields keep their place in the shape.
+//
+// The start/end filter is inclusive at both ends, matching the legacy
+// `time_bucket BETWEEN ? AND ?` predicate exactly — including the degenerate
+// zero-time case, where both paths return an empty array.
+func metricBucketsFromTopology(
+	snap aggregate.TopologySnapshot,
+	name, service string,
+	start, end time.Time,
+) ([]views.MetricBucket, aggregate.Coverage) {
+	out := make([]views.MetricBucket, 0, 8)
+	for _, m := range snap.Metrics {
+		if m.Metric != name {
+			continue
+		}
+		if service != "" && m.Service != service {
+			continue
+		}
+		for _, win := range m.Windows {
+			// A window the metric was not observed in carries no value
+			// statistics; emitting it would report a fabricated zero sample.
+			if win.ValueCount == 0 {
+				continue
+			}
+			if win.Start.Before(start) || win.Start.After(end) {
+				continue
+			}
+			out = append(out, views.MetricBucket{
+				Name:        m.Metric,
+				ServiceName: m.Service,
+				TimeBucket:  win.Start,
+				Min:         win.ValueMin,
+				Max:         win.ValueMax,
+				Sum:         win.ValueSum,
+				Count:       clampToInt64(win.ValueCount),
+			})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].TimeBucket.Equal(out[j].TimeBucket) {
+			return out[i].TimeBucket.Before(out[j].TimeBucket)
+		}
+		return out[i].ServiceName < out[j].ServiceName
+	})
+	return out, metricSeriesCoverage(snap, start)
+}
+
+// metricSeriesCoverage reports whether a projected metric answer is complete.
+// It is not when a projection cap refused metric facts, and it is not when the
+// caller asked for history older than the projection retains: outside that
+// horizon the engine holds nothing, and an empty stretch of chart must not read
+// as "the metric was flat".
+func metricSeriesCoverage(snap aggregate.TopologySnapshot, start time.Time) aggregate.Coverage {
+	if snap.DroppedMetrics > 0 {
+		return aggregate.CoverageSampled
+	}
+	if snap.Horizon > 0 && !snap.Now.IsZero() && start.Before(snap.Now.Add(-snap.Horizon)) {
+		return aggregate.CoverageSampled
+	}
+	return aggregate.CoverageFull
+}
+
+// clampToInt64 narrows a projection counter for the wire shape. The counters
+// are bounded by accepted data points inside one retained window, so the clamp
+// is unreachable in practice and exists so the conversion is total.
+func clampToInt64(v uint64) int64 {
+	if v > math.MaxInt64 {
+		return math.MaxInt64
+	}
+	return int64(v)
+}
+
 // handleGetMetricNames handles GET /api/metadata/metrics
 func (s *Server) handleGetMetricNames(w http.ResponseWriter, r *http.Request) {
 	serviceName := r.URL.Query().Get("service_name")
+
+	// Aggregate mode: metric_buckets is not written, so the DISTINCT scan has
+	// nothing to find. The names come from the engine's topology projection.
+	if s.aggregateReads() {
+		snap := s.aggregateEngine.TopologySnapshot(storage.TenantFromContext(r.Context()))
+		// Always sampled, never full: the projection holds a bounded recent
+		// horizon while the legacy answer spanned HOT_RETENTION_DAYS. A metric
+		// that stopped reporting an hour ago is absent from this list, and the
+		// header is what says so.
+		setCoverage(w, aggregate.CoverageSampled)
+		w.Header().Set(httpconst.HeaderContentType, httpconst.ContentTypeJSON)
+		_ = json.NewEncoder(w).Encode(metricNamesFromTopology(snap, serviceName))
+		return
+	}
 
 	names, err := s.repo.GetMetricNames(r.Context(), serviceName)
 	if err != nil {
@@ -358,4 +470,27 @@ func (s *Server) handleGetServices(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set(httpconst.HeaderContentType, httpconst.ContentTypeJSON)
 	_ = json.NewEncoder(w).Encode(services)
+}
+
+// metricNamesFromTopology lists the distinct metric names the projection holds
+// for a tenant, optionally narrowed to one service. Sorted ascending and never
+// nil, matching the legacy DISTINCT ... ORDER BY name ASC answer.
+func metricNamesFromTopology(snap aggregate.TopologySnapshot, service string) []string {
+	seen := make(map[string]struct{}, len(snap.Metrics))
+	names := make([]string, 0, len(snap.Metrics))
+	for _, m := range snap.Metrics {
+		if service != "" && m.Service != service {
+			continue
+		}
+		if m.Metric == "" {
+			continue
+		}
+		if _, dup := seen[m.Metric]; dup {
+			continue
+		}
+		seen[m.Metric] = struct{}{}
+		names = append(names, m.Metric)
+	}
+	sort.Strings(names)
+	return names
 }

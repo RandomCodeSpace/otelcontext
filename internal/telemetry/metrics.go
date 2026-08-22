@@ -986,3 +986,43 @@ func (m *Metrics) HealthHandler() http.HandlerFunc {
 func PrometheusHandler() http.Handler {
 	return promhttp.Handler()
 }
+
+// DisableTSDBCollectors unregisters the collectors that only the legacy TSDB
+// aggregator and ring buffer can move. Call it exactly once, at startup, when
+// that path is not constructed (AGGREGATE_MODE=aggregate, #194 finding 10).
+//
+// Leaving them registered would publish TSDB ingest, drop and cardinality
+// series pinned at 0, which a dashboard reads as "no overflow" rather than
+// "no TSDB". The aggregate engine reports its own admission and cardinality
+// caps; these must not shadow them. The struct fields stay non-nil so any
+// residual call site is inert rather than a nil dereference.
+func (m *Metrics) DisableTSDBCollectors() {
+	if m == nil {
+		return
+	}
+	// Each field is checked in its own concrete type: a nil *CounterVec stored
+	// in a Collector interface is NOT interface-nil, and Unregister would
+	// Describe it straight into a nil dereference. Partially-populated Metrics
+	// literals exist in tests, so this has to hold.
+	if m.TSDBIngestTotal != nil {
+		prometheus.Unregister(m.TSDBIngestTotal)
+	}
+	if m.TSDBFlushDuration != nil {
+		prometheus.Unregister(m.TSDBFlushDuration)
+	}
+	if m.TSDBBatchesDropped != nil {
+		prometheus.Unregister(m.TSDBBatchesDropped)
+	}
+	if m.TSDBCardinalityOverflow != nil {
+		prometheus.Unregister(m.TSDBCardinalityOverflow)
+	}
+	if m.TSDBCardinalityOverflowByTenant != nil {
+		prometheus.Unregister(m.TSDBCardinalityOverflowByTenant)
+	}
+	if m.TSDBRingSeriesActive != nil {
+		prometheus.Unregister(m.TSDBRingSeriesActive)
+	}
+	if m.TSDBRingSeriesRejected != nil {
+		prometheus.Unregister(m.TSDBRingSeriesRejected)
+	}
+}

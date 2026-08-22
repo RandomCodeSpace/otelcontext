@@ -401,9 +401,10 @@ func (s *MetricsServer) Export(ctx context.Context, req *colmetricspb.ExportMetr
 }
 
 // exportNumberPoints handles the Gauge and Sum data points of one metric: the
-// aggregate reduction, the TSDB ring buffer and the real-time bypass, in that
-// order. It is a method rather than a closure so the histogram branches above
-// stay flat and the loop body is not duplicated per instrument type.
+// aggregate reduction, then — only when a legacy consumer exists — the TSDB
+// ring buffer and the real-time bypass. It is a method rather than a closure so
+// the histogram branches above stay flat and the loop body is not duplicated
+// per instrument type.
 func (s *MetricsServer) exportNumberPoints(
 	reducer *aggregate.Reducer,
 	m *metricspb.Metric,
@@ -411,6 +412,13 @@ func (s *MetricsServer) exportNumberPoints(
 	serviceName, tenantID string,
 	producerIdentity aggregate.ResourceIdentity,
 ) {
+	// In AGGREGATE_MODE=aggregate main.go constructs neither the TSDB
+	// aggregator nor the metric callback, and this collapses to zero: no
+	// RawMetric, no per-point attribute map, no channel hop (#194 finding 10).
+	// The attribute map alone is an allocation per data point, and at 120
+	// services it is the single largest allocator left on the metric path.
+	legacy := s.aggregator != nil || s.metricCallback != nil
+
 	for _, p := range points {
 		if p == nil {
 			continue
@@ -423,19 +431,7 @@ func (s *MetricsServer) exportNumberPoints(
 			val = float64(v.AsInt)
 		}
 
-		raw := tsdb.RawMetric{
-			Name:        m.Name,
-			ServiceName: serviceName,
-			Value:       val,
-			Timestamp:   time.Unix(0, int64(p.TimeUnixNano)), // #nosec G115 -- OTLP time in nanos: uint64 source fits int64 until year 2262
-			Attributes:  make(map[string]any),
-			TenantID:    tenantID,
-		}
-
-		// Convert attributes to map for TSDB grouping
-		for _, kv := range p.Attributes {
-			raw.Attributes[kv.Key] = kv.Value.String()
-		}
+		ts := time.Unix(0, int64(p.TimeUnixNano)) // #nosec G115 -- OTLP time in nanos: uint64 source fits int64 until year 2262
 
 		// 0. Aggregate accounting, ahead of every other consumer.
 		if reducer != nil {
@@ -445,13 +441,31 @@ func (s *MetricsServer) exportNumberPoints(
 				Service:     serviceName,
 				Name:        m.Name,
 				Value:       val,
-				Timestamp:   raw.Timestamp,
+				Timestamp:   ts,
 				StartTime:   time.Unix(0, int64(p.StartTimeUnixNano)), // #nosec G115 -- OTLP time in nanos: uint64 source fits int64 until year 2262
 				Temporality: temporality,
 				Monotonic:   monotonic,
 				Resource:    producerIdentity,
 				Attributes:  p.Attributes,
 			})
+		}
+
+		if !legacy {
+			continue
+		}
+
+		raw := tsdb.RawMetric{
+			Name:        m.Name,
+			ServiceName: serviceName,
+			Value:       val,
+			Timestamp:   ts,
+			Attributes:  make(map[string]any, len(p.Attributes)),
+			TenantID:    tenantID,
+		}
+
+		// Convert attributes to map for TSDB grouping
+		for _, kv := range p.Attributes {
+			raw.Attributes[kv.Key] = kv.Value.String()
 		}
 
 		// 1. Process via TSDB Aggregator (for storage)
