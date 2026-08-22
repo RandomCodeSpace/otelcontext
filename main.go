@@ -924,6 +924,43 @@ func main() {
 		apiServer.SetAggregateRecoveryProbe(aggRecovery.Done)
 	}
 
+	// Aggregate RUNTIME readiness probes (#194 finding 18). Recovery is a
+	// one-time gate; these cover the ways a recovered process later stops
+	// being able to serve: the store goes unreachable, group commits fail in
+	// a row, admission saturates, the finalizer wedges, the delta log stops
+	// draining, or the aggregate tier outgrows its share of the disk budget.
+	// Every signal is read from counters the writer already maintains, so a
+	// readiness request never queues behind the single SQLite writer.
+	apiServer.SetReadinessThresholds(api.ReadinessThresholds{
+		MaxCommitFailureStreak:   uint64(cfg.ReadyMaxCommitFailureStreak),
+		MaxFinalizeFailureStreak: uint64(cfg.ReadyMaxFinalizeFailureStreak),
+		MaxAdmissionRatio:        cfg.ReadyMaxAdmissionRatio,
+		MaxDeltaLogAgeSeconds:    float64(cfg.ReadyMaxDeltaLogAgeS),
+		MaxAggregateDiskRatio:    cfg.ReadyMaxAggregateDiskRatio,
+	})
+	if aggStore != nil {
+		apiServer.SetAggregateDBProbe(aggStore.PingContext)
+	}
+	if aggWriter != nil {
+		aggDiskBudget := int64(cfg.ReadyAggregateDiskBudgetMB) * 1024 * 1024
+		aggDBPath := cfg.AggregateDBPath
+		writer := aggWriter
+		apiServer.SetAggregateRuntimeProbe(func() api.AggregateRuntime {
+			st := writer.Stats()
+			return api.AggregateRuntime{
+				CommitFailureStreak:   st.CommitFailureStreak,
+				FinalizeFailureStreak: st.FinalizeFailureStreak,
+				AdmissionRatio:        st.AdmissionRatio(),
+				DeltaLogAgeSeconds:    st.DeltaLogAge(time.Now()),
+				// Same figure the disk watchdog attributes to the
+				// aggregate_db component, measured against the tier's
+				// share of the budget instead of the whole volume.
+				DiskUsedBytes:   fileBytes(aggDBPath),
+				DiskBudgetBytes: aggDiskBudget,
+			}
+		})
+	}
+
 	// Wire up live log streaming + AI + DLQ metrics
 	logHandler := func(l storage.Log) {
 		start := time.Now()

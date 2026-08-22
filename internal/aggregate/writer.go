@@ -2,6 +2,7 @@ package aggregate
 
 import (
 	"log/slog"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -148,6 +149,72 @@ type WriterStats struct {
 	Waiters       int
 	// Finalized counts windows finalized by the writer's state machine.
 	Finalized uint64
+
+	// The runtime-readiness surface (#194 finding 18). Cumulative counters
+	// say what happened since boot; a readiness probe needs to know what is
+	// happening NOW, which is what the streaks and the cached backlog sample
+	// carry.
+	//
+	// CommitFailureStreak and FinalizeFailureStreak count CONSECUTIVE
+	// failures: any success resets them to zero. A handful of failures spread
+	// over a week is a log line; three in a row is a store that has stopped
+	// accepting writes.
+	CommitFailureStreak   uint64
+	FinalizeFailureStreak uint64
+	// FinalizeErrors counts finalization failures since boot.
+	FinalizeErrors uint64
+
+	// MaxPendingBytes, MaxPendingDeltas and MaxWaiters are the configured
+	// admission bounds the live occupancy above is measured against.
+	MaxPendingBytes  int64
+	MaxPendingDeltas int
+	MaxWaiters       int
+
+	// DeltaLogRows, DeltaLogAgeSeconds and BacklogSampledAt are the last
+	// delta-log backlog sample the finalize loop published. Cached rather
+	// than queried on demand so a readiness probe never stacks behind the
+	// single SQLite writer. BacklogSampledAt is zero before the first sample.
+	DeltaLogRows       int64
+	DeltaLogAgeSeconds float64
+	BacklogSampledAt   time.Time
+}
+
+// AdmissionRatio is the writer's admission occupancy as a fraction in
+// [0.0, 1.0+]: the fullest of the three bounds, because admission is refused
+// as soon as ANY of them is breached. Bounds that are unset (non-positive)
+// contribute nothing.
+func (s WriterStats) AdmissionRatio() float64 {
+	ratio := 0.0
+	if s.MaxPendingBytes > 0 {
+		ratio = math.Max(ratio, float64(s.PendingBytes)/float64(s.MaxPendingBytes))
+	}
+	if s.MaxPendingDeltas > 0 {
+		ratio = math.Max(ratio, float64(s.PendingDeltas)/float64(s.MaxPendingDeltas))
+	}
+	if s.MaxWaiters > 0 {
+		ratio = math.Max(ratio, float64(s.Waiters)/float64(s.MaxWaiters))
+	}
+	return ratio
+}
+
+// DeltaLogAge is the age of the oldest un-finalized window at now, carrying
+// the staleness of the sample it is derived from.
+//
+// Adding the time since the sample is not cosmetic: a wedged finalize loop
+// stops REFRESHING the sample, and an age frozen at its last healthy value is
+// exactly the reading that would let a stuck writer look ready forever. An
+// empty backlog ages at zero — there is no oldest window to get older.
+func (s WriterStats) DeltaLogAge(now time.Time) float64 {
+	if s.DeltaLogAgeSeconds <= 0 {
+		return 0
+	}
+	age := s.DeltaLogAgeSeconds
+	if !s.BacklogSampledAt.IsZero() {
+		if elapsed := now.Sub(s.BacklogSampledAt).Seconds(); elapsed > 0 {
+			age += elapsed
+		}
+	}
+	return age
 }
 
 // Writer is the group-commit writer. It is the engine's Applier once the
@@ -183,6 +250,17 @@ type Writer struct {
 	deltas       atomic.Uint64
 	rejections   atomic.Uint64
 	finalized    atomic.Uint64
+
+	// Consecutive-failure streaks and the cached backlog sample, read by the
+	// runtime readiness probes (#194 finding 18). Counters only: nothing here
+	// participates in a commit, a finalize or an admission decision.
+	commitFailStreak   atomic.Uint64
+	finalizeErrors     atomic.Uint64
+	finalizeFailStreak atomic.Uint64
+
+	backlogRows      atomic.Int64
+	backlogAgeBits   atomic.Uint64
+	backlogSampledAt atomic.Int64 // unix nanos; 0 before the first sample
 }
 
 // NewWriter builds a writer over store and engine. It does not start it.
@@ -308,7 +386,7 @@ func (w *Writer) Stats() WriterStats {
 	w.mu.Lock()
 	pendingBytes, pendingDeltas, waiters := w.pendingBytes, w.pendingDeltas, w.waiters
 	w.mu.Unlock()
-	return WriterStats{
+	stats := WriterStats{
 		Commits:       w.commits.Load(),
 		CommitErrors:  w.commitErrors.Load(),
 		Deltas:        w.deltas.Load(),
@@ -317,7 +395,22 @@ func (w *Writer) Stats() WriterStats {
 		PendingDeltas: pendingDeltas,
 		Waiters:       waiters,
 		Finalized:     w.finalized.Load(),
+
+		CommitFailureStreak:   w.commitFailStreak.Load(),
+		FinalizeFailureStreak: w.finalizeFailStreak.Load(),
+		FinalizeErrors:        w.finalizeErrors.Load(),
+
+		MaxPendingBytes:  w.cfg.MaxPendingBytes,
+		MaxPendingDeltas: w.cfg.MaxPendingDeltas,
+		MaxWaiters:       w.cfg.MaxWaiters,
+
+		DeltaLogRows:       w.backlogRows.Load(),
+		DeltaLogAgeSeconds: math.Float64frombits(w.backlogAgeBits.Load()),
 	}
+	if ns := w.backlogSampledAt.Load(); ns > 0 {
+		stats.BacklogSampledAt = time.Unix(0, ns)
+	}
+	return stats
 }
 
 // Apply implements Applier. It exists so a caller that cannot act on an error
@@ -509,6 +602,7 @@ func (w *Writer) commit(batch []*submission) {
 	w.commits.Add(1)
 	if err != nil {
 		w.commitErrors.Add(1)
+		w.commitFailStreak.Add(1)
 		// Nothing became durable, so nothing may keep the resources the write
 		// would have justified: release the cardinality reservation, hand the
 		// drained baselines back the increase this batch was carrying, and
@@ -518,6 +612,7 @@ func (w *Writer) commit(batch []*submission) {
 		w.finish(batch, commitResult{revision: w.engine.Revision(), err: err})
 		return
 	}
+	w.commitFailStreak.Store(0)
 	w.deltas.Add(uint64(len(gb.Deltas)))
 	w.series.Committed(gb.Series)
 	if w.reg != nil {
@@ -567,18 +662,23 @@ func (w *Writer) FinalizeDue(now time.Time) int {
 	windows, err := w.store.FinalizableWindows(FinalizeCutoff(now), finalizeWindowsPerPass)
 	if err != nil {
 		slog.Error("aggregate: list finalizable windows failed", "error", err)
+		w.finalizeErrors.Add(1)
+		w.finalizeFailStreak.Add(1)
 		return 0
 	}
 	done := 0
 	for _, window := range windows {
 		if _, err := w.store.FinalizeWindow(window); err != nil {
 			slog.Error("aggregate: finalize window failed", "window_start", window, "error", err)
+			w.finalizeErrors.Add(1)
+			w.finalizeFailStreak.Add(1)
 			continue
 		}
 		// The buckets are committed, so ownership of the window moves to the
 		// store in the same step that evicts it from the shards (#164).
 		w.engine.MarkFinalized(window)
 		w.finalized.Add(1)
+		w.finalizeFailStreak.Store(0)
 		done++
 	}
 	return done
@@ -595,6 +695,9 @@ func (w *Writer) publishBacklog(now time.Time) {
 	if stats.OldestWindow > 0 {
 		age = now.Sub(time.Unix(stats.OldestWindow, 0)).Seconds()
 	}
+	w.backlogRows.Store(stats.Rows)
+	w.backlogAgeBits.Store(math.Float64bits(age))
+	w.backlogSampledAt.Store(now.UnixNano())
 	w.cfg.Metrics.SetBacklog(stats.Rows, age)
 }
 

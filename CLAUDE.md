@@ -597,6 +597,63 @@ asserts the deltas are committed, and acknowledging data that was not stored is
 data loss with better branding. Shadow mode is unaffected: there the legacy raw
 path is still the source of truth.
 
+### Health probes — `/live` and `/ready`
+
+`/live` is **process-only** and has no dependencies: it answers 200 as long as
+the process is up. Nothing below can make it fail. Killing a process because
+its store went unreachable throws away the in-memory shards and buys a delta-log
+replay; that is a worse outage than the one it was reacting to.
+
+`/ready` is the dependency probe. It answers 200 only when every named check
+below passes and 503 with the full per-check breakdown otherwise. **Check names
+are an operator contract** (asserted by the #202 gate): they are stable, and
+each runtime probe carries its measured number in the payload so an alert can
+be built on a figure rather than on a word.
+
+| Check | Source | 503 when |
+|---|---|---|
+| `database` | main relational DB `PingContext` (2s) | ping fails |
+| `graphrag` | coordinator | not running (`skipped` when unconfigured) |
+| `dlq_disk` | DLQ bytes ÷ `DLQ_MAX_DISK_MB` | ≥ 0.95 |
+| `pipeline` | ingest queue depth ÷ capacity | ≥ 0.95 |
+| `aggregate_store` | `RecoveryGate` | delta-log replay not finished (#173) |
+| `disk` | disk watchdog state (#201 Q5) | `raw_off` |
+| `aggregate_db` | aggregate store **read pool** ping (2s) | ping fails |
+| `aggregate_commit` | consecutive group-commit failures | streak ≥ `READY_MAX_COMMIT_FAILURE_STREAK` |
+| `aggregate_finalizer` | consecutive window-finalize failures | streak ≥ `READY_MAX_FINALIZE_FAILURE_STREAK` |
+| `aggregate_admission` | fullest of pending bytes / pending deltas / waiters ÷ their bounds | ≥ `READY_MAX_ADMISSION_RATIO` |
+| `aggregate_delta_log` | age of the oldest un-finalized window | ≥ `READY_MAX_DELTA_LOG_AGE_S` seconds |
+| `aggregate_disk` | `aggregate.db` bytes ÷ `READY_AGGREGATE_DISK_BUDGET_MB` | ≥ `READY_MAX_AGGREGATE_DISK_RATIO` |
+
+The six `aggregate_*` runtime probes (#194 finding 18) are **degraded-not-dead**:
+each flips `/ready` to 503, none touches `/live`, none stops the process, and
+each recovers on its own the moment its signal does. `aggregate_store` gates
+startup; the rest cover the ways a process that finished recovery later stops
+being able to serve. Every check reports `skipped` when its source is not
+configured (`AGGREGATE_MODE=legacy`, no DLQ cap, no watchdog), so a legacy
+deployment's readiness is unchanged.
+
+Runtime signals are read from counters the group-commit writer already keeps —
+including the delta-log backlog sample the finalize loop publishes — so a
+readiness request never queries the aggregate store and never queues behind the
+single SQLite writer. The one exception is `aggregate_db`, which pings the
+**read** pool with a 2s deadline for the same reason: the writer pool is
+`MaxOpenConns(1)` behind the group commit, and a ping issued there would report
+"unreachable" for a database that is merely busy. The delta-log age carries the
+staleness of its sample (age + time since the sample was taken), so a wedged
+finalize loop cannot look healthy by simply never refreshing the number.
+
+Thresholds (`0` disables that probe):
+
+| Env var | Default | Rationale |
+|---|---|---|
+| `READY_MAX_COMMIT_FAILURE_STREAK` | 3 | One failed commit is a retry; three in a row is a store that stopped accepting writes. |
+| `READY_MAX_FINALIZE_FAILURE_STREAK` | 3 | Same shape, on the finalizer. |
+| `READY_MAX_ADMISSION_RATIO` | 0.9 | Below the 0.95 the DLQ/pipeline probes use: the writer's admission bound is what turns an Export into `RESOURCE_EXHAUSTED`, so readiness says "stop sending" before clients are refused, not while they are. |
+| `READY_MAX_DELTA_LOG_AGE_S` | 1800 | 2× (`WindowSize` 5m + `AllowedLateness` 10m). A window is finalizable 900s after it opens, so a healthy oldest entry tops out just past 900s plus one finalize tick. |
+| `READY_AGGREGATE_DISK_BUDGET_MB` | 1536 | `aggregate.db`'s share of the 8 GiB data budget (#201 Q1). The disk watchdog enforces the **volume**; this enforces the **tier**, so a runaway aggregate file is visible before it eats another tier's allocation. |
+| `READY_MAX_AGGREGATE_DISK_RATIO` | 0.9 | Warn inside the tier before the volume-level ladder starts shedding. |
+
 ## Security & Supply Chain
 
 OtelContext targets the OpenSSF Best Practices `passing` badge (project [12646](https://www.bestpractices.dev/en/projects/12646)) and ships a six-job OSS-CLI security stack, supplemented by **SonarCloud SAST as a required gate** (board reversal 2026-04-28). No CodeQL, no NVD-direct tooling. Cost: $0 for the OSS-CLI tier; SonarCloud is free for public repos.

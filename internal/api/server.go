@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"net/http"
 	"strconv"
 	"time"
@@ -51,6 +52,83 @@ type Server struct {
 	// diagnostics anyone comes here for, and an orchestrator should stop
 	// routing fresh ingest at it. nil means "no watchdog" and is skipped.
 	diskPressure func() (string, bool)
+
+	// aggregateRuntime reports the aggregate engine's RUNTIME health — the
+	// signals that say a process which finished recovery has since stopped
+	// being able to serve (#194 finding 18). nil means "no aggregate store"
+	// and every runtime probe is skipped.
+	aggregateRuntime func() AggregateRuntime
+
+	// aggregateDBPing is a cheap reachability check on the aggregate store's
+	// READ pool. It takes a context so the probe carries its own deadline and
+	// cannot park a readiness request behind a slow database.
+	aggregateDBPing func(context.Context) error
+
+	// readyThresholds are the runtime-probe limits. nil takes
+	// DefaultReadinessThresholds; an explicitly-set zero struct disables
+	// every runtime probe, which is what a 0 in each env knob means.
+	readyThresholds *ReadinessThresholds
+}
+
+// AggregateRuntime is the aggregate runtime health snapshot /ready consults.
+// It is a plain value, sampled from counters the writer already maintains, so
+// a readiness request never queries the store and never stacks behind the
+// single SQLite writer.
+type AggregateRuntime struct {
+	// CommitFailureStreak and FinalizeFailureStreak are CONSECUTIVE failure
+	// counts: any success resets them.
+	CommitFailureStreak   uint64
+	FinalizeFailureStreak uint64
+	// AdmissionRatio is the group-commit writer's admission occupancy as a
+	// fraction of its bounds — the fullest of pending bytes, pending deltas
+	// and parked waiters.
+	AdmissionRatio float64
+	// DeltaLogAgeSeconds is the age of the oldest un-finalized window,
+	// including the staleness of the sample it came from.
+	DeltaLogAgeSeconds float64
+	// DiskUsedBytes and DiskBudgetBytes are the aggregate tier's on-disk size
+	// against its share of the data budget. A zero budget disables the check.
+	DiskUsedBytes   int64
+	DiskBudgetBytes int64
+}
+
+// DiskRatio is the aggregate tier's usage as a fraction of its budget.
+func (a AggregateRuntime) DiskRatio() float64 {
+	if a.DiskBudgetBytes <= 0 {
+		return 0
+	}
+	return float64(a.DiskUsedBytes) / float64(a.DiskBudgetBytes)
+}
+
+// ReadinessThresholds are the limits the aggregate runtime probes compare
+// against. A non-positive limit disables that probe: an operator who
+// disagrees with a default switches it off rather than patching the binary.
+type ReadinessThresholds struct {
+	MaxCommitFailureStreak   uint64
+	MaxFinalizeFailureStreak uint64
+	MaxAdmissionRatio        float64
+	MaxDeltaLogAgeSeconds    float64
+	MaxAggregateDiskRatio    float64
+}
+
+// DefaultReadinessThresholds mirrors the config defaults so a Server built
+// without explicit thresholds still probes rather than silently passing.
+func DefaultReadinessThresholds() ReadinessThresholds {
+	return ReadinessThresholds{
+		MaxCommitFailureStreak:   3,
+		MaxFinalizeFailureStreak: 3,
+		MaxAdmissionRatio:        0.9,
+		MaxDeltaLogAgeSeconds:    1800,
+		MaxAggregateDiskRatio:    0.9,
+	}
+}
+
+// thresholds resolves the configured limits, falling back to the defaults.
+func (s *Server) thresholds() ReadinessThresholds {
+	if s.readyThresholds == nil {
+		return DefaultReadinessThresholds()
+	}
+	return *s.readyThresholds
 }
 
 // NewServer creates a new API server.
@@ -115,6 +193,25 @@ func (s *Server) SetAggregateRecoveryProbe(fn func() bool) {
 // no watchdog is configured.
 func (s *Server) SetDiskPressureProbe(fn func() (string, bool)) {
 	s.diskPressure = fn
+}
+
+// SetAggregateRuntimeProbe registers the aggregate runtime health sampler.
+// Pass nil (the default) when no aggregate store is configured; every runtime
+// check then reports "skipped" and readiness is unaffected.
+func (s *Server) SetAggregateRuntimeProbe(fn func() AggregateRuntime) {
+	s.aggregateRuntime = fn
+}
+
+// SetAggregateDBProbe registers the aggregate store reachability check. The
+// callback must honour the context deadline the probe passes it.
+func (s *Server) SetAggregateDBProbe(fn func(context.Context) error) {
+	s.aggregateDBPing = fn
+}
+
+// SetReadinessThresholds overrides the runtime-probe limits. A zero value in
+// any field disables that probe.
+func (s *Server) SetReadinessThresholds(t ReadinessThresholds) {
+	s.readyThresholds = &t
 }
 
 // RegisterRoutes registers API endpoints on the provided mux.
