@@ -663,6 +663,12 @@ func main() {
 			"note", "durable ACK: Export returns only after the group commit",
 		)
 
+		// Exemplar-tier retention (#201 Q2). Only in aggregate mode: there the
+		// raw rows are exemplars attached to a seven-day aggregate dataset and
+		// a two-day purge is budget enforcement. In legacy and shadow the raw
+		// rows ARE the dataset and the same purge would be data loss.
+		retention.SetExemplarRetention(cfg.ExemplarRetentionDays)
+
 		// Retention owns the hourly aggregate purge and the conservative daily
 		// ANALYZE. No VACUUM on this file, by decision (#162).
 		retention.SetAggregateRetention(
@@ -720,6 +726,11 @@ func main() {
 		"aggregate_store", cfg.AggregateMode != aggregate.ModeLegacy,
 	)
 
+	// diskWatchdogPolicy is the exemplar policy the disk watchdog sheds
+	// through. nil outside aggregate mode, where there is no exemplar policy
+	// to shed and the raw rows are the dataset.
+	var diskWatchdogPolicy *ingest.ExemplarPolicy
+
 	// Bounded exemplar retention (#176). In AGGREGATE_MODE=aggregate this is
 	// the ONLY raw-retention gate — the adaptive sampler below is skipped
 	// entirely, so SAMPLING_RATE has no effect on what gets persisted (#161).
@@ -738,10 +749,13 @@ func main() {
 			LogsWarnPerServiceWindow:  cfg.ExemplarLogsWarnPerServiceWindow,
 			MaxSpansPerTrace:          cfg.ExemplarMaxSpansPerTrace,
 			MaxBytesPerTrace:          int64(cfg.ExemplarMaxBytesPerTrace),
+			SynthLogsPerSpan:          cfg.ExemplarSynthLogsPerSpan,
+			SynthLogsPerTrace:         cfg.ExemplarSynthLogsPerTrace,
 			Metrics:                   metrics,
 		})
 		traceServer.SetExemplarPolicy(exemplarPolicy)
 		logsServer.SetExemplarPolicy(exemplarPolicy)
+		diskWatchdogPolicy = exemplarPolicy
 		slog.Info("🎚️  Bounded exemplar retention enabled (adaptive sampler retired)",
 			"traces_per_service_window", cfg.ExemplarTracesPerServiceWindow,
 			"traces_global_window", cfg.ExemplarTracesGlobalWindow,
@@ -749,6 +763,9 @@ func main() {
 			"bytes_global_window", cfg.ExemplarBytesGlobalWindow,
 			"healthy_rate", cfg.ExemplarHealthyRate,
 			"latency_threshold_ms", cfg.SamplingLatencyThresholdMs,
+			"retention_days", cfg.ExemplarRetentionDays,
+			"synth_logs_per_span", cfg.ExemplarSynthLogsPerSpan,
+			"synth_logs_per_trace", cfg.ExemplarSynthLogsPerTrace,
 		)
 	} else if cfg.SamplingRate > 0 && cfg.SamplingRate < 1.0 {
 		// Wire adaptive sampler (only when rate < 1.0 to avoid unnecessary overhead)
@@ -760,6 +777,49 @@ func main() {
 			"latency_threshold_ms", cfg.SamplingLatencyThresholdMs,
 		)
 	}
+
+	// Disk watchdog (#201 Q5). statfs on the data volume drives staged
+	// shedding with hysteresis; per-component file sizes attribute the 8 GiB
+	// budget table (#201 Q1) so the seven-day gate (#202) validates it against
+	// measurements rather than intent.
+	diskWatchdog := storage.NewDiskWatchdog(storage.DiskWatchdogConfig{
+		Path:        cfg.DataDiskPath,
+		BudgetBytes: int64(cfg.DataDiskBudgetMB) * 1024 * 1024,
+		Metrics:     metrics,
+		OnRawOff: func() {
+			// At >=95% waiting up to an hour for the next retention tick is
+			// not a plan. Purge the expired exemplar tier now, then checkpoint
+			// the WAL so the freed pages are actually handed back.
+			retention.PurgeExemplarsNow(ctxRetention)
+			if err := repo.CheckpointWAL(ctxRetention); err != nil {
+				slog.Error("disk watchdog: WAL checkpoint failed", "error", err)
+			}
+		},
+	})
+	diskWatchdog.AddComponent("main_db", func() int64 { return repo.HotDBSizeBytes() })
+	diskWatchdog.AddComponent("wal", func() int64 {
+		return sidecarBytes(sqliteMainDBPath(cfg)) + sidecarBytes(cfg.AggregateDBPath)
+	})
+	if cfg.AggregateMode != aggregate.ModeLegacy {
+		diskWatchdog.AddComponent("aggregate_db", func() int64 { return fileBytes(cfg.AggregateDBPath) })
+	}
+	if dlq != nil {
+		diskWatchdog.AddComponent("dlq", func() int64 { return dlq.DiskBytes() })
+	}
+	if diskWatchdogPolicy != nil {
+		diskWatchdog.AddObserver(diskWatchdogPolicy.SetShedding)
+	}
+	apiServer.SetDiskPressureProbe(func() (string, bool) {
+		return diskWatchdog.State().String(), diskWatchdog.Healthy()
+	})
+	ctxDisk, cancelDisk := context.WithCancel(context.Background())
+	diskWatchdog.Start(ctxDisk)
+	slog.Info("💽 Disk watchdog started",
+		"path", cfg.DataDiskPath,
+		"budget_mb", cfg.DataDiskBudgetMB,
+		"errors_only_at", "90%",
+		"raw_off_at", "95%",
+	)
 
 	// Wire async ingest pipeline. Decouples OTLP Export() from synchronous
 	// DB writes — caller returns as soon as the parsed batch is enqueued.
@@ -1317,6 +1377,8 @@ func main() {
 	dlq.Stop()
 
 	// 4a. Stop retention + partition schedulers before closing DB (both issue queries).
+	cancelDisk()
+	diskWatchdog.Stop()
 	cancelRetention()
 	retention.Stop()
 	cancelPartitions()
@@ -1483,4 +1545,41 @@ func graphRAGServiceEdges(ctx context.Context, g *graphrag.GraphRAG) []storage.S
 		})
 	}
 	return edges
+}
+
+// fileBytes returns the size of one file, or 0 when it cannot be stat'ed.
+// Attribution only: a missing file is a component that is not using disk.
+func fileBytes(path string) int64 {
+	if path == "" {
+		return 0
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		return 0
+	}
+	return fi.Size()
+}
+
+// sidecarBytes returns the combined size of a SQLite file's -wal and -shm
+// sidecars. They are charged to the WAL/temp tier of the budget table, not to
+// the database tier: a checkpoint moves bytes between the two and the gauges
+// should show that rather than double-count it.
+func sidecarBytes(path string) int64 {
+	if path == "" {
+		return 0
+	}
+	return fileBytes(path+"-wal") + fileBytes(path+"-shm")
+}
+
+// sqliteMainDBPath resolves the main relational DB file for SQLite. Mirrors the
+// default in storage.NewDatabase; returns "" for every server-backed driver,
+// where there is no local file to stat.
+func sqliteMainDBPath(cfg *config.Config) string {
+	if strings.ToLower(cfg.DBDriver) != "sqlite" && cfg.DBDriver != "" {
+		return ""
+	}
+	if cfg.DBDSN == "" {
+		return "OtelContext.db"
+	}
+	return cfg.DBDSN
 }

@@ -43,6 +43,14 @@ type Server struct {
 	// no orchestrator routes traffic to a process whose shards are only
 	// half-replayed (#173). nil means "no store configured" and is skipped.
 	aggregateRecovered func() bool
+
+	// diskPressure reports the disk watchdog's state (#201 Q5): a label for
+	// the readiness breakdown and whether the process should still be
+	// considered ready. At raw-off it is not — the platform still serves
+	// reads and still accounts aggregates, but it can no longer retain the
+	// diagnostics anyone comes here for, and an orchestrator should stop
+	// routing fresh ingest at it. nil means "no watchdog" and is skipped.
+	diskPressure func() (string, bool)
 }
 
 // NewServer creates a new API server.
@@ -100,6 +108,13 @@ func (s *Server) aggregateReads() bool { return s.aggregateEngine != nil }
 // until it does. Pass nil (the default) when no aggregate store is configured.
 func (s *Server) SetAggregateRecoveryProbe(fn func() bool) {
 	s.aggregateRecovered = fn
+}
+
+// SetDiskPressureProbe registers a callback returning the disk watchdog's
+// state label and whether readiness should pass. Pass nil (the default) when
+// no watchdog is configured.
+func (s *Server) SetDiskPressureProbe(fn func() (string, bool)) {
+	s.diskPressure = fn
 }
 
 // RegisterRoutes registers API endpoints on the provided mux.

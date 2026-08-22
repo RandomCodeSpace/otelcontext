@@ -73,7 +73,7 @@ func baseValid() *Config {
 		ExemplarTracesPerServiceWindow:    25,
 		ExemplarTracesGlobalWindow:        1500,
 		ExemplarBytesPerServiceWindow:     512 * 1024,
-		ExemplarBytesGlobalWindow:         8 * 1024 * 1024,
+		ExemplarBytesGlobalWindow:         3 * 1024 * 1024,
 		ExemplarHealthyRate:               0.005,
 		ExemplarStratumTopK:               5,
 		ExemplarLogsErrorPerServiceWindow: 50,
@@ -81,6 +81,12 @@ func baseValid() *Config {
 		ExemplarLogsWarnPerServiceWindow:  20,
 		ExemplarMaxSpansPerTrace:          500,
 		ExemplarMaxBytesPerTrace:          256 * 1024,
+		// 8 GiB data budget (#201)
+		ExemplarRetentionDays:     2,
+		ExemplarSynthLogsPerSpan:  8,
+		ExemplarSynthLogsPerTrace: 64,
+		DataDiskBudgetMB:          8192,
+		DataDiskPath:              "./data",
 	}
 }
 
@@ -915,7 +921,14 @@ func TestLoad_ExemplarDefaultsMatchResolution(t *testing.T) {
 		{"EXEMPLAR_TRACES_PER_SERVICE_WINDOW", cfg.ExemplarTracesPerServiceWindow, 25},
 		{"EXEMPLAR_TRACES_GLOBAL_WINDOW", cfg.ExemplarTracesGlobalWindow, 1500},
 		{"EXEMPLAR_BYTES_PER_SERVICE_WINDOW", cfg.ExemplarBytesPerServiceWindow, 512 * 1024},
-		{"EXEMPLAR_BYTES_GLOBAL_WINDOW", cfg.ExemplarBytesGlobalWindow, 8 * 1024 * 1024},
+		// 3 MiB, frozen in #201 Q2. 4 MiB stays configurable but is not the
+		// default: it consumes the whole 4.5 GiB main tier under the
+		// optimistic 2x amplification assumption.
+		{"EXEMPLAR_BYTES_GLOBAL_WINDOW", cfg.ExemplarBytesGlobalWindow, 3 * 1024 * 1024},
+		{"EXEMPLAR_RETENTION_DAYS", cfg.ExemplarRetentionDays, 2},
+		{"EXEMPLAR_SYNTH_LOGS_PER_SPAN", cfg.ExemplarSynthLogsPerSpan, 8},
+		{"EXEMPLAR_SYNTH_LOGS_PER_TRACE", cfg.ExemplarSynthLogsPerTrace, 64},
+		{"DATA_DISK_BUDGET_MB", cfg.DataDiskBudgetMB, 8192},
 		{"EXEMPLAR_LOGS_ERROR_PER_SERVICE_WINDOW", cfg.ExemplarLogsErrorPerServiceWindow, 50},
 		{"EXEMPLAR_LOGS_WARN_PER_SERVICE_WINDOW", cfg.ExemplarLogsWarnPerServiceWindow, 20},
 	}
@@ -929,5 +942,69 @@ func TestLoad_ExemplarDefaultsMatchResolution(t *testing.T) {
 	}
 	if cfg.ExemplarLogsWarnEnabled {
 		t.Error("EXEMPLAR_LOGS_WARN_ENABLED should default off — WARN raw retention is opt-in")
+	}
+}
+
+// --- 8 GiB data budget knobs (#201) -----------------------------------------
+
+// TestValidate_ExemplarRetentionDays_Bounds: the exemplar tier is a
+// shorter-lived subset of hot retention. Longer than HOT_RETENTION_DAYS is not
+// a tuning choice, it is a contradiction — the rows would be purged by the
+// other scheduler anyway.
+func TestValidate_ExemplarRetentionDays_Bounds(t *testing.T) {
+	for _, days := range []int{0, -1, 8, 100} {
+		c := baseValid()
+		c.HotRetentionDays = 7
+		c.ExemplarRetentionDays = days
+		if err := c.Validate(); err == nil {
+			t.Errorf("EXEMPLAR_RETENTION_DAYS=%d should be rejected against HOT_RETENTION_DAYS=7", days)
+		}
+	}
+	for _, days := range []int{1, 2, 7} {
+		c := baseValid()
+		c.HotRetentionDays = 7
+		c.ExemplarRetentionDays = days
+		if err := c.Validate(); err != nil {
+			t.Errorf("EXEMPLAR_RETENTION_DAYS=%d should validate: %v", days, err)
+		}
+	}
+}
+
+// TestValidate_ExemplarSynthLogCaps: a per-trace cap below the per-span cap
+// makes the per-span cap unreachable, which is a config that lies.
+func TestValidate_ExemplarSynthLogCaps(t *testing.T) {
+	c := baseValid()
+	c.ExemplarSynthLogsPerSpan = 0
+	if err := c.Validate(); err == nil {
+		t.Error("EXEMPLAR_SYNTH_LOGS_PER_SPAN=0 should be rejected")
+	}
+
+	c = baseValid()
+	c.ExemplarSynthLogsPerSpan = 16
+	c.ExemplarSynthLogsPerTrace = 8
+	if err := c.Validate(); err == nil {
+		t.Error("a per-trace synth cap below the per-span cap should be rejected")
+	}
+
+	c = baseValid()
+	c.ExemplarSynthLogsPerSpan = 8
+	c.ExemplarSynthLogsPerTrace = 8
+	if err := c.Validate(); err != nil {
+		t.Errorf("equal synth caps should validate: %v", err)
+	}
+}
+
+// TestValidate_DataDiskBudget: the watchdog needs a ceiling and a path.
+func TestValidate_DataDiskBudget(t *testing.T) {
+	c := baseValid()
+	c.DataDiskBudgetMB = 63
+	if err := c.Validate(); err == nil {
+		t.Error("DATA_DISK_BUDGET_MB=63 should be rejected")
+	}
+
+	c = baseValid()
+	c.DataDiskPath = "   "
+	if err := c.Validate(); err == nil {
+		t.Error("a blank DATA_DISK_PATH should be rejected")
 	}
 }

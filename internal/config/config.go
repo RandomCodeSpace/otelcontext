@@ -432,6 +432,30 @@ type Config struct {
 	ExemplarLogsWarnPerServiceWindow  int     // Default 20
 	ExemplarMaxSpansPerTrace          int     // Default 500
 	ExemplarMaxBytesPerTrace          int     // Default 262144 (256 KiB)
+
+	// Exemplar-tier retention and synthesized-log metering (#201 Q2/Q3).
+	//
+	// ExemplarRetentionDays is SHORTER than HotRetentionDays on purpose: in
+	// aggregate mode the raw rows are exemplars attached to a seven-day
+	// aggregate dataset, and 576 five-minute windows (two days) at the 3 MiB
+	// global window budget is 1.69 GiB of charged payload — 3.38 GiB at the
+	// provisional 2x DB/index/FTS amplification, inside the 4.5 GiB main tier
+	// with ~1.12 GiB of margin. Seven days of the same rate does not fit.
+	ExemplarRetentionDays    int // Default 2, validated 1..HotRetentionDays
+	ExemplarSynthLogsPerSpan int // Default 8
+	// ExemplarSynthLogsPerTrace bounds the synthesized logs one retained trace
+	// may carry across all its spans.
+	ExemplarSynthLogsPerTrace int // Default 64
+
+	// Data-volume budget and disk watchdog (#201 Q1/Q5).
+	//
+	// DataDiskBudgetMB is the configured ceiling for everything this process
+	// writes: main relational tier, aggregate.db, DLQ, WAL/temp, and the
+	// mandatory unused headroom. Enforcement uses the LOWER of this and the
+	// usable volume capacity — a 4 GiB PVC does not become 8 GiB because the
+	// config says so.
+	DataDiskBudgetMB int    // Default 8192 (8 GiB)
+	DataDiskPath     string // Default ./data — any path on the data volume
 }
 
 func Load(customPath string) (*Config, error) {
@@ -608,10 +632,14 @@ func Load(customPath string) (*Config, error) {
 		AggregateMaxDimTuplesPerTenant: getEnvInt("AGGREGATE_MAX_DIM_TUPLES_PER_TENANT", 5000),
 		AggregateMaxDimTuples:          getEnvInt("AGGREGATE_MAX_DIM_TUPLES", 50000),
 		// Bounded exemplar retention (aggregate mode only)
-		ExemplarTracesPerServiceWindow:    getEnvInt("EXEMPLAR_TRACES_PER_SERVICE_WINDOW", 25),
-		ExemplarTracesGlobalWindow:        getEnvInt("EXEMPLAR_TRACES_GLOBAL_WINDOW", 1500),
-		ExemplarBytesPerServiceWindow:     getEnvInt("EXEMPLAR_BYTES_PER_SERVICE_WINDOW", 512*1024),
-		ExemplarBytesGlobalWindow:         getEnvInt("EXEMPLAR_BYTES_GLOBAL_WINDOW", 8*1024*1024),
+		ExemplarTracesPerServiceWindow: getEnvInt("EXEMPLAR_TRACES_PER_SERVICE_WINDOW", 25),
+		ExemplarTracesGlobalWindow:     getEnvInt("EXEMPLAR_TRACES_GLOBAL_WINDOW", 1500),
+		ExemplarBytesPerServiceWindow:  getEnvInt("EXEMPLAR_BYTES_PER_SERVICE_WINDOW", 512*1024),
+		// 3 MiB, not 4 (#201 Q2). 4 MiB/window consumes the entire 4.5 GiB
+		// main tier under the optimistic 2x amplification assumption and
+		// leaves no operational margin; it stays configurable, it is not the
+		// default until the seven-day gate (#202) proves it fits.
+		ExemplarBytesGlobalWindow:         getEnvInt("EXEMPLAR_BYTES_GLOBAL_WINDOW", 3*1024*1024),
 		ExemplarHealthyRate:               getEnvFloat("EXEMPLAR_HEALTHY_RATE", 0.005),
 		ExemplarStratumTopK:               getEnvInt("EXEMPLAR_STRATUM_TOP_K", 5),
 		ExemplarLogsErrorPerServiceWindow: getEnvInt("EXEMPLAR_LOGS_ERROR_PER_SERVICE_WINDOW", 50),
@@ -619,6 +647,12 @@ func Load(customPath string) (*Config, error) {
 		ExemplarLogsWarnPerServiceWindow:  getEnvInt("EXEMPLAR_LOGS_WARN_PER_SERVICE_WINDOW", 20),
 		ExemplarMaxSpansPerTrace:          getEnvInt("EXEMPLAR_MAX_SPANS_PER_TRACE", 500),
 		ExemplarMaxBytesPerTrace:          getEnvInt("EXEMPLAR_MAX_BYTES_PER_TRACE", 256*1024),
+		ExemplarRetentionDays:             getEnvInt("EXEMPLAR_RETENTION_DAYS", 2),
+		ExemplarSynthLogsPerSpan:          getEnvInt("EXEMPLAR_SYNTH_LOGS_PER_SPAN", 8),
+		ExemplarSynthLogsPerTrace:         getEnvInt("EXEMPLAR_SYNTH_LOGS_PER_TRACE", 64),
+		// 8 GiB data budget (#201 Q1).
+		DataDiskBudgetMB: getEnvInt("DATA_DISK_BUDGET_MB", 8192),
+		DataDiskPath:     getEnv("DATA_DISK_PATH", "./data"),
 	}
 
 	// Parse AGGREGATE_METRIC_DIMS config
@@ -1048,6 +1082,21 @@ func (c *Config) Validate() error {
 	}
 	if c.ExemplarMaxBytesPerTrace < 1024 {
 		return fmt.Errorf("EXEMPLAR_MAX_BYTES_PER_TRACE must be >= 1024, got %d", c.ExemplarMaxBytesPerTrace)
+	}
+	if c.ExemplarRetentionDays < 1 || c.ExemplarRetentionDays > c.HotRetentionDays {
+		return fmt.Errorf("EXEMPLAR_RETENTION_DAYS must be between 1 and HOT_RETENTION_DAYS (%d), got %d: the exemplar tier is a shorter-lived subset of hot retention, never a longer-lived one", c.HotRetentionDays, c.ExemplarRetentionDays)
+	}
+	if c.ExemplarSynthLogsPerSpan < 1 {
+		return fmt.Errorf("EXEMPLAR_SYNTH_LOGS_PER_SPAN must be >= 1, got %d", c.ExemplarSynthLogsPerSpan)
+	}
+	if c.ExemplarSynthLogsPerTrace < c.ExemplarSynthLogsPerSpan {
+		return fmt.Errorf("EXEMPLAR_SYNTH_LOGS_PER_TRACE (%d) must be >= EXEMPLAR_SYNTH_LOGS_PER_SPAN (%d): a per-trace cap below the per-span cap makes the per-span cap unreachable", c.ExemplarSynthLogsPerTrace, c.ExemplarSynthLogsPerSpan)
+	}
+	if c.DataDiskBudgetMB < 64 {
+		return fmt.Errorf("DATA_DISK_BUDGET_MB must be >= 64, got %d", c.DataDiskBudgetMB)
+	}
+	if strings.TrimSpace(c.DataDiskPath) == "" {
+		return fmt.Errorf("DATA_DISK_PATH must not be empty")
 	}
 
 	// Sum-of-caps validation: sub-caps must fit under global cap

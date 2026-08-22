@@ -100,6 +100,19 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 		checks["aggregate_store"] = "ok"
 	}
 
+	// Disk pressure. At >=95% of the enforcement ceiling the raw exemplar
+	// path is off entirely; readiness says so rather than letting an
+	// orchestrator keep aiming ingest at a nearly full volume.
+	if s.diskPressure == nil {
+		checks["disk"] = "skipped"
+	} else {
+		state, ok := s.diskPressure()
+		checks["disk"] = state
+		if !ok {
+			ready = false
+		}
+	}
+
 	status := http.StatusOK
 	if !ready {
 		status = http.StatusServiceUnavailable

@@ -65,6 +65,12 @@ type RetentionScheduler struct {
 	// twenty-four times a day for names that change on the timescale of a
 	// deployment.
 	aggregateGC func() error
+
+	// exemplarRetentionDays is the separate, shorter retention of the raw
+	// exemplar tier (#201 Q2, EXEMPLAR_RETENTION_DAYS). 0 disables it, which
+	// is the correct setting in legacy and shadow mode: there the raw rows ARE
+	// the dataset and a two-day purge is data loss, not budget enforcement.
+	exemplarRetentionDays int
 }
 
 // NewRetentionScheduler constructs a scheduler but does not start it.
@@ -109,6 +115,76 @@ func (r *RetentionScheduler) SetAggregateRetention(purge func(time.Time) (int64,
 // the daily maintenance pass. May be nil. Call before Start; not synchronized.
 func (r *RetentionScheduler) SetAggregateGC(collect func() error) {
 	r.aggregateGC = collect
+}
+
+// SetExemplarRetention enables the exemplar-tier purge with the given retention
+// in days. Call before Start; not synchronized. Only meaningful in
+// AGGREGATE_MODE=aggregate — see the field comment.
+func (r *RetentionScheduler) SetExemplarRetention(days int) {
+	r.exemplarRetentionDays = days
+}
+
+// PurgeExemplarsNow runs one exemplar-tier purge immediately, outside the
+// hourly tick. The disk watchdog calls it on the transition into raw-off:
+// the point of that transition is that waiting up to an hour for the next
+// tick is no longer an option.
+//
+// It respects the same overlap guard as the scheduled passes; a tick already
+// in flight is doing this work anyway.
+func (r *RetentionScheduler) PurgeExemplarsNow(ctx context.Context) {
+	if r.exemplarRetentionDays <= 0 {
+		return
+	}
+	if !r.running.CompareAndSwap(false, true) {
+		r.skippedRuns.Add(1)
+		slog.Warn("retention: previous run still in progress, skipping on-demand exemplar purge")
+		return
+	}
+	defer r.running.Store(false)
+	r.runExemplarPurge(ctx)
+}
+
+// runExemplarPurge deletes the raw exemplar tier past EXEMPLAR_RETENTION_DAYS.
+// Caller holds the running guard.
+func (r *RetentionScheduler) runExemplarPurge(ctx context.Context) {
+	if r.exemplarRetentionDays <= 0 {
+		return
+	}
+	cutoff := time.Now().UTC().Add(-time.Duration(r.exemplarRetentionDays) * 24 * time.Hour)
+	start := time.Now()
+	stats, err := r.repo.PurgeExemplarsBatched(ctx, cutoff, r.purgeBatchSize, r.purgeBatchSleep)
+	metrics := r.repo.metrics
+	if metrics != nil {
+		if metrics.ExemplarPurgeDurationSeconds != nil {
+			metrics.ExemplarPurgeDurationSeconds.Observe(time.Since(start).Seconds())
+		}
+		if metrics.ExemplarRowsPurgedTotal != nil {
+			for table, n := range map[string]int64{
+				"traces":       stats.Traces,
+				"spans":        stats.Spans,
+				"logs":         stats.Logs,
+				"orphan_spans": stats.OrphanSpans,
+			} {
+				if n > 0 {
+					metrics.ExemplarRowsPurgedTotal.WithLabelValues(table).Add(float64(n))
+				}
+			}
+		}
+	}
+	if err != nil {
+		slog.Error("retention: exemplar purge failed",
+			"cutoff", cutoff.Format(time.RFC3339), "rows_deleted", stats.Total(), "error", err)
+		return
+	}
+	slog.Info("retention: exemplar purge complete",
+		"cutoff", cutoff.Format(time.RFC3339),
+		"retention_days", r.exemplarRetentionDays,
+		"traces_deleted", stats.Traces,
+		"spans_deleted", stats.Spans,
+		"logs_deleted", stats.Logs,
+		"weak_refs_deleted", stats.OrphanSpans,
+		"duration", time.Since(start),
+	)
 }
 
 // purgeAggregate runs the aggregate store's share of one retention tick.
@@ -225,6 +301,11 @@ func (r *RetentionScheduler) runPurge(ctx context.Context) {
 		driver = "sqlite"
 	}
 	cutoff := time.Now().UTC().Add(-time.Duration(r.retentionDays) * 24 * time.Hour)
+
+	// Exemplar tier first (#201 Q2). It has the shorter retention, so it frees
+	// the most pages per second of writer lock, and doing it before the 7-day
+	// pass means the long pass runs against a smaller table.
+	r.runExemplarPurge(ctx)
 
 	// The aggregate store is a separate database file with its own writer, so
 	// its purge never contends with the relational one (ADR 0003).

@@ -59,6 +59,12 @@ type Batch struct {
 	SpanCallback func(storage.Span)
 	LogCallback  func(storage.Log)
 
+	// Reservation carries the exemplar bytes reserved for the rows in this
+	// batch (#201 Q4). submitExemplars commits it when a destination accepts
+	// the batch and releases it when none does. Nil outside aggregate mode,
+	// and every method on it is nil-safe.
+	Reservation *ExemplarReservation
+
 	enqueuedAt time.Time
 
 	// sizeBytes is the approxBytes() estimate computed once at Submit time

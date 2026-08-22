@@ -42,6 +42,17 @@ func applyAggregate(eng *aggregate.Engine, r *aggregate.Reducer) error {
 		return grpcstatus.Errorf(codes.ResourceExhausted, "aggregate store at capacity")
 	}
 	if eng.Mode() == aggregate.ModeAggregate {
+		// The one case where a disk problem MUST fail the Export (#201 Q5).
+		// Raw exemplar shedding never does this — diagnostics are droppable.
+		// The authoritative aggregate commit is not: a success response
+		// asserts the deltas are in a committed transaction, and answering OK
+		// for data that hit ENOSPC or SQLITE_FULL is data loss with better
+		// branding. ResourceExhausted so the client backs off and retries
+		// rather than hammering a full disk.
+		if aggregate.IsDiskFull(err) {
+			slog.Error("aggregate commit failed: device out of space — failing the Export so the client retries", "error", err)
+			return grpcstatus.Errorf(codes.ResourceExhausted, "aggregate store commit failed: no space left on device")
+		}
 		return grpcstatus.Errorf(codes.Unavailable, "aggregate store commit failed")
 	}
 	slog.Error("aggregate shadow commit failed (legacy path remains the source of truth)", "error", err)
@@ -137,41 +148,71 @@ func (o exemplarOutcome) message() string {
 // continues with the remaining tenant groups. Non-ErrQueueFull errors are
 // still returned — those are not backpressure.
 //
+// dlqDisabled closes the DLQ fallback. Set when the disk watchdog is in
+// raw-off (#201 Q5): at >=95% of the enforcement ceiling, deferring an
+// exemplar to the DLQ is still writing to the disk that is about to fill.
+//
 // exemplars(b) counts the selected raw exemplars carried by one batch.
+//
+// Byte accounting: each batch carries the reservation for the rows in it
+// (#201 Q4). Accepted by the primary queue or the DLQ => Commit, and the
+// charge is monotonic for that window from then on. Refused by both, or
+// abandoned because this Export is going to fail => Release.
 func submitExemplars(
 	p *Pipeline,
 	metrics *telemetry.Metrics,
 	signal SignalType,
 	batches []*Batch,
 	ackedByAggregate bool,
+	dlqDisabled bool,
 	exemplars func(*Batch) int,
 ) (exemplarOutcome, error) {
 	var out exemplarOutcome
-	for _, b := range batches {
+	for i, b := range batches {
 		_, err := p.Submit(b)
 		if err == nil {
+			b.Reservation.Commit()
 			if ackedByAggregate {
 				observeExemplarSubmit(metrics, signal, "queued", "none")
 			}
 			continue
 		}
 		if !ackedByAggregate || !errors.Is(err, ErrQueueFull) {
+			// The Export fails, so nothing in this batch or any batch after it
+			// reached a destination. Their bytes were never written.
+			releaseFrom(batches, i)
 			return out, err
 		}
 
 		// Aggregate mode, primary queue saturated: one bounded attempt at the
-		// DLQ. Accepted => deferred; refused or errored => permanent counted
-		// loss. Neither changes the Export result.
+		// DLQ. Accepted => deferred; refused, errored, or closed by the disk
+		// watchdog => permanent counted loss. Neither changes the Export
+		// result.
 		n := exemplars(b)
+		if dlqDisabled {
+			b.Reservation.Release()
+			out.lost += n
+			observeExemplarSubmit(metrics, signal, "lost", "disk_shed")
+			observeExemplarLost(metrics, signal, "disk_shed")
+			slog.Warn("exemplar batch dropped: raw pipeline saturated and DLQ closed by disk pressure",
+				"signal", signalLabel(signal),
+				"tenant", b.Tenant,
+				"exemplars", n,
+			)
+			continue
+		}
 		switch dlqErr := p.OfferToDLQ(b); {
 		case dlqErr == nil:
+			b.Reservation.Commit()
 			out.deferred += n
 			observeExemplarSubmit(metrics, signal, "dlq", "queue_full")
 		case errors.Is(dlqErr, ErrDLQFull):
+			b.Reservation.Release()
 			out.lost += n
 			observeExemplarSubmit(metrics, signal, "lost", "dlq_full")
 			observeExemplarLost(metrics, signal, "dlq_full")
 		default:
+			b.Reservation.Release()
 			out.lost += n
 			observeExemplarSubmit(metrics, signal, "lost", "dlq_error")
 			observeExemplarLost(metrics, signal, "dlq_error")
@@ -184,6 +225,14 @@ func submitExemplars(
 		}
 	}
 	return out, nil
+}
+
+// releaseFrom hands back the reservations of batches[i:] — the batch that just
+// failed and every one that will never be attempted.
+func releaseFrom(batches []*Batch, i int) {
+	for _, b := range batches[i:] {
+		b.Reservation.Release()
+	}
 }
 
 func observeExemplarSubmit(m *telemetry.Metrics, signal SignalType, outcome, reason string) {
