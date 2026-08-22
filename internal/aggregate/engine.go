@@ -17,14 +17,23 @@ import (
 // mutable set is the current window plus the windows still inside the lateness
 // horizon; everything older is finalized and never re-enters memory.
 //
-// ROLLOVER IS AN EVICTION, NOT A DELETION — once the durable store is wired
-// (#173). A window leaving the mutable set is dropped from the shards, and the
-// writer's finalize pass has already materialized it from the delta log into
-// aggregate_buckets; finalized history lives on disk and never comes back into
-// RAM. WITHOUT a store (no writer installed, engine constructed directly in a
-// test) rollover really is loss: the counts in the expiring window are gone,
-// which is why nothing may be presented to a user as authoritative unless the
-// group-commit writer is the applier.
+// ROLLOVER CLOSES A WINDOW; FINALIZATION EVICTS IT (#194 blocker 6). A window
+// past its lateness horizon stops accepting points but keeps its shard
+// contents, its memory ownership and its readability until the writer's
+// finalize pass has materialized it from the delta log into aggregate_buckets
+// and called MarkFinalized. Rolling ownership forward at close time instead —
+// what this engine used to do — pointed reads at a store that had no buckets
+// yet, so the window silently disappeared from every query until the next
+// successful finalize, and permanently while the finalizer was failing.
+//
+// The exception is the closed-window cap: memory may not grow without bound
+// behind a wedged finalizer, so past DefaultMaxClosedWindows the oldest closed
+// windows are evicted anyway. That is loss, and it is counted — see
+// Snapshot.ClosedWindowsForced and otelcontext_aggregate_closed_windows_*.
+// WITHOUT a store (no writer installed, engine constructed directly in a test)
+// nothing ever finalizes, so the cap is the only thing bounding memory and
+// every window it drops is gone: nothing may be presented to a user as
+// authoritative unless the group-commit writer is the applier.
 //
 // Shards are four plain mutex-guarded maps (hash & 3). No shard goroutines, no
 // channels. Two shard locks are NEVER held at once: a delta touches exactly one
@@ -44,6 +53,16 @@ const (
 	MaxFutureSkew = 2 * time.Minute
 	// NumShards is the shard count. Fixed at four per #160.
 	NumShards = 4
+	// DefaultMaxClosedWindows bounds how many closed-but-unfinalized windows
+	// the engine keeps in RAM (#194 blocker 6).
+	//
+	// A window closes one lateness horizon after it opens and the writer's
+	// finalize pass runs every 30 s, so the steady state is one closed window
+	// or none. Twelve is an hour of finalizer backlog: enough that a slow or
+	// briefly failing store never costs data, small enough that a wedged
+	// finalizer cannot grow memory without bound. Past it the engine falls
+	// back to the old lossy eviction and counts every window it drops.
+	DefaultMaxClosedWindows = 12
 )
 
 // Modes. Phase 1 ships legacy and aggregate-shadow; ModeAggregate is accepted
@@ -143,6 +162,11 @@ type EngineConfig struct {
 	// edge's caller service. Zero takes DefaultEdgeResolverSpans.
 	EdgeResolverSpans int
 
+	// MaxClosedWindows bounds the closed-but-unfinalized windows held in
+	// memory. Zero takes DefaultMaxClosedWindows; negative is unbounded and
+	// is for tests only.
+	MaxClosedWindows int
+
 	// Epoch identifies this engine instance. A consumer that sees a new epoch
 	// knows the revision counter restarted and must replace its state rather
 	// than reconcile against it. Zero derives one from the clock.
@@ -182,8 +206,11 @@ type Engine struct {
 	applier  atomic.Pointer[Applier]
 	revision atomic.Uint64
 
+	maxClosedWindows int
+
 	windowsDiscarded atomic.Uint64
 	seriesDiscarded  atomic.Uint64
+	closedForced     atomic.Uint64
 }
 
 // shard is one mutex-guarded slice of the mutable window set.
@@ -209,6 +236,13 @@ type ownership struct {
 	mu sync.RWMutex
 	// mutable is the set of window starts the shards own.
 	mutable map[int64]struct{}
+	// closed is the subset of mutable whose lateness horizon has expired.
+	// A closed window refuses NEW points but is still memory-owned and still
+	// readable: only a committed FinalizeWindow may take it out of memory
+	// (#194 blocker 6). Evicting at rollover instead made the window vanish
+	// from queries until the next successful finalize — indefinitely while the
+	// finalizer was failing.
+	closed map[int64]struct{}
 	// watermark is the newest window start handed to the store. Every window
 	// at or below it is store-owned.
 	watermark int64
@@ -273,6 +307,10 @@ func NewEngine(cfg EngineConfig) (*Engine, error) {
 		dims:    cfg.MetricDims,
 		epoch:   epoch,
 	}
+	e.maxClosedWindows = cfg.MaxClosedWindows
+	if e.maxClosedWindows == 0 {
+		e.maxClosedWindows = DefaultMaxClosedWindows
+	}
 	e.topology = newTopologyProjection(cfg.Topology, epoch)
 	e.edges = NewEdgeResolver(cfg.EdgeResolverSpans)
 	if e.metrics == nil {
@@ -299,6 +337,7 @@ func NewEngine(cfg EngineConfig) (*Engine, error) {
 		e.shards[i].windows = make(map[int64]map[SeriesKey]*AggregateDelta)
 	}
 	e.own.mutable = make(map[int64]struct{})
+	e.own.closed = make(map[int64]struct{})
 	e.own.epoch = newEpoch(cfg.Now())
 	var a Applier = directApplier{e}
 	e.applier.Store(&a)
@@ -417,14 +456,21 @@ func (e *Engine) ownershipLocked() Ownership {
 // the handover is exactly as atomic as the transaction that materialized the
 // buckets: a query either sees the window in memory or in the store, never in
 // both and never in neither.
+//
+// It is the ONLY path that may evict a window from the shards, drop its mutable
+// ownership and advance the watermark — with one counted exception, the closed
+// window cap in Rollover (#194 blocker 6).
 func (e *Engine) MarkFinalized(windowStart int64) {
 	e.own.mu.Lock()
 	released := e.evictWindowLocked(windowStart)
 	delete(e.own.mutable, windowStart)
+	delete(e.own.closed, windowStart)
 	if windowStart > e.own.watermark {
 		e.own.watermark = windowStart
 	}
+	closed := len(e.own.closed)
 	e.own.mu.Unlock()
+	e.metrics.SetClosedWindows(closed)
 	for _, swk := range released {
 		e.limiter.Release(swk.Key, swk.WindowStart)
 	}
@@ -586,16 +632,86 @@ func (e *Engine) ApplyCommitted(m DeltaMap) uint64 {
 	if len(m) == 0 {
 		return e.revision.Load()
 	}
-	resolved := e.Admit(m)
+	return e.CommitAdmission(e.PlanAdmission(m))
+}
 
+// AdmissionPlan is one batch's cardinality reservation: the identities the
+// shards will hold, plus the occupancy this plan charged the limiter for.
+//
+// It exists because admission has to precede the durable write — the row that
+// becomes durable must carry the identity the shards will hold — while the
+// charge must not survive a write that never happened (#194 blocker 3). Before
+// it, a failed CommitGroup left the occupancy charged with no shard window to
+// release it from, so a store that kept refusing writes ate the cardinality
+// budget permanently and forced live telemetry into __other__.
+type AdmissionPlan struct {
+	// Resolved is the batch keyed by the identity to record under.
+	Resolved DeltaMap
+	// reserved is the (series, window) presence this plan created. Pairs that
+	// were already present belong to an earlier committed batch and are not
+	// listed: releasing those would take budget from data that is still live.
+	reserved []SeriesWindowKey
+}
+
+// PlanAdmission rolls the mutable window set forward and reserves one batch of
+// deltas against the cardinality budget WITHOUT touching the shards.
+//
+// The durable writer (#173) calls it before its COMMIT so the row that becomes
+// durable carries the same identity the shards will later hold: admitting after
+// the write would let the store accumulate series the in-memory caps already
+// rerouted to __other__. Exactly one of CommitAdmission or RollbackAdmission
+// must follow.
+func (e *Engine) PlanAdmission(m DeltaMap) *AdmissionPlan {
+	plan := &AdmissionPlan{Resolved: m}
+	if len(m) == 0 {
+		return plan
+	}
+	e.Rollover(e.now())
+
+	cutoff := e.now().Unix() - int64(WindowSize/time.Second) - int64(AllowedLateness/time.Second)
+	resolved := make(DeltaMap, len(m))
+	for swk, d := range m {
+		if swk.WindowStart <= cutoff {
+			// The window's lateness horizon expired between reduction and
+			// apply, so it is closed and no longer accepts points.
+			e.seriesDiscarded.Add(1)
+			continue
+		}
+		adm := e.limiter.Admit(swk.Key, swk.WindowStart)
+		if adm.Overflowed {
+			e.metrics.RecordOverflow(swk.Key.Signal, adm.Reason)
+		}
+		target := SeriesWindowKey{Key: adm.Key, WindowStart: swk.WindowStart}
+		if adm.Reserved {
+			plan.reserved = append(plan.reserved, target)
+		}
+		if existing, ok := resolved[target]; ok {
+			// Two source series collapsed onto the same overflow series.
+			// Totals are preserved; only identity detail is gone.
+			existing.Merge(d)
+			continue
+		}
+		resolved[target] = d
+	}
+	plan.Resolved = resolved
+	return plan
+}
+
+// CommitAdmission folds a committed plan into the mutable windows and returns
+// the new revision. The reservations become ordinary occupancy, released later
+// by MarkFinalized like any other series in the window.
+func (e *Engine) CommitAdmission(plan *AdmissionPlan) uint64 {
+	if plan == nil || len(plan.Resolved) == 0 {
+		return e.revision.Load()
+	}
 	// The shard writes and the ownership registration happen inside one
 	// ownership critical section so a concurrent Ownership() never reports a
 	// window as memory-owned before memory holds it, nor the reverse.
 	e.own.mu.Lock()
 	for i := range e.shards {
-		e.applyShard(i, resolved)
+		e.applyShard(i, plan.Resolved)
 	}
-	for swk := range resolved {
+	for swk := range plan.Resolved {
 		e.own.mutable[swk.WindowStart] = struct{}{}
 	}
 	rev := e.revision.Add(1)
@@ -605,45 +721,17 @@ func (e *Engine) ApplyCommitted(m DeltaMap) uint64 {
 	return rev
 }
 
-// Admit rolls the mutable window set forward and resolves one batch of deltas
-// against the cardinality budget WITHOUT touching the shards.
-//
-// The durable writer (#173) calls it before its COMMIT so the row that becomes
-// durable carries the same identity the shards will later hold: admitting after
-// the write would let the store accumulate series the in-memory caps already
-// rerouted to __other__. Admission is idempotent for a series already present
-// in a window, so the ApplyCommitted that follows the commit re-resolves the
-// same map to itself.
-func (e *Engine) Admit(m DeltaMap) DeltaMap {
-	if len(m) == 0 {
-		return m
+// RollbackAdmission releases the occupancy a plan charged after its commit
+// failed. Nothing reached the shards, so there is no window eviction that would
+// ever release it — this is the only undo there is.
+func (e *Engine) RollbackAdmission(plan *AdmissionPlan) {
+	if plan == nil || len(plan.reserved) == 0 {
+		return
 	}
-	e.Rollover(e.now())
-
-	cutoff := e.now().Unix() - int64(WindowSize/time.Second) - int64(AllowedLateness/time.Second)
-	resolved := make(DeltaMap, len(m))
-	for swk, d := range m {
-		if swk.WindowStart <= cutoff {
-			// The window's lateness horizon expired between reduction and
-			// apply. Recreating it here would only have it discarded at the
-			// next rollover.
-			e.seriesDiscarded.Add(1)
-			continue
-		}
-		adm := e.limiter.Admit(swk.Key, swk.WindowStart)
-		if adm.Overflowed {
-			e.metrics.RecordOverflow(swk.Key.Signal, adm.Reason)
-		}
-		target := SeriesWindowKey{Key: adm.Key, WindowStart: swk.WindowStart}
-		if existing, ok := resolved[target]; ok {
-			// Two source series collapsed onto the same overflow series.
-			// Totals are preserved; only identity detail is gone.
-			existing.Merge(d)
-			continue
-		}
-		resolved[target] = d
+	for _, swk := range plan.reserved {
+		e.limiter.Release(swk.Key, swk.WindowStart)
 	}
-	return resolved
+	e.publishActiveSeries()
 }
 
 // applyShard folds every entry belonging to shard i into it, under that shard's
@@ -677,56 +765,75 @@ func (e *Engine) applyShard(i int, resolved DeltaMap) {
 	}
 }
 
-// Rollover evicts every window whose lateness horizon has expired and returns
-// how many it dropped.
+// Rollover CLOSES every window whose lateness horizon has expired and returns
+// how many windows the closed-window cap forced out of memory — which is loss,
+// and is normally zero.
 //
-// With the durable store wired, the window has already been finalized into
-// aggregate_buckets by the writer's finalize pass, so this is an eviction from
-// RAM. Without a store it is loss. See the file header.
+// It does not evict. A closed window refuses new points (Admit drops deltas at
+// or below the cutoff) but keeps its shard contents, its mutable ownership and
+// its place below the watermark until a committed FinalizeWindow hands it over
+// through MarkFinalized. Evicting here — the pre-#194 behaviour — advanced
+// ownership to a store that had not yet materialized aggregate_buckets, so
+// every read of that window skipped the delta log and returned nothing until
+// the next successful finalize, and forever while the finalizer was failing.
+//
+// The one thing memory cannot do is grow without bound behind a wedged
+// finalizer, so the closed set is capped. Past the cap the oldest closed
+// windows are evicted the old way and counted: lossy, but no longer silent.
 func (e *Engine) Rollover(now time.Time) int {
 	cutoff := now.Unix() - int64(WindowSize/time.Second) - int64(AllowedLateness/time.Second)
-	dropped := 0
+	forced := 0
 	var released []SeriesWindowKey
 	e.own.mu.Lock()
-	for i := range e.shards {
-		sh := &e.shards[i]
-		sh.mu.Lock()
-		for start, w := range sh.windows {
-			if start > cutoff {
-				continue
-			}
-			for key := range w {
-				released = append(released, SeriesWindowKey{Key: key, WindowStart: start})
-			}
-			delete(sh.windows, start)
-			dropped++
-		}
-		sh.mu.Unlock()
-	}
-	// A window whose lateness horizon expired is no longer memory-owned even
-	// if the writer has not finalized it yet: the shards no longer hold it, so
-	// claiming memory ownership would report zero for a window that has data.
-	// Handing it to the store is the honest transition — the delta rows are
-	// already durable and the next finalize pass materializes them.
 	for start := range e.own.mutable {
 		if start > cutoff {
 			continue
 		}
+		e.own.closed[start] = struct{}{}
+	}
+	for _, start := range e.overCapClosedLocked() {
+		released = append(released, e.evictWindowLocked(start)...)
+		delete(e.own.closed, start)
 		delete(e.own.mutable, start)
 		if start > e.own.watermark {
 			e.own.watermark = start
 		}
+		forced++
 	}
+	closed := len(e.own.closed)
 	e.own.mu.Unlock()
 	for _, swk := range released {
 		e.limiter.Release(swk.Key, swk.WindowStart)
 	}
-	if dropped > 0 {
-		e.windowsDiscarded.Add(uint64(dropped))
+	e.metrics.SetClosedWindows(closed)
+	if forced > 0 {
+		e.windowsDiscarded.Add(uint64(forced))
 		e.seriesDiscarded.Add(uint64(len(released)))
+		e.closedForced.Add(uint64(forced))
+		for i := 0; i < forced; i++ {
+			e.metrics.RecordClosedWindowEvicted()
+		}
 		e.publishActiveSeries()
 	}
-	return dropped
+	return forced
+}
+
+// overCapClosedLocked returns the oldest closed windows that exceed the closed
+// window cap, oldest first. e.own.mu must be held for writing.
+func (e *Engine) overCapClosedLocked() []int64 {
+	if e.maxClosedWindows < 0 {
+		return nil
+	}
+	over := len(e.own.closed) - e.maxClosedWindows
+	if over <= 0 {
+		return nil
+	}
+	starts := make([]int64, 0, len(e.own.closed))
+	for start := range e.own.closed {
+		starts = append(starts, start)
+	}
+	sort.Slice(starts, func(i, j int) bool { return starts[i] < starts[j] })
+	return starts[:over]
 }
 
 // publishActiveSeries pushes the limiter's occupancy into the active-series
@@ -764,9 +871,15 @@ type Snapshot struct {
 	ActiveBySignal map[Signal]int
 	// Overflow counts admissions rerouted to an __other__ series, per reason.
 	Overflow map[OverflowReason]uint64
-	// WindowsDiscarded and SeriesDiscarded count Phase 1 rollover loss.
+	// WindowsDiscarded and SeriesDiscarded count rollover loss.
 	WindowsDiscarded uint64
 	SeriesDiscarded  uint64
+	// ClosedWindowsForced counts closed-but-unfinalized windows the cap
+	// forced out of memory. Every one is data the finalizer never
+	// materialized, so a non-zero value means the finalizer is behind.
+	ClosedWindowsForced uint64
+	// ClosedWindows is how many closed-but-unfinalized windows memory holds.
+	ClosedWindows int
 }
 
 // Snapshot returns a copy of the mutable window set.
@@ -803,14 +916,19 @@ func (e *Engine) Snapshot() Snapshot {
 	}
 
 	ls := e.limiter.Stats()
+	e.own.mu.RLock()
+	closed := len(e.own.closed)
+	e.own.mu.RUnlock()
 	return Snapshot{
-		Revision:         e.revision.Load(),
-		Windows:          windows,
-		ActiveSeries:     ls.Active,
-		ActiveBySignal:   ls.ActiveBySignal,
-		Overflow:         ls.Overflow,
-		WindowsDiscarded: e.windowsDiscarded.Load(),
-		SeriesDiscarded:  e.seriesDiscarded.Load(),
+		Revision:            e.revision.Load(),
+		Windows:             windows,
+		ActiveSeries:        ls.Active,
+		ActiveBySignal:      ls.ActiveBySignal,
+		Overflow:            ls.Overflow,
+		WindowsDiscarded:    e.windowsDiscarded.Load(),
+		SeriesDiscarded:     e.seriesDiscarded.Load(),
+		ClosedWindowsForced: e.closedForced.Load(),
+		ClosedWindows:       closed,
 	}
 }
 

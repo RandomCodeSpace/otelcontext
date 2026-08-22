@@ -155,6 +155,10 @@ type CumulativeOutcome struct {
 	// Degraded is true when the point was attributed to the per-series shared
 	// baseline because the producer bound was exhausted.
 	Degraded bool
+	// Recovered is true when Delta also carries an increase whose group commit
+	// failed earlier and which this point re-attributes (#194 blocker 2). It is
+	// informational: the stranded amount is already folded into Delta.
+	Recovered bool
 }
 
 // BaselineStats is a snapshot of BaselineTracker counters.
@@ -178,6 +182,15 @@ type BaselineStats struct {
 	// GlobalOverflow counts points that could not take a dedicated baseline
 	// because the global baseline budget was exhausted.
 	GlobalOverflow uint64
+	// Owed is the number of records currently carrying an increase whose
+	// group commit failed. A number that does not return to zero means the
+	// store is refusing writes, not that accounting is drifting.
+	Owed int
+	// Recovered counts points that re-attributed a stranded increase.
+	Recovered uint64
+	// Stranded counts stranded increases dropped by a downtime re-seed,
+	// which is the one place the owed ledger is deliberately not honoured.
+	Stranded uint64
 }
 
 // BaselineTrackerConfig bounds the tracker.
@@ -204,6 +217,11 @@ type DirtyBaseline struct {
 	Key      SeriesKey
 	Producer ProducerID
 	Baseline Baseline
+	// Inflight is the increase this record emitted as deltas since its last
+	// drain. It rides the drain so a failed commit can hand the amount back
+	// as owed instead of stranding it (#194 blocker 2). It is not part of the
+	// durable BaselineRow — the store never sees it.
+	Inflight float64
 }
 
 // baselineRef identifies one baseline record.
@@ -212,15 +230,39 @@ type baselineRef struct {
 	producer ProducerID
 }
 
+// baselineState is one live baseline plus the ledger that makes a failed group
+// commit exactly recoverable (#194 blocker 2).
+//
+// The baseline VALUE is never rewound on commit failure. Rewinding looks like
+// the obvious fix and is wrong: between the drain and the commit result another
+// point may already have chained off the advanced value, and rewinding then
+// either fabricates the next increment or swallows it depending on which point
+// lands first. What a failed commit actually loses is an AMOUNT — the increase
+// whose delta rows never became durable — so that amount is carried forward and
+// re-attributed to the first point that can carry it. An identical client retry
+// (stale by timestamp, and therefore normally ignored) is such a point, which is
+// what makes "commit fails, client retries, delta survives" hold without
+// duplicating anything when a newer point arrives instead.
+type baselineState struct {
+	Baseline
+	// pending is the increase emitted as deltas since the last drain. The
+	// drain moves it into DirtyBaseline.Inflight and clears it.
+	pending float64
+	// owed is in-flight increase whose commit failed. The next point that
+	// moves this record adds it to its own delta and clears it.
+	owed float64
+}
+
 // BaselineTracker converts cumulative monotonic points into deltas and detects
 // resets. It is safe for concurrent use.
 type BaselineTracker struct {
 	cfg BaselineTrackerConfig
 
 	mu      sync.Mutex
-	series  map[SeriesKey]map[ProducerID]*Baseline
+	series  map[SeriesKey]map[ProducerID]*baselineState
 	dirty   map[baselineRef]struct{}
 	entries int
+	owed    int
 
 	stale            uint64
 	seeded           uint64
@@ -229,6 +271,8 @@ type BaselineTracker struct {
 	resetsRegression uint64
 	producerOverflow uint64
 	globalOverflow   uint64
+	recovered        uint64
+	stranded         uint64
 }
 
 // NewBaselineTracker returns a tracker bounded by cfg. Zero or negative bounds
@@ -245,7 +289,7 @@ func NewBaselineTracker(cfg BaselineTrackerConfig) *BaselineTracker {
 	}
 	return &BaselineTracker{
 		cfg:    cfg,
-		series: make(map[SeriesKey]map[ProducerID]*Baseline),
+		series: make(map[SeriesKey]map[ProducerID]*baselineState),
 		dirty:  make(map[baselineRef]struct{}),
 	}
 }
@@ -259,14 +303,13 @@ func (t *BaselineTracker) Seed(key SeriesKey, producer ProducerID, b Baseline) {
 	defer t.mu.Unlock()
 	byProducer, ok := t.series[key]
 	if !ok {
-		byProducer = make(map[ProducerID]*Baseline, 1)
+		byProducer = make(map[ProducerID]*baselineState, 1)
 		t.series[key] = byProducer
 	}
 	if _, exists := byProducer[producer]; !exists {
 		t.entries++
 	}
-	cp := b
-	byProducer[producer] = &cp
+	byProducer[producer] = &baselineState{Baseline: b}
 }
 
 // DrainDirty returns the baselines mutated since the last drain and clears the
@@ -274,6 +317,9 @@ func (t *BaselineTracker) Seed(key SeriesKey, producer ProducerID, b Baseline) {
 // record is at least as new as the deltas in that batch: on a crash a baseline
 // can be ahead of the durable deltas (the next point under-counts by one
 // interval) but never behind them (which would double-count).
+//
+// Each drained row also carries the increase that record emitted since the
+// previous drain, so Rollback can hand it back if the commit fails.
 func (t *BaselineTracker) DrainDirty() []DirtyBaseline {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -282,18 +328,31 @@ func (t *BaselineTracker) DrainDirty() []DirtyBaseline {
 	}
 	out := make([]DirtyBaseline, 0, len(t.dirty))
 	for ref := range t.dirty {
-		b, ok := t.series[ref.key][ref.producer]
+		st, ok := t.series[ref.key][ref.producer]
 		if !ok {
 			continue
 		}
-		out = append(out, DirtyBaseline{Key: ref.key, Producer: ref.producer, Baseline: *b})
+		out = append(out, DirtyBaseline{
+			Key:      ref.key,
+			Producer: ref.producer,
+			Baseline: st.Baseline,
+			Inflight: st.pending,
+		})
+		st.pending = 0
 	}
 	clear(t.dirty)
 	return out
 }
 
-// Redirty puts drained baselines back after a failed commit.
-func (t *BaselineTracker) Redirty(rows []DirtyBaseline) {
+// Rollback puts drained baselines back after a failed commit AND hands each
+// record the increase that commit was carrying, so the amount is re-attributed
+// to the next point instead of being lost (#194 blocker 2).
+//
+// Re-dirtying alone was the bug: the in-memory baseline had already advanced at
+// reduction time, so an identical client retry classified as stale and its delta
+// vanished. See baselineState for why the amount is carried forward rather than
+// the value rewound.
+func (t *BaselineTracker) Rollback(rows []DirtyBaseline) {
 	if len(rows) == 0 {
 		return
 	}
@@ -301,6 +360,14 @@ func (t *BaselineTracker) Redirty(rows []DirtyBaseline) {
 	defer t.mu.Unlock()
 	for _, r := range rows {
 		t.dirty[baselineRef{key: r.Key, producer: r.Producer}] = struct{}{}
+		st, ok := t.series[r.Key][r.Producer]
+		if !ok || r.Inflight == 0 {
+			continue
+		}
+		if st.owed == 0 {
+			t.owed++
+		}
+		st.owed += r.Inflight
 	}
 }
 
@@ -330,7 +397,7 @@ func (t *BaselineTracker) ObserveCumulative(key SeriesKey, producer ProducerID, 
 
 	byProducer, ok := t.series[key]
 	if !ok {
-		byProducer = make(map[ProducerID]*Baseline, 1)
+		byProducer = make(map[ProducerID]*baselineState, 1)
 		t.series[key] = byProducer
 	}
 
@@ -354,7 +421,9 @@ func (t *BaselineTracker) ObserveCumulative(key SeriesKey, producer ProducerID, 
 	}
 
 	if !ok {
-		byProducer[producer] = &Baseline{StartTime: startTime, LastTimestamp: ts, Value: value}
+		byProducer[producer] = &baselineState{
+			Baseline: Baseline{StartTime: startTime, LastTimestamp: ts, Value: value},
+		}
 		t.entries++
 		t.seeded++
 		t.markDirtyLocked(key, producer)
@@ -362,19 +431,38 @@ func (t *BaselineTracker) ObserveCumulative(key SeriesKey, producer ProducerID, 
 		return out
 	}
 
-	// (1) Stale or duplicate: never moves the baseline, never a reset.
+	// (1) Stale or duplicate: never moves the baseline, never a reset. It may
+	// still settle an owed increase — an identical retry after a failed commit
+	// is exactly this case, and refusing it there is what lost the delta.
 	if !ts.After(b.LastTimestamp) {
 		t.stale++
+		if b.owed > 0 {
+			out.Delta = b.owed
+			out.Recovered = true
+			b.pending += b.owed
+			b.owed = 0
+			t.owed--
+			t.recovered++
+			t.markDirtyLocked(key, producer)
+			return out
+		}
 		out.Ignored = true
 		return out
 	}
 
 	// Downtime gap: the increase spans more than the mutable-window horizon,
-	// so it cannot be attributed to any window we still own. Re-seed.
+	// so it cannot be attributed to any window we still own. Re-seed. An owed
+	// increase belongs to a window that is equally gone, so it is dropped here
+	// too — counted, not silent (#166 downtime handling).
 	if ts.Sub(b.LastTimestamp) > t.cfg.GapThreshold {
 		b.StartTime = startTime
 		b.LastTimestamp = ts
 		b.Value = value
+		if b.owed > 0 {
+			b.owed = 0
+			t.owed--
+			t.stranded++
+		}
 		t.gaps++
 		t.markDirtyLocked(key, producer)
 		out.Gap = true
@@ -399,6 +487,18 @@ func (t *BaselineTracker) ObserveCumulative(key SeriesKey, producer ProducerID, 
 		out.Delta = value - b.Value
 	}
 
+	// Settle any increase a failed commit stranded on this record. Totals stay
+	// exact across a commit failure whichever point arrives first: an identical
+	// retry settles it above, a newer point settles it here, and only one of
+	// them can, because settling clears the ledger.
+	if b.owed > 0 {
+		out.Delta += b.owed
+		out.Recovered = true
+		b.owed = 0
+		t.owed--
+		t.recovered++
+	}
+	b.pending += out.Delta
 	b.StartTime = startTime
 	b.LastTimestamp = ts
 	b.Value = value
@@ -411,11 +511,11 @@ func (t *BaselineTracker) ObserveCumulative(key SeriesKey, producer ProducerID, 
 func (t *BaselineTracker) Baseline(key SeriesKey, producer ProducerID) (Baseline, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	b, ok := t.series[key][producer]
+	st, ok := t.series[key][producer]
 	if !ok {
 		return Baseline{}, false
 	}
-	return *b, true
+	return st.Baseline, true
 }
 
 // Stats returns a snapshot of the tracker counters.
@@ -432,6 +532,9 @@ func (t *BaselineTracker) Stats() BaselineStats {
 		ResetsRegression: t.resetsRegression,
 		ProducerOverflow: t.producerOverflow,
 		GlobalOverflow:   t.globalOverflow,
+		Owed:             t.owed,
+		Recovered:        t.recovered,
+		Stranded:         t.stranded,
 	}
 }
 

@@ -140,7 +140,10 @@ func TestLatePointLandsInItsOwnWindow(t *testing.T) {
 	}
 }
 
-func TestRolloverDiscardsExpiredWindowsAndReleasesBudget(t *testing.T) {
+// TestRolloverClosesWithoutEvicting pins #194 blocker 6: a window past its
+// lateness horizon stops accepting points but stays in memory, readable and
+// still holding its budget, until a committed finalize hands it to the store.
+func TestRolloverClosesWithoutEvicting(t *testing.T) {
 	base := mustTime(t, "2026-08-21T12:00:00Z")
 	clock := base
 	e, err := NewEngine(EngineConfig{Mode: ModeShadow, Now: func() time.Time { return clock }})
@@ -158,21 +161,77 @@ func TestRolloverDiscardsExpiredWindowsAndReleasesBudget(t *testing.T) {
 
 	// Advance past the window's close plus the full lateness horizon.
 	clock = base.Add(WindowSize + AllowedLateness + time.Second)
-	if dropped := e.Rollover(clock); dropped != 1 {
-		t.Fatalf("rollover dropped %d windows, want 1", dropped)
+	if forced := e.Rollover(clock); forced != 0 {
+		t.Fatalf("rollover force-evicted %d windows under the cap, want 0", forced)
 	}
 
 	snap := e.Snapshot()
-	if len(snap.Windows) != 0 {
-		t.Errorf("windows = %d, want 0", len(snap.Windows))
+	if len(snap.Windows) != 1 {
+		t.Fatalf("windows = %d after rollover, want 1 — a closed window must stay readable", len(snap.Windows))
 	}
-	if snap.ActiveSeries != 0 {
-		t.Errorf("active series = %d after rollover, want 0 — budget must be released", snap.ActiveSeries)
+	if snap.ClosedWindows != 1 {
+		t.Errorf("closed windows = %d, want 1", snap.ClosedWindows)
 	}
-	// Phase 1 loses the window rather than finalizing it. The counters exist so
-	// the loss is visible instead of silent.
-	if snap.WindowsDiscarded != 1 || snap.SeriesDiscarded != 1 {
-		t.Errorf("discard counters = (%d, %d), want (1, 1)", snap.WindowsDiscarded, snap.SeriesDiscarded)
+	if snap.ActiveSeries != 1 {
+		t.Errorf("active series = %d, want 1 — a closed window still occupies budget", snap.ActiveSeries)
+	}
+	if snap.WindowsDiscarded != 0 || snap.ClosedWindowsForced != 0 {
+		t.Errorf("discard counters = (%d, %d), want (0, 0) — nothing was lost", snap.WindowsDiscarded, snap.ClosedWindowsForced)
+	}
+
+	// Finalization is the only thing that may evict it and release the budget.
+	e.MarkFinalized(WindowStart(base))
+	snap = e.Snapshot()
+	if len(snap.Windows) != 0 || snap.ActiveSeries != 0 || snap.ClosedWindows != 0 {
+		t.Errorf("after MarkFinalized: windows=%d active=%d closed=%d, want 0/0/0",
+			len(snap.Windows), snap.ActiveSeries, snap.ClosedWindows)
+	}
+}
+
+// TestRolloverCapForcesLossyEvictionAndCountsIt pins the memory bound: a wedged
+// finalizer must not grow RAM without limit, and the fallback to the old lossy
+// eviction must be counted rather than silent.
+func TestRolloverCapForcesLossyEvictionAndCountsIt(t *testing.T) {
+	base := mustTime(t, "2026-08-21T12:00:00Z")
+	clock := base
+	const cap = 2
+	e, err := NewEngine(EngineConfig{
+		Mode:             ModeShadow,
+		MaxClosedWindows: cap,
+		Now:              func() time.Time { return clock },
+	})
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+
+	// Four windows, one point each, no finalizer ever running.
+	const windows = 4
+	for i := 0; i < windows; i++ {
+		clock = base.Add(time.Duration(i) * WindowSize)
+		r := e.NewReducer(clock)
+		r.ReduceSpan(SpanInput{Tenant: "t", Service: "svc", SpanName: "op", Timestamp: clock, DurationMicros: 1})
+		e.ApplyReducer(r)
+	}
+
+	clock = base.Add(time.Duration(windows)*WindowSize + AllowedLateness + time.Second)
+	forced := e.Rollover(clock)
+	snap := e.Snapshot()
+	if snap.ClosedWindows > cap {
+		t.Fatalf("holding %d closed windows against a cap of %d", snap.ClosedWindows, cap)
+	}
+	if forced != windows-cap {
+		t.Fatalf("rollover force-evicted %d windows, want %d", forced, windows-cap)
+	}
+	if snap.ClosedWindowsForced != uint64(windows-cap) {
+		t.Errorf("ClosedWindowsForced = %d, want %d — forced loss must be counted",
+			snap.ClosedWindowsForced, windows-cap)
+	}
+	// The oldest windows are the ones that go, and only they.
+	if own := e.Ownership(); own.OwnsInMemory(WindowStart(base)) {
+		t.Error("the oldest closed window survived the cap")
+	}
+	if own := e.Ownership(); !own.OwnsInMemory(WindowStart(base.Add((windows - 1) * WindowSize))) {
+		t.Error("the newest closed window was evicted before older ones")
 	}
 }
 

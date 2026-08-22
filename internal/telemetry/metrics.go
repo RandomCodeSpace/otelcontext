@@ -187,6 +187,15 @@ type Metrics struct {
 	// AggregateShadowErrorsTotal — errors accounted on the aggregate side per
 	// service. Cheap invariant only (#165): no per-series comparison.
 	AggregateShadowErrorsTotal *prometheus.CounterVec
+	// AggregateClosedWindows — windows past their lateness horizon that
+	// memory still holds because the finalizer has not materialized them into
+	// aggregate_buckets yet. Steady state is 0 or 1; a value that stays high
+	// means finalization is behind or failing.
+	AggregateClosedWindows prometheus.Gauge
+	// AggregateClosedWindowsEvictedTotal — closed windows the closed-window
+	// cap forced out of memory before finalization. Each one is lost data:
+	// alert on any increase.
+	AggregateClosedWindowsEvictedTotal prometheus.Counter
 
 	// --- Durable aggregate store (#173) ---
 	// AggregateCommitDurationSeconds — group-commit wall time. This IS the
@@ -548,6 +557,14 @@ func New() *Metrics {
 		Name: "otelcontext_aggregate_shadow_errors_total",
 		Help: "Errors accounted on the aggregate side, per service. Cheap shadow-mode invariant only.",
 	}, []string{"service"})
+	m.AggregateClosedWindows = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "otelcontext_aggregate_closed_windows",
+		Help: "Windows past their lateness horizon still held in memory awaiting finalization. Steady state is 0 or 1.",
+	})
+	m.AggregateClosedWindowsEvictedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "otelcontext_aggregate_closed_windows_evicted_total",
+		Help: "Closed windows forced out of memory by the closed-window cap before finalization. Each one is lost data.",
+	})
 	m.AggregateCommitDurationSeconds = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "otelcontext_aggregate_commit_duration_seconds",
 		Help:    "Group-commit wall time on the aggregate store. This is the floor of OTLP ACK latency under durable ACK.",

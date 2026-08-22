@@ -29,6 +29,13 @@ type MetricsRecorder interface {
 	// __other__ reserve occupancy, both per signal. They are separate numbers
 	// because only the first is bounded by the AGGREGATE_MAX_SERIES* caps.
 	SetActiveSeries(active, overflow map[Signal]int)
+	// SetClosedWindows publishes how many closed-but-unfinalized windows the
+	// engine is holding. It is the finalizer-backlog signal: a value that does
+	// not return to zero means finalization is failing.
+	SetClosedWindows(held int)
+	// RecordClosedWindowEvicted counts one closed window the cap forced out of
+	// memory before it was finalized. Every one is lost data.
+	RecordClosedWindowEvicted()
 }
 
 // noopRecorder is the default when no metrics are wired.
@@ -37,6 +44,8 @@ type noopRecorder struct{}
 func (noopRecorder) RecordReduction(ReducerStats, map[Signal]uint64) {}
 func (noopRecorder) RecordOverflow(Signal, OverflowReason)           {}
 func (noopRecorder) SetActiveSeries(_, _ map[Signal]int)             {}
+func (noopRecorder) SetClosedWindows(int)                            {}
+func (noopRecorder) RecordClosedWindowEvicted()                      {}
 
 // promRecorder bridges the engine onto the platform's Prometheus metrics.
 type promRecorder struct{ m *telemetry.Metrics }
@@ -96,6 +105,16 @@ func (r promRecorder) SetActiveSeries(active, overflow map[Signal]int) {
 		r.m.AggregateSeriesActive.WithLabelValues(label).Set(float64(active[sig]))
 		r.m.AggregateOverflowSeriesActive.WithLabelValues(label).Set(float64(overflow[sig]))
 	}
+}
+
+// SetClosedWindows implements MetricsRecorder.
+func (r promRecorder) SetClosedWindows(held int) {
+	r.m.AggregateClosedWindows.Set(float64(held))
+}
+
+// RecordClosedWindowEvicted implements MetricsRecorder.
+func (r promRecorder) RecordClosedWindowEvicted() {
+	r.m.AggregateClosedWindowsEvictedTotal.Inc()
 }
 
 // promStoreRecorder bridges the durable store and the group-commit writer onto

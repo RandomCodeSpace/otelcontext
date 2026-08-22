@@ -368,10 +368,11 @@ func TestQueryRejectsUnboundedRange(t *testing.T) {
 	}
 }
 
-// TestRolloverHandsOwnershipToTheStore pins that an evicted window stops
-// claiming memory ownership: claiming it would report zero for a window whose
-// deltas are already durable.
-func TestRolloverHandsOwnershipToTheStore(t *testing.T) {
+// TestFinalizeHandsOwnershipToTheStore pins #194 blocker 6: rollover closes an
+// expired window but keeps it memory-owned, and only a committed finalize moves
+// ownership and the watermark. Advancing at rollover routed reads to a store
+// that had no buckets yet, so the window silently vanished from queries.
+func TestFinalizeHandsOwnershipToTheStore(t *testing.T) {
 	f := newQueryFixture(t)
 	old := f.window() - int64((WindowSize+AllowedLateness+WindowSize)/time.Second)
 	f.engine.own.mu.Lock()
@@ -380,8 +381,17 @@ func TestRolloverHandsOwnershipToTheStore(t *testing.T) {
 
 	f.engine.Rollover(f.now)
 	own := f.engine.Ownership()
+	if !own.OwnsInMemory(old) {
+		t.Fatal("closed window lost memory ownership before it was finalized")
+	}
+	if own.FinalizedWatermark >= old {
+		t.Errorf("FinalizedWatermark = %d, want below %d until finalize commits", own.FinalizedWatermark, old)
+	}
+
+	f.engine.MarkFinalized(old)
+	own = f.engine.Ownership()
 	if own.OwnsInMemory(old) {
-		t.Fatal("expired window is still memory-owned after rollover")
+		t.Fatal("finalized window is still memory-owned")
 	}
 	if own.FinalizedWatermark < old {
 		t.Errorf("FinalizedWatermark = %d, want at least %d", own.FinalizedWatermark, old)
