@@ -157,6 +157,29 @@ type Metrics struct {
 	// label matcher. reason="dlq_full"|"dlq_error".
 	ExemplarSubmitLostTotal *prometheus.CounterVec
 
+	// --- OTLP metric completeness (#199) ---
+	// IngestMetricsUnsupportedTotal — metric data points the aggregate path
+	// refused outright and reported in ExportMetricsPartialSuccess. Labeled by
+	// the OTLP point type (summary|histogram|exponential_histogram) and the
+	// reason: cumulative_temporality, unspecified_temporality, unsupported_type
+	// or malformed_point. Every increment is a point that did NOT enter
+	// aggregate accounting, and the client must not retry it.
+	IngestMetricsUnsupportedTotal *prometheus.CounterVec
+	// IngestMetricsSketchDroppedTotal — histogram points whose SCALARS were
+	// kept but whose percentiles are unavailable, by reason:
+	// negative_observations (negative buckets or a bucket that spans negative
+	// values without a proving min>=0), scale_out_of_range (an
+	// ExponentialHistogram below scale 0, which the positive-only scale-4
+	// sketch cannot represent) or no_finite_boundaries.
+	// This is NOT a rejection: count/sum/min/max still land in the aggregate.
+	IngestMetricsSketchDroppedTotal *prometheus.CounterVec
+	// IngestMetricsDimsRejectedTotal — metric points whose configured
+	// dimension tuple was refused from series identity, by reason. Today the
+	// only reason is unsupported_value_type: an array or kvlist attribute
+	// value has no canonical scalar rendering, so it cannot be interned.
+	// The point is still aggregated, under DimsID=0.
+	IngestMetricsDimsRejectedTotal *prometheus.CounterVec
+
 	// HTTPOTLPThrottledTotal — count of HTTP 429s issued by the OTLP HTTP
 	// receiver when the async ingest pipeline is full. Mirrors the gRPC
 	// RESOURCE_EXHAUSTED path so operators see a single throttling signal
@@ -557,6 +580,18 @@ func New() *Metrics {
 		Name: "otelcontext_dashboard_p99_row_cap_hits_total",
 		Help: "Number of dashboard p99 computations that hit the SQLite row cap (200k). Indicates the dataset is too large for in-memory p99 — use Postgres for prod.",
 	})
+	m.IngestMetricsUnsupportedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "otelcontext_ingest_metrics_unsupported_total",
+		Help: "OTLP metric data points refused by the aggregate path and reported as rejected_data_points. type=summary|histogram|exponential_histogram, reason=cumulative_temporality|unspecified_temporality|unsupported_type|malformed_point.",
+	}, []string{"type", "reason"})
+	m.IngestMetricsSketchDroppedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "otelcontext_ingest_metrics_sketch_dropped_total",
+		Help: "Histogram points accepted for their scalars but whose percentiles are unavailable. reason=negative_observations|scale_out_of_range|no_finite_boundaries.",
+	}, []string{"reason"})
+	m.IngestMetricsDimsRejectedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "otelcontext_ingest_metrics_dims_rejected_total",
+		Help: "Metric points whose configured dimension tuple was refused from series identity. reason=unsupported_value_type. The point is still aggregated under DimsID=0.",
+	}, []string{"reason"})
 	m.AggregateInputPointsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "otelcontext_aggregate_input_points_total",
 		Help: "Points offered to the aggregate reducer, per signal, counted before sampling and severity gates.",
@@ -675,6 +710,34 @@ func New() *Metrics {
 		Help: "Retained traces forced past max spans/bytes. Persisted with truncated=true plus retained/observed span counts.",
 	})
 	return m
+}
+
+// RecordMetricUnsupported counts one OTLP metric data point refused by the
+// aggregate path. pointType is the OTLP point type, reason names why.
+// A nil *Metrics is a no-op: every ingest unit test passes one.
+func (m *Metrics) RecordMetricUnsupported(pointType, reason string, n int) {
+	if m == nil || n <= 0 {
+		return
+	}
+	m.IngestMetricsUnsupportedTotal.WithLabelValues(pointType, reason).Add(float64(n))
+}
+
+// RecordMetricSketchDropped counts one histogram point kept for its scalars
+// with percentiles suppressed.
+func (m *Metrics) RecordMetricSketchDropped(reason string) {
+	if m == nil {
+		return
+	}
+	m.IngestMetricsSketchDroppedTotal.WithLabelValues(reason).Inc()
+}
+
+// RecordMetricDimsRejected counts metric points whose dimension tuple was
+// refused from series identity.
+func (m *Metrics) RecordMetricDimsRejected(reason string, n uint64) {
+	if m == nil || n == 0 {
+		return
+	}
+	m.IngestMetricsDimsRejectedTotal.WithLabelValues(reason).Add(float64(n))
 }
 
 // RecordExemplarEligible implements ingest.ExemplarMetrics.

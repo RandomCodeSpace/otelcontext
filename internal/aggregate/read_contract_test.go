@@ -639,7 +639,9 @@ func TestRequestErrorRateReflectsEntryPointStatusOnly(t *testing.T) {
 
 // TestStoreRefusesAV2FileAndRebuildsOnDemand is #197 Q5's fail-closed policy at
 // the v2 -> v3 bump: request_count cannot be derived from a v2 file, so the only
-// two answers are "run the old binary" and "destroy and recreate".
+// two answers are "run the old binary" and "destroy and recreate". The wanted
+// version is read from StoreSchemaVersion, not spelled out: the policy is what
+// this test pins, and it does not change when a later bump adds columns.
 func TestStoreRefusesAV2FileAndRebuildsOnDemand(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "aggregate.db")
 	store := newTestStoreAt(t, path, StoreConfig{})
@@ -655,8 +657,9 @@ func TestStoreRefusesAV2FileAndRebuildsOnDemand(t *testing.T) {
 	if !errors.As(err, &schemaErr) {
 		t.Fatalf("open of a v2 file = %v, want *SchemaError", err)
 	}
-	if schemaErr.Got != "2" || schemaErr.Want != "3" {
-		t.Fatalf("mismatch reported %s -> %s, want 2 -> 3", schemaErr.Got, schemaErr.Want)
+	want := fmt.Sprint(StoreSchemaVersion)
+	if schemaErr.Got != "2" || schemaErr.Want != want {
+		t.Fatalf("mismatch reported %s -> %s, want 2 -> %s", schemaErr.Got, schemaErr.Want, want)
 	}
 
 	rebuilt, err := OpenSQLiteStore(StoreConfig{Path: path, AllowRebuild: true})
@@ -667,7 +670,7 @@ func TestStoreRefusesAV2FileAndRebuildsOnDemand(t *testing.T) {
 	if rebuilt.UUID() == original {
 		t.Fatal("rebuild kept the old store uuid; it must mint a new identity")
 	}
-	// The rebuilt schema must actually carry the v3 columns.
+	// The rebuilt schema must actually carry the current columns.
 	if err := rebuilt.CommitGroup(&GroupBatch{
 		Series: []SeriesRow{{ID: 1, Key: storeKey(1)}},
 		Deltas: []DeltaRow{{SeriesID: 1, WindowStart: 600, Delta: &AggregateDelta{Count: 3, RequestCount: 2, ErrorRequestCount: 1}}},

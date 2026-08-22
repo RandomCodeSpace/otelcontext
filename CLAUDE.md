@@ -59,6 +59,74 @@ resolved tenant is stamped on every async-pipeline `Batch`, so
 When `OTLP_TRUST_RESOURCE_TENANT=true` and one Export carries resources for
 several tenants, the Export is split into one batch per tenant. Every row in the relational DB carries a `tenant_id` column; every read method in `internal/storage/` scopes by the tenant in the request context (`Where("tenant_id = ?", tenant)`). Retention (`RetentionScheduler`) is **cross-tenant** — it purges by age, not by tenant.
 
+### OTLP Metric Points in Aggregate Mode
+
+`MetricsServer.Export` (`internal/ingest/otlp.go`) accounts four OTLP point
+types. Folding lives in `internal/aggregate/histogram.go`; the platform sketch
+is positive-only at scale 4.
+
+| Point type | Aggregate handling |
+|---|---|
+| `NumberDataPoint` (Gauge, Sum) | Gauge-like or baseline-converted per the temporality model. Also feeds the TSDB ring and the real-time bypass. |
+| `HistogramDataPoint` (delta) | Bucket counts folded as **weighted** synthetic observations at each finite positive bucket's geometric midpoint — one sketch add per bucket, never one per count. |
+| `ExponentialHistogramDataPoint` (delta) | Exact index transfer. Scale > 4 downscales by shifting indexes; scale 0–3 downscales the accumulating sketch to the source scale; `zero_count` folds into the zero bucket. |
+| `SummaryDataPoint` | **Wholly unsupported.** Producer-chosen quantiles cannot be merged across series or windows. |
+
+**Delta temporality only.** GA aggregates delta-temporality Histogram and
+ExponentialHistogram points. A cumulative (or unspecified-temporality)
+histogram point is refused **completely** — no count, no scalar, no bin — and
+counted on `otelcontext_ingest_metrics_unsupported_total{type,reason}`.
+Convert upstream with the OpenTelemetry Collector's
+[`cumulativetodeltaprocessor`](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/processor/cumulativetodeltaprocessor),
+which handles cumulative Sum, Histogram and ExponentialHistogram streams.
+⚠️ That processor is **stateful**: it keeps the previous cumulative value per
+series in memory, so the collector fleet must route each series to **one**
+instance (a single collector, or a `loadbalancing` exporter keyed by the
+resource/attribute set). Round-robin across replicas produces wrong deltas and
+spurious resets, not an error.
+
+**Percentile honesty.** Scalars (count/sum/min/max) are kept even when the
+distribution cannot enter the sketch; percentiles are then marked unavailable
+and `otelcontext_ingest_metrics_sketch_dropped_total{reason}` is incremented:
+- `negative_observations` — negative exponential buckets held counts, or an
+  explicit bucket admits negative values and no reported `min >= 0` proves the
+  population non-negative. Publishing the positive side's p99 as the global p99
+  is a lie, so no quantile is published at all.
+- `scale_out_of_range` — an ExponentialHistogram below scale 0. Valid OTLP,
+  not representable by the unsigned sketch scale.
+- `no_finite_boundaries` — an explicit-bounds Histogram with observations and
+  no boundary.
+
+The `+Inf` bucket is tracked separately (`HistogramTailCount` /
+`HistogramTailBound`) and never folded. `AggregateDelta.HistogramQuantile`
+returns `(value, lowerBound, ok)`: a quantile landing in the tail is answered
+as `p99 >= last_finite_boundary`, never as an ordinary estimate.
+`AccuracyMetadata` carries `source_bucket_error` and `unbounded_tail`
+alongside the sketch's own bound — a bare `degraded=true` does not describe an
+unbounded bucket.
+
+**Dimensions.** Configured `AGGREGATE_METRIC_DIMS` keys are extracted from each
+point's attributes into the SeriesKey `DimsID`, identically for all three point
+types. Missing any configured key yields `DimsID=0` (all-or-nothing). String,
+int, bool and double attribute values are supported; array and kvlist values
+are refused from identity and counted on
+`otelcontext_ingest_metrics_dims_rejected_total{reason="unsupported_value_type"}`.
+Extraction runs against a request-local scratch — no per-point map allocation.
+
+**Response honesty.** Every refused point lands in
+`ExportMetricsPartialSuccess.rejected_data_points` with an exact count and a
+bounded message naming the types and reasons. The Export still returns success
+for the accepted points, and **clients must not retry a populated
+partial-success response**. Late and future points are *not* counted there:
+they are excluded from aggregates and reported on the lateness counters, but a
+retry would not change their fate. Legacy mode (`AGGREGATE_MODE=legacy`) has no
+aggregate accounting to be honest about and leaves the response unchanged.
+
+Aggregate store schema is **v4**: eight `hist_*` columns carry the population
+statistics and accuracy metadata. A v3 file cannot be migrated (the columns
+have no derivable values) — start an older binary or set
+`AGGREGATE_ALLOW_REBUILD=true`.
+
 ## Storage Architecture
 
 | Layer | Package | Purpose |

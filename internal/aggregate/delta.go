@@ -1,6 +1,9 @@
 package aggregate
 
-import "time"
+import (
+	"math"
+	"time"
+)
 
 // AggregateDelta is the compact aggregate contribution of one Export request to
 // one series in one window (CONTEXT.md, "Delta"). It is what request-local
@@ -87,6 +90,40 @@ type AggregateDelta struct {
 	// ResetCount is the number of counter resets observed in this window
 	// (start-time change or value regression, per #166).
 	ResetCount uint64
+
+	// --- histogram metrics (#199) ---
+	//
+	// Populated by OTLP Histogram and ExponentialHistogram data points. The
+	// distribution itself rides in Sketch, which no metric series uses for
+	// anything else (Duration* is trace-only, gauges and counters carry no
+	// sketch), so a metric delta holds at most one distribution.
+
+	// HistogramCount is the population count reported by the folded points.
+	// It counts OBSERVATIONS, unlike Count which counts data points.
+	HistogramCount uint64
+	// HistogramSum is the authoritative sum reported by the producer. It is
+	// never derived from the sketch: bucket folding only knows bucket
+	// midpoints, and a sum of midpoints is an estimate.
+	HistogramSum float64
+	// HistogramMin and HistogramMax are the producer-reported extremes, valid
+	// only when HistHasMin / HistHasMax are set in HistogramFlags.
+	HistogramMin float64
+	HistogramMax float64
+	// HistogramFlags is the bit set defined in histogram.go:
+	// HistPercentilesUnavailable, HistUnboundedTail, HistHasMin, HistHasMax,
+	// plus a SketchDropReason in its high byte.
+	HistogramFlags uint32
+	// HistogramSourceError is the worst-case relative error imported from the
+	// SOURCE histogram's bucket widths, as a fraction. Zero for exponential
+	// histograms; an explicit-bounds histogram with decade-wide buckets can
+	// put this an order of magnitude above the sketch's own bound.
+	HistogramSourceError float64
+	// HistogramTailBound is the last finite boundary below the +Inf bucket,
+	// and HistogramTailCount how many observations landed above it. They are
+	// NOT in the sketch: a quantile that falls in the tail is answerable only
+	// as "at least HistogramTailBound".
+	HistogramTailBound float64
+	HistogramTailCount uint64
 
 	// --- logs ---
 
@@ -182,6 +219,109 @@ func (d *AggregateDelta) ObserveCounter(delta float64, reset bool) {
 	}
 }
 
+// ObserveHistogram records one folded OTLP histogram data point.
+//
+// Count counts the DATA POINT; HistogramCount counts the observations it
+// summarizes. Both are needed: the first is the reduction denominator, the
+// second is the population the percentiles describe.
+//
+// A fold with percentiles unavailable contributes its scalars and poisons the
+// series' percentile availability for the window. That is deliberate: once one
+// point in a window could not be represented, no quantile computed from the
+// rest describes the window's distribution.
+func (d *AggregateDelta) ObserveHistogram(f HistogramFold) {
+	d.Count++
+	d.HistogramCount += f.Count
+	d.HistogramSum += f.Sum
+	if f.HasMin && (d.HistogramFlags&HistHasMin == 0 || f.Min < d.HistogramMin) {
+		d.HistogramMin = f.Min
+	}
+	if f.HasMax && (d.HistogramFlags&HistHasMax == 0 || f.Max > d.HistogramMax) {
+		d.HistogramMax = f.Max
+	}
+	if f.SourceBucketError > d.HistogramSourceError {
+		d.HistogramSourceError = f.SourceBucketError
+	}
+	if f.UnboundedTail {
+		// The sound lower bound for a union of tails is the LOWEST of their
+		// boundaries: an observation from the other tail is only known to
+		// exceed its own.
+		if d.HistogramFlags&HistUnboundedTail == 0 || f.UnboundedTailBound < d.HistogramTailBound {
+			d.HistogramTailBound = f.UnboundedTailBound
+		}
+		d.HistogramTailCount += f.UnboundedTailCount
+	}
+	d.HistogramFlags = mergeHistFlags(d.HistogramFlags, f.flags())
+	if f.Sketch != nil {
+		if d.Sketch == nil {
+			d.Sketch = NewSketch()
+		}
+		d.Sketch.Merge(f.Sketch)
+	}
+}
+
+// mergeHistFlags ORs two histogram flag words. The drop reason is the LOWEST
+// non-zero code of the two, which makes the merge order-independent without
+// needing a per-reason counter.
+func mergeHistFlags(a, b uint32) uint32 {
+	reasonA, reasonB := histReason(a), histReason(b)
+	reason := reasonA
+	switch {
+	case reasonA == SketchDropNone:
+		reason = reasonB
+	case reasonB != SketchDropNone && reasonB < reasonA:
+		reason = reasonB
+	}
+	return withHistReason((a|b)&^histReasonMask, reason)
+}
+
+// HistogramPercentilesAvailable reports whether a quantile may be published
+// for this delta's histogram distribution.
+func (d *AggregateDelta) HistogramPercentilesAvailable() bool {
+	return d.HistogramCount > 0 && d.HistogramFlags&HistPercentilesUnavailable == 0
+}
+
+// HistogramQuantile estimates the q-quantile of the folded histogram
+// distribution.
+//
+// The three-way return is the whole point (#199 Q2). lowerBound=true means the
+// quantile falls inside the source histogram's +Inf bucket: the answer is
+// "at least value", not "approximately value", and a caller that renders it as
+// an ordinary number is fabricating a tail it was never given. ok=false means
+// no quantile may be published at all -- an empty window, or a point whose
+// percentiles were suppressed.
+func (d *AggregateDelta) HistogramQuantile(q float64) (value float64, lowerBound, ok bool) {
+	if !d.HistogramPercentilesAvailable() || math.IsNaN(q) || q < 0 || q > 1 {
+		return 0, false, false
+	}
+	var sketched uint64
+	if d.Sketch != nil {
+		sketched = d.Sketch.Count()
+	}
+	total := sketched + d.HistogramTailCount
+	if total == 0 {
+		return 0, false, false
+	}
+	// Same rank convention as Sketch.Quantile: the element at rank
+	// q*(n-1), with the tail occupying the top HistogramTailCount ranks.
+	if rank := q * float64(total-1); rank >= float64(sketched) {
+		return d.HistogramTailBound, true, true
+	}
+	if d.Sketch == nil {
+		return 0, false, false
+	}
+	// Rescale q onto the sketched population so the sketch answers the same
+	// rank it would have answered inside the full distribution.
+	sq := 0.0
+	if sketched > 1 {
+		sq = q * float64(total-1) / float64(sketched-1)
+	}
+	if sq > 1 {
+		sq = 1
+	}
+	return d.Sketch.Quantile(sq), false, true
+}
+
 // Merge folds other into d. Every field is additive or order-independent, so
 // merging is associative and commutative: the result depends only on the
 // multiset of observations, never on the order they arrived in.
@@ -228,6 +368,28 @@ func (d *AggregateDelta) Merge(other *AggregateDelta) {
 
 	d.CounterDelta += other.CounterDelta
 	d.ResetCount += other.ResetCount
+
+	if other.HistogramCount > 0 || other.HistogramFlags != 0 {
+		if other.HistogramFlags&HistHasMin != 0 &&
+			(d.HistogramFlags&HistHasMin == 0 || other.HistogramMin < d.HistogramMin) {
+			d.HistogramMin = other.HistogramMin
+		}
+		if other.HistogramFlags&HistHasMax != 0 &&
+			(d.HistogramFlags&HistHasMax == 0 || other.HistogramMax > d.HistogramMax) {
+			d.HistogramMax = other.HistogramMax
+		}
+		if other.HistogramFlags&HistUnboundedTail != 0 &&
+			(d.HistogramFlags&HistUnboundedTail == 0 || other.HistogramTailBound < d.HistogramTailBound) {
+			d.HistogramTailBound = other.HistogramTailBound
+		}
+		d.HistogramCount += other.HistogramCount
+		d.HistogramSum += other.HistogramSum
+		d.HistogramTailCount += other.HistogramTailCount
+		if other.HistogramSourceError > d.HistogramSourceError {
+			d.HistogramSourceError = other.HistogramSourceError
+		}
+		d.HistogramFlags = mergeHistFlags(d.HistogramFlags, other.HistogramFlags)
+	}
 
 	d.LogCount += other.LogCount
 	if !other.FirstTimestamp.IsZero() && (d.FirstTimestamp.IsZero() || other.FirstTimestamp.Before(d.FirstTimestamp)) {

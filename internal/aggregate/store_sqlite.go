@@ -294,7 +294,9 @@ func (s *SQLiteStore) Close() error {
 const deltaColumnList = `point_count, error_count, duration_count, duration_sum, duration_min, duration_max,
 	gauge_count, gauge_sum, gauge_min, gauge_max, gauge_last, gauge_last_ts,
 	counter_delta, reset_count, log_count, first_ts, last_ts, sketch,
-	request_count, error_request_count`
+	request_count, error_request_count,
+	hist_count, hist_sum, hist_min, hist_max, hist_flags, hist_source_error,
+	hist_tail_bound, hist_tail_count`
 
 // deltaColumnDDL is deltaColumnList with types, shared by both tables.
 const deltaColumnDDL = `point_count INTEGER NOT NULL,
@@ -316,10 +318,18 @@ const deltaColumnDDL = `point_count INTEGER NOT NULL,
 	last_ts INTEGER NOT NULL,
 	sketch BLOB,
 	request_count INTEGER NOT NULL,
-	error_request_count INTEGER NOT NULL`
+	error_request_count INTEGER NOT NULL,
+	hist_count INTEGER NOT NULL,
+	hist_sum REAL NOT NULL,
+	hist_min REAL NOT NULL,
+	hist_max REAL NOT NULL,
+	hist_flags INTEGER NOT NULL,
+	hist_source_error REAL NOT NULL,
+	hist_tail_bound REAL NOT NULL,
+	hist_tail_count INTEGER NOT NULL`
 
 // deltaValuePlaceholders matches deltaColumnList's arity.
-const deltaValuePlaceholders = `?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?`
+const deltaValuePlaceholders = `?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?`
 
 // schemaDDL is the complete aggregate schema (#162).
 func schemaDDL() []string {
@@ -1520,19 +1530,24 @@ type scanFunc func(dst ...any) error
 // that also wants the series id).
 func scanDelta(scan scanFunc, id *int64) (*AggregateDelta, error) {
 	var (
-		d                   AggregateDelta
-		gaugeLastTS         int64
-		firstTS, lastTS     int64
-		sketch              []byte
-		dst                 []any
-		pointCount, errCnt  int64
-		durCount, gaugeCnt  int64
-		resetCount, logCnt  int64
-		reqCount, errReqCnt int64
-		durSum, durMin      float64
-		durMax, gaugeSum    float64
-		gaugeMin, gaugeMax  float64
-		gaugeLast, counterD float64
+		d                    AggregateDelta
+		gaugeLastTS          int64
+		firstTS, lastTS      int64
+		sketch               []byte
+		dst                  []any
+		pointCount, errCnt   int64
+		durCount, gaugeCnt   int64
+		resetCount, logCnt   int64
+		reqCount, errReqCnt  int64
+		durSum, durMin       float64
+		durMax, gaugeSum     float64
+		gaugeMin, gaugeMax   float64
+		gaugeLast, counterD  float64
+		histCount, histFlags int64
+		histTailCount        int64
+		histSum, histMin     float64
+		histMax, histSrcErr  float64
+		histTailBound        float64
 	)
 	if id != nil {
 		dst = append(dst, id)
@@ -1542,6 +1557,8 @@ func scanDelta(scan scanFunc, id *int64) (*AggregateDelta, error) {
 		&gaugeCnt, &gaugeSum, &gaugeMin, &gaugeMax, &gaugeLast, &gaugeLastTS,
 		&counterD, &resetCount, &logCnt, &firstTS, &lastTS, &sketch,
 		&reqCount, &errReqCnt,
+		&histCount, &histSum, &histMin, &histMax, &histFlags, &histSrcErr,
+		&histTailBound, &histTailCount,
 	)
 	if err := scan(dst...); err != nil {
 		return nil, err
@@ -1558,6 +1575,11 @@ func scanDelta(scan scanFunc, id *int64) (*AggregateDelta, error) {
 	d.GaugeSum, d.GaugeMin, d.GaugeMax, d.GaugeLast = gaugeSum, gaugeMin, gaugeMax, gaugeLast
 	d.CounterDelta = counterD
 	d.GaugeLastTime = timeFromNanos(gaugeLastTS)
+	d.HistogramCount = uint64(histCount)         // #nosec G115 -- counters are written from uint64
+	d.HistogramTailCount = uint64(histTailCount) // #nosec G115 -- counters are written from uint64
+	d.HistogramFlags = uint32(histFlags)         // #nosec G115 -- flags are written from uint32
+	d.HistogramSum, d.HistogramMin, d.HistogramMax = histSum, histMin, histMax
+	d.HistogramSourceError, d.HistogramTailBound = histSrcErr, histTailBound
 	d.FirstTimestamp = timeFromNanos(firstTS)
 	d.LastTimestamp = timeFromNanos(lastTS)
 	if len(sketch) > 0 {
@@ -1586,6 +1608,9 @@ func deltaArgs(d *AggregateDelta, sketch []byte) []any {
 		d.CounterDelta, int64(d.ResetCount), int64(d.LogCount), // #nosec G115
 		nanosOf(d.FirstTimestamp), nanosOf(d.LastTimestamp), blob,
 		int64(d.RequestCount), int64(d.ErrorRequestCount), // #nosec G115 -- counters are bounded by ingest volume
+		int64(d.HistogramCount), d.HistogramSum, d.HistogramMin, d.HistogramMax, // #nosec G115 -- counters are bounded by ingest volume
+		int64(d.HistogramFlags), d.HistogramSourceError, // #nosec G115 -- a uint32 flags word always fits int64
+		d.HistogramTailBound, int64(d.HistogramTailCount), // #nosec G115 -- counters are bounded by ingest volume
 	}
 }
 
