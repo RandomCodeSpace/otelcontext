@@ -64,21 +64,7 @@ type httpBackpressureHarness struct {
 
 func newHTTPBackpressureHarness(t *testing.T) *httpBackpressureHarness {
 	t.Helper()
-	db, err := storage.NewDatabase("sqlite", ":memory:")
-	if err != nil {
-		t.Fatalf("NewDatabase: %v", err)
-	}
-	if err := storage.AutoMigrateModels(db, "sqlite"); err != nil {
-		t.Fatalf("AutoMigrateModels: %v", err)
-	}
-	repo := storage.NewRepositoryFromDB(db, "sqlite")
-
-	cfg := &config.Config{
-		IngestMinSeverity:          "DEBUG",
-		SamplingLatencyThresholdMs: 500,
-	}
-	traces := NewTraceServer(repo, nil, cfg)
-	logs := NewLogsServer(repo, nil, cfg)
+	repo, traces, logs := newIngestTestRepo(t)
 	// Metrics server is not needed for backpressure tests — the throttle
 	// path is exercised via traces and logs. Pass a no-op MetricsServer
 	// (nil tsdb is safe because we never invoke metrics.Export here).
@@ -95,7 +81,7 @@ func newHTTPBackpressureHarness(t *testing.T) *httpBackpressureHarness {
 	// backpressure and lands in the channel — capacity 1, so the channel is
 	// now full. Subsequent priority submits hit ErrQueueFull (the channel-
 	// full path); healthy submits would still be silently soft-dropped.
-	if err := pl.Submit(&Batch{
+	if _, err := pl.Submit(&Batch{
 		Type:     SignalTraces,
 		Tenant:   "default",
 		Traces:   []storage.Trace{{TraceID: "x", ServiceName: "svc"}},

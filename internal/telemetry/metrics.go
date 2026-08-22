@@ -139,6 +139,24 @@ type Metrics struct {
 	// result="no_sink"       — no DLQ wired into the pipeline; the batch IS lost.
 	IngestPipelineDLQTotal *prometheus.CounterVec
 
+	// ExemplarSubmitTotal — outcome of every raw-exemplar batch submission in
+	// AGGREGATE_MODE=aggregate, where the durable aggregate commit is the
+	// Export ACK and raw exemplar storage is bounded best-effort (#196).
+	// outcome="queued" reason="none"        — the batch entered the raw pipeline.
+	// outcome="dlq"    reason="queue_full"  — pipeline saturated, DLQ accepted
+	//                                         the batch. Deferred, NOT lost.
+	// outcome="lost"   reason="dlq_full"    — the DLQ refused it for capacity.
+	// outcome="lost"   reason="dlq_error"   — no DLQ wired, or its write failed.
+	// lost{reason="queue_full"} is never emitted: on the lost outcome the
+	// reason names why the DLQ could not hold the batch, not why the primary
+	// queue refused it. Intentional soft-backpressure drops are not counted
+	// here — they are already on IngestPipelineDroppedTotal.
+	ExemplarSubmitTotal *prometheus.CounterVec
+	// ExemplarSubmitLostTotal — dedicated counter for the permanent-loss
+	// subset of ExemplarSubmitTotal, so an alert can target loss without a
+	// label matcher. reason="dlq_full"|"dlq_error".
+	ExemplarSubmitLostTotal *prometheus.CounterVec
+
 	// HTTPOTLPThrottledTotal — count of HTTP 429s issued by the OTLP HTTP
 	// receiver when the async ingest pipeline is full. Mirrors the gRPC
 	// RESOURCE_EXHAUSTED path so operators see a single throttling signal
@@ -496,6 +514,14 @@ func New() *Metrics {
 			Name: "otelcontext_ingest_pipeline_dlq_total",
 			Help: "Async ingest batches routed to the DLQ after a persist failure. result=enqueued (durable, awaiting replay), enqueue_failed or no_sink (batch lost).",
 		}, []string{"signal", "result"}),
+		ExemplarSubmitTotal: promauto.NewCounterVec(prometheus.CounterOpts{
+			Name: "otelcontext_exemplar_submit_total",
+			Help: "Raw exemplar batch submissions in aggregate mode. outcome=queued (raw pipeline), dlq (deferred after queue_full), lost (dlq_full or dlq_error).",
+		}, []string{"signal", "outcome", "reason"}),
+		ExemplarSubmitLostTotal: promauto.NewCounterVec(prometheus.CounterOpts{
+			Name: "otelcontext_exemplar_submit_lost_total",
+			Help: "Raw exemplar batches permanently lost in aggregate mode after the DLQ fallback failed. reason=dlq_full or dlq_error.",
+		}, []string{"signal", "reason"}),
 
 		// DB pool (Task 7 — visibility for DB_MAX_OPEN_CONNS sizing).
 		DBPoolOpenConnections: promauto.NewGauge(prometheus.GaugeOpts{

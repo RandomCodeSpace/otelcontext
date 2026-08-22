@@ -85,7 +85,7 @@ func TestPipeline_DBFailure_LandsInDLQAndReplays(t *testing.T) {
 	t.Cleanup(p.Stop)
 
 	b := healthyBatch() // 1 trace + 1 span + 1 log
-	if err := p.Submit(b); err != nil {
+	if _, err := p.Submit(b); err != nil {
 		t.Fatalf("Submit: %v", err)
 	}
 
@@ -135,7 +135,7 @@ func TestPipeline_DBFailure_NoDLQKeepsLegacyDrop(t *testing.T) {
 	p.Start(t.Context())
 	t.Cleanup(p.Stop)
 
-	if err := p.Submit(healthyBatch()); err != nil {
+	if _, err := p.Submit(healthyBatch()); err != nil {
 		t.Fatalf("Submit: %v", err)
 	}
 	if !waitFor(t, 20*time.Second, func() bool { return p.Stats().ProcessFailures == 1 }) {
@@ -170,7 +170,7 @@ func TestPipeline_DBFailure_DLQEnqueueFailureCounted(t *testing.T) {
 	p.Start(t.Context())
 	t.Cleanup(p.Stop)
 
-	if err := p.Submit(healthyBatch()); err != nil {
+	if _, err := p.Submit(healthyBatch()); err != nil {
 		t.Fatalf("Submit: %v", err)
 	}
 	if !waitFor(t, 20*time.Second, func() bool { return p.Stats().DLQFailed == 1 }) {
@@ -211,7 +211,7 @@ func TestPipeline_DLQEnvelope_CarriesStoreFilteredLogsOnly(t *testing.T) {
 		{Body: "debug-row", Severity: "DEBUG"},
 		{Body: "error-row", Severity: "ERROR"},
 	}
-	if err := p.Submit(b); err != nil {
+	if _, err := p.Submit(b); err != nil {
 		t.Fatalf("Submit: %v", err)
 	}
 	select {

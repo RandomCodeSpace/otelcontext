@@ -99,6 +99,50 @@ func (b *Batch) Priority() bool { return b.HasError || b.HasSlow }
 // HTTP 429 with a Retry-After hint so OTLP clients back off cleanly.
 var ErrQueueFull = errors.New("ingest pipeline at capacity")
 
+// ErrNoDLQ is returned by OfferToDLQ when no DLQ sink is wired. The batch is
+// gone; the caller must count it as permanent loss.
+var ErrNoDLQ = errors.New("no dead letter queue configured")
+
+// ErrDLQFull is the sentinel a BatchSink returns when it refuses a batch
+// because its bounded budget is exhausted, as opposed to the write itself
+// failing. *queue.DeadLetterQueue evicts FIFO rather than refusing, so this
+// is produced only by sinks that choose strict bounding — it exists so the
+// exemplar loss metric can tell "nowhere to put it" from "the write broke".
+var ErrDLQFull = errors.New("dead letter queue at capacity")
+
+// SubmitOutcome is the success value of Submit. A hard rejection stays an
+// error (ErrQueueFull); this type distinguishes the two ways Submit can
+// succeed without the caller having to infer them from counters.
+//
+// The distinction is load-bearing for the aggregate-shadow ordering state
+// machine (#196 Q4): both outcomes are non-retry Export results, so both
+// permit the shadow aggregate to be applied exactly once, but only
+// SubmitEnqueued means the rows will actually reach the database.
+type SubmitOutcome uint8
+
+const (
+	// SubmitEnqueued — the batch holds a queue slot and a worker will
+	// persist it. Also returned for a nil or empty batch, which needs no
+	// slot and loses nothing.
+	SubmitEnqueued SubmitOutcome = iota
+	// SubmitSoftDropped — the batch was intentionally shed at the door by
+	// soft backpressure or the per-tenant admission cap. Already counted on
+	// otelcontext_ingest_pipeline_dropped_total; the Export still succeeds.
+	SubmitSoftDropped
+)
+
+// String renders the outcome for logs and test failure messages.
+func (o SubmitOutcome) String() string {
+	switch o {
+	case SubmitEnqueued:
+		return "enqueued"
+	case SubmitSoftDropped:
+		return "soft_dropped"
+	default:
+		return "unknown"
+	}
+}
+
 // DLQBatchType is the `type` discriminator of the typed DLQ envelope used
 // for a whole failed pipeline batch. It extends the existing
 // {"type":"logs|spans|traces|metrics","data":[...]} family with a fifth
@@ -389,27 +433,30 @@ func (p *Pipeline) Start(ctx context.Context) {
 	}
 }
 
-// Submit enqueues a batch for asynchronous persistence. Returns nil when
-// the batch is accepted (or silently dropped under soft backpressure)
-// and ErrQueueFull when the queue is at hard capacity. Nil batches are
-// no-ops.
+// Submit enqueues a batch for asynchronous persistence. It returns a
+// SubmitOutcome plus a nil error when the batch is accepted (or
+// intentionally shed under soft backpressure), and ErrQueueFull when the
+// queue is at hard capacity. Nil batches are no-ops.
 //
 // Soft backpressure: when fullness >= SoftThreshold, healthy batches
-// (Priority()==false) are dropped at the door and Submit returns nil so
-// the OTLP client sees a successful Export. Errors and slow traces
-// always continue to the channel.
+// (Priority()==false) are dropped at the door and Submit returns
+// (SubmitSoftDropped, nil) so the OTLP client sees a successful Export.
+// Errors and slow traces always continue to the channel.
 //
-// Hard backpressure: when the channel send fails (buffer at 100%),
-// Submit returns ErrQueueFull regardless of priority. The caller should
-// translate this into a backpressure signal so the client retries with
-// exponential backoff rather than tighter loops.
-func (p *Pipeline) Submit(b *Batch) error {
+// Hard backpressure: when the channel send fails (buffer at 100%) or the
+// byte cap would be exceeded, Submit returns ErrQueueFull regardless of
+// priority. The caller should translate this into a backpressure signal so
+// the client retries with exponential backoff rather than tighter loops —
+// except in AGGREGATE_MODE=aggregate, where the durable aggregate commit is
+// already the ACK and the caller absorbs the rejection (see submitExemplars).
+func (p *Pipeline) Submit(b *Batch) (SubmitOutcome, error) {
 	if b == nil {
-		return nil
+		return SubmitEnqueued, nil
 	}
 	if len(b.Traces) == 0 && len(b.Spans) == 0 && len(b.Logs) == 0 {
-		// Empty batch — nothing to persist. Skip the channel entirely.
-		return nil
+		// Empty batch — nothing to persist, nothing lost. Skip the channel
+		// entirely and report it as enqueued: there is no drop to account for.
+		return SubmitEnqueued, nil
 	}
 	b.enqueuedAt = time.Now()
 	b.sizeBytes = b.approxBytes()
@@ -421,7 +468,7 @@ func (p *Pipeline) Submit(b *Batch) error {
 	if max(itemFullness, byteFullness) >= p.cfg.SoftThreshold && !b.Priority() {
 		p.droppedHealthy.Add(1)
 		p.observeDrop(b.Type, "soft_backpressure")
-		return nil
+		return SubmitSoftDropped, nil
 	}
 
 	// Per-tenant cap — only enforced for healthy batches (priority bypasses,
@@ -435,7 +482,7 @@ func (p *Pipeline) Submit(b *Batch) error {
 			p.tenantMu.Unlock()
 			p.tenantDropped.Add(1)
 			p.observeDrop(b.Type, "tenant_backpressure")
-			return nil
+			return SubmitSoftDropped, nil
 		}
 		p.tenantInFlight[b.Tenant]++
 		tenantReserved = true
@@ -453,7 +500,7 @@ func (p *Pipeline) Submit(b *Batch) error {
 		}
 		p.rejectedBytes.Add(1)
 		p.observeDrop(b.Type, "bytes_full")
-		return ErrQueueFull
+		return SubmitEnqueued, ErrQueueFull
 	}
 
 	select {
@@ -461,7 +508,7 @@ func (p *Pipeline) Submit(b *Batch) error {
 		p.enqueuedTotal.Add(1)
 		p.observeQueueDepth(b.Type)
 		p.observeQueueBytes()
-		return nil
+		return SubmitEnqueued, nil
 	default:
 		p.inFlightBytes.Add(-b.sizeBytes)
 		if tenantReserved {
@@ -469,7 +516,7 @@ func (p *Pipeline) Submit(b *Batch) error {
 		}
 		p.rejectedFull.Add(1)
 		p.observeDrop(b.Type, "queue_full")
-		return ErrQueueFull
+		return SubmitEnqueued, ErrQueueFull
 	}
 }
 
@@ -529,8 +576,8 @@ type PipelineStats struct {
 	RejectedFull    int64
 	RejectedBytes   int64 // batches rejected because the byte cap was exceeded
 	ProcessFailures int64
-	DLQEnqueued     int64 // failed batches durably handed to the DLQ
-	DLQFailed       int64 // failed batches the DLQ itself refused (data lost)
+	DLQEnqueued     int64 // batches durably handed to the DLQ (persist failure or queue saturation)
+	DLQFailed       int64 // batches the DLQ itself refused (data lost)
 	StoreFiltered   int64 // logs dropped by STORE_MIN_SEVERITY at persist time
 	QueueDepth      int
 	Capacity        int
@@ -574,6 +621,27 @@ func (p *Pipeline) worker(ctx context.Context) {
 // longer "tolerated" with downstream spans/logs continuing — the whole batch
 // is now atomic. This is intentional. Traces are idempotent (ON CONFLICT
 // DO NOTHING), so a DLQ retry of the same envelope re-attempts cleanly.
+// applyStoreSeverity returns the subset of logs that clears the second-tier
+// STORE_MIN_SEVERITY gate, counting every rejection on storeFiltered. Shared
+// by process() (the persist path) and OfferToDLQ (the saturation path) so a
+// batch handed to the DLQ carries exactly the rows a successful write would
+// have persisted — replay runs BatchCreateAll directly and never re-applies
+// the gate. 0 (gate disabled) returns the input slice untouched.
+func (p *Pipeline) applyStoreSeverity(logs []storage.Log) []storage.Log {
+	if p.storeMinSeverity <= 0 || len(logs) == 0 {
+		return logs
+	}
+	kept := make([]storage.Log, 0, len(logs))
+	for _, l := range logs {
+		if shouldIngestSeverity(l.Severity, p.storeMinSeverity) {
+			kept = append(kept, l)
+		} else {
+			p.storeFiltered.Add(1)
+		}
+	}
+	return kept
+}
+
 func (p *Pipeline) process(b *Batch) {
 	if b == nil {
 		return
@@ -615,18 +683,7 @@ func (p *Pipeline) process(b *Batch) {
 	// Apply the second-tier store-severity gate. Logs below the threshold
 	// are dropped from the persist set but still flow through the callback
 	// so in-memory enrichers (vectordb, GraphRAG Drain) keep seeing them.
-	logsToPersist := b.Logs
-	if p.storeMinSeverity > 0 && len(b.Logs) > 0 {
-		kept := make([]storage.Log, 0, len(b.Logs))
-		for _, l := range b.Logs {
-			if shouldIngestSeverity(l.Severity, p.storeMinSeverity) {
-				kept = append(kept, l)
-			} else {
-				p.storeFiltered.Add(1)
-			}
-		}
-		logsToPersist = kept
-	}
+	logsToPersist := p.applyStoreSeverity(b.Logs)
 
 	if err := p.writer.BatchCreateAll(b.Traces, b.Spans, logsToPersist); err != nil {
 		slog.Error("ingest pipeline: BatchCreateAll failed", "error", err)
@@ -676,14 +733,39 @@ func (p *Pipeline) observeDrop(t SignalType, reason string) {
 	p.metrics.IngestPipelineDroppedTotal.WithLabelValues(signalLabel(t), reason).Inc()
 }
 
-// toDLQ serializes a failed batch into the typed DLQ envelope and enqueues it.
+// toDLQ hands a batch whose persist transaction failed to the DLQ. The
+// outcome is counted, never returned — process() has nobody to report to.
+func (p *Pipeline) toDLQ(b *Batch, logs []storage.Log) {
+	_ = p.enqueueDLQ(b, logs)
+}
+
+// OfferToDLQ hands a batch the primary queue REFUSED (ErrQueueFull) to the DLQ
+// sink, so a hard rejection can degrade to deferred storage instead of loss.
+// It is the second half of the aggregate-mode ACK contract (#196 Q2): once the
+// durable aggregate commit has landed, the Export is already acknowledged and
+// the raw exemplars must go somewhere other than the client's retry loop.
+//
+// Returns nil when the sink accepted the batch, ErrNoDLQ when no sink is
+// wired, ErrDLQFull when the sink refused for capacity, and the sink's own
+// error otherwise. A non-nil return means the batch is permanently lost.
+//
+// The batch never held a queue slot or a byte reservation (Submit released
+// both before returning ErrQueueFull), so there is nothing to release here.
+func (p *Pipeline) OfferToDLQ(b *Batch) error {
+	if b == nil {
+		return nil
+	}
+	return p.enqueueDLQ(b, p.applyStoreSeverity(b.Logs))
+}
+
+// enqueueDLQ serializes a batch into the typed DLQ envelope and enqueues it.
 // Every outcome is counted on otelcontext_ingest_pipeline_dlq_total so a
 // silent loss is impossible to miss: result=enqueued means the batch is
 // durable, anything else means it is gone.
-func (p *Pipeline) toDLQ(b *Batch, logs []storage.Log) {
+func (p *Pipeline) enqueueDLQ(b *Batch, logs []storage.Log) error {
 	if p.dlq == nil {
 		p.observeDLQ(b.Type, "no_sink")
-		return
+		return ErrNoDLQ
 	}
 	env := DLQBatchEnvelope{
 		Type: DLQBatchType,
@@ -705,10 +787,11 @@ func (p *Pipeline) toDLQ(b *Batch, logs []storage.Log) {
 		)
 		p.dlqFailed.Add(1)
 		p.observeDLQ(b.Type, "enqueue_failed")
-		return
+		return err
 	}
 	p.dlqEnqueued.Add(1)
 	p.observeDLQ(b.Type, "enqueued")
+	return nil
 }
 
 func (p *Pipeline) observeDLQ(t SignalType, result string) {
