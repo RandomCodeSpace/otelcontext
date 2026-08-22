@@ -285,7 +285,13 @@ func buildRange(specs []seriesSpec, deltas []aggregate.AggregateDelta, sketches 
 				} else if v > 60e6 {
 					v = 60e6
 				}
-				d.ObserveSpan(v, r.Float64() < sp.errRate)
+				// Trace-operation series model server-side operations and so
+				// count on the request basis; service-edge series model the
+				// client side of a call and do not (#197 request-basis
+				// counting). Without this the seeded history carries a zero
+				// request count and every request-basis read over the prefill
+				// range is silently empty.
+				d.ObserveSpan(v, r.Float64() < sp.errRate, i < numTraceSeries)
 			}
 			st.observations += int64(n)
 			sz := len(d.Sketch.Encode())

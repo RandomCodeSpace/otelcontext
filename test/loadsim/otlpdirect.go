@@ -51,6 +51,8 @@ import (
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 
 	mrand "math/rand"
+
+	"github.com/RandomCodeSpace/otelcontext/test/gate/gatecore"
 )
 
 // Measurement phases. Latency samples are bucketed by the phase in effect when
@@ -126,6 +128,10 @@ type emitterResult struct {
 	firstErr string
 }
 
+// ackLedger is nil unless -ack-ledger was given. Every emitter records into
+// it; gatecore.LedgerRecorder is safe for concurrent use.
+var ackLedger *gatecore.LedgerRecorder
+
 // live counters for the progress line.
 var (
 	liveAcked     [kindCount]atomic.Int64
@@ -147,6 +153,12 @@ type directConfig struct {
 	interval   time.Duration // batch tick
 	burstMul   float64
 	callTimout time.Duration
+	// ledgerPath, when set, turns on the ACK ledger: a per-aggregate-window
+	// record of contributions attempted versus contributions acknowledged,
+	// fsynced every ledgerFlush so a copy predating a server crash always
+	// exists on disk. The #202 recovery gate reads it; nothing else does.
+	ledgerPath  string
+	ledgerFlush time.Duration
 }
 
 // directEmitter drives one (service, signal) pair.
@@ -235,21 +247,30 @@ func (e *directEmitter) run(ctx context.Context, wg *sync.WaitGroup) {
 		e.carry -= float64(n)
 
 		var send func(context.Context) error
+		// contrib is the batch's per-aggregate-window point counts, derived
+		// from the timestamps the payload actually carries. The aggregate
+		// engine picks a span's window from its START time, which is
+		// backdated relative to this Export, so charging the whole batch to
+		// the call's own window would misattribute spans at every boundary.
+		var contrib gatecore.Contribution
 		switch e.kind {
 		case kindSpans:
-			req := e.buildSpans(n)
+			req, c := e.buildSpans(n)
+			contrib = c
 			send = func(c context.Context) error {
 				_, err := e.traceClient.Export(c, req)
 				return err
 			}
 		case kindLogs:
-			req := e.buildLogs(n)
+			req, c := e.buildLogs(n)
+			contrib = c
 			send = func(c context.Context) error {
 				_, err := e.logClient.Export(c, req)
 				return err
 			}
 		case kindMetrics:
-			req := e.buildMetrics(n)
+			req, c := e.buildMetrics(n)
+			contrib = c
 			send = func(c context.Context) error {
 				_, err := e.metricClient.Export(c, req)
 				return err
@@ -273,6 +294,11 @@ func (e *directEmitter) run(ctx context.Context, wg *sync.WaitGroup) {
 		liveSent[e.kind].Add(int64(n))
 		liveInflight.Add(1)
 		start := time.Now()
+		// The attempt is recorded BEFORE the Export leaves, so a ledger
+		// flushed mid-flight still bounds the crash interval from above.
+		if ackLedger != nil {
+			ackLedger.Attempt(contrib, signalNames[e.kind])
+		}
 		err := send(callCtx)
 		elapsed := time.Since(start)
 		liveInflight.Add(-1)
@@ -285,6 +311,11 @@ func (e *directEmitter) run(ctx context.Context, wg *sync.WaitGroup) {
 			e.out.reqOK[ph]++
 			e.out.pointsAcked[ph] += int64(n)
 			liveAcked[e.kind].Add(int64(n))
+			// The same Contribution the attempt used, so the two sides of
+			// the bound can never land in different windows.
+			if ackLedger != nil {
+				ackLedger.Ack(contrib, signalNames[e.kind])
+			}
 			continue
 		}
 
@@ -307,8 +338,9 @@ func (e *directEmitter) run(ctx context.Context, wg *sync.WaitGroup) {
 
 // buildSpans generates n spans grouped into short traces (a parent plus its
 // children, matching the SDK producer's every-10th-span shape at batch scale).
-func (e *directEmitter) buildSpans(n int) *coltracepb.ExportTraceServiceRequest {
+func (e *directEmitter) buildSpans(n int) (*coltracepb.ExportTraceServiceRequest, gatecore.Contribution) {
 	spans := make([]*tracepb.Span, 0, n)
+	contrib := gatecore.Contribution{}
 	var traceID, parentID []byte
 	inTrace := 0
 	now := time.Now()
@@ -348,6 +380,8 @@ func (e *directEmitter) buildSpans(n int) *coltracepb.ExportTraceServiceRequest 
 				intAttr("http.response.status_code", httpStatus),
 			},
 		}
+		// internal/aggregate windows a span by its START time.
+		contrib.Add(start, gatecore.WindowSecs)
 		spans = append(spans, sp)
 		if parentID == nil {
 			parentID = spanID
@@ -364,7 +398,7 @@ func (e *directEmitter) buildSpans(n int) *coltracepb.ExportTraceServiceRequest 
 				Spans: spans,
 			}},
 		}},
-	}
+	}, contrib
 }
 
 func (e *directEmitter) randomDur() time.Duration {
@@ -373,9 +407,10 @@ func (e *directEmitter) randomDur() time.Duration {
 
 // buildLogs generates n log records using the existing template and severity
 // mix helpers.
-func (e *directEmitter) buildLogs(n int) *collogspb.ExportLogsServiceRequest {
+func (e *directEmitter) buildLogs(n int) (*collogspb.ExportLogsServiceRequest, gatecore.Contribution) {
 	recs := make([]*logspb.LogRecord, 0, n)
 	now := time.Now()
+	contrib := gatecore.Contribution{}
 	for i := 0; i < n; i++ {
 		sev := pickSeverity(e.seq)
 		body := e.generateLogBodyRNG(e.seq)
@@ -387,6 +422,7 @@ func (e *directEmitter) buildLogs(n int) *collogspb.ExportLogsServiceRequest {
 				Value: &commonpb.AnyValue_StringValue{StringValue: body},
 			},
 		})
+		contrib.Add(now, gatecore.WindowSecs)
 		e.seq++
 	}
 	return &collogspb.ExportLogsServiceRequest{
@@ -397,7 +433,7 @@ func (e *directEmitter) buildLogs(n int) *collogspb.ExportLogsServiceRequest {
 				LogRecords: recs,
 			}},
 		}},
-	}
+	}, contrib
 }
 
 // generateLogBodyRNG mirrors (*producer).generateLogBody against this
@@ -428,8 +464,9 @@ func countPct(s string) int {
 // buildMetrics generates n data points spread across the three instruments the
 // SDK producer publishes: a cumulative monotonic request counter, a queue-depth
 // gauge, and a cumulative counter that resets every ~5 minutes.
-func (e *directEmitter) buildMetrics(n int) *colmetricspb.ExportMetricsServiceRequest {
-	now := uint64(time.Now().UnixNano()) // #nosec G115 -- wall clock, always positive
+func (e *directEmitter) buildMetrics(n int) (*colmetricspb.ExportMetricsServiceRequest, gatecore.Contribution) {
+	wallNow := time.Now()
+	now := uint64(wallNow.UnixNano()) // #nosec G115 -- wall clock, always positive
 	var counterPts, gaugePts, resetPts []*metricspb.NumberDataPoint
 
 	if time.Since(e.resetAt) > 5*time.Minute {
@@ -461,6 +498,10 @@ func (e *directEmitter) buildMetrics(n int) *colmetricspb.ExportMetricsServiceRe
 			})
 		}
 		e.seq++
+	}
+	contrib := gatecore.Contribution{}
+	for i := 0; i < n; i++ {
+		contrib.Add(wallNow, gatecore.WindowSecs)
 	}
 
 	var ms []*metricspb.Metric
@@ -500,7 +541,7 @@ func (e *directEmitter) buildMetrics(n int) *colmetricspb.ExportMetricsServiceRe
 				Metrics: ms,
 			}},
 		}},
-	}
+	}, contrib
 }
 
 // -------------------------------------------------------------------------
@@ -698,6 +739,15 @@ func runDirect(ctx context.Context, cfg directConfig, settle, sustained, burst t
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	if cfg.ledgerPath != "" {
+		flush := cfg.ledgerFlush
+		if flush <= 0 {
+			flush = 2 * time.Second
+		}
+		ackLedger = gatecore.NewLedgerRecorder(gatecore.WindowSecs, flush, time.Now())
+		go flushLedgerLoop(runCtx, cfg.ledgerPath, flush)
+	}
+
 	var wg sync.WaitGroup
 	currentPhase.Store(phaseSettle)
 	started := time.Now()
@@ -764,6 +814,13 @@ func runDirect(ctx context.Context, cfg directConfig, settle, sustained, burst t
 		"sustained_sec":       sustained.Seconds(),
 		"burst_sec":           burst.Seconds(),
 	}
+	if ackLedger != nil {
+		if err := gatecore.WriteLedger(cfg.ledgerPath, ackLedger.Snapshot(time.Now(), true)); err != nil {
+			return runReport{}, fmt.Errorf("write final ack ledger: %w", err)
+		}
+		fmt.Printf("ack ledger written to %s\n", cfg.ledgerPath)
+	}
+
 	rep := buildReport(results, phaseDur, cfgMap, started, ended)
 	if reportPath != "" {
 		if err := writeReport(reportPath, rep); err != nil {
@@ -772,6 +829,23 @@ func runDirect(ctx context.Context, cfg directConfig, settle, sustained, burst t
 	}
 	printDirectSummary(rep)
 	return rep, nil
+}
+
+// flushLedgerLoop fsyncs the ledger on an interval so a copy that predates a
+// server kill -9 is always on the platter, whatever happens to this process.
+func flushLedgerLoop(ctx context.Context, path string, every time.Duration) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if err := gatecore.WriteLedger(path, ackLedger.Snapshot(time.Now(), false)); err != nil {
+				fmt.Printf("ack ledger flush failed: %v\n", err)
+			}
+		}
+	}
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) {
