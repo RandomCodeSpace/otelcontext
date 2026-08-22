@@ -97,9 +97,15 @@ type ServiceError struct {
 
 // DashboardStats is the aggregated dashboard metric view.
 //
-// The coverage/accuracy/epoch/revision fields are ADDITIVE and only populated
-// in aggregate mode: `omitempty` keeps the legacy payload byte-for-byte what it
-// has always been.
+// The coverage/accuracy/epoch/revision fields and the six basis fields are
+// ADDITIVE and only populated in aggregate mode: `omitempty` keeps the legacy
+// payload byte-for-byte what it has always been.
+//
+// total_traces / total_errors / error_rate are REQUEST-basis in both modes —
+// legacy counts trace rows, aggregate counts root/SERVER spans (#194 blocker
+// 5). requests/request_errors/request_error_rate restate that basis by name,
+// and spans/span_errors/span_error_rate carry the span basis the old aggregate
+// payload was mislabelling as traces. Both rates are percents, like error_rate.
 type DashboardStats struct {
 	TotalTraces        int64          `json:"total_traces"`
 	TotalLogs          int64          `json:"total_logs"`
@@ -109,6 +115,13 @@ type DashboardStats struct {
 	ActiveServices     int64          `json:"active_services"`
 	P99LatencyMs       float64        `json:"p99_latency_ms"`
 	TopFailingServices []ServiceError `json:"top_failing_services"`
+
+	Requests         int64   `json:"requests,omitempty"`
+	RequestErrors    int64   `json:"request_errors,omitempty"`
+	RequestErrorRate float64 `json:"request_error_rate,omitempty"`
+	Spans            int64   `json:"spans,omitempty"`
+	SpanErrors       int64   `json:"span_errors,omitempty"`
+	SpanErrorRate    float64 `json:"span_error_rate,omitempty"`
 
 	Coverage     string                      `json:"coverage,omitempty"`
 	CoverageNote string                      `json:"coverage_note,omitempty"`
@@ -377,12 +390,20 @@ func DashboardStatsFromAggregate(r *aggregate.DashboardResult) DashboardStats {
 	}
 	acc := r.Accuracy
 	out := DashboardStats{
-		TotalTraces:    r.TotalTraces,
-		TotalLogs:      r.TotalLogs,
-		TotalErrors:    r.TotalErrors,
-		AvgLatencyMs:   r.AvgLatencyMs,
-		ErrorRate:      r.ErrorRate,
-		ActiveServices: r.ActiveServices,
+		// The headline trio is the REQUEST basis: that is what a dashboard
+		// labelled "traces" and "error rate" has always meant to a reader.
+		TotalTraces:      r.RequestCount,
+		TotalErrors:      r.ErrorRequestCount,
+		ErrorRate:        r.RequestErrorRate,
+		Requests:         r.RequestCount,
+		RequestErrors:    r.ErrorRequestCount,
+		RequestErrorRate: r.RequestErrorRate,
+		Spans:            r.SpanCount,
+		SpanErrors:       r.SpanErrorCount,
+		SpanErrorRate:    r.SpanErrorRate,
+		TotalLogs:        r.TotalLogs,
+		AvgLatencyMs:     r.AvgLatencyMs,
+		ActiveServices:   r.ActiveServices,
 		// The engine reports microseconds, matching storage.P99Latency; the
 		// view is milliseconds in both modes.
 		P99LatencyMs: r.P99LatencyMicros / 1000.0,

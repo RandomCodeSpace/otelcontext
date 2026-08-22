@@ -370,7 +370,7 @@ func TestDeltaMergeIsOrderIndependent(t *testing.T) {
 	build := func(vals []float64, offset int) *AggregateDelta {
 		d := &AggregateDelta{}
 		for i, v := range vals {
-			d.ObserveSpan(v, i%3 == 0)
+			d.ObserveSpan(v, i%3 == 0, true)
 			d.ObserveGauge(v, ts.Add(time.Duration(offset+i)*time.Second))
 		}
 		return d

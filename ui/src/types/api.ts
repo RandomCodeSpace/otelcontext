@@ -124,12 +124,25 @@ export interface ServiceMapMetrics {
 // internal/storage/metrics_repo.go
 // ============================================================================
 
-/** storage.TrafficPoint — point on the traffic chart. */
+/**
+ * storage.TrafficPoint — point on the traffic chart.
+ *
+ * `count` / `error_count` are the headline series and are REQUEST-based in both
+ * modes. The four basis-named fields are aggregate-mode only.
+ */
 export interface TrafficPoint {
   /** RFC3339 */
   timestamp: string
   count: number
   error_count: number
+  /** aggregate mode: request entry points (root or SERVER spans) */
+  requests?: number
+  /** aggregate mode: error subset of `requests` */
+  request_errors?: number
+  /** aggregate mode: spans, the per-operation diagnostic basis */
+  spans?: number
+  /** aggregate mode: error subset of `spans` */
+  span_errors?: number
   coverage?: CoverageType
   coverage_note?: string
 }
@@ -166,7 +179,13 @@ export interface AccuracyMetadata {
 /** Coverage type: full, sampled, or exemplar. */
 export type CoverageType = 'full' | 'sampled' | 'exemplar'
 
-/** storage.DashboardStats — aggregated dashboard metrics. */
+/**
+ * storage.DashboardStats — aggregated dashboard metrics.
+ *
+ * `total_traces` / `total_errors` / `error_rate` are REQUEST-based in both
+ * modes: legacy counts trace rows, aggregate counts root/SERVER spans. The six
+ * basis-named fields are aggregate-mode only; both rates are percents.
+ */
 export interface DashboardStats {
   total_traces: number
   total_logs: number
@@ -176,6 +195,18 @@ export interface DashboardStats {
   active_services: number
   p99_latency_ms: number
   top_failing_services: ServiceError[]
+  /** aggregate mode: request entry points; same value as `total_traces` */
+  requests?: number
+  /** aggregate mode: error subset of `requests`; same value as `total_errors` */
+  request_errors?: number
+  /** aggregate mode: percent; same value as `error_rate` */
+  request_error_rate?: number
+  /** aggregate mode: spans, the per-operation diagnostic basis */
+  spans?: number
+  /** aggregate mode: error subset of `spans` */
+  span_errors?: number
+  /** aggregate mode: percent */
+  span_error_rate?: number
   coverage?: CoverageType
   coverage_note?: string
   accuracy?: AccuracyMetadata

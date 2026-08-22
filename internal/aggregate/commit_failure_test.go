@@ -337,14 +337,16 @@ func seedTraceWindow(t *testing.T, f *cumulativeFixture, spans int) int64 {
 	return WindowStart(f.clock.Now())
 }
 
-// dashboardTraces queries the whole retained range and returns TotalTraces.
-func dashboardTraces(t *testing.T, e *Engine, from, to time.Time) int64 {
+// dashboardSpans queries the whole retained range and returns the SPAN count.
+// These tests seed spans directly and are about window VISIBILITY, not about
+// the request/span basis, so the span counter is the honest assertion here.
+func dashboardSpans(t *testing.T, e *Engine, from, to time.Time) int64 {
 	t.Helper()
 	res, err := e.QueryDashboard(Query{Tenant: "acme", Start: from, End: to})
 	if err != nil {
 		t.Fatalf("QueryDashboard: %v", err)
 	}
-	return res.TotalTraces
+	return res.SpanCount
 }
 
 // TestQueryDuringRolloverFinalizeGapReturnsTheWindow is the read-side proof of
@@ -361,16 +363,16 @@ func TestQueryDuringRolloverFinalizeGapReturnsTheWindow(t *testing.T) {
 	if forced := f.eng.Rollover(f.clock.Now()); forced != 0 {
 		t.Fatalf("rollover force-evicted %d windows, want 0", forced)
 	}
-	if got := dashboardTraces(t, f.eng, from, f.clock.Now()); got != 5 {
-		t.Fatalf("TotalTraces in the rollover-to-finalize gap = %d, want 5 — the window vanished", got)
+	if got := dashboardSpans(t, f.eng, from, f.clock.Now()); got != 5 {
+		t.Fatalf("SpanCount in the rollover-to-finalize gap = %d, want 5 — the window vanished", got)
 	}
 
 	// After the finalize commits, the same query is served from the store.
 	if n := f.w.FinalizeDue(f.clock.Now()); n != 1 {
 		t.Fatalf("finalized %d windows, want 1", n)
 	}
-	if got := dashboardTraces(t, f.eng, from, f.clock.Now()); got != 5 {
-		t.Fatalf("TotalTraces after finalize = %d, want 5", got)
+	if got := dashboardSpans(t, f.eng, from, f.clock.Now()); got != 5 {
+		t.Fatalf("SpanCount after finalize = %d, want 5", got)
 	}
 }
 
@@ -388,8 +390,8 @@ func TestFinalizerFailureKeepsTheWindowReadable(t *testing.T) {
 		if n := f.w.FinalizeDue(f.clock.Now()); n != 0 {
 			t.Fatalf("pass %d finalized %d windows against a failing store", i, n)
 		}
-		if got := dashboardTraces(t, f.eng, from, f.clock.Now()); got != 7 {
-			t.Fatalf("TotalTraces after %d failed finalizes = %d, want 7", i+1, got)
+		if got := dashboardSpans(t, f.eng, from, f.clock.Now()); got != 7 {
+			t.Fatalf("SpanCount after %d failed finalizes = %d, want 7", i+1, got)
 		}
 	}
 	if own := f.eng.Ownership(); !own.OwnsInMemory(WindowStart(from.Add(time.Minute))) {
@@ -401,7 +403,7 @@ func TestFinalizerFailureKeepsTheWindowReadable(t *testing.T) {
 	if n := f.w.FinalizeDue(f.clock.Now()); n != 1 {
 		t.Fatalf("finalized %d windows after recovery, want 1", n)
 	}
-	if got := dashboardTraces(t, f.eng, from, f.clock.Now()); got != 7 {
-		t.Fatalf("TotalTraces after the finalizer recovered = %d, want 7", got)
+	if got := dashboardSpans(t, f.eng, from, f.clock.Now()); got != 7 {
+		t.Fatalf("SpanCount after the finalizer recovered = %d, want 7", got)
 	}
 }

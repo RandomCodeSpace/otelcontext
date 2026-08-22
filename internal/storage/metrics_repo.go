@@ -20,10 +20,21 @@ import (
 var sqliteP99RowCap = 200_000
 
 // TrafficPoint represents a data point for the traffic chart.
+//
+// count/error_count are the chart's headline series and keep their legacy
+// meaning: one REQUEST per point in both modes (legacy counts trace rows;
+// aggregate counts root/SERVER spans). The four explicitly-named fields below
+// are additive, aggregate-mode-only and say their basis outright (#197 Q3) so a
+// client never has to guess which one it is looking at.
 type TrafficPoint struct {
 	Timestamp  time.Time `json:"timestamp"`
 	Count      int64     `json:"count"`
 	ErrorCount int64     `json:"error_count"`
+
+	Requests      int64 `json:"requests,omitempty"`
+	RequestErrors int64 `json:"request_errors,omitempty"`
+	Spans         int64 `json:"spans,omitempty"`
+	SpanErrors    int64 `json:"span_errors,omitempty"`
 }
 
 // LatencyPoint represents a data point for the latency heatmap.
@@ -41,6 +52,13 @@ type ServiceError struct {
 }
 
 // DashboardStats represents aggregated metrics for the dashboard.
+//
+// total_traces / total_errors / error_rate keep their legacy meaning in both
+// modes: a REQUEST count, its error subset, and the error rate over it as a
+// percent. In legacy mode they come from counting trace rows; in aggregate mode
+// they come from root/SERVER span counting, which is what #194 blocker 5 says
+// they should always have been. The six additive fields below are populated
+// only in aggregate mode and name their basis explicitly (#197 Q3).
 type DashboardStats struct {
 	TotalTraces        int64          `json:"total_traces"`
 	TotalLogs          int64          `json:"total_logs"`
@@ -50,6 +68,13 @@ type DashboardStats struct {
 	ActiveServices     int64          `json:"active_services"`
 	P99Latency         int64          `json:"p99_latency"`
 	TopFailingServices []ServiceError `json:"top_failing_services"`
+
+	Requests         int64   `json:"requests,omitempty"`
+	RequestErrors    int64   `json:"request_errors,omitempty"`
+	RequestErrorRate float64 `json:"request_error_rate,omitempty"`
+	Spans            int64   `json:"spans,omitempty"`
+	SpanErrors       int64   `json:"span_errors,omitempty"`
+	SpanErrorRate    float64 `json:"span_error_rate,omitempty"`
 }
 
 // BatchCreateMetrics inserts aggregated metrics in batches.
