@@ -83,7 +83,7 @@ func aggregateTestServer(t *testing.T, withEngine bool) (*Server, *rawTableCount
 // current window.
 func seedAggregate(t *testing.T, e *aggregate.Engine, tenant, service string, spans int, micros float64) {
 	t.Helper()
-	tenantID := e.TenantID(tenant)
+	tenantID, _ := e.TenantID(tenant)
 	key := aggregate.SeriesKey{
 		TenantID:    tenantID,
 		ServiceID:   e.Cache().Intern(tenantID, aggregate.KindService, service),

@@ -168,7 +168,7 @@ func newSeedFixture(t *testing.T) *seedFixture {
 	store := newTestStoreAt(t, filepath.Join(t.TempDir(), "aggregate.db"), StoreConfig{})
 	e.SetStore(store)
 
-	tenantID := e.TenantID("default")
+	tenantID, _ := e.TenantID("default")
 	windowSecs := int64(WindowSize / time.Second)
 	base := WindowStart(now) - int64(seedWindows+2)*windowSecs
 
@@ -262,7 +262,7 @@ func (f *seedFixture) query(services ...string) Query {
 // selector is the store-level equivalent of query.
 func (f *seedFixture) selector() Selector {
 	return Selector{
-		TenantID: f.engine.TenantID("default"),
+		TenantID: mustTenantID(f.engine, "default"),
 		Start:    f.base,
 		End:      f.base + int64(seedWindows)*int64(WindowSize/time.Second),
 	}
@@ -449,7 +449,7 @@ func TestPercentilePathReadsEverySketchBearingRow(t *testing.T) {
 	store := newTestStoreAt(t, filepath.Join(t.TempDir(), "aggregate.db"), StoreConfig{})
 	e.SetStore(store)
 
-	tenantID := e.TenantID("default")
+	tenantID, _ := e.TenantID("default")
 	windowSecs := int64(WindowSize / time.Second)
 	base := WindowStart(now) - 4*windowSecs
 
@@ -684,4 +684,14 @@ func TestStoreRefusesAV2FileAndRebuildsOnDemand(t *testing.T) {
 	if len(sums) != 1 || sums[0].RequestCount != 2 || sums[0].ErrorRequestCount != 1 {
 		t.Fatalf("rebuilt store summed %+v, want 2 requests / 1 error request", sums)
 	}
+}
+
+// mustTenantID resolves a tenant identity in tests, failing loudly on the
+// rejection path rather than silently building a zero-tenant key.
+func mustTenantID(e *Engine, name string) uint32 {
+	id, ok := e.TenantID(name)
+	if !ok {
+		panic("aggregate test: tenant identity rejected: " + name)
+	}
+	return id
 }

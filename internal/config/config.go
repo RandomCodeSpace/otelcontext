@@ -368,6 +368,44 @@ type Config struct {
 	// whose lateness horizon has expired.
 	AggregateFinalizeIntervalSec int
 
+	// Identity lifecycle (#200). The aggregate dictionary and series table
+	// were append-only: every name a deployment ever emitted stayed on disk
+	// long after retention purged the last bucket naming it.
+
+	// AggregateGCEnabled runs the daily mark-and-sweep over the aggregate
+	// dictionary, series and log-template tables. On by default. Turning it
+	// off is a disk-growth decision, not a safety one — a pass that fails
+	// leaves memory untouched.
+	AggregateGCEnabled bool
+
+	// AggregateMaxValueBytes caps the ENCODED length of a dictionary value
+	// for every non-tenant kind: service names, metric names, operations,
+	// dimension keys, dimension values and dimension tuples. An over-length
+	// value routes to __other__ and is NEVER truncated — a truncated value is
+	// a different identity wearing the same name.
+	AggregateMaxValueBytes int
+
+	// AggregateMaxTenantBytes is the stricter cap on a tenant name, and
+	// AggregateMaxTenants is the instance-wide tenant-identity cap. A tenant
+	// that breaches either is REJECTED: the point is refused and counted, and
+	// the tenant is never collapsed into a shared identity, because a shared
+	// overflow tenant is precisely the cross-tenant merge the cap prevents.
+	AggregateMaxTenantBytes int
+	AggregateMaxTenants     int
+
+	// Per-tenant and instance-wide dictionary count caps for the namespaces
+	// that were uncapped before #200. The per-tenant cap bounds one tenant;
+	// the instance cap is the backstop for many tenants each staying just
+	// under their own. Overflow routes to __other__, per existing semantics.
+	AggregateMaxServicesPerTenant  int
+	AggregateMaxServices           int
+	AggregateMaxDimKeysPerTenant   int
+	AggregateMaxDimKeys            int
+	AggregateMaxDimValuesPerTenant int
+	AggregateMaxDimValues          int
+	AggregateMaxDimTuplesPerTenant int
+	AggregateMaxDimTuples          int
+
 	// AggregateMetricDims is the parsed AGGREGATE_METRIC_DIMS config:
 	// map of metric name -> sorted list of OTLP attribute keys.
 	// Empty map when AGGREGATE_METRIC_DIMS is unset/empty.
@@ -555,6 +593,20 @@ func Load(customPath string) (*Config, error) {
 		AggregateCommitMaxWaiters:       getEnvInt("AGGREGATE_COMMIT_MAX_WAITERS", 512),
 		AggregateCommitMaxPendingDeltas: getEnvInt("AGGREGATE_COMMIT_MAX_PENDING_DELTAS", 200000),
 		AggregateFinalizeIntervalSec:    getEnvInt("AGGREGATE_FINALIZE_INTERVAL_SEC", 30),
+
+		// Identity lifecycle (#200)
+		AggregateGCEnabled:             getEnvBool("AGGREGATE_GC_ENABLED", true),
+		AggregateMaxValueBytes:         getEnvInt("AGGREGATE_MAX_VALUE_BYTES", 512),
+		AggregateMaxTenantBytes:        getEnvInt("AGGREGATE_MAX_TENANT_BYTES", 128),
+		AggregateMaxTenants:            getEnvInt("AGGREGATE_MAX_TENANTS", 256),
+		AggregateMaxServicesPerTenant:  getEnvInt("AGGREGATE_MAX_SERVICES_PER_TENANT", 500),
+		AggregateMaxServices:           getEnvInt("AGGREGATE_MAX_SERVICES", 5000),
+		AggregateMaxDimKeysPerTenant:   getEnvInt("AGGREGATE_MAX_DIM_KEYS_PER_TENANT", 200),
+		AggregateMaxDimKeys:            getEnvInt("AGGREGATE_MAX_DIM_KEYS", 2000),
+		AggregateMaxDimValuesPerTenant: getEnvInt("AGGREGATE_MAX_DIM_VALUES_PER_TENANT", 5000),
+		AggregateMaxDimValues:          getEnvInt("AGGREGATE_MAX_DIM_VALUES", 50000),
+		AggregateMaxDimTuplesPerTenant: getEnvInt("AGGREGATE_MAX_DIM_TUPLES_PER_TENANT", 5000),
+		AggregateMaxDimTuples:          getEnvInt("AGGREGATE_MAX_DIM_TUPLES", 50000),
 		// Bounded exemplar retention (aggregate mode only)
 		ExemplarTracesPerServiceWindow:    getEnvInt("EXEMPLAR_TRACES_PER_SERVICE_WINDOW", 25),
 		ExemplarTracesGlobalWindow:        getEnvInt("EXEMPLAR_TRACES_GLOBAL_WINDOW", 1500),

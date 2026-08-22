@@ -529,11 +529,32 @@ func main() {
 		// the value resolves to __other__, the designed degradation. Service,
 		// tenant and dimension namespaces stay uncapped — they are bounded by
 		// the deployment and by AGGREGATE_METRIC_DIMS respectively.
-		registrar, err := aggregate.NewDurableRegistrar(aggStore, map[aggregate.Kind]int{
-			aggregate.KindOperation:   cfg.AggregateMaxSeriesTraces + cfg.AggregateMaxSeriesEdges,
-			aggregate.KindMetricName:  cfg.AggregateMaxSeriesMetrics,
-			aggregate.KindLogTemplate: cfg.AggregateMaxSeriesLogs,
-		})
+		//
+		// #200 Q3 closed the remaining holes: the service, dim-key, dim-value
+		// and dim-tuple namespaces are capped per tenant AND instance-wide,
+		// every value carries an encoded-length bound, and the tenant
+		// namespace is capped and REFUSES rather than degrading.
+		aggBounds := aggregate.Bounds{
+			MaxValueBytes:  cfg.AggregateMaxValueBytes,
+			MaxTenantBytes: cfg.AggregateMaxTenantBytes,
+			MaxTenants:     cfg.AggregateMaxTenants,
+			PerTenantKind: map[aggregate.Kind]int{
+				aggregate.KindOperation:   cfg.AggregateMaxSeriesTraces + cfg.AggregateMaxSeriesEdges,
+				aggregate.KindMetricName:  cfg.AggregateMaxSeriesMetrics,
+				aggregate.KindLogTemplate: cfg.AggregateMaxSeriesLogs,
+				aggregate.KindService:     cfg.AggregateMaxServicesPerTenant,
+				aggregate.KindDimKey:      cfg.AggregateMaxDimKeysPerTenant,
+				aggregate.KindDimValue:    cfg.AggregateMaxDimValuesPerTenant,
+				aggregate.KindDimTuple:    cfg.AggregateMaxDimTuplesPerTenant,
+			},
+			InstanceKind: map[aggregate.Kind]int{
+				aggregate.KindService:  cfg.AggregateMaxServices,
+				aggregate.KindDimKey:   cfg.AggregateMaxDimKeys,
+				aggregate.KindDimValue: cfg.AggregateMaxDimValues,
+				aggregate.KindDimTuple: cfg.AggregateMaxDimTuples,
+			},
+		}
+		registrar, err := aggregate.NewDurableRegistrarWithBounds(aggStore, aggBounds)
 		if err != nil {
 			fatal("❌ Aggregate dictionary could not be loaded", err, "path", cfg.AggregateDBPath)
 		}
@@ -541,6 +562,7 @@ func main() {
 		aggEngine, err = aggregate.NewEngine(aggregate.EngineConfig{
 			Mode:      cfg.AggregateMode,
 			Registrar: registrar,
+			Bounds:    aggBounds,
 			Limiter: aggregate.LimiterConfig{
 				MaxSeries:                 cfg.AggregateMaxSeries,
 				MaxSeriesMetrics:          cfg.AggregateMaxSeriesMetrics,
@@ -585,6 +607,16 @@ func main() {
 		})
 		if err != nil {
 			fatal("❌ Aggregate group-commit writer rejected", err)
+		}
+
+		// Log-template miner state is reloaded BEFORE anything can mine a line
+		// (#200 Q4). A line mined against an empty miner would mint a second
+		// identity for a pattern that already has one, and both would be live
+		// against the same seven-day buckets.
+		if restored, err := aggregate.RestoreMiner(aggStore, aggEngine.Miner()); err != nil {
+			fatal("❌ Aggregate log-template state could not be reloaded", err, "path", cfg.AggregateDBPath)
+		} else if restored > 0 {
+			slog.Info("🔤 Aggregate log templates reloaded", "templates", restored)
 		}
 
 		// Recovery runs BEFORE the writer starts accepting Exports and before
@@ -640,6 +672,20 @@ func main() {
 			},
 			aggStore.Analyze,
 		)
+
+		// Identity GC rides the same daily maintenance tick as ANALYZE
+		// (#200 Q1). Retention deletes the buckets; this is what deletes the
+		// names those buckets were the last reference to. The full mark scan
+		// runs lock-free — only the revalidate/fence/delete tail serializes
+		// with the group commit.
+		if cfg.AggregateGCEnabled {
+			writer := aggWriter
+			retention.SetAggregateGC(func() error {
+				stats, err := writer.CollectIdentities()
+				aggregate.LogGC(stats, err)
+				return err
+			})
+		}
 	}
 
 	// Aggregate READ path (#175). Only AGGREGATE_MODE=aggregate switches the

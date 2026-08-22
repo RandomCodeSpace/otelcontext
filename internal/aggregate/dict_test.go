@@ -79,7 +79,7 @@ func TestCacheInternIsStableAndTenantScoped(t *testing.T) {
 func TestCacheInternTenantUsesGlobalScope(t *testing.T) {
 	reg := NewMemRegistrar(nil)
 	c := NewCache(reg)
-	id := c.InternTenant("acme")
+	id, _ := c.InternTenant("acme")
 	if id != c.Intern(GlobalTenant, KindTenant, "acme") {
 		t.Fatal("InternTenant disagrees with the global tenant scope")
 	}

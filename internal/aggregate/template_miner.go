@@ -187,6 +187,21 @@ type TemplateMiner struct {
 	idxMu sync.RWMutex
 	text  map[uint32]string
 	alias map[uint32]uint32
+
+	// stageMu guards the durable-state staging maps (#200 Q4). Lock order is
+	// partition mutex -> stageMu, never the reverse.
+	//
+	// pending holds IDENTITY-critical mutations — a new template, a pattern
+	// generalization, an alias change. They ride the next group commit, so
+	// they become durable in the same transaction as the delta that used the
+	// identity. A periodic snapshot alone would let a crash acknowledge a
+	// bucket whose NameID the reloaded miner has never heard of.
+	//
+	// dirty holds the non-identity counters. Losing one costs a count, not an
+	// identity, so they take the cheap periodic path instead.
+	stageMu sync.Mutex
+	pending map[uint32]TemplateRow
+	dirty   map[uint32]TemplateStatRow
 }
 
 // NewTemplateMiner builds a miner from cfg, applying defaults.
@@ -201,6 +216,8 @@ func NewTemplateMiner(cfg TemplateMinerConfig) *TemplateMiner {
 		parts:        make(map[tmPartKey]*tmPartition),
 		text:         make(map[uint32]string),
 		alias:        make(map[uint32]uint32),
+		pending:      make(map[uint32]TemplateRow),
+		dirty:        make(map[uint32]TemplateStatRow),
 	}
 	if m.maxTemplates <= 0 {
 		m.maxTemplates = DefaultMaxLogTemplatesPerService
@@ -403,6 +420,10 @@ type tmTemplate struct {
 	id     uint32
 	seq    uint64 // partition-local creation ordinal; lower survives convergence
 	tokens []string
+	// version increments on every generalization of tokens. It is what makes
+	// a re-offered row from a failed commit unable to roll a newer pattern
+	// backwards, and what a reload uses to pick the winner (#200 Q4).
+	version uint32
 
 	count     uint64
 	firstSeen time.Time
@@ -493,13 +514,16 @@ func (m *TemplateMiner) mine(p *tmPartition, tokens []string, raw string, at tim
 		}
 		if changed {
 			// The ID does not move — only the text under it.
+			best.version++
 			m.setText(best.id, tmJoin(best.tokens))
+			m.stage(p, best)
 			if twin := p.findTwinLocked(best); twin != nil {
 				best = m.convergeLocked(p, best, twin)
 			}
 		}
 		best.count++
 		best.lastSeen = at
+		m.markDirty(best)
 
 		if !wantText {
 			return best.id, false, ""
@@ -546,6 +570,7 @@ func (m *TemplateMiner) mine(p *tmPartition, tokens []string, raw string, at tim
 	leaf.groups = append(leaf.groups, t)
 	p.templates[id] = t
 	m.setText(id, text)
+	m.stage(p, t)
 	return id, false, text
 }
 
@@ -568,6 +593,13 @@ func (m *TemplateMiner) ensureOtherLocked(p *tmPartition) {
 	}
 	p.otherID = id
 	m.setText(id, TemplateOther)
+	m.stageRow(TemplateRow{
+		ID:      id,
+		Tenant:  p.tenant,
+		Service: p.service,
+		Tokens:  TemplateOther,
+		IsOther: true,
+	})
 }
 
 // tmBestMatch scores the leaf's templates by Drain's simSeq. Ties go to the
@@ -649,6 +681,24 @@ func (m *TemplateMiner) convergeLocked(p *tmPartition, a, b *tmTemplate) *tmTemp
 	p.converged++
 
 	m.aliasID(retired.id, survivor.id)
+	// BOTH ends of the alias are staged. A historical series still names the
+	// retired ID, so the forwarding row is as identity-critical as the
+	// survivor's pattern — losing it turns a seven-day bucket into a template
+	// nothing can resolve (#200 Q5).
+	retired.version++
+	m.stageRow(TemplateRow{
+		ID:             retired.id,
+		Tenant:         p.tenant,
+		Service:        p.service,
+		PatternVersion: retired.version,
+		Tokens:         tmEncodeTokens(retired.tokens),
+		Seq:            retired.seq,
+		AliasOf:        survivor.id,
+		Count:          retired.count,
+		FirstSeen:      tmUnixNano(retired.firstSeen),
+		LastSeen:       tmUnixNano(retired.lastSeen),
+	})
+	m.stage(p, survivor)
 	return survivor
 }
 
@@ -908,4 +958,316 @@ func tmTokensEqual(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// --- durable miner state (#200 Q4, Q5) --------------------------------------
+//
+// What is persisted, and why exactly this much:
+//
+//	tenant/service     the partition a template belongs to, as STRINGS — a
+//	                   reload has to rebuild partitions before any dictionary
+//	                   cache is warm.
+//	template_id        the immutable surrogate identity. It IS the dictionary
+//	                   ID and IS the log series NameID; there is no second ID
+//	                   space.
+//	pattern_version    monotonic per template, so a stale write cannot roll a
+//	                   generalization backwards.
+//	tokens             the token pattern, which is everything the prefix tree
+//	                   needs to be rebuilt.
+//	seq                the partition-local ordinal convergence uses to pick a
+//	                   survivor. Two restarts must not pick differently.
+//	is_other           marks the partition's overflow identity.
+//	alias_of           the survivor a retired ID forwards to.
+//	count/first/last   statistics. Non-identity, periodic path.
+//
+// What is NOT persisted: the raw log sample. It is a credential and PII sink,
+// and exemplars already carry the raw line for the cases that need one.
+
+// tmTokenSep joins tokens for storage. The tokenizer splits on whitespace and
+// never emits an empty or NUL-bearing token, so NUL is an unambiguous
+// separator that survives any body a client can send.
+const tmTokenSep = "\x00"
+
+// tmEncodeTokens renders a token pattern for storage.
+func tmEncodeTokens(tokens []string) string { return strings.Join(tokens, tmTokenSep) }
+
+// tmDecodeTokens parses a stored token pattern. An empty string is no tokens,
+// not one empty token.
+func tmDecodeTokens(s string) []string {
+	if s == "" {
+		return nil
+	}
+	return strings.Split(s, tmTokenSep)
+}
+
+// tmUnixNano renders a time for storage; the zero time stores as 0.
+func tmUnixNano(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return t.UnixNano()
+}
+
+// tmTimeFromNano reverses tmUnixNano.
+func tmTimeFromNano(n int64) time.Time {
+	if n == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, n).UTC()
+}
+
+// stage records one template's identity state for the next group commit. The
+// partition mutex must be held.
+func (m *TemplateMiner) stage(p *tmPartition, t *tmTemplate) {
+	var aliasOf uint32
+	if t.aliasOf != nil {
+		aliasOf = t.aliasOf.id
+	}
+	m.stageRow(TemplateRow{
+		ID:             t.id,
+		Tenant:         p.tenant,
+		Service:        p.service,
+		PatternVersion: t.version,
+		Tokens:         tmEncodeTokens(t.tokens),
+		Seq:            t.seq,
+		AliasOf:        aliasOf,
+		Count:          t.count,
+		FirstSeen:      tmUnixNano(t.firstSeen),
+		LastSeen:       tmUnixNano(t.lastSeen),
+	})
+}
+
+// stageRow queues one identity mutation. A newer version for the same ID
+// replaces an older staged one: only the latest pattern is worth committing.
+func (m *TemplateMiner) stageRow(row TemplateRow) {
+	if row.ID == 0 {
+		return
+	}
+	m.stageMu.Lock()
+	if prev, ok := m.pending[row.ID]; !ok || row.PatternVersion >= prev.PatternVersion {
+		m.pending[row.ID] = row
+	}
+	m.stageMu.Unlock()
+}
+
+// markDirty records a statistics-only change. The partition mutex must be held.
+func (m *TemplateMiner) markDirty(t *tmTemplate) {
+	if t.id == 0 {
+		return
+	}
+	m.stageMu.Lock()
+	m.dirty[t.id] = TemplateStatRow{
+		ID:        t.id,
+		Count:     t.count,
+		FirstSeen: tmUnixNano(t.firstSeen),
+		LastSeen:  tmUnixNano(t.lastSeen),
+	}
+	m.stageMu.Unlock()
+}
+
+// DrainPending returns the staged identity mutations for the next group
+// commit, oldest ID first. They stay staged until Committed confirms them, so
+// a failed commit re-offers them rather than acknowledging a delta whose
+// template identity never became durable.
+func (m *TemplateMiner) DrainPending() []TemplateRow {
+	m.stageMu.Lock()
+	defer m.stageMu.Unlock()
+	if len(m.pending) == 0 {
+		return nil
+	}
+	out := make([]TemplateRow, 0, len(m.pending))
+	for _, row := range m.pending {
+		out = append(out, row)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+// Committed marks drained rows durable. A row whose pattern moved on since the
+// drain stays staged: the version guard is what makes that safe.
+func (m *TemplateMiner) Committed(rows []TemplateRow) {
+	if len(rows) == 0 {
+		return
+	}
+	m.stageMu.Lock()
+	for _, row := range rows {
+		if cur, ok := m.pending[row.ID]; ok && cur.PatternVersion <= row.PatternVersion {
+			delete(m.pending, row.ID)
+		}
+	}
+	m.stageMu.Unlock()
+}
+
+// PendingCount reports how many identity mutations are staged but not durable.
+func (m *TemplateMiner) PendingCount() int {
+	m.stageMu.Lock()
+	defer m.stageMu.Unlock()
+	return len(m.pending)
+}
+
+// DrainDirtyStats returns the statistics-only updates for the periodic write
+// and clears the dirty set. These are fire-and-forget: a lost batch costs a
+// count that the next line restores, never an identity.
+func (m *TemplateMiner) DrainDirtyStats() []TemplateStatRow {
+	m.stageMu.Lock()
+	defer m.stageMu.Unlock()
+	if len(m.dirty) == 0 {
+		return nil
+	}
+	out := make([]TemplateStatRow, 0, len(m.dirty))
+	for _, row := range m.dirty {
+		out = append(out, row)
+	}
+	m.dirty = make(map[uint32]TemplateStatRow)
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+// Roots returns every template ID the miner keeps alive: live templates, the
+// per-partition overflow sentinels, both ends of every alias, and every staged
+// mutation (#200 Q5).
+//
+// Both ends, deliberately. A historical series that named a retired template
+// keeps that ID, its alias row, AND the survivor alive: collecting the survivor
+// would leave the alias pointing at nothing, and collecting the alias would
+// leave the series unresolvable.
+func (m *TemplateMiner) Roots() map[uint32]struct{} {
+	m.mu.RLock()
+	parts := make([]*tmPartition, 0, len(m.parts))
+	for _, p := range m.parts {
+		parts = append(parts, p)
+	}
+	m.mu.RUnlock()
+
+	out := make(map[uint32]struct{}, len(parts)*(m.maxTemplates+1))
+	for _, p := range parts {
+		p.mu.Lock()
+		if p.otherID != 0 {
+			out[p.otherID] = struct{}{}
+		}
+		for id := range p.templates {
+			out[id] = struct{}{}
+		}
+		p.mu.Unlock()
+	}
+
+	m.idxMu.RLock()
+	for id := range m.text {
+		out[id] = struct{}{}
+	}
+	for from, to := range m.alias {
+		out[from] = struct{}{}
+		out[to] = struct{}{}
+	}
+	m.idxMu.RUnlock()
+
+	m.stageMu.Lock()
+	for id, row := range m.pending {
+		out[id] = struct{}{}
+		if row.AliasOf != 0 {
+			out[row.AliasOf] = struct{}{}
+		}
+	}
+	m.stageMu.Unlock()
+	return out
+}
+
+// Restore rebuilds the miner's partitions, prefix trees, alias index and cap
+// accounting from durable rows. It must run BEFORE ingest starts: a line mined
+// against an empty miner would mint a second identity for a pattern that
+// already has one, and both would be live.
+//
+// Restoring stages nothing: every row handed here is already durable.
+func (m *TemplateMiner) Restore(rows []TemplateRow) {
+	if len(rows) == 0 {
+		return
+	}
+	// Deterministic order so partition sequence counters and leaf group order
+	// rebuild identically on every boot.
+	ordered := append([]TemplateRow(nil), rows...)
+	sort.Slice(ordered, func(i, j int) bool {
+		if ordered[i].Tenant != ordered[j].Tenant {
+			return ordered[i].Tenant < ordered[j].Tenant
+		}
+		if ordered[i].Service != ordered[j].Service {
+			return ordered[i].Service < ordered[j].Service
+		}
+		if ordered[i].Seq != ordered[j].Seq {
+			return ordered[i].Seq < ordered[j].Seq
+		}
+		return ordered[i].ID < ordered[j].ID
+	})
+
+	byID := make(map[uint32]*tmTemplate, len(ordered))
+	aliasTargets := make(map[uint32]uint32, len(ordered))
+	for _, row := range ordered {
+		p := m.partition(row.Tenant, row.Service)
+		p.mu.Lock()
+		if row.IsOther {
+			p.otherID = row.ID
+			p.mu.Unlock()
+			m.setText(row.ID, TemplateOther)
+			continue
+		}
+		tokens := tmDecodeTokens(row.Tokens)
+		t := &tmTemplate{
+			id:        row.ID,
+			seq:       row.Seq,
+			tokens:    tokens,
+			version:   row.PatternVersion,
+			count:     row.Count,
+			firstSeen: tmTimeFromNano(row.FirstSeen),
+			lastSeen:  tmTimeFromNano(row.LastSeen),
+		}
+		if row.Seq >= p.nextSeq {
+			p.nextSeq = row.Seq + 1
+		}
+		if row.AliasOf != 0 {
+			// A retired ID stays in its leaf as a forwarder so lines that used
+			// to match it resolve to the survivor, and it does NOT consume a
+			// slot against the per-partition cap.
+			aliasTargets[row.ID] = row.AliasOf
+		} else {
+			p.templates[row.ID] = t
+		}
+		if len(tokens) > 0 {
+			leaf := p.descend(tokens, m.depth, m.maxChildren)
+			t.leaf = leaf
+			leaf.groups = append(leaf.groups, t)
+		}
+		p.mu.Unlock()
+		byID[row.ID] = t
+		if row.AliasOf == 0 {
+			m.setText(row.ID, tmJoin(tokens))
+		}
+	}
+
+	// Second pass: alias edges, once every template object exists.
+	m.idxMu.Lock()
+	for from, to := range aliasTargets {
+		m.alias[from] = to
+		delete(m.text, from)
+	}
+	m.idxMu.Unlock()
+	for from, to := range aliasTargets {
+		if src, ok := byID[from]; ok {
+			src.aliasOf = byID[to]
+		}
+	}
+}
+
+// RestoreMiner warms miner from store before ingest starts. A store that
+// cannot carry templates (an older implementation) restores nothing, which is
+// the pre-#200 behaviour.
+func RestoreMiner(store Store, miner *TemplateMiner) (int, error) {
+	gcs, ok := store.(GCStore)
+	if !ok || miner == nil {
+		return 0, nil
+	}
+	rows, err := gcs.LoadTemplates(0)
+	if err != nil {
+		return 0, err
+	}
+	miner.Restore(rows)
+	return len(rows), nil
 }

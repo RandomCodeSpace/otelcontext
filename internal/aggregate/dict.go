@@ -69,6 +69,106 @@ const OtherValue = "__other__"
 // never propagates it to the hot path — identity resolution never fails.
 var ErrDictFull = errors.New("aggregate: dictionary full")
 
+// ErrTenantRejected is returned when a tenant identity cannot be admitted: its
+// encoded name is over the tenant length cap, it is empty, or the
+// instance-wide tenant-identity cap is full.
+//
+// Unlike every other namespace, a tenant is NEVER collapsed into __other__
+// (#200 Q3). Merging two tenants into one identity is a data-isolation
+// failure, not a degradation: the point is refused and counted instead.
+var ErrTenantRejected = errors.New("aggregate: tenant identity rejected")
+
+// Identity bound defaults (#200 Q3).
+const (
+	// DefaultMaxValueBytes is the encoded-value length cap applied to every
+	// non-tenant dictionary kind. An over-length value is routed to
+	// __other__ and NEVER truncated: a truncated value is a different
+	// identity wearing the same name, which is worse than an honest
+	// "unnamed" bucket.
+	DefaultMaxValueBytes = 512
+
+	// DefaultMaxTenantBytes is the stricter cap on a tenant name. Tenants are
+	// asserted by clients (header, gRPC metadata, or an OTLP resource
+	// attribute), so the namespace that scopes every other namespace gets the
+	// tightest bound.
+	DefaultMaxTenantBytes = 128
+
+	// DefaultMaxTenants is the instance-wide tenant-identity cap. A shared
+	// API key grants access to every tenant, so an authenticated but hostile
+	// client can still assert tenant names; this is what bounds that.
+	DefaultMaxTenants = 256
+
+	// Instance-wide dictionary backstops for the namespaces that were
+	// uncapped before #200. The per-tenant caps bound one tenant; these bound
+	// the instance when many tenants each stay just under their own cap.
+	DefaultMaxServicesPerTenant  = 500
+	DefaultMaxServices           = 5000
+	DefaultMaxDimKeysPerTenant   = 200
+	DefaultMaxDimKeys            = 2000
+	DefaultMaxDimValuesPerTenant = 5000
+	DefaultMaxDimValues          = 50000
+	DefaultMaxDimTuplesPerTenant = 5000
+	DefaultMaxDimTuples          = 50000
+)
+
+// Bounds is the identity-bound configuration of a Cache and its Registrar
+// (#200 Q3). The zero value takes every default.
+type Bounds struct {
+	// MaxValueBytes caps the encoded length of a non-tenant dictionary value.
+	MaxValueBytes int
+	// MaxTenantBytes caps the encoded length of a tenant name.
+	MaxTenantBytes int
+	// MaxTenants is the instance-wide tenant-identity cap.
+	MaxTenants int
+	// PerTenantKind caps entries per (tenant, kind). A missing or zero entry
+	// means unlimited. __other__ entries are exempt.
+	PerTenantKind map[Kind]int
+	// InstanceKind caps entries per kind across every tenant — the backstop
+	// behind PerTenantKind. A missing or zero entry means unlimited.
+	InstanceKind map[Kind]int
+}
+
+// withDefaults returns b with unset knobs filled in.
+func (b Bounds) withDefaults() Bounds {
+	if b.MaxValueBytes <= 0 {
+		b.MaxValueBytes = DefaultMaxValueBytes
+	}
+	if b.MaxTenantBytes <= 0 {
+		b.MaxTenantBytes = DefaultMaxTenantBytes
+	}
+	if b.MaxTenants <= 0 {
+		b.MaxTenants = DefaultMaxTenants
+	}
+	b.PerTenantKind = cloneKindLimits(b.PerTenantKind)
+	b.InstanceKind = cloneKindLimits(b.InstanceKind)
+	return b
+}
+
+// cloneKindLimits copies a kind-limit map, dropping non-positive entries.
+func cloneKindLimits(in map[Kind]int) map[Kind]int {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[Kind]int, len(in))
+	for k, v := range in {
+		if v > 0 {
+			out[k] = v
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// valueCap returns the encoded-length cap for kind.
+func (b Bounds) valueCap(kind Kind) int {
+	if kind == KindTenant {
+		return b.MaxTenantBytes
+	}
+	return b.MaxValueBytes
+}
+
 // Registrar mints dictionary IDs. Phase 1 ships MemRegistrar, whose IDs are
 // provisional and vanish on restart; Phase 2 (#173) plugs in a SQLite-backed
 // registrar that mints durable IDs atomically with the first delta referencing
@@ -121,6 +221,16 @@ type CacheStats struct {
 	// Errors counts misses the Registrar failed for any other reason. These
 	// were also routed to __other__; Phase 2 must surface this as a metric.
 	Errors uint64
+	// OverLength counts values refused for exceeding the encoded-length cap
+	// and routed to __other__ (#200 Q3). Never truncated.
+	OverLength uint64
+	// TenantsRejected counts tenant identities refused outright — over-length,
+	// empty, or past the instance-wide tenant cap. These points are DROPPED,
+	// not collapsed.
+	TenantsRejected uint64
+	// Fenced counts lookups that hit a dictionary ID the identity-maintenance
+	// barrier had fenced, and were therefore served from __other__ (#200 Q2).
+	Fenced uint64
 }
 
 // Cache is the hot-path canonical-value to ID map in front of a Registrar. It
@@ -137,22 +247,64 @@ type CacheStats struct {
 // cached, so a pathological-cardinality tenant cannot grow this map without
 // bound; they pay a Registrar call per point instead.
 type Cache struct {
-	reg Registrar
+	reg    Registrar
+	bounds Bounds
 
 	mu  sync.RWMutex
 	ids map[dictScope]map[string]uint32
+	// fenced holds the dictionary IDs the identity-maintenance barrier has
+	// taken out of service while their rows are being deleted (#200 Q2). It
+	// is read on the hit path under the same RLock as ids, and only when
+	// fenceOn says a barrier is actually in progress, so the steady-state
+	// cost is one atomic load.
+	fenced map[uint32]struct{}
+	// fenceOn mirrors len(fenced) > 0 so the hit path can skip the map probe.
+	fenceOn atomic.Bool
 
-	hits      atomic.Uint64
-	misses    atomic.Uint64
-	overflows atomic.Uint64
-	errors    atomic.Uint64
+	// overflow, when set, publishes an identity routed to __other__ by a #200
+	// Q3 bound. It is a plain function rather than a MetricsRecorder so this
+	// file keeps no dependency on the engine's metric surface.
+	overflow atomic.Pointer[func(Kind, string)]
+
+	hits            atomic.Uint64
+	misses          atomic.Uint64
+	overflows       atomic.Uint64
+	errors          atomic.Uint64
+	overLength      atomic.Uint64
+	tenantsRejected atomic.Uint64
+	fencedHits      atomic.Uint64
 }
 
-// NewCache returns a Cache in front of reg. reg must not be nil.
-func NewCache(reg Registrar) *Cache {
+// NewCache returns a Cache in front of reg with default bounds. reg must not
+// be nil.
+func NewCache(reg Registrar) *Cache { return NewCacheWithBounds(reg, Bounds{}) }
+
+// NewCacheWithBounds returns a Cache in front of reg honouring b (#200 Q3).
+func NewCacheWithBounds(reg Registrar, b Bounds) *Cache {
 	return &Cache{
-		reg: reg,
-		ids: make(map[dictScope]map[string]uint32),
+		reg:    reg,
+		bounds: b.withDefaults(),
+		ids:    make(map[dictScope]map[string]uint32),
+	}
+}
+
+// Bounds returns the identity bounds in force.
+func (c *Cache) Bounds() Bounds { return c.bounds }
+
+// SetOverflowSink installs (or, with nil, removes) the callback that publishes
+// bound-driven __other__ routing. Safe to call while interning is in flight.
+func (c *Cache) SetOverflowSink(fn func(kind Kind, bound string)) {
+	if fn == nil {
+		c.overflow.Store(nil)
+		return
+	}
+	c.overflow.Store(&fn)
+}
+
+// recordOverflow publishes one bound-driven routing, if a sink is installed.
+func (c *Cache) recordOverflow(kind Kind, bound string) {
+	if p := c.overflow.Load(); p != nil {
+		(*p)(kind, bound)
 	}
 }
 
@@ -161,14 +313,38 @@ func NewCache(reg Registrar) *Cache {
 // pre-created __other__ ID for the scope.
 func (c *Cache) Intern(tenantID uint32, kind Kind, value string) uint32 {
 	scope := dictScope{tenant: tenantID, kind: kind}
-	c.mu.RLock()
-	id, ok := c.ids[scope][value]
-	c.mu.RUnlock()
-	if ok {
-		c.hits.Add(1)
+	if id, ok := c.lookupCached(scope, value); ok {
 		return id
 	}
+	if len(value) > c.bounds.valueCap(kind) {
+		// Over-length identities are routed, never truncated (#200 Q3).
+		c.overLength.Add(1)
+		c.recordOverflow(kind, "length")
+		return c.reg.OtherID(tenantID, kind)
+	}
 	return c.register(scope, []byte(value))
+}
+
+// lookupCached is the hit path: one RLock, no allocation, and — only while a
+// maintenance barrier is fencing IDs — one extra map probe.
+func (c *Cache) lookupCached(scope dictScope, value string) (uint32, bool) {
+	c.mu.RLock()
+	id, ok := c.ids[scope][value]
+	blocked := false
+	if ok && c.fenceOn.Load() {
+		_, blocked = c.fenced[id]
+	}
+	c.mu.RUnlock()
+	switch {
+	case blocked:
+		c.fencedHits.Add(1)
+		return 0, false
+	case ok:
+		c.hits.Add(1)
+		return id, true
+	default:
+		return 0, false
+	}
 }
 
 // InternBytes is Intern for a byte-slice value (dimension tuples). The slice is
@@ -176,20 +352,55 @@ func (c *Cache) Intern(tenantID uint32, kind Kind, value string) uint32 {
 // does not allocate.
 func (c *Cache) InternBytes(tenantID uint32, kind Kind, value []byte) uint32 {
 	scope := dictScope{tenant: tenantID, kind: kind}
-	c.mu.RLock()
-	id, ok := c.ids[scope][string(value)]
-	c.mu.RUnlock()
-	if ok {
-		c.hits.Add(1)
+	if id, ok := c.lookupCached(scope, string(value)); ok {
 		return id
+	}
+	if len(value) > c.bounds.valueCap(kind) {
+		c.overLength.Add(1)
+		c.recordOverflow(kind, "length")
+		return c.reg.OtherID(tenantID, kind)
 	}
 	return c.register(scope, value)
 }
 
 // InternTenant returns the ID for a tenant name, which lives in the
 // instance-global tenant namespace.
-func (c *Cache) InternTenant(name string) uint32 {
-	return c.Intern(GlobalTenant, KindTenant, name)
+//
+// It is the ONE namespace that refuses instead of degrading (#200 Q3): an
+// over-length, empty, or over-cap tenant returns ok=false and the caller drops
+// the point. Collapsing two tenants onto one identity would silently merge
+// their telemetry, and no downstream reader could tell.
+//
+// One consequence worth stating plainly: while the identity-maintenance
+// barrier is fencing a tenant ID, this refuses points for that tenant instead
+// of routing them anywhere. That window is single-digit milliseconds, once a
+// day, and it only ever covers a tenant GC had already determined nothing
+// references. A refused point is the honest answer; an __other__ tenant is not.
+func (c *Cache) InternTenant(name string) (uint32, bool) {
+	const scopeTenant = KindTenant
+	scope := dictScope{tenant: GlobalTenant, kind: scopeTenant}
+	if id, ok := c.lookupCached(scope, name); ok {
+		return id, true
+	}
+	if name == "" || len(name) > c.bounds.MaxTenantBytes {
+		c.tenantsRejected.Add(1)
+		return 0, false
+	}
+	c.misses.Add(1)
+	id, err := c.reg.Register(GlobalTenant, scopeTenant, []byte(name))
+	if err != nil || id == 0 {
+		c.tenantsRejected.Add(1)
+		return 0, false
+	}
+	c.mu.Lock()
+	inner := c.ids[scope]
+	if inner == nil {
+		inner = make(map[string]uint32)
+		c.ids[scope] = inner
+	}
+	inner[name] = id
+	c.mu.Unlock()
+	return id, true
 }
 
 // register handles the miss path: one Registrar call, then a cache store on
@@ -200,6 +411,7 @@ func (c *Cache) register(scope dictScope, value []byte) uint32 {
 	if err != nil {
 		if errors.Is(err, ErrDictFull) {
 			c.overflows.Add(1)
+			c.recordOverflow(scope.kind, "count")
 		} else {
 			c.errors.Add(1)
 		}
@@ -248,11 +460,83 @@ func (c *Cache) Len() int {
 // Stats returns a snapshot of the cache counters.
 func (c *Cache) Stats() CacheStats {
 	return CacheStats{
-		Hits:      c.hits.Load(),
-		Misses:    c.misses.Load(),
-		Overflows: c.overflows.Load(),
-		Errors:    c.errors.Load(),
+		Hits:            c.hits.Load(),
+		Misses:          c.misses.Load(),
+		Overflows:       c.overflows.Load(),
+		Errors:          c.errors.Load(),
+		OverLength:      c.overLength.Load(),
+		TenantsRejected: c.tenantsRejected.Load(),
+		Fenced:          c.fencedHits.Load(),
 	}
+}
+
+// --- identity-maintenance barrier hooks (#200 Q2) ---------------------------
+
+// Fence takes ids out of service for the hot path without touching the maps
+// that hold them. A fenced ID is never returned by Intern; the value resolves
+// to __other__ for the duration, which is the same degradation a full
+// namespace already produces.
+//
+// Fencing is deliberately NOT deletion: a sweep whose DELETE fails must be
+// able to release the fence and leave memory exactly as it was.
+func (c *Cache) Fence(ids map[uint32]struct{}) {
+	if len(ids) == 0 {
+		return
+	}
+	c.mu.Lock()
+	if c.fenced == nil {
+		c.fenced = make(map[uint32]struct{}, len(ids))
+	}
+	for id := range ids {
+		c.fenced[id] = struct{}{}
+	}
+	c.fenceOn.Store(true)
+	c.mu.Unlock()
+}
+
+// Unfence releases every fenced ID.
+func (c *Cache) Unfence() {
+	c.mu.Lock()
+	c.fenced = nil
+	c.fenceOn.Store(false)
+	c.mu.Unlock()
+}
+
+// Forget removes cached entries whose ID is in ids. It runs after a sweep has
+// COMMITTED, never before: the forward map and the reverse map must not
+// disagree with the database in the window where the delete could still fail.
+func (c *Cache) Forget(ids map[uint32]struct{}) {
+	if len(ids) == 0 {
+		return
+	}
+	c.mu.Lock()
+	for scope, inner := range c.ids {
+		for value, id := range inner {
+			if _, gone := ids[id]; gone {
+				delete(inner, value)
+			}
+		}
+		if len(inner) == 0 {
+			delete(c.ids, scope)
+		}
+	}
+	c.mu.Unlock()
+}
+
+// Roots returns every dictionary ID this cache can still hand to the hot path.
+// They are GC roots by construction: a cached ID is one map read away from
+// becoming a series identity, and no lock the collector can take would make
+// that read wait.
+func (c *Cache) Roots() map[uint32]struct{} {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make(map[uint32]struct{}, len(c.ids)*4)
+	for _, inner := range c.ids {
+		for _, id := range inner {
+			out[id] = struct{}{}
+		}
+	}
+	return out
 }
 
 // DimPair is one operator-configured dimension, already reduced to dictionary

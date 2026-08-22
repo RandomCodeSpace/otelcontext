@@ -289,7 +289,7 @@ func TestWriterDurableRegistrationRidesTheCommit(t *testing.T) {
 	eng := newTestEngine(t, clock, reg)
 	w := newTestWriter(t, base, eng, clock, WriterConfig{Registrar: reg})
 
-	tenant := eng.Cache().InternTenant("acme")
+	tenant, _ := eng.Cache().InternTenant("acme")
 	nameID := eng.Cache().Intern(tenant, KindOperation, "GET /orders")
 	if reg.PendingCount() == 0 {
 		t.Fatal("registrations were not staged before the commit")

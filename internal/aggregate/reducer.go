@@ -55,6 +55,12 @@ type ReducerStats struct {
 	// refused from series identity because an attribute value had no scalar
 	// rendering (#199 Q4). The point is still aggregated, under DimsID 0.
 	DimsRejected uint64
+	// TenantsRejected counts points DROPPED because their tenant identity was
+	// refused — over-length, empty, or past the instance-wide tenant cap
+	// (#200 Q3). Every other namespace degrades into __other__; the tenant
+	// namespace refuses instead, because a shared overflow tenant is exactly
+	// the cross-tenant merge the cap exists to prevent.
+	TenantsRejected uint64
 	// ErrorsByService counts errors per service — the cheap invariant #165
 	// asks for on the aggregate side, and nothing more expensive.
 	ErrorsByService map[string]uint64
@@ -70,6 +76,7 @@ func (s *ReducerStats) merge(other *ReducerStats) {
 	}
 	s.StaleCumulative += other.StaleCumulative
 	s.DimsRejected += other.DimsRejected
+	s.TenantsRejected += other.TenantsRejected
 	for svc, n := range other.ErrorsByService {
 		if s.ErrorsByService == nil {
 			s.ErrorsByService = make(map[string]uint64, len(other.ErrorsByService))
@@ -268,6 +275,14 @@ func (r *Reducer) countError(service string) {
 	r.stats.ErrorsByService[service]++
 }
 
+// rejectTenant records one point dropped for an unusable tenant identity. The
+// point was already counted as input by admitPoint; it is NOT counted as
+// accepted, so the shadow-comparison numerator stays honest.
+func (r *Reducer) rejectTenant(signal Signal) {
+	r.stats.TenantsRejected++
+	r.eng.metrics.RecordTenantRejected(signal)
+}
+
 // IsRequestSpan reports whether a span is a request entry point and therefore
 // contributes to AggregateDelta.RequestCount.
 //
@@ -286,7 +301,11 @@ func (r *Reducer) ReduceSpan(in SpanInput) {
 	if !ok {
 		return
 	}
-	tenantID := r.eng.cache.InternTenant(in.Tenant)
+	tenantID, tenantOK := r.eng.cache.InternTenant(in.Tenant)
+	if !tenantOK {
+		r.rejectTenant(SignalTraceOp)
+		return
+	}
 	operation := NormalizeOperation(in.HTTPRoute, in.URLPath, in.SpanName)
 	key := SeriesKey{
 		TenantID:    tenantID,
@@ -349,7 +368,11 @@ func (r *Reducer) ReduceEdge(in EdgeInput) {
 	if !ok {
 		return
 	}
-	tenantID := r.eng.cache.InternTenant(in.Tenant)
+	tenantID, tenantOK := r.eng.cache.InternTenant(in.Tenant)
+	if !tenantOK {
+		r.rejectTenant(SignalServiceEdge)
+		return
+	}
 	key := SeriesKey{
 		TenantID:  tenantID,
 		ServiceID: r.eng.cache.Intern(tenantID, KindService, in.Caller),
@@ -377,7 +400,11 @@ func (r *Reducer) ReduceLog(in LogInput) {
 	if !ok {
 		return
 	}
-	tenantID := r.eng.cache.InternTenant(in.Tenant)
+	tenantID, tenantOK := r.eng.cache.InternTenant(in.Tenant)
+	if !tenantOK {
+		r.rejectTenant(SignalLog)
+		return
+	}
 	templateID, _ := r.eng.miner.MineAt(in.Tenant, in.Service, in.Severity, in.Body, r.arrival)
 	tier := SeverityTier(in.Severity, in.SeverityNumber)
 	key := SeriesKey{
@@ -507,7 +534,11 @@ func (r *Reducer) reduceFold(c HistogramCommon, fold HistogramFold) MetricPointR
 	if !ok {
 		return MetricPointResult{Outcome: MetricPointExcluded}
 	}
-	tenantID := r.eng.cache.InternTenant(c.Tenant)
+	tenantID, tenantOK := r.eng.cache.InternTenant(c.Tenant)
+	if !tenantOK {
+		r.rejectTenant(SignalMetric)
+		return MetricPointResult{Outcome: MetricPointExcluded}
+	}
 	key := r.metricSeriesKey(tenantID, c.Service, c.Name, c.Attributes)
 	r.delta(key, window).ObserveHistogram(fold)
 	r.identify(key, window, topoIdentity{Kind: topoMetric, Tenant: c.Tenant, A: c.Service, B: c.Name})
@@ -552,7 +583,11 @@ func (r *Reducer) ReduceMetricPoint(in MetricInput) {
 	if !ok {
 		return
 	}
-	tenantID := r.eng.cache.InternTenant(in.Tenant)
+	tenantID, tenantOK := r.eng.cache.InternTenant(in.Tenant)
+	if !tenantOK {
+		r.rejectTenant(SignalMetric)
+		return
+	}
 	key := r.metricSeriesKey(tenantID, in.Service, in.Name, in.Attributes)
 
 	switch {

@@ -143,6 +143,11 @@ type EngineConfig struct {
 	// whose IDs are provisional and vanish on restart (#173 replaces it).
 	Registrar Registrar
 
+	// Bounds are the identity bounds of #200 Q3: encoded-value length caps,
+	// per-(tenant, kind) and instance-wide dictionary counts, and the tenant
+	// cap. The zero value takes every default.
+	Bounds Bounds
+
 	// Miner is the ingest-owned template miner (#163). Defaults to one built
 	// from the log-template cap.
 	Miner *TemplateMiner
@@ -301,7 +306,7 @@ func NewEngine(cfg EngineConfig) (*Engine, error) {
 	e := &Engine{
 		mode:    cfg.Mode,
 		now:     cfg.Now,
-		cache:   NewCache(reg),
+		cache:   NewCacheWithBounds(reg, cfg.Bounds),
 		miner:   cfg.Miner,
 		metrics: cfg.Metrics,
 		dims:    cfg.MetricDims,
@@ -316,6 +321,7 @@ func NewEngine(cfg EngineConfig) (*Engine, error) {
 	if e.metrics == nil {
 		e.metrics = noopRecorder{}
 	}
+	e.cache.SetOverflowSink(e.metrics.RecordIdentityOverflow)
 	limCfg.OtherNameID = e.otherNameID
 	e.limiter = NewLimiter(limCfg)
 	e.baselines = NewBaselineTracker(BaselineTrackerConfig{
@@ -425,8 +431,36 @@ func (e *Engine) Store() Store {
 	return *p
 }
 
-// TenantID resolves a tenant name to its dictionary ID for the read path.
-func (e *Engine) TenantID(name string) uint32 { return e.cache.InternTenant(name) }
+// TenantID resolves a tenant name to its dictionary ID for the read path. ok
+// is false when the tenant identity was REJECTED — over-length, empty, or past
+// the instance-wide tenant cap (#200 Q3). A rejected tenant is never collapsed
+// into a shared identity; the caller reads nothing rather than another
+// tenant's data.
+func (e *Engine) TenantID(name string) (uint32, bool) { return e.cache.InternTenant(name) }
+
+// ActiveSeriesKeys returns every series identity the mutable shards currently
+// hold. It is a GC root set (#200 Q1): a series present in memory is live even
+// if the durable tables have not caught up with it yet.
+//
+// Bounded by AGGREGATE_MAX_SERIES plus the overflow reserve, so the map is
+// thousands of entries, not millions.
+func (e *Engine) ActiveSeriesKeys() map[SeriesKey]struct{} {
+	out := make(map[SeriesKey]struct{}, 1024)
+	if e == nil {
+		return out
+	}
+	for i := range e.shards {
+		sh := &e.shards[i]
+		sh.mu.Lock()
+		for _, window := range sh.windows {
+			for key := range window {
+				out[key] = struct{}{}
+			}
+		}
+		sh.mu.Unlock()
+	}
+	return out
+}
 
 // Ownership captures {mutable set, finalized watermark, revision, epoch} in
 // one critical section. Every read path starts here.
@@ -529,7 +563,13 @@ func (e *Engine) otherNameID(tenantID uint32, signal Signal) uint32 {
 // registration time: that pair is the immutable surrogate identity, and the
 // text may evolve under the same ID later without the ID moving (#163).
 func (e *Engine) registerTemplate(r TemplateRegistration) (uint32, error) {
-	tenantID := e.cache.InternTenant(r.Tenant)
+	tenantID, ok := e.cache.InternTenant(r.Tenant)
+	if !ok {
+		// No tenant identity means no template identity. The miner treats a
+		// zero ID as "no identity available" and routes the line to its
+		// partition overflow; the reducer has already refused the point.
+		return 0, ErrTenantRejected
+	}
 	if r.IsOther {
 		return e.cache.OtherID(tenantID, KindLogTemplate), nil
 	}

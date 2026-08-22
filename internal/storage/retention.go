@@ -57,6 +57,14 @@ type RetentionScheduler struct {
 	// statistics of a table that is written and deleted every hour go stale.
 	aggregatePurge   func(cutoff time.Time) (int64, error)
 	aggregateAnalyze func() error
+
+	// aggregateGC is the aggregate store's identity mark-and-sweep (#200).
+	// It rides the DAILY maintenance tick, not the hourly purge: the mark
+	// phase is a full scan of three tables, and the sweep serializes with the
+	// durable-ACK group commit. Hourly would put that in the ACK budget
+	// twenty-four times a day for names that change on the timescale of a
+	// deployment.
+	aggregateGC func() error
 }
 
 // NewRetentionScheduler constructs a scheduler but does not start it.
@@ -95,6 +103,12 @@ func (r *RetentionScheduler) SetFullVacuum(enabled bool) { r.fullVacuum = enable
 func (r *RetentionScheduler) SetAggregateRetention(purge func(time.Time) (int64, error), analyze func() error) {
 	r.aggregatePurge = purge
 	r.aggregateAnalyze = analyze
+}
+
+// SetAggregateGC wires the aggregate store's identity garbage collection into
+// the daily maintenance pass. May be nil. Call before Start; not synchronized.
+func (r *RetentionScheduler) SetAggregateGC(collect func() error) {
+	r.aggregateGC = collect
 }
 
 // purgeAggregate runs the aggregate store's share of one retention tick.
@@ -552,6 +566,17 @@ func (r *RetentionScheduler) runMaintenance(ctx context.Context) {
 	if r.aggregateAnalyze != nil {
 		if err := r.aggregateAnalyze(); err != nil {
 			slog.Error("retention: aggregate analyze failed", "error", err)
+			maintFailed = true
+		}
+	}
+
+	// Identity GC after ANALYZE: the sweep deletes rows, and running the
+	// planner refresh first means the delete statements plan against current
+	// statistics. A failed pass changes nothing in memory, so it is a
+	// maintenance failure and not a data-integrity one.
+	if r.aggregateGC != nil {
+		if err := r.aggregateGC(); err != nil {
+			slog.Error("retention: aggregate identity gc failed", "error", err)
 			maintFailed = true
 		}
 	}

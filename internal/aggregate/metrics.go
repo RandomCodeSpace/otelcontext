@@ -36,6 +36,15 @@ type MetricsRecorder interface {
 	// RecordClosedWindowEvicted counts one closed window the cap forced out of
 	// memory before it was finalized. Every one is lost data.
 	RecordClosedWindowEvicted()
+	// RecordTenantRejected counts one point dropped because its tenant
+	// identity was refused (#200 Q3). Unlike every other identity cap this is
+	// a DROP, so it deserves its own counter rather than a reason label on
+	// the overflow one.
+	RecordTenantRejected(signal Signal)
+	// RecordIdentityOverflow counts one identity routed to __other__ by a
+	// #200 Q3 bound, labeled by dictionary kind and the bound that tripped
+	// ("length" or "count").
+	RecordIdentityOverflow(kind Kind, bound string)
 }
 
 // noopRecorder is the default when no metrics are wired.
@@ -46,6 +55,8 @@ func (noopRecorder) RecordOverflow(Signal, OverflowReason)           {}
 func (noopRecorder) SetActiveSeries(_, _ map[Signal]int)             {}
 func (noopRecorder) SetClosedWindows(int)                            {}
 func (noopRecorder) RecordClosedWindowEvicted()                      {}
+func (noopRecorder) RecordTenantRejected(Signal)                     {}
+func (noopRecorder) RecordIdentityOverflow(Kind, string)             {}
 
 // promRecorder bridges the engine onto the platform's Prometheus metrics.
 type promRecorder struct{ m *telemetry.Metrics }
@@ -116,6 +127,16 @@ func (r promRecorder) SetClosedWindows(held int) {
 // RecordClosedWindowEvicted implements MetricsRecorder.
 func (r promRecorder) RecordClosedWindowEvicted() {
 	r.m.AggregateClosedWindowsEvictedTotal.Inc()
+}
+
+// RecordTenantRejected implements MetricsRecorder.
+func (r promRecorder) RecordTenantRejected(signal Signal) {
+	r.m.AggregateTenantRejectedTotal.WithLabelValues(signal.String()).Inc()
+}
+
+// RecordIdentityOverflow implements MetricsRecorder.
+func (r promRecorder) RecordIdentityOverflow(kind Kind, bound string) {
+	r.m.AggregateIdentityOverflowTotal.WithLabelValues(kind.String(), bound).Inc()
 }
 
 // promStoreRecorder bridges the durable store and the group-commit writer onto
@@ -191,6 +212,27 @@ func (r promStoreRecorder) RecordPurge(stats PurgeStats, err error) {
 func (r promStoreRecorder) SetBacklog(rows int64, ageSeconds float64) {
 	r.m.AggregateDeltaLogRows.Set(float64(rows))
 	r.m.AggregateDeltaLogAgeSeconds.Set(ageSeconds)
+}
+
+// RecordGC implements StoreMetrics.
+func (r promStoreRecorder) RecordGC(stats GCStats, err error) {
+	r.m.AggregateGCDurationSeconds.WithLabelValues("mark").Observe(stats.MarkDuration.Seconds())
+	r.m.AggregateGCDurationSeconds.WithLabelValues("barrier").Observe(stats.BarrierDuration.Seconds())
+	r.m.AggregateGCRunsTotal.WithLabelValues(result(err)).Inc()
+	if err != nil {
+		return
+	}
+	for table, n := range map[string]int64{
+		"aggregate_series":       stats.SeriesSwept,
+		"aggregate_dict":         stats.DictSwept,
+		"aggregate_log_template": stats.TemplatesSwept,
+	} {
+		if n > 0 {
+			r.m.AggregateGCSweptTotal.WithLabelValues(table).Add(float64(n))
+		}
+	}
+	r.m.AggregateGCRetained.WithLabelValues("aggregate_series").Set(float64(stats.SeriesRetained))
+	r.m.AggregateGCRetained.WithLabelValues("aggregate_dict").Set(float64(stats.DictRetained))
 }
 
 // RecordRecovery implements StoreMetrics.
