@@ -1008,3 +1008,65 @@ func TestValidate_DataDiskBudget(t *testing.T) {
 		t.Error("a blank DATA_DISK_PATH should be rejected")
 	}
 }
+
+// --- aggregate runtime readiness thresholds (#194 finding 18) ---------------
+
+// TestLoad_ReadinessThresholdDefaults pins the defaults the /ready probes ship
+// with. Three consecutive failures, not one; 0.9 admission saturation, below
+// the 0.95 the DLQ and pipeline probes use, because the writer's admission
+// bound is what turns an Export into RESOURCE_EXHAUSTED; 1800s delta-log age,
+// twice the 900s a window needs to become finalizable; 1.5 GiB, aggregate.db's
+// share of the 8 GiB data budget (#201 Q1).
+func TestLoad_ReadinessThresholdDefaults(t *testing.T) {
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ReadyMaxCommitFailureStreak != 3 {
+		t.Errorf("READY_MAX_COMMIT_FAILURE_STREAK = %d, want 3", cfg.ReadyMaxCommitFailureStreak)
+	}
+	if cfg.ReadyMaxFinalizeFailureStreak != 3 {
+		t.Errorf("READY_MAX_FINALIZE_FAILURE_STREAK = %d, want 3", cfg.ReadyMaxFinalizeFailureStreak)
+	}
+	if cfg.ReadyMaxDeltaLogAgeS != 1800 {
+		t.Errorf("READY_MAX_DELTA_LOG_AGE_S = %d, want 1800", cfg.ReadyMaxDeltaLogAgeS)
+	}
+	if cfg.ReadyMaxAdmissionRatio != 0.9 {
+		t.Errorf("READY_MAX_ADMISSION_RATIO = %v, want 0.9", cfg.ReadyMaxAdmissionRatio)
+	}
+	if cfg.ReadyAggregateDiskBudgetMB != 1536 {
+		t.Errorf("READY_AGGREGATE_DISK_BUDGET_MB = %d, want 1536", cfg.ReadyAggregateDiskBudgetMB)
+	}
+	if cfg.ReadyMaxAggregateDiskRatio != 0.9 {
+		t.Errorf("READY_MAX_AGGREGATE_DISK_RATIO = %v, want 0.9", cfg.ReadyMaxAggregateDiskRatio)
+	}
+}
+
+// TestValidate_ReadinessThresholds: zero disables a probe and must stay
+// accepted; negatives and out-of-range ratios are typos, not policies.
+func TestValidate_ReadinessThresholds(t *testing.T) {
+	c := baseValid()
+	c.ReadyMaxCommitFailureStreak = 0
+	c.ReadyMaxAdmissionRatio = 0
+	if err := c.Validate(); err != nil {
+		t.Fatalf("zero thresholds should be accepted as disabled: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name  string
+		apply func(*Config)
+	}{
+		{"READY_MAX_COMMIT_FAILURE_STREAK", func(c *Config) { c.ReadyMaxCommitFailureStreak = -1 }},
+		{"READY_MAX_FINALIZE_FAILURE_STREAK", func(c *Config) { c.ReadyMaxFinalizeFailureStreak = -1 }},
+		{"READY_MAX_DELTA_LOG_AGE_S", func(c *Config) { c.ReadyMaxDeltaLogAgeS = -1 }},
+		{"READY_MAX_ADMISSION_RATIO", func(c *Config) { c.ReadyMaxAdmissionRatio = 1.5 }},
+		{"READY_AGGREGATE_DISK_BUDGET_MB", func(c *Config) { c.ReadyAggregateDiskBudgetMB = -1 }},
+		{"READY_MAX_AGGREGATE_DISK_RATIO", func(c *Config) { c.ReadyMaxAggregateDiskRatio = -0.1 }},
+	} {
+		c := baseValid()
+		tc.apply(c)
+		if err := c.Validate(); err == nil || !strings.Contains(err.Error(), tc.name) {
+			t.Errorf("%s: expected a validation error, got %v", tc.name, err)
+		}
+	}
+}

@@ -271,6 +271,20 @@ func (s *SQLiteStore) Path() string { return s.path }
 // operator "this is a different store", not "this is the same store rebuilt".
 func (s *SQLiteStore) UUID() string { return s.uuid }
 
+// PingContext verifies the aggregate database is reachable on the READ pool.
+//
+// The read pool, never the writer: the writer is MaxOpenConns(1) behind the
+// group commit, so a ping issued there would queue behind whatever commit is
+// in flight and report "unreachable" for a database that is merely busy. A
+// readiness probe has to answer "can this process still read its aggregates",
+// which is exactly what the read pool answers.
+func (s *SQLiteStore) PingContext(ctx context.Context) error {
+	if s == nil || s.reader == nil {
+		return ErrStoreClosed
+	}
+	return s.reader.PingContext(ctx)
+}
+
 // lockWriter acquires the exclusive write slot.
 func (s *SQLiteStore) lockWriter() { s.writeMu <- struct{}{} }
 

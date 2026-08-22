@@ -456,6 +456,24 @@ type Config struct {
 	// config says so.
 	DataDiskBudgetMB int    // Default 8192 (8 GiB)
 	DataDiskPath     string // Default ./data — any path on the data volume
+
+	// Aggregate runtime readiness thresholds (#194 finding 18).
+	//
+	// Startup recovery is not the only way an aggregate deployment stops
+	// being able to serve: the store can become unreachable, group commits
+	// can fail in a row, admission can saturate, the finalizer can wedge and
+	// the delta log can grow without bound. Each threshold below turns one of
+	// those into a /ready 503. Degraded-not-dead: none of them touches
+	// /live, and none of them stops the process.
+	//
+	// Every threshold takes 0 as "disable this probe" so an operator who
+	// disagrees with a default can switch it off without patching the binary.
+	ReadyMaxCommitFailureStreak   int     // READY_MAX_COMMIT_FAILURE_STREAK, default 3
+	ReadyMaxFinalizeFailureStreak int     // READY_MAX_FINALIZE_FAILURE_STREAK, default 3
+	ReadyMaxDeltaLogAgeS          int     // READY_MAX_DELTA_LOG_AGE_S, default 1800
+	ReadyMaxAdmissionRatio        float64 // READY_MAX_ADMISSION_RATIO, default 0.9
+	ReadyAggregateDiskBudgetMB    int     // READY_AGGREGATE_DISK_BUDGET_MB, default 1536
+	ReadyMaxAggregateDiskRatio    float64 // READY_MAX_AGGREGATE_DISK_RATIO, default 0.9
 }
 
 func Load(customPath string) (*Config, error) {
@@ -653,6 +671,30 @@ func Load(customPath string) (*Config, error) {
 		// 8 GiB data budget (#201 Q1).
 		DataDiskBudgetMB: getEnvInt("DATA_DISK_BUDGET_MB", 8192),
 		DataDiskPath:     getEnv("DATA_DISK_PATH", "./data"),
+		// Aggregate runtime readiness probes (#194 finding 18).
+		//
+		// Three consecutive failures, not one: a single failed group commit or
+		// finalize pass is a retry, and flipping an orchestrator's readiness on
+		// a retry is how a healthy process gets pulled out of rotation by a
+		// transient lock.
+		ReadyMaxCommitFailureStreak:   getEnvInt("READY_MAX_COMMIT_FAILURE_STREAK", 3),
+		ReadyMaxFinalizeFailureStreak: getEnvInt("READY_MAX_FINALIZE_FAILURE_STREAK", 3),
+		// 1800s = 2x (WindowSize 5m + AllowedLateness 10m). A window is
+		// finalizable 900s after it opens, so a healthy oldest delta-log entry
+		// tops out just past 900s plus one finalize tick; double that is
+		// margin, not a target.
+		ReadyMaxDeltaLogAgeS: getEnvInt("READY_MAX_DELTA_LOG_AGE_S", 1800),
+		// 0.9, below the 0.95 the DLQ and pipeline probes use: the writer's
+		// admission bound is what turns an Export into RESOURCE_EXHAUSTED, so
+		// readiness should say "stop sending" before clients are being refused,
+		// not while they are.
+		ReadyMaxAdmissionRatio: getEnvFloat("READY_MAX_ADMISSION_RATIO", 0.9),
+		// 1.5 GiB is aggregate.db's share of the 8 GiB data budget (#201 Q1).
+		// The disk watchdog enforces the VOLUME; this enforces the tier, so a
+		// runaway aggregate file is visible before it eats another tier's
+		// allocation and takes the whole volume past 95% with it.
+		ReadyAggregateDiskBudgetMB: getEnvInt("READY_AGGREGATE_DISK_BUDGET_MB", 1536),
+		ReadyMaxAggregateDiskRatio: getEnvFloat("READY_MAX_AGGREGATE_DISK_RATIO", 0.9),
 	}
 
 	// Parse AGGREGATE_METRIC_DIMS config
@@ -1097,6 +1139,24 @@ func (c *Config) Validate() error {
 	}
 	if strings.TrimSpace(c.DataDiskPath) == "" {
 		return fmt.Errorf("DATA_DISK_PATH must not be empty")
+	}
+	if c.ReadyMaxCommitFailureStreak < 0 {
+		return fmt.Errorf("READY_MAX_COMMIT_FAILURE_STREAK must be >= 0 (0 disables the probe), got %d", c.ReadyMaxCommitFailureStreak)
+	}
+	if c.ReadyMaxFinalizeFailureStreak < 0 {
+		return fmt.Errorf("READY_MAX_FINALIZE_FAILURE_STREAK must be >= 0 (0 disables the probe), got %d", c.ReadyMaxFinalizeFailureStreak)
+	}
+	if c.ReadyMaxDeltaLogAgeS < 0 {
+		return fmt.Errorf("READY_MAX_DELTA_LOG_AGE_S must be >= 0 (0 disables the probe), got %d", c.ReadyMaxDeltaLogAgeS)
+	}
+	if c.ReadyMaxAdmissionRatio < 0 || c.ReadyMaxAdmissionRatio > 1 {
+		return fmt.Errorf("READY_MAX_ADMISSION_RATIO must be between 0 and 1 (0 disables the probe), got %v", c.ReadyMaxAdmissionRatio)
+	}
+	if c.ReadyAggregateDiskBudgetMB < 0 {
+		return fmt.Errorf("READY_AGGREGATE_DISK_BUDGET_MB must be >= 0 (0 disables the probe), got %d", c.ReadyAggregateDiskBudgetMB)
+	}
+	if c.ReadyMaxAggregateDiskRatio < 0 || c.ReadyMaxAggregateDiskRatio > 1 {
+		return fmt.Errorf("READY_MAX_AGGREGATE_DISK_RATIO must be between 0 and 1 (0 disables the probe), got %v", c.ReadyMaxAggregateDiskRatio)
 	}
 
 	// Sum-of-caps validation: sub-caps must fit under global cap
