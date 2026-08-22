@@ -205,7 +205,7 @@ func TestThresholdFailures(t *testing.T) {
 		}},
 		{"memory peak over 4 GiB", "memory.peak", func(r *Result) { r.Memory.PeakBytes = 5 * GiB }},
 		{"oom counter unreadable", "memory.oom_kills", func(r *Result) { r.Memory.OOMObserved = false }},
-		{"aggregate tier too big", "disk.aggregate", func(r *Result) { r.Disk.Tiers[1].Bytes = 2 * GiB }},
+		{"aggregate tier too big", "disk.aggregate", func(r *Result) { r.Disk.Tiers[1].Bytes = 3 * GiB }},
 		{"dlq tier too big", "disk.dlq", func(r *Result) { r.Disk.Tiers[2].Bytes = GiB }},
 		{"wal tier too big", "disk.wal_temp_tls", func(r *Result) { r.Disk.Tiers[3].Bytes = GiB }},
 		{"total over 7 GiB", "disk.total", func(r *Result) { r.Disk.TotalBytes = 8 * GiB }},

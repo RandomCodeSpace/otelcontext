@@ -449,8 +449,8 @@ type Config struct {
 	// aggregate mode the raw rows are exemplars attached to a seven-day
 	// aggregate dataset, and 576 five-minute windows (two days) at the 3 MiB
 	// global window budget is 1.69 GiB of charged payload — 3.38 GiB at the
-	// provisional 2x DB/index/FTS amplification, inside the 4.5 GiB main tier
-	// with ~1.12 GiB of margin. Seven days of the same rate does not fit.
+	// provisional 2x DB/index/FTS amplification, inside the 4.0 GiB main tier
+	// with ~0.62 GiB of margin. Seven days of the same rate does not fit.
 	ExemplarRetentionDays    int // Default 2, validated 1..HotRetentionDays
 	ExemplarSynthLogsPerSpan int // Default 8
 	// ExemplarSynthLogsPerTrace bounds the synthesized logs one retained trace
@@ -664,7 +664,7 @@ func Load(customPath string) (*Config, error) {
 		ExemplarTracesPerServiceWindow: getEnvInt("EXEMPLAR_TRACES_PER_SERVICE_WINDOW", 25),
 		ExemplarTracesGlobalWindow:     getEnvInt("EXEMPLAR_TRACES_GLOBAL_WINDOW", 1500),
 		ExemplarBytesPerServiceWindow:  getEnvInt("EXEMPLAR_BYTES_PER_SERVICE_WINDOW", 512*1024),
-		// 3 MiB, not 4 (#201 Q2). 4 MiB/window consumes the entire 4.5 GiB
+		// 3 MiB, not 4 (#201 Q2). 4 MiB/window consumes the entire 4.0 GiB
 		// main tier under the optimistic 2x amplification assumption and
 		// leaves no operational margin; it stays configurable, it is not the
 		// default until the seven-day gate (#202) proves it fits.
@@ -700,11 +700,13 @@ func Load(customPath string) (*Config, error) {
 		// readiness should say "stop sending" before clients are being refused,
 		// not while they are.
 		ReadyMaxAdmissionRatio: getEnvFloat("READY_MAX_ADMISSION_RATIO", 0.9),
-		// 1.5 GiB is aggregate.db's share of the 8 GiB data budget (#201 Q1).
+		// 2.25 GiB is aggregate.db's share of the 8 GiB data budget (#201 Q1,
+		// rebalanced 2026-08-22 after the seven-day gate measured 2.08 GiB at
+		// full-density occupancy with the v4 histogram columns).
 		// The disk watchdog enforces the VOLUME; this enforces the tier, so a
 		// runaway aggregate file is visible before it eats another tier's
 		// allocation and takes the whole volume past 95% with it.
-		ReadyAggregateDiskBudgetMB: getEnvInt("READY_AGGREGATE_DISK_BUDGET_MB", 1536),
+		ReadyAggregateDiskBudgetMB: getEnvInt("READY_AGGREGATE_DISK_BUDGET_MB", 2304),
 		ReadyMaxAggregateDiskRatio: getEnvFloat("READY_MAX_AGGREGATE_DISK_RATIO", 0.9),
 	}
 

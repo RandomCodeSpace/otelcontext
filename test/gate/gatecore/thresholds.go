@@ -102,10 +102,10 @@ func DefaultThresholds() Thresholds {
 		MemoryPeakMaxBytes: 4 * GiB,
 		MaxOOMKills:        0,
 
-		DiskMainMaxBytes:       4*GiB + GiB/2,
-		DiskAggregateMaxBytes:  GiB + GiB/2,
+		DiskMainMaxBytes:       4 * GiB,
+		DiskAggregateMaxBytes:  2*GiB + GiB/4,
 		DiskDLQMaxBytes:        GiB / 2,
-		DiskWALTempTLSMaxBytes: GiB / 2,
+		DiskWALTempTLSMaxBytes: GiB / 4,
 		DiskTotalMaxBytes:      7 * GiB,
 		DiskFreeMinBytes:       GiB,
 
