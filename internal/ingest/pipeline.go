@@ -550,6 +550,13 @@ func (p *Pipeline) Stop() {
 // Stats returns snapshot counters for tests and for telemetry that
 // doesn't already use Prometheus instruments. The values are best-effort
 // and not synchronized across atomics — sufficient for diagnostics.
+//
+// Processed is the one exception and is load-bearing: it is incremented in
+// process()'s outermost defer, so observing Processed >= N guarantees that
+// N batches finished completely — writes attempted, callbacks fired, tenant
+// slots and byte reservations released. That makes it the correct barrier
+// for a caller (a test, a drain check) that wants to read state process()
+// produced. Every other counter is a plain progress tally.
 func (p *Pipeline) Stats() PipelineStats {
 	return PipelineStats{
 		Enqueued:        p.enqueuedTotal.Load(),
@@ -571,7 +578,7 @@ func (p *Pipeline) Stats() PipelineStats {
 // PipelineStats is a snapshot of pipeline counters.
 type PipelineStats struct {
 	Enqueued        int64
-	Processed       int64
+	Processed       int64 // batches whose process() ran to completion (see Stats)
 	DroppedHealthy  int64
 	RejectedFull    int64
 	RejectedBytes   int64 // batches rejected because the byte cap was exceeded
@@ -646,6 +653,14 @@ func (p *Pipeline) process(b *Batch) {
 	if b == nil {
 		return
 	}
+	// processedTotal is the pipeline's completion barrier and must therefore
+	// be the LAST thing process() touches — hence registered as the FIRST
+	// defer (defers run LIFO). By the time it increments, the batch's write
+	// has committed or failed, the callbacks have run, the per-tenant slot is
+	// released and the byte reservation is returned. It used to be a plain
+	// increment at the top of the function, which made Stats().Processed mean
+	// "a worker picked this batch up" — a barrier for nothing.
+	defer p.processedTotal.Add(1)
 	// Release the byte reservation taken at Submit time. Unconditional —
 	// every batch that reached the channel reserved sizeBytes, priority or
 	// not — and deferred so the panic path below releases too. Mirrors the
@@ -674,7 +689,6 @@ func (p *Pipeline) process(b *Batch) {
 			}
 		}
 	}()
-	p.processedTotal.Add(1)
 
 	if len(b.Traces) == 0 && len(b.Spans) == 0 && len(b.Logs) == 0 {
 		return

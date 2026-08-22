@@ -497,17 +497,21 @@ func TestPipeline_PerTenantCap_ReleasedAfterProcess(t *testing.T) {
 	if _, err := p.Submit(mk()); err != nil {
 		t.Fatalf("submit 1: %v", err)
 	}
-	// Wait for the worker to drain it (and release the slot). The test
-	// passes locally in milliseconds; 30s is for the race detector on
-	// starved shared CI runners, where 5s was observed to expire.
-	if !waitFor(t, 30*time.Second, func() bool { return p.Stats().Processed == 1 }) {
+	// Wait for the worker to finish the batch. Processed is incremented in
+	// process()'s outermost defer, so Processed == 1 happens-after the
+	// per-tenant slot release — which is exactly the postcondition the next
+	// submit depends on. The 30s deadline this wait carried was a symptom
+	// fix: while Processed meant "picked up", the second Submit could land
+	// before the slot was released, get silently soft-dropped (no error) and
+	// leave Processed pinned at 1 for however long the deadline allowed.
+	if !waitFor(t, 5*time.Second, func() bool { return p.Stats().Processed == 1 }) {
 		t.Fatalf("worker did not process first batch")
 	}
 	// Second batch must succeed because the slot was released.
 	if _, err := p.Submit(mk()); err != nil {
 		t.Fatalf("submit 2 after release: %v", err)
 	}
-	if !waitFor(t, 30*time.Second, func() bool { return p.Stats().Processed == 2 }) {
+	if !waitFor(t, 5*time.Second, func() bool { return p.Stats().Processed == 2 }) {
 		t.Fatalf("worker did not process second batch")
 	}
 	if got := p.TenantDropped(); got != 0 {
