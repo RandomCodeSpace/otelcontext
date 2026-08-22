@@ -221,10 +221,10 @@ func TestSeverityDistribution(t *testing.T) {
 // TestProfileResolution verifies that profile flags set correct service/rate combinations.
 func TestProfileResolution(t *testing.T) {
 	cases := []struct {
-		profile   string
-		wantSvc   int
-		wantSpan  int
-		wantLog   int
+		profile    string
+		wantSvc    int
+		wantSpan   int
+		wantLog    int
 		wantMetric int
 	}{
 		{"aggregate-acceptance", 150, 50, 10, 7},

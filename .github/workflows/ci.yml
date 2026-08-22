@@ -35,3 +35,16 @@ jobs:
 
       - name: loadsim build tag compiles
         run: go build -tags loadtest ./test/loadsim/...
+
+      # The seven-day release gate (#202). CI compiles the orchestrator and
+      # runs its unit tests — parsers, projection fit, threshold logic, report
+      # renderer. It must NOT run the protocol: that is four to five hours of
+      # sustained load and a kill -9, and it does not belong on a shared runner.
+      - name: prefill build tag compiles
+        run: go build -tags prefill ./test/aggprefill/...
+
+      - name: gate build tag compiles
+        run: go build -tags gate ./test/gate/...
+
+      - name: gate unit tests
+        run: go test -race -timeout 60s ./test/gate/...

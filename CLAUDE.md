@@ -445,7 +445,12 @@ internal/
   ui/           # Embedded React frontend
 ui/             # React frontend (Vite + token CSS Modules, no UI framework)
 test/           # Microservice simulation (7 services)
+  aggprefill/   # Deterministic 7-day store-level prefill (build tag `prefill`)
+  loadsim/      # OTLP load generator (build tag `loadtest`); --direct measures ACK latency, --ack-ledger persists the per-window contribution ledger
+  gate/         # Seven-day release-gate orchestrator (build tag `gate`)
+    gatecore/   # Untagged, unit-tested: config, parsers, projection fit, threshold logic, report renderer
 docs/           # Specifications and plans
+  gates/        # Committed gate reports (JSON is the source of truth; Markdown is rendered from it)
 ```
 
 ## Configuration (Environment Variables)
@@ -748,6 +753,27 @@ See [`SECURITY.md`](SECURITY.md). Preferred channel: GitHub Security Advisories 
 ### Self-assessment evidence
 
 - [`.bestpractices.json`](.bestpractices.json) — OpenSSF Best Practices evidence map (project 12646, level `passing`, six categories self-assessed). The badge level transition from `in_progress` → `passing` requires a board admin to log into bestpractices.dev with the OSS-Random identity.
+
+## Seven-Day Release Gate
+
+The runnable acceptance gate for aggregate mode lives in `test/gate/` behind the `gate` build tag; its reports land in `docs/gates/`. It certifies exactly one claim — **"crash-durable on a surviving volume"** at 10k pts/s on two vCPU, inside the documented disk and memory budgets, answering the full seven-day range. The normative durability contract (what an `emptyDir` survives and what it does not) is the Durability Contract section of `docs/OPERATIONS.md`.
+
+```bash
+make gate-build   # otelcontext + loadsim + aggprefill + gate
+make gate-run     # ~4-5 h manual protocol; exit 0 only if every assertion passed
+```
+
+- **Split.** `test/gate/gatecore/` is untagged and unit-tested on the normal build (config, Prometheus/cgroup/slog parsers, the projection fit, threshold evaluation, the Markdown renderer). `test/gate/*.go` is tagged `gate` and owns process supervision, confinement, sampling and phase sequencing. CI compiles the tagged binary and runs the untagged tests; **CI never runs the protocol**.
+- **JSON is the source of truth.** The Markdown report is rendered from the same `gatecore.Result` value, so the two cannot disagree. Never hand-write a report.
+- **Missing evidence fails.** A metric the gate needs but cannot read produces a FAILED assertion carrying the reason, never a blank cell.
+- **Confinement.** cgroup-v2 transient scope (`CPUQuota=200%`, `MemoryMax=4G`), verified by reading `cpu.max`/`memory.max` back. Falls back to `taskset -c 0,1` + `GOMAXPROCS=2`, marked `taskset-fallback`, which validates dedicated-core behaviour and not quota throttling.
+- **At-least-once, not exactly-once.** Crash-affected windows are asserted as a range: `confirmed-ACKed <= post-restart total <= all attempted`. Windows the crash never touched carry `attempted == acked`, so the same rule is an exact equality there.
+- **The main tier is projected, not measured.** Physical bytes per completed 5-minute window fitted over the steady portion, times the 576-window two-day horizon, gated on the conservative upper estimate. Amplification (physical/charged) is reported and **never** multiplied back into an already-physical slope.
+- `search_logs` is 24h-clamped and is deliberately **not** a seven-day completeness target. The five aggregate-backed MCP tools that are: `get_anomaly_timeline`, `get_service_map`, `get_service_health`, `root_cause_analysis`, `impact_analysis` — named explicitly in `test/gate/gate.config.json`.
+- **Coverage is asserted per surface.** `/api/metrics/traffic` and `/api/metrics/dashboard` must declare `full`; `/api/metrics/service-map` must declare `sampled`, because its nodes are aggregate-derived while its edges come from the exemplar-backed topology and the handler says so on purpose.
+- **The ACK ledger is keyed on data time.** `internal/aggregate` windows a span by its START time, which the load generator backdates, so a ledger keyed on Export time would misattribute a second of spans at every boundary.
+
+Metric gaps the gate documents on every run (closing them means touching `internal/`, which the gate tooling does not): `RecoveryStats.SkippedSeries` and `SeededBaselines` have no Prometheus gauge and are parsed from the server's slog line; `/api/metrics/*` carries no `truncated` field because the engine pages reads to completion; a drop counter vector that never fires emits nothing at all, so an empty `late_points_total` is indistinguishable from a deleted one without a witness metric; `test/aggprefill` emits no per-window observation totals; there is no process-RSS collector; nothing reports logical charged bytes for the main tier.
 
 ## Build & Run
 

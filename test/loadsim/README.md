@@ -55,6 +55,20 @@ bin/loadsim -profile=aggregate-acceptance -burst=2x30s -duration=60s
 | `--tenant-id` | `""` | Attach `x-tenant-id` metadata (empty = omit) |
 | `--warmup` | `5s` | Linear producer ramp-up window |
 
+### Direct engine
+
+`--direct` swaps the SDK producer for the direct OTLP emission engine: one synchronous `Export` per batch tick, timed, so the measured ACK latency is the durable round trip. It is the only path that reaches 10k points/s and the only one the release gates score. See `otlpdirect.go` for why.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--direct` | `false` | Use the direct OTLP emission engine |
+| `--settle` | `60s` | Unmeasured settle window before the sustained phase |
+| `--batch-interval` | `250ms` | Per-emitter batch tick |
+| `--call-timeout` | `30s` | Per-`Export` deadline |
+| `--report` | `""` | Write the JSON latency/throughput report here |
+| `--ack-ledger` | `""` | Persist the per-aggregate-window attempted-vs-ACKed contribution ledger here. Required by the seven-day recovery gate (#202): it is the only record of what the client believes was acknowledged, and therefore the only way to check "no acknowledged loss" across a `kill -9`. |
+| `--ack-ledger-flush` | `2s` | How often the ledger is fsynced, so a copy predating a server crash always exists on disk |
+
 ## Output
 
 Progress lines show per-signal counters, e.g.

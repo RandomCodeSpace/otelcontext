@@ -1,0 +1,242 @@
+{
+  "run_id": "",
+  "repo_root": "",
+  "work_dir": "./data/gate-run",
+  "data_dir": "./data/gate-run/data",
+  "report_dir": "./docs/gates",
+  "binaries": {
+    "server": "./bin/otelcontext",
+    "loadsim": "./bin/loadsim",
+    "prefill": "./bin/aggprefill"
+  },
+  "http_addr": "127.0.0.1:8080",
+  "grpc_addr": "127.0.0.1:4317",
+  "mcp_path": "/mcp",
+  "api_key": "",
+  "confinement": {
+    "enabled": true,
+    "allow_fallback": true,
+    "cpu_quota_percent": 200,
+    "memory_max": "4G",
+    "fallback_cpus": "0,1",
+    "fallback_gomaxprocs": 2,
+    "unit_prefix": "otelcontext-gate"
+  },
+  "prefill": {
+    "enabled": true,
+    "windows": 2016,
+    "workers": 8,
+    "db_path": "./data/gate-run/data/aggregate.db"
+  },
+  "load": {
+    "profile": "aggregate-acceptance",
+    "services": 150,
+    "settle_sec": 120,
+    "sustained_sec": 10800,
+    "burst_spec": "2x60s",
+    "batch_interval_ms": 250,
+    "call_timeout_sec": 30,
+    "tenant_id": "",
+    "post_burst_allowance_sec": 120,
+    "post_burst_proof_sec": 120,
+    "quiet_gap_sec": 360,
+    "crash_run_sec": 900,
+    "crash_run_settle_sec": 60,
+    "crash_at_sec": 450,
+    "ledger_flush_sec": 2
+  },
+  "sampling": {
+    "interval_sec": 15,
+    "steady_start_offset_sec": 900,
+    "metrics": [
+      "otelcontext_aggregate_input_points_total",
+      "otelcontext_aggregate_late_points_total",
+      "otelcontext_aggregate_admission_rejected_total",
+      "otelcontext_aggregate_identity_overflow_total",
+      "otelcontext_aggregate_delta_log_rows",
+      "otelcontext_aggregate_delta_log_age_seconds",
+      "otelcontext_aggregate_deltas_total",
+      "otelcontext_aggregate_commits_total",
+      "otelcontext_aggregate_commit_bytes_total",
+      "otelcontext_aggregate_finalize_rows_total",
+      "otelcontext_aggregate_closed_windows",
+      "otelcontext_aggregate_series_active",
+      "otelcontext_aggregate_overflow_series_active",
+      "otelcontext_aggregate_gc_swept_total",
+      "otelcontext_aggregate_recovery_duration_seconds",
+      "otelcontext_aggregate_recovery_rows",
+      "otelcontext_disk_component_bytes",
+      "otelcontext_disk_component_high_water_bytes",
+      "otelcontext_disk_used_bytes",
+      "otelcontext_disk_used_ratio",
+      "otelcontext_disk_shedding_state",
+      "otelcontext_ingest_pipeline_queue_depth",
+      "otelcontext_ingest_pipeline_dropped_total",
+      "otelcontext_exemplar_dropped_total",
+      "otelcontext_exemplar_rows_purged_total"
+    ],
+    "required_metrics": [
+      "otelcontext_aggregate_input_points_total",
+      "otelcontext_aggregate_late_points_total",
+      "otelcontext_aggregate_admission_rejected_total",
+      "otelcontext_aggregate_delta_log_rows",
+      "otelcontext_disk_component_bytes"
+    ],
+    "backlog_metric": "otelcontext_aggregate_delta_log_rows",
+    "charged_bytes_metric": ""
+  },
+  "queries": {
+    "api": [
+      {
+        "name": "traffic_seven_day",
+        "path": "/api/metrics/traffic",
+        "range": "seven_day",
+        "per_window": true,
+        "expect_coverage": "full",
+        "scalar_keys": null
+      },
+      {
+        "name": "dashboard_seven_day",
+        "path": "/api/metrics/dashboard",
+        "range": "seven_day",
+        "per_window": false,
+        "expect_coverage": "full",
+        "scalar_keys": [
+          "total_traces",
+          "total_logs",
+          "total_errors",
+          "active_services",
+          "requests",
+          "request_errors",
+          "spans",
+          "span_errors",
+          "p99_latency_ms"
+        ]
+      },
+      {
+        "name": "service_map_seven_day",
+        "path": "/api/metrics/service-map",
+        "range": "seven_day",
+        "per_window": false,
+        "expect_coverage": "sampled",
+        "scalar_keys": null
+      },
+      {
+        "name": "stats",
+        "path": "/api/stats",
+        "range": "none",
+        "per_window": false,
+        "expect_coverage": "",
+        "scalar_keys": null
+      },
+      {
+        "name": "ready",
+        "path": "/ready",
+        "range": "none",
+        "per_window": false,
+        "expect_coverage": "",
+        "scalar_keys": null
+      },
+      {
+        "name": "live",
+        "path": "/live",
+        "range": "none",
+        "per_window": false,
+        "expect_coverage": "",
+        "scalar_keys": null
+      }
+    ],
+    "mcp_tools": [
+      {
+        "name": "get_anomaly_timeline",
+        "arguments": {},
+        "since_arg": "since"
+      },
+      {
+        "name": "get_service_map",
+        "arguments": {
+          "depth": 3
+        }
+      },
+      {
+        "name": "get_service_health",
+        "arguments": {
+          "service_name": "loadsim-svc-000"
+        }
+      },
+      {
+        "name": "root_cause_analysis",
+        "arguments": {
+          "service": "loadsim-svc-000",
+          "time_range": "7d"
+        }
+      },
+      {
+        "name": "impact_analysis",
+        "arguments": {
+          "depth": 3,
+          "service": "loadsim-svc-000"
+        }
+      }
+    ],
+    "timeout_sec": 120
+  },
+  "thresholds": {
+    "sustained_hours": 3,
+    "sustained_points_per_sec": 10000,
+    "sustained_rate_tolerance": 0.05,
+    "ack_p99_max_ms": 250,
+    "ack_ratio_min": 0.999,
+    "max_resource_exhausted": 0,
+    "max_late_points_delta": 0,
+    "max_admission_rejected_delta": 0,
+    "max_identity_overflow_delta": 0,
+    "backlog_allowance_fraction": 0.1,
+    "backlog_allowance_floor_rows": 5000,
+    "backlog_min_samples": 12,
+    "burst_points_per_sec": 20000,
+    "burst_seconds": 60,
+    "burst_recovery_seconds": 120,
+    "ready_seconds": 60,
+    "max_skipped_series": 0,
+    "memory_peak_max_bytes": 4294967296,
+    "max_oom_kills": 0,
+    "disk_main_max_bytes": 4831838208,
+    "disk_aggregate_max_bytes": 1610612736,
+    "disk_dlq_max_bytes": 536870912,
+    "disk_wal_temp_tls_max_bytes": 536870912,
+    "disk_total_max_bytes": 7516192768,
+    "disk_free_min_bytes": 1073741824,
+    "projection_min_samples": 6,
+    "projection_min_window_span": 6,
+    "projection_upper_estimate_z": 2,
+    "projection_horizon_windows": 576,
+    "prefill_windows": 2016,
+    "prefill_series": 6000,
+    "required_coverage": "full"
+  },
+  "server_env": {
+    "AGGREGATE_MODE": "aggregate",
+    "AGGREGATE_SYNCHRONOUS": "NORMAL",
+    "API_KEY": "",
+    "APP_ENV": "development",
+    "DATA_DISK_BUDGET_MB": "8192",
+    "DB_DRIVER": "sqlite",
+    "EXEMPLAR_RETENTION_DAYS": "2",
+    "HOT_RETENTION_DAYS": "8",
+    "INGEST_ASYNC_ENABLED": "true",
+    "LOG_FTS_ENABLED": "true",
+    "MCP_ENABLED": "true",
+    "OTELCONTEXT_ALLOW_SQLITE_PROD": "false",
+    "SAMPLING_RATE": "1.0",
+    "TLS_AUTO_SELFSIGNED": "false"
+  },
+  "ready_timeout_sec": 180,
+  "shutdown_timeout_sec": 60,
+  "tier_spec": {
+    "main_db_file": "otelcontext.db",
+    "aggregate_db_file": "aggregate.db",
+    "dlq_dir": "dlq",
+    "tls_dir": "tls"
+  }
+}

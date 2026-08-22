@@ -588,6 +588,8 @@ func main() {
 	batchInterval := flag.Duration("batch-interval", 250*time.Millisecond, "Direct engine: per-emitter batch tick")
 	callTimeout := flag.Duration("call-timeout", 30*time.Second, "Direct engine: per-Export deadline")
 	reportPath := flag.String("report", "", "Direct engine: write the JSON latency/throughput report to this path")
+	ackLedgerPath := flag.String("ack-ledger", "", "Direct engine: persist the per-window attempted/ACKed contribution ledger to this path (required by the #202 recovery gate)")
+	ackLedgerFlush := flag.Duration("ack-ledger-flush", 2*time.Second, "Direct engine: how often the ACK ledger is fsynced to disk")
 	flag.Parse()
 
 	// Apply profile if set.
@@ -633,16 +635,18 @@ func main() {
 			mul = 1
 		}
 		cfg := directConfig{
-			endpoint:   *endpoint,
-			tenantID:   *tenantID,
-			insecure:   *insecure,
-			services:   *numServices,
-			spanRate:   float64(*rps),
-			logRate:    float64(*logsRate),
-			metricRate: float64(*metricsRate),
-			interval:   *batchInterval,
-			burstMul:   mul,
-			callTimout: *callTimeout,
+			endpoint:    *endpoint,
+			tenantID:    *tenantID,
+			insecure:    *insecure,
+			services:    *numServices,
+			spanRate:    float64(*rps),
+			logRate:     float64(*logsRate),
+			metricRate:  float64(*metricsRate),
+			interval:    *batchInterval,
+			burstMul:    mul,
+			callTimout:  *callTimeout,
+			ledgerPath:  *ackLedgerPath,
+			ledgerFlush: *ackLedgerFlush,
 		}
 		fmt.Printf("direct engine: %d services -> %s | per-service %.1f span/s %.1f log/s %.1f metric/s\n",
 			cfg.services, cfg.endpoint, cfg.spanRate, cfg.logRate, cfg.metricRate)

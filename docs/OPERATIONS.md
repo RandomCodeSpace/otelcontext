@@ -203,6 +203,52 @@ pg_restore -d otelcontext --clean --if-exists /backups/otelcontext-YYYY-MM-DD.du
 
 ---
 
+## Durability Contract
+
+**Normative.** This section states exactly what OtelContext guarantees about surviving a failure, and what it does not. It is the contract the seven-day release gate (`docs/gates/`) verifies and the wording GA material must use.
+
+### The claim
+
+> **Crash-durable on a surviving volume.**
+
+Committed aggregate data survives a process or container `kill -9` **provided the underlying volume is still there afterwards**. On restart, `internal/aggregate.Recover()` finalizes windows whose lateness horizon expired during downtime, replays the mutable delta log back into the shards, and re-seeds cumulative baselines. `/ready` is held at 503 by `RecoveryGate` until that completes, so no dashboard is ever served from half-populated shards.
+
+Nothing beyond that sentence is claimed. In particular:
+
+- This is **not** a host power-loss claim. The gate records `AGGREGATE_SYNCHRONOUS` for the run it certifies; at the default `NORMAL` the SQLite WAL is not fsynced on every commit, so a power cut or kernel panic can lose recently committed transactions. Set `AGGREGATE_SYNCHRONOUS=FULL` if you need that, and expect the write throughput cost.
+- This is **not** a Pod-reschedule or node-loss claim. See the volume table below.
+
+### At-least-once across the crash boundary
+
+The write path acknowledges an OTLP `Export` only after the reduced deltas are in a committed transaction. The converse does not hold: a request whose transaction committed but whose ACK never reached the client is legitimate, and after recovery its contributions are present. So for the window a crash lands in:
+
+```
+confirmed-ACKed contributions <= post-restart total <= all attempted contributions
+```
+
+Clients must treat aggregate ingestion as **at-least-once**, never exactly-once. Windows a crash did not touch carry no ambiguity: attempted equals acknowledged, and the same rule collapses to exact equality.
+
+### Volume durability is the deployment's contract, not the binary's
+
+| Storage | Container restart, same Pod | Pod replacement / deletion / rescheduling | Node loss |
+|---|---|---|---|
+| `emptyDir` (disk-backed) | **Survives** | **Data is destroyed** | **Data is lost** |
+| `emptyDir` (`medium: Memory`) | **Survives** | Data is destroyed | Data is lost |
+| PVC on network-attached storage | Survives | Survives (volume re-attaches) | Survives, subject to the storage class |
+| Host path / local PV | Survives | Survives on the same node | **Data is lost** |
+
+A disk-backed `emptyDir` is enough for the crash-durability claim above and nothing more: the kubelet deletes it permanently when the Pod is removed from the node, for any reason — eviction, rescheduling, scale-down, node drain. If losing the hot window on a reschedule is unacceptable, the deployment must provide a **PersistentVolumeClaim or equivalent persistent volume**. That is a deployment decision; the binary cannot make it, and no configuration flag changes it.
+
+`DATA_DISK_BUDGET_MB` (default 8192) must fit inside whatever volume you attach, with headroom. Note what the watchdog actually compares: it runs `statfs` on the volume and uses **total minus available for the whole filesystem**, not the size of the data directory. On a dedicated volume those are the same number; on a shared filesystem they are not, and the watchdog will read a mount that is 40% full as being 4000% over an 8 GiB budget. It sheds the raw exemplar tier at 95% of the budget and holds `/ready` at 503 there rather than letting ingest fill the volume, so give OtelContext its own volume.
+
+### What to verify before claiming durability in your environment
+
+1. Confirm the volume type actually attached to the Pod (`kubectl get pod -o jsonpath='{.spec.volumes}'`), not the one the chart intended.
+2. Confirm `AGGREGATE_SYNCHRONOUS` in the running process's environment matches the claim you intend to make.
+3. Run the seven-day gate (`make gate-run`, see `docs/gates/README.md`) against a build of the deployed commit, and reference the committed passing report.
+
+---
+
 ## Incident Response
 
 ### `/ready` returns 503
