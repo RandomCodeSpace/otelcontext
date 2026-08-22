@@ -1300,6 +1300,7 @@ func (s *SQLiteStore) SumBuckets(sel Selector, by GroupBy) ([]SumRow, error) {
 	}{
 		{GroupByWindow, "window_start"},
 		{GroupByService, "service_id"},
+		{GroupByName, "name_id"},
 		{GroupBySignal, "signal"},
 	} {
 		if by&g.flag != 0 {
@@ -1315,7 +1316,8 @@ func (s *SQLiteStore) SumBuckets(sel Selector, by GroupBy) ([]SumRow, error) {
 		COALESCE(SUM(duration_count),0), COALESCE(SUM(duration_sum),0),
 		COALESCE(SUM(log_count),0) FROM (`)
 	args = appendBucketUnion(&sb, sel,
-		`t.window_start AS window_start, s.service_id AS service_id, s.signal AS signal, `+
+		`t.window_start AS window_start, s.service_id AS service_id,
+			s.name_id AS name_id, s.signal AS signal, `+
 			aliasColumns("t.", sumColumnList), args)
 	sb.WriteString(`)`)
 	if len(group) > 0 {
@@ -1331,17 +1333,18 @@ func (s *SQLiteStore) SumBuckets(sel Selector, by GroupBy) ([]SumRow, error) {
 	for rows.Next() {
 		var (
 			r                              SumRow
-			window, service, signal        int64
+			window, service, name, signal  int64
 			count, errCount, reqs, errReqs int64
 			durCount, logCount             int64
 			durSum                         float64
 		)
-		if err := rows.Scan(&window, &service, &signal,
+		if err := rows.Scan(&window, &service, &name, &signal,
 			&count, &errCount, &reqs, &errReqs, &durCount, &durSum, &logCount); err != nil {
 			return nil, fmt.Errorf("aggregate store: sum buckets: %w", err)
 		}
 		r.WindowStart = window
 		r.ServiceID = uint32(service)         // #nosec G115 -- dictionary IDs are uint32
+		r.NameID = uint32(name)               // #nosec G115 -- dictionary IDs are uint32
 		r.Signal = Signal(signal)             // #nosec G115 -- signal is written from the bounded Signal enum
 		r.Count = uint64(count)               // #nosec G115 -- counters are written from uint64
 		r.ErrorCount = uint64(errCount)       // #nosec G115 -- counters are written from uint64
@@ -1437,6 +1440,67 @@ func (s *SQLiteStore) ReplayMutable(since int64) ([]DeltaRow, error) {
 		out = append(out, DeltaRow{SeriesID: SeriesID(id), WindowStart: window, Delta: d})
 	}
 	return out, rows.Err()
+}
+
+// ReadFinalizedSince implements Store. It reads MATERIALIZED bucket rows only:
+// the delta log holds the mutable set, which recovery replays through its own
+// path, so reading both here would fold the same contribution twice.
+//
+// Newest window first. The cap is the store's own row cap, applied with the
+// limit+1 probe every read in this file uses, so a caller learns that its
+// horizon was cut instead of silently receiving a partial service map.
+func (s *SQLiteStore) ReadFinalizedSince(since int64, signals []Signal, limit int) (FinalizedPage, error) {
+	if limit <= 0 || limit > MaxReadRows {
+		limit = MaxReadRows
+	}
+	var (
+		sb   strings.Builder
+		args []any
+	)
+	sb.WriteString(`SELECT t.window_start, t.series_id, ` + aliasColumns("t.", deltaColumnList) +
+		` FROM aggregate_buckets t JOIN aggregate_series s ON s.id = t.series_id
+		  WHERE t.window_start >= ?`)
+	args = append(args, since)
+	if len(signals) > 0 {
+		sb.WriteString(` AND s.signal IN (` + placeholders(len(signals)) + `)`)
+		for _, sig := range signals {
+			args = append(args, int64(sig))
+		}
+	}
+	sb.WriteString(` ORDER BY t.window_start DESC, t.series_id LIMIT ?`)
+	args = append(args, limit+1)
+
+	rows, err := s.reader.Query(sb.String(), args...)
+	if err != nil {
+		return FinalizedPage{}, fmt.Errorf("aggregate store: read finalized: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	page := FinalizedPage{Buckets: make([]Bucket, 0, 64)}
+	for rows.Next() {
+		var window, id int64
+		d, err := scanDelta(func(dst ...any) error {
+			return rows.Scan(append([]any{&window, &id}, dst...)...)
+		}, nil)
+		if err != nil {
+			return FinalizedPage{}, fmt.Errorf("aggregate store: read finalized: %w", err)
+		}
+		if len(page.Buckets) == limit {
+			// The limit+1'th row is never returned; it only proves the answer
+			// is incomplete.
+			page.Truncated = true
+			break
+		}
+		page.Buckets = append(page.Buckets, Bucket{
+			WindowStart: window,
+			SeriesID:    SeriesID(id),
+			Delta:       d,
+			Source:      SourceFinalized,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return FinalizedPage{}, fmt.Errorf("aggregate store: read finalized: %w", err)
+	}
+	return page, nil
 }
 
 // LoadBaselines implements Store.

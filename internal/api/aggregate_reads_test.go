@@ -11,6 +11,7 @@ import (
 
 	"github.com/RandomCodeSpace/otelcontext/internal/aggregate"
 	"github.com/RandomCodeSpace/otelcontext/internal/cache"
+	"github.com/RandomCodeSpace/otelcontext/internal/graphrag"
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 	"gorm.io/gorm"
 )
@@ -112,6 +113,29 @@ func seedAggregate(t *testing.T, e *aggregate.Engine, tenant, service string, sp
 	})
 }
 
+// seedAggregateEdge folds one caller/callee service-edge series into the
+// engine's current window. The caller is the series SERVICE and the callee is
+// its NAME — the identity the reducer writes for a cross-service call.
+func seedAggregateEdge(t *testing.T, e *aggregate.Engine, tenant, caller, callee string, spans int, micros float64) {
+	t.Helper()
+	tenantID, _ := e.TenantID(tenant)
+	key := aggregate.SeriesKey{
+		TenantID:    tenantID,
+		ServiceID:   e.Cache().Intern(tenantID, aggregate.KindService, caller),
+		NameID:      e.Cache().Intern(tenantID, aggregate.KindOperation, callee),
+		Signal:      aggregate.SignalServiceEdge,
+		StatusClass: aggregate.StatusOK,
+		Variant:     aggregate.SpanKindClient,
+	}
+	d := &aggregate.AggregateDelta{}
+	for i := 0; i < spans; i++ {
+		d.ObserveSpan(micros, false, true)
+	}
+	e.ApplyCommitted(aggregate.DeltaMap{
+		{Key: key, WindowStart: aggregate.WindowStart(time.Now())}: d,
+	})
+}
+
 // seedLegacy inserts equivalent raw rows so the legacy path has something to
 // aggregate.
 func seedLegacy(t *testing.T, s *Server, tenant, service string, spans int, micros int64) {
@@ -208,11 +232,15 @@ func TestServiceMapContractLegacyVsAggregate(t *testing.T) {
 	_, aggBody := getJSON(t, agg.handleGetServiceMapMetrics, "/api/metrics/service-map", tenant)
 
 	assertFieldCompatible(t, "service-map", legacyBody, aggBody)
-	if aggBody["coverage"] != string(aggregate.CoverageSampled) {
-		t.Errorf("service-map coverage = %v, want %q", aggBody["coverage"], aggregate.CoverageSampled)
+	// Nodes and edges now come from one engine query over one tenant and one
+	// range (#194 finding 15). The response used to say "sampled" only to
+	// cover for edges supplemented from GraphRAG; with the side-channel gone
+	// the engine's own coverage stands, and a full response carries no caveat.
+	if aggBody["coverage"] != string(aggregate.CoverageFull) {
+		t.Errorf("service-map coverage = %v, want %q", aggBody["coverage"], aggregate.CoverageFull)
 	}
-	if note, _ := aggBody["coverage_note"].(string); note == "" {
-		t.Error("sampled service-map carries no coverage note")
+	if note, _ := aggBody["coverage_note"].(string); note != "" {
+		t.Errorf("full service-map carries a coverage caveat: %q", note)
 	}
 }
 
@@ -336,5 +364,49 @@ func jsonKind(v any) string {
 		return "object"
 	default:
 		return "null"
+	}
+}
+
+// TestServiceMapAggregateEdgesAreEngineSourced is #194 finding 15 at the wire:
+// the aggregate service map carries the engine's own service-edge series and
+// nothing from GraphRAG, whose topology store has a different range and a
+// different retention rule. GraphRAG itself is untouched — the system-graph
+// endpoint still reads it — so the assertion is about which store the
+// AGGREGATE response is built from.
+func TestServiceMapAggregateEdgesAreEngineSourced(t *testing.T) {
+	const tenant = "default"
+	agg, _, engine := aggregateTestServer(t, true)
+
+	g := graphrag.New(nil, nil, nil, graphrag.DefaultConfig())
+	agg.SetGraphRAG(g)
+	// A CALLS edge that exists ONLY in GraphRAG. Before finding 15 it would
+	// have been supplemented straight into the response.
+	g.ObserveSpanTopology(tenant, "trace-1", "span-parent", "", "ghost-caller")
+	g.ObserveSpanTopology(tenant, "trace-1", "span-child", "span-parent", "ghost-callee")
+
+	seedAggregate(t, engine, tenant, "checkout", 6, 2000)
+	seedAggregate(t, engine, tenant, "gateway", 6, 1000)
+	seedAggregateEdge(t, engine, tenant, "gateway", "checkout", 4, 1500)
+
+	_, body := getJSON(t, agg.handleGetServiceMapMetrics, "/api/metrics/service-map", tenant)
+	edges, ok := body["edges"].([]any)
+	if !ok {
+		t.Fatalf("service-map response carries no edges array: %v", body)
+	}
+	if len(edges) != 1 {
+		t.Fatalf("edges = %v, want exactly the engine's gateway->checkout edge", edges)
+	}
+	edge, _ := edges[0].(map[string]any)
+	if edge["source"] != "gateway" || edge["target"] != "checkout" {
+		t.Fatalf("edge = %v, want gateway->checkout", edge)
+	}
+	if count, _ := edge["call_count"].(float64); count != 4 {
+		t.Errorf("edge call_count = %v, want 4", edge["call_count"])
+	}
+
+	// The GraphRAG edge is still in GraphRAG — this is a source change, not a
+	// deletion — it simply no longer reaches the aggregate response.
+	if len(g.AllServiceEdges(storage.WithTenantContext(context.Background(), tenant))) == 0 {
+		t.Fatal("the test never created a GraphRAG edge, so it proves nothing")
 	}
 }

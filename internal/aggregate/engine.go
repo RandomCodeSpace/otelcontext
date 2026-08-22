@@ -392,6 +392,24 @@ func (e *Engine) TopologySnapshot(tenant string) TopologySnapshot {
 // gone silent.
 func (e *Engine) PruneTopology() { e.topology.Prune(e.now()) }
 
+// TopologyHorizon is how much finalized history the projection retains behind
+// the mutable set. Startup restore reads no further back than this: a window
+// the projection would immediately prune is a window there is no point paying
+// to read.
+func (e *Engine) TopologyHorizon() time.Duration { return e.topology.cfg.Horizon }
+
+// RestoreTopology folds durable rows into the TOPOLOGY PROJECTION ONLY.
+//
+// It is the read side of the bounded startup exception (#194 finding 15): the
+// mutable shards are untouched, so nothing here can resurrect finalized
+// history as mutable state or double-count a window the delta-log replay
+// already restored. Identities come from reversed dictionary IDs rather than
+// from a reducer, and the projection's own retention cutoff still applies —
+// which is why the folded count, not the row count, is what recovery reports.
+func (e *Engine) RestoreTopology(ids map[SeriesWindowKey]topoIdentity, deltas DeltaMap) int {
+	return e.topology.fold(e.now(), e.revision.Load(), ids, deltas)
+}
+
 // SetTemplateFactSink installs the log-fact consumer on the ingest-owned
 // template miner (#163). GraphRAG performs no mining of its own in shadow and
 // aggregate modes; it consumes these facts. Passing nil detaches the sink.

@@ -352,6 +352,20 @@ type BucketPage struct {
 	Next BucketCursor
 }
 
+// FinalizedPage is one bounded, cross-tenant read of finalized bucket rows.
+//
+// It carries no resume cursor on purpose: its caller restores a bounded
+// horizon, and a caller that could page past the cap would no longer have a
+// bounded startup. Truncated is the honest end of the answer, not an
+// invitation to ask again.
+type FinalizedPage struct {
+	// Buckets are the rows, ordered by (window DESC, series). Newest first, so
+	// a cap drops the OLDEST part of the horizon rather than the freshest.
+	Buckets []Bucket
+	// Truncated reports that more rows matched than the cap allowed.
+	Truncated bool
+}
+
 // BucketSource says which durable table a row came from. It exists so a paged
 // read has a TOTAL order to resume from: (window_start, series_id) is unique
 // within each table but a window can legitimately hold a materialized bucket
@@ -428,6 +442,11 @@ const (
 	GroupByWindow GroupBy = 1 << iota
 	// GroupByService emits one row per service dictionary ID.
 	GroupByService
+	// GroupByName emits one row per name dictionary ID. The namespace of a
+	// NameID is the signal's (see NameKind), so this flag is only meaningful
+	// on a single-signal selector — joining NameIDs across signals is exactly
+	// the mistake the namespace split exists to prevent.
+	GroupByName
 	// GroupBySignal emits one row per signal.
 	GroupBySignal
 )
@@ -442,7 +461,10 @@ const (
 type SumRow struct {
 	WindowStart int64
 	ServiceID   uint32
-	Signal      Signal
+	// NameID is set only when GroupByName was requested. It resolves through
+	// NameKind(Signal), never through the service namespace.
+	NameID uint32
+	Signal Signal
 
 	Count             uint64
 	ErrorCount        uint64
@@ -563,6 +585,20 @@ type Store interface {
 	// the mutable set only. Finalized history never hydrates into RAM (#160).
 	ReplayMutable(since int64) ([]DeltaRow, error)
 
+	// ReadFinalizedSince returns MATERIALIZED bucket rows at or after since
+	// for the given signals, across every tenant, NEWEST window first, capped
+	// at limit rows.
+	//
+	// It is the one bounded exception to "finalized history never hydrates"
+	// (#194 finding 15): the topology projection is rebuilt from it at
+	// startup so a restart does not erase the recent service map. It feeds
+	// the projection ONLY — never the mutable shards — and the two bounds
+	// that keep it a startup cost rather than a startup stall are the caller's
+	// horizon (since) and the row cap. Truncated reports that the cap cut the
+	// answer, so a restored topology is never presented as complete when it
+	// is not.
+	ReadFinalizedSince(since int64, signals []Signal, limit int) (FinalizedPage, error)
+
 	// LoadBaselines returns every durable cumulative baseline, capped at max.
 	LoadBaselines(max int) ([]BaselineRow, error)
 
@@ -599,9 +635,9 @@ type StoreMetrics interface {
 	RecordPurge(stats PurgeStats, err error)
 	// SetBacklog publishes the delta-log backlog health bounds.
 	SetBacklog(rows int64, ageSeconds float64)
-	// RecordRecovery publishes the startup recovery duration and how many
-	// delta rows were replayed.
-	RecordRecovery(d time.Duration, replayed int, finalized int)
+	// RecordRecovery publishes one startup recovery: its duration and every
+	// row class it moved.
+	RecordRecovery(stats RecoveryStats)
 	// RecordGC publishes one identity garbage-collection pass.
 	RecordGC(stats GCStats, err error)
 }
@@ -614,7 +650,7 @@ func (noopStoreMetrics) RecordAdmissionRejected(string)                {}
 func (noopStoreMetrics) RecordFinalize(FinalizeStats, error)           {}
 func (noopStoreMetrics) RecordPurge(PurgeStats, error)                 {}
 func (noopStoreMetrics) SetBacklog(int64, float64)                     {}
-func (noopStoreMetrics) RecordRecovery(time.Duration, int, int)        {}
+func (noopStoreMetrics) RecordRecovery(RecoveryStats)                  {}
 func (noopStoreMetrics) RecordGC(GCStats, error)                       {}
 
 // MutableSince returns the oldest window start still inside the mutable set at

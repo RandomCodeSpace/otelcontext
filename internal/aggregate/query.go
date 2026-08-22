@@ -237,6 +237,12 @@ type TopologyEdge struct {
 }
 
 // TopologyResult is the answer to QueryTopology.
+//
+// Nodes and Edges come from ONE query over ONE tenant and ONE range, read
+// under ONE ownership snapshot. That is the whole point (#194 finding 15):
+// before it, edges were supplemented into API responses from GraphRAG, a store
+// with a different range, a different tenant scope and a different retention
+// rule, and nothing in the response said so.
 type TopologyResult struct {
 	Nodes    []ServiceStat
 	Edges    []TopologyEdge
@@ -431,12 +437,25 @@ func (e *Engine) serviceName(key SeriesKey) string {
 
 // serviceNameByID is serviceName for the SQL aggregation path, which knows the
 // dictionary ID but never builds a SeriesKey.
-func (e *Engine) serviceNameByID(id uint32) string {
+func (e *Engine) serviceNameByID(id uint32) string { return e.nameByID(id) }
+
+// nameByID reverses one dictionary ID. The dictionary is keyed by ID alone, so
+// the same reversal serves every namespace; the CALLER is responsible for
+// having taken the ID out of the right field of the right signal's key.
+func (e *Engine) nameByID(id uint32) string {
 	entry, ok := e.cache.Lookup(id)
 	if !ok {
 		return ""
 	}
 	return string(entry.Value)
+}
+
+// edgeEnds resolves a service-edge series to (caller, callee). ReduceEdge puts
+// the caller in ServiceID and the callee in NameID — the callee is the edge's
+// "name" inside the caller's operation namespace, which is what makes a
+// caller's fan-out subject to MAX_OPERATIONS_PER_SERVICE.
+func (e *Engine) edgeEnds(key SeriesKey) (caller, callee string) {
+	return e.nameByID(key.ServiceID), e.nameByID(key.NameID)
 }
 
 // serviceFilter turns the query's service list into a membership test. A nil
@@ -740,13 +759,32 @@ func topFailing(perSvc map[string]*dashAccum, limit int) []ServiceStat {
 }
 
 // QueryTopology returns the service topology: one node per service with its
-// aggregate accounting, plus whatever caller/callee edge series exist.
+// aggregate accounting, plus the caller/callee edges of the SAME tenant and
+// range, read under the SAME ownership snapshot.
 //
-// Like the other two, its store half is a SQL GROUP BY — one row per service,
-// not one per series — so CoverageFull here means what it says.
+// Both halves are SQL GROUP BY on the store side — one row per service for the
+// nodes, one row per (caller, callee) for the edges, never one per series — so
+// CoverageFull here means what it says and no row cap can truncate the answer.
+//
+// A Services filter selects a SUBGRAPH: an edge survives only when both of its
+// ends survive, so the result is never a graph with edges hanging off nodes it
+// does not contain.
 func (e *Engine) QueryTopology(q Query) (*TopologyResult, error) {
-	q.Signal = SignalTraceOp
+	// No signal filter: the trace-op series carry the nodes and the
+	// service-edge series carry the edges, and both must be read through the
+	// one plan that pins tenant, range and ownership.
+	q.Signal = SignalUnspecified
 	filter := serviceFilter(q.Services)
+	keep := func(name string) bool {
+		if name == "" {
+			return false
+		}
+		if filter == nil {
+			return true
+		}
+		_, ok := filter[name]
+		return ok
+	}
 	nodes := make(map[string]*dashAccum)
 	at := func(name string) *dashAccum {
 		acc := nodes[name]
@@ -756,38 +794,66 @@ func (e *Engine) QueryTopology(q Query) (*TopologyResult, error) {
 		}
 		return acc
 	}
+	edges := make(map[topoPair]*dashAccum)
+	edgeAt := func(caller, callee string) *dashAccum {
+		key := topoPair{caller, callee}
+		acc := edges[key]
+		if acc == nil {
+			acc = &dashAccum{}
+			edges[key] = acc
+		}
+		return acc
+	}
 
 	own, sel, hasStore, err := e.plan(q, func(_ int64, key SeriesKey, d *AggregateDelta) {
-		name := e.serviceName(key)
-		if name == "" {
-			return
-		}
-		if filter != nil {
-			if _, ok := filter[name]; !ok {
+		switch key.Signal {
+		case SignalTraceOp:
+			name := e.serviceName(key)
+			if !keep(name) {
 				return
 			}
+			at(name).addDelta(d)
+		case SignalServiceEdge:
+			caller, callee := e.edgeEnds(key)
+			if !keep(caller) || !keep(callee) {
+				return
+			}
+			edgeAt(caller, callee).addDelta(d)
 		}
-		at(name).addDelta(d)
 	})
 	if err != nil {
 		return nil, err
 	}
 	if hasStore {
-		sums, err := e.sumStore(sel, GroupByService)
+		nodeSel := sel
+		nodeSel.Signal = SignalTraceOp
+		sums, err := e.sumStore(nodeSel, GroupByService)
 		if err != nil {
 			return nil, err
 		}
 		for _, r := range sums {
 			name := e.serviceNameByID(r.ServiceID)
-			if name == "" {
+			if !keep(name) {
 				continue
 			}
-			if filter != nil {
-				if _, ok := filter[name]; !ok {
-					continue
-				}
-			}
 			at(name).addSum(r)
+		}
+
+		// One row per (caller, callee): the callee is the series NAME, so the
+		// edge grouping is GroupByService|GroupByName under a single-signal
+		// selector — the only shape in which a NameID means one namespace.
+		edgeSel := sel
+		edgeSel.Signal = SignalServiceEdge
+		edgeSums, err := e.sumStore(edgeSel, GroupByService|GroupByName)
+		if err != nil {
+			return nil, err
+		}
+		for _, r := range edgeSums {
+			caller, callee := e.nameByID(r.ServiceID), e.nameByID(r.NameID)
+			if !keep(caller) || !keep(callee) {
+				continue
+			}
+			edgeAt(caller, callee).addSum(r)
 		}
 	}
 
@@ -812,9 +878,37 @@ func (e *Engine) QueryTopology(q Query) (*TopologyResult, error) {
 
 	return &TopologyResult{
 		Nodes:    out,
-		Edges:    []TopologyEdge{},
+		Edges:    topologyEdges(edges),
 		Coverage: CoverageFull,
 		Epoch:    own.Epoch,
 		Revision: own.Revision,
 	}, nil
+}
+
+// topologyEdges renders the accumulated caller/callee pairs, sorted by
+// (caller, callee) so a client diffing two responses sees data changes rather
+// than map-iteration noise.
+func topologyEdges(acc map[topoPair]*dashAccum) []TopologyEdge {
+	out := make([]TopologyEdge, 0, len(acc))
+	for pair, a := range acc {
+		edge := TopologyEdge{
+			Source:    pair.a,
+			Target:    pair.b,
+			CallCount: asInt64(a.count),
+		}
+		if a.count > 0 {
+			edge.ErrorRate = float64(a.errors) / float64(a.count)
+		}
+		if a.durCount > 0 {
+			edge.AvgLatencyMs = a.durSum / float64(a.durCount) / 1000.0
+		}
+		out = append(out, edge)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Source != out[j].Source {
+			return out[i].Source < out[j].Source
+		}
+		return out[i].Target < out[j].Target
+	})
+	return out
 }

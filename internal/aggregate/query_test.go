@@ -109,12 +109,15 @@ func (s *stubStore) SumBuckets(sel Selector, by GroupBy) ([]SumRow, error) {
 		if by&GroupByService != 0 {
 			g.ServiceID = key.ServiceID
 		}
+		if by&GroupByName != 0 {
+			g.NameID = key.NameID
+		}
 		if by&GroupBySignal != 0 {
 			g.Signal = key.Signal
 		}
 		acc := groups[g]
 		if acc == nil {
-			acc = &SumRow{WindowStart: g.WindowStart, ServiceID: g.ServiceID, Signal: g.Signal}
+			acc = &SumRow{WindowStart: g.WindowStart, ServiceID: g.ServiceID, NameID: g.NameID, Signal: g.Signal}
 			groups[g] = acc
 			order = append(order, g)
 		}
@@ -133,7 +136,46 @@ func (s *stubStore) SumBuckets(sel Selector, by GroupBy) ([]SumRow, error) {
 	return out, nil
 }
 
-func (s *stubStore) ReplayMutable(int64) ([]DeltaRow, error)  { return nil, nil }
+func (s *stubStore) ReplayMutable(int64) ([]DeltaRow, error) { return nil, nil }
+
+// ReadFinalizedSince is the naive reference: filter by window and signal in
+// Go, newest window first, cap with the same limit+1 probe the SQLite store
+// uses.
+func (s *stubStore) ReadFinalizedSince(since int64, signals []Signal, limit int) (FinalizedPage, error) {
+	if limit <= 0 || limit > MaxReadRows {
+		limit = MaxReadRows
+	}
+	want := make(map[Signal]struct{}, len(signals))
+	for _, sig := range signals {
+		want[sig] = struct{}{}
+	}
+	out := make([]Bucket, 0, len(s.buckets))
+	for _, b := range s.buckets {
+		if b.WindowStart < since || b.Source != SourceFinalized {
+			continue
+		}
+		if len(want) > 0 {
+			if _, ok := want[s.infos[b.SeriesID].Signal]; !ok {
+				continue
+			}
+		}
+		out = append(out, b)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].WindowStart != out[j].WindowStart {
+			return out[i].WindowStart > out[j].WindowStart
+		}
+		return out[i].SeriesID < out[j].SeriesID
+	})
+	page := FinalizedPage{}
+	if len(out) > limit {
+		out = out[:limit]
+		page.Truncated = true
+	}
+	page.Buckets = out
+	return page, nil
+}
+
 func (s *stubStore) LoadBaselines(int) ([]BaselineRow, error) { return nil, nil }
 func (s *stubStore) ResolveSeries(ids []SeriesID) ([]SeriesInfo, error) {
 	out := make([]SeriesInfo, 0, len(ids))
@@ -175,6 +217,20 @@ func (f *queryFixture) traceKey(service, op string) SeriesKey {
 		Signal:      SignalTraceOp,
 		StatusClass: StatusOK,
 		Variant:     SpanKindServer,
+	}
+}
+
+// edgeKey builds a service-edge series key for a caller/callee pair. The
+// CALLER is the series' service and the CALLEE is its name, interned in the
+// operation namespace — the identity ReduceEdge writes.
+func (f *queryFixture) edgeKey(caller, callee string) SeriesKey {
+	return SeriesKey{
+		TenantID:    f.tenantID,
+		ServiceID:   f.engine.Cache().Intern(f.tenantID, KindService, caller),
+		NameID:      f.engine.Cache().Intern(f.tenantID, KindOperation, callee),
+		Signal:      SignalServiceEdge,
+		StatusClass: StatusOK,
+		Variant:     SpanKindClient,
 	}
 }
 
@@ -482,5 +538,92 @@ func TestFinalizeHandsOwnershipToTheStore(t *testing.T) {
 	}
 	if own.FinalizedWatermark < old {
 		t.Errorf("FinalizedWatermark = %d, want at least %d", own.FinalizedWatermark, old)
+	}
+}
+
+// TestQueryTopologyEdgesShareTheNodeQuery is #194 finding 15: edges come out of
+// the SAME plan as the nodes — same tenant, same range, same ownership
+// snapshot — with the memory-owned and store-owned halves added rather than one
+// of them silently winning.
+func TestQueryTopologyEdgesShareTheNodeQuery(t *testing.T) {
+	f := newQueryFixture(t)
+	st := newStubStore()
+	f.engine.SetStore(st)
+
+	w := f.window()
+	old := w - 3*int64(WindowSize/time.Second)
+
+	f.apply(f.traceKey("cart", "op"), w, spanDelta(3, 2000))
+	f.apply(f.traceKey("checkout", "op"), w, spanDelta(6, 1000))
+	f.apply(f.edgeKey("cart", "checkout"), w, spanDelta(6, 1000))
+
+	// Store-owned rows in the same range: they must ADD to the memory half.
+	st.put(1, f.traceKey("cart", "op"), old, spanDelta(3, 2000))
+	st.put(2, f.edgeKey("cart", "checkout"), old, spanDelta(3, 2000))
+
+	// Another tenant's edge over the same window must never leak in.
+	otherID, ok := f.engine.TenantID("other")
+	if !ok {
+		t.Fatal("second tenant was refused")
+	}
+	st.put(3, SeriesKey{
+		TenantID:  otherID,
+		ServiceID: f.engine.Cache().Intern(otherID, KindService, "cart"),
+		NameID:    f.engine.Cache().Intern(otherID, KindOperation, "checkout"),
+		Signal:    SignalServiceEdge,
+	}, old, spanDelta(30, 1000))
+
+	res, err := f.engine.QueryTopology(f.rangeQuery())
+	if err != nil {
+		t.Fatalf("QueryTopology: %v", err)
+	}
+	if len(res.Edges) != 1 {
+		t.Fatalf("edges = %+v, want exactly one cart->checkout edge", res.Edges)
+	}
+	edge := res.Edges[0]
+	if edge.Source != "cart" || edge.Target != "checkout" {
+		t.Fatalf("edge = %s->%s, want cart->checkout", edge.Source, edge.Target)
+	}
+	if edge.CallCount != 9 {
+		t.Errorf("edge call count = %d, want 9 (6 memory-owned + 3 store-owned)", edge.CallCount)
+	}
+	// spanDelta marks every third observation an error: 2 of 6 plus 1 of 3.
+	if math.Abs(edge.ErrorRate-3.0/9.0) > 1e-9 {
+		t.Errorf("edge error rate = %v, want %v", edge.ErrorRate, 3.0/9.0)
+	}
+	wantLatency := (6*1000.0 + 3*2000.0) / 9 / 1000.0
+	if math.Abs(edge.AvgLatencyMs-wantLatency) > 1e-9 {
+		t.Errorf("edge avg latency = %v ms, want %v", edge.AvgLatencyMs, wantLatency)
+	}
+	// The edge series must not be counted as a service node.
+	if len(res.Nodes) != 2 {
+		t.Fatalf("nodes = %+v, want cart and checkout only", res.Nodes)
+	}
+	if res.Coverage != CoverageFull {
+		t.Errorf("coverage = %q, want %q", res.Coverage, CoverageFull)
+	}
+}
+
+// TestQueryTopologyServiceFilterKeepsTheGraphClosed proves a filtered topology
+// is a SUBGRAPH: an edge whose other end was filtered out is dropped rather
+// than left hanging off a node the response does not contain.
+func TestQueryTopologyServiceFilterKeepsTheGraphClosed(t *testing.T) {
+	f := newQueryFixture(t)
+	w := f.window()
+	f.apply(f.traceKey("cart", "op"), w, spanDelta(3, 2000))
+	f.apply(f.traceKey("checkout", "op"), w, spanDelta(6, 1000))
+	f.apply(f.edgeKey("cart", "checkout"), w, spanDelta(6, 1000))
+
+	q := f.rangeQuery()
+	q.Services = []string{"checkout"}
+	res, err := f.engine.QueryTopology(q)
+	if err != nil {
+		t.Fatalf("QueryTopology: %v", err)
+	}
+	if len(res.Nodes) != 1 || res.Nodes[0].Service != "checkout" {
+		t.Fatalf("nodes = %+v, want checkout only", res.Nodes)
+	}
+	if len(res.Edges) != 0 {
+		t.Fatalf("edges = %+v, want none: cart was filtered out", res.Edges)
 	}
 }

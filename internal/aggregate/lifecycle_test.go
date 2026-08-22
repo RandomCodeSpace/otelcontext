@@ -29,13 +29,17 @@ type lifecycleFixture struct {
 // identity stack over it.
 func newLifecycleFixture(t *testing.T, b Bounds) *lifecycleFixture {
 	t.Helper()
-	return openLifecycleFixture(t, filepath.Join(t.TempDir(), "aggregate.db"), b, nil)
+	return openLifecycleFixture(t, filepath.Join(t.TempDir(), "aggregate.db"), b, nil, nil)
 }
 
 // openLifecycleFixture wires a cold identity stack over the store at path,
 // which is what a restart looks like: durable rows are there, every in-memory
 // map starts empty. wrap, when set, decorates the store the writer sees.
-func openLifecycleFixture(t *testing.T, path string, b Bounds, wrap func(*SQLiteStore) Store) *lifecycleFixture {
+//
+// clock, when non-nil, is adopted rather than replaced: a restart must not
+// rewind the wall clock, or "the process was down for twenty minutes" cannot
+// be expressed.
+func openLifecycleFixture(t *testing.T, path string, b Bounds, wrap func(*SQLiteStore) Store, clock *fixedClock) *lifecycleFixture {
 	t.Helper()
 	sqlite := newTestStoreAt(t, path, StoreConfig{})
 	var store Store = sqlite
@@ -46,7 +50,9 @@ func openLifecycleFixture(t *testing.T, path string, b Bounds, wrap func(*SQLite
 	if err != nil {
 		t.Fatalf("NewDurableRegistrarWithBounds: %v", err)
 	}
-	clock := newClock(time.Unix(3_000_000, 0).UTC())
+	if clock == nil {
+		clock = newClock(time.Unix(3_000_000, 0).UTC())
+	}
 	eng, err := NewEngine(EngineConfig{
 		Mode:      ModeAggregate,
 		Registrar: reg,
@@ -70,7 +76,7 @@ func (f *lifecycleFixture) restart(b Bounds) *lifecycleFixture {
 	if err := f.sqlite.Close(); err != nil {
 		f.t.Fatalf("close store: %v", err)
 	}
-	return openLifecycleFixture(f.t, f.path, b, nil)
+	return openLifecycleFixture(f.t, f.path, b, nil, f.clock)
 }
 
 // collect runs one GC pass through the fixture's writer barrier.
@@ -448,7 +454,7 @@ func TestSweepFailureLeavesMemoryUntouched(t *testing.T) {
 	f := openLifecycleFixture(t, path, Bounds{}, func(s *SQLiteStore) Store {
 		failing = &failingSweepStore{SQLiteStore: s, err: boom}
 		return failing
-	})
+	}, nil)
 
 	_, err := f.writer.CollectIdentities()
 	if !errors.Is(err, boom) {
@@ -547,7 +553,7 @@ func TestMinerSurvivesCrashBetweenCommitAndSnapshot(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 
-	cold := openLifecycleFixture(t, f.path, Bounds{}, nil)
+	cold := openLifecycleFixture(t, f.path, Bounds{}, nil, nil)
 	restored, err := RestoreMiner(cold.store, cold.eng.Miner())
 	if err != nil {
 		t.Fatalf("RestoreMiner: %v", err)

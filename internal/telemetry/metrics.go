@@ -743,7 +743,7 @@ func New() *Metrics {
 	})
 	m.AggregateRecoveryRows = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "otelcontext_aggregate_recovery_rows",
-		Help: "Rows handled by the last aggregate startup recovery, by kind (replayed|finalized_windows).",
+		Help: "Rows handled by the last aggregate startup recovery, by kind (replayed|finalized_windows|topology_restored_rows|topology_restored_windows).",
 	}, []string{"kind"})
 	m.AggregateGCRunsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "otelcontext_aggregate_gc_runs_total",

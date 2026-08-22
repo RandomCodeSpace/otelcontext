@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/joho/godotenv"
 )
@@ -364,6 +365,15 @@ type Config struct {
 	AggregateCommitMaxWaiters       int
 	AggregateCommitMaxPendingDeltas int
 
+	// AggregateTopologyRestoreHorizon is how much FINALIZED history the
+	// engine's topology projection is rebuilt from at startup (#194 finding
+	// 15). Without it a restart erases the recent service map until new
+	// telemetry re-derives one. Accepts a Go duration ("30m", "1h"); 0
+	// disables the restore. Clamped to 24h, and internally to the projection's
+	// own retention horizon — reading a window the projection would prune on
+	// arrival is startup cost with nothing to show for it.
+	AggregateTopologyRestoreHorizon time.Duration
+
 	// AggregateFinalizeIntervalSec is how often the writer looks for windows
 	// whose lateness horizon has expired.
 	AggregateFinalizeIntervalSec int
@@ -635,6 +645,7 @@ func Load(customPath string) (*Config, error) {
 		AggregateCommitMaxWaiters:       getEnvInt("AGGREGATE_COMMIT_MAX_WAITERS", 512),
 		AggregateCommitMaxPendingDeltas: getEnvInt("AGGREGATE_COMMIT_MAX_PENDING_DELTAS", 200000),
 		AggregateFinalizeIntervalSec:    getEnvInt("AGGREGATE_FINALIZE_INTERVAL_SEC", 30),
+		AggregateTopologyRestoreHorizon: getEnvDuration("AGGREGATE_TOPOLOGY_RESTORE_HORIZON", 30*time.Minute),
 
 		// Identity lifecycle (#200)
 		AggregateGCEnabled:             getEnvBool("AGGREGATE_GC_ENABLED", true),
@@ -828,6 +839,18 @@ func splitCSV(v string) []string {
 		return nil
 	}
 	return out
+}
+
+// getEnvDuration parses a Go duration ("30m", "1h30m"). An unparseable value
+// takes the fallback, matching getEnvInt: a typo must not silently disable a
+// bounded-cost knob by reading as zero.
+func getEnvDuration(key string, fallback time.Duration) time.Duration {
+	if v, exists := os.LookupEnv(key); exists {
+		if d, err := time.ParseDuration(strings.TrimSpace(v)); err == nil {
+			return d
+		}
+	}
+	return fallback
 }
 
 func getEnvBool(key string, fallback bool) bool {
@@ -1089,6 +1112,12 @@ func (c *Config) Validate() error {
 		if c.AggregateCommitMaxPendingBytes < c.AggregateCommitMaxBytes {
 			return fmt.Errorf("AGGREGATE_COMMIT_MAX_PENDING_BYTES (%d) must be >= AGGREGATE_COMMIT_MAX_BYTES (%d)",
 				c.AggregateCommitMaxPendingBytes, c.AggregateCommitMaxBytes)
+		}
+		// The topology restore is a startup cost paid before readiness. A
+		// negative horizon is a typo, and an unbounded one is a stalled boot.
+		if c.AggregateTopologyRestoreHorizon < 0 || c.AggregateTopologyRestoreHorizon > 24*time.Hour {
+			return fmt.Errorf("AGGREGATE_TOPOLOGY_RESTORE_HORIZON must be between 0 and 24h, got %s",
+				c.AggregateTopologyRestoreHorizon)
 		}
 	}
 

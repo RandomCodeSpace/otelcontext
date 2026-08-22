@@ -578,3 +578,60 @@ func assertEmpty(t *testing.T, s *SQLiteStore, table string) {
 	t.Helper()
 	assertCount(t, s, table, 0)
 }
+
+// TestSumBucketsGroupsByNameWithinASignal covers the grouping QueryTopology's
+// edge half rests on: one row per (service, name) under a single-signal
+// selector. The name namespace is the signal's, so the selector pins the signal
+// and the grouping never joins a NameID across two of them.
+func TestSumBucketsGroupsByNameWithinASignal(t *testing.T) {
+	store := newTestStore(t)
+	edge := func(caller, callee uint32) SeriesKey {
+		return SeriesKey{
+			TenantID: 1, ServiceID: caller, NameID: callee,
+			Signal: SignalServiceEdge, StatusClass: StatusOK, Variant: SpanKindClient,
+		}
+	}
+	window := int64(1_800_000)
+	if err := store.CommitGroup(&GroupBatch{
+		Series: []SeriesRow{
+			{ID: 1, Key: edge(10, 20)},
+			{ID: 2, Key: edge(10, 30)},
+			{ID: 3, Key: storeKey(20)},
+		},
+		Deltas: []DeltaRow{
+			{SeriesID: 1, WindowStart: window, Delta: spanDelta(4, 100)},
+			{SeriesID: 1, WindowStart: window + int64(WindowSize/time.Second), Delta: spanDelta(2, 100)},
+			{SeriesID: 2, WindowStart: window, Delta: spanDelta(3, 100)},
+			{SeriesID: 3, WindowStart: window, Delta: spanDelta(9, 100)},
+		},
+	}); err != nil {
+		t.Fatalf("CommitGroup: %v", err)
+	}
+
+	sums, err := store.SumBuckets(Selector{
+		TenantID: 1,
+		Start:    window,
+		End:      window + 4*int64(WindowSize/time.Second),
+		Signal:   SignalServiceEdge,
+	}, GroupByService|GroupByName)
+	if err != nil {
+		t.Fatalf("SumBuckets: %v", err)
+	}
+	got := make(map[uint32]uint64, len(sums))
+	for _, r := range sums {
+		if r.ServiceID != 10 {
+			t.Fatalf("row %+v carries a service the selector excluded", r)
+		}
+		if r.WindowStart != 0 {
+			t.Errorf("row %+v carries a window start without GroupByWindow", r)
+		}
+		got[r.NameID] += r.Count
+	}
+	if len(got) != 2 {
+		t.Fatalf("grouped rows = %v, want one per callee", got)
+	}
+	// Both windows of the first edge collapse into its single group row.
+	if got[20] != 6 || got[30] != 3 {
+		t.Fatalf("grouped counts = %v, want {20: 6, 30: 3}", got)
+	}
+}

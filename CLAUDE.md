@@ -177,6 +177,50 @@ projection retains a bounded recent horizon (the mutable windows plus
 absent. History older than that horizon is unavailable in aggregate mode — it is
 reported as reduced coverage, never as a flat line.
 
+### Engine-sourced topology and finalized-horizon restore (#194 finding 15)
+
+`Engine.QueryTopology` returns **nodes and edges from one query**: one tenant,
+one range, one ownership snapshot. The store half is SQL `GROUP BY` on both
+sides — one row per service for the nodes, one row per `(caller, callee)` for
+the edges (`GroupByService|GroupByName` under a `SignalServiceEdge` selector) —
+so neither half can be truncated by a row cap. A `Services` filter selects a
+**subgraph**: an edge survives only when both ends do, so the result never
+carries an edge hanging off a node the response omits.
+
+The GraphRAG edge side-channel is **gone** from aggregate-mode responses.
+`GET /api/metrics/service-map` and the WebSocket `live_snapshot` used to take
+their nodes from the engine and their edges from the GraphRAG service store — a
+different range, a different retention rule, exemplar-fed counts — and marked
+the whole response `sampled` to cover for it. Both now carry the engine's own
+coverage (`full`) and its edges. GraphRAG itself is untouched: `/api/graph`
+still reads it, and in aggregate mode its topology is already replaced per
+revision from `TopologySnapshot`.
+
+**Startup restore.** `aggregate.Recover` takes a `RecoverOptions` and, when
+`TopologyHorizon > 0`, rebuilds the topology projection from **finalized bucket
+rows** inside that horizon (`Store.ReadFinalizedSince`, newest window first)
+plus the mutable delta rows it just replayed. Without it a restart erased the
+recent service map — every node, edge and metric baseline — while the numbers
+sat in the bucket table.
+
+This is the **only** exception to "finalized history never hydrates", and it
+stops short of the shards: it writes to the projection only, so no finalized
+window can re-enter the mutable set through it. It is bounded three ways — the
+configured horizon, a row cap (`RecoverOptions.TopologyMaxRows`, default
+20,000, clamped to `MaxReadRows`), and the projection's own retention cutoff,
+which is why recovery reports what the fold **accepted**, not what the store
+returned.
+
+- `AGGREGATE_TOPOLOGY_RESTORE_HORIZON` (Go duration, default `30m`, `0`
+  disables, validated `0..24h`) — clamped internally to
+  `TopologySnapshot.Horizon`; reading a window the projection would prune on
+  arrival is startup cost with nothing to show for it.
+- Recovery reports `restored_topology_rows`, `restored_topology_windows` and
+  `restored_topology_truncated` on the recovery log line, and
+  `otelcontext_aggregate_recovery_rows{kind="topology_restored_rows"|"topology_restored_windows"}`.
+  A truncated restore logs a warning: the topology is real but incomplete at
+  its oldest end.
+
 ### Aggregate identity lifecycle (#200)
 
 The dictionary and series tables were append-only. They are not any more.

@@ -428,9 +428,13 @@ func DashboardStatsFromAggregate(r *aggregate.DashboardResult) DashboardStats {
 }
 
 // ServiceMapMetricsFromAggregate converts an engine topology query into the
-// topology view. Edges are passed in by the caller because caller/callee
-// identity is not aggregate data — see the handler.
-func ServiceMapMetricsFromAggregate(r *aggregate.TopologyResult, edges []ServiceMapEdge, coverage aggregate.Coverage) ServiceMapMetrics {
+// topology view.
+//
+// Nodes AND edges come from the one result: they were read from one tenant,
+// one range and one ownership snapshot, and the coverage the engine reported
+// describes both. Nothing is supplemented from a second store here — that
+// supplementation is #194 finding 15.
+func ServiceMapMetricsFromAggregate(r *aggregate.TopologyResult) ServiceMapMetrics {
 	if r == nil {
 		return ServiceMapMetrics{Nodes: []ServiceMapNode{}, Edges: []ServiceMapEdge{}}
 	}
@@ -443,14 +447,21 @@ func ServiceMapMetricsFromAggregate(r *aggregate.TopologyResult, edges []Service
 			AvgLatencyMs: n.AvgLatencyMs,
 		}
 	}
-	if edges == nil {
-		edges = []ServiceMapEdge{}
+	edges := make([]ServiceMapEdge, len(r.Edges))
+	for i, e := range r.Edges {
+		edges[i] = ServiceMapEdge{
+			Source:       e.Source,
+			Target:       e.Target,
+			CallCount:    e.CallCount,
+			AvgLatencyMs: e.AvgLatencyMs,
+			ErrorRate:    e.ErrorRate,
+		}
 	}
 	return ServiceMapMetrics{
 		Nodes:        nodes,
 		Edges:        edges,
-		Coverage:     string(coverage),
-		CoverageNote: coverage.Note(),
+		Coverage:     string(r.Coverage),
+		CoverageNote: r.Coverage.Note(),
 		Epoch:        r.Epoch,
 		Revision:     r.Revision,
 	}

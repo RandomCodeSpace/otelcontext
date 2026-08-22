@@ -36,7 +36,7 @@ func TestRecoveryReplaysMutableWindowsOnly(t *testing.T) {
 	}
 
 	eng := newTestEngine(t, clock, nil)
-	stats, err := Recover(store, eng, nil, clock.Now())
+	stats, err := Recover(store, eng, nil, clock.Now(), RecoverOptions{})
 	if err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
@@ -78,7 +78,7 @@ func TestRecoverySeedsBaselines(t *testing.T) {
 	}
 
 	eng := newTestEngine(t, clock, nil)
-	stats, err := Recover(store, eng, nil, clock.Now())
+	stats, err := Recover(store, eng, nil, clock.Now(), RecoverOptions{})
 	if err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
@@ -113,7 +113,7 @@ func TestRecoveryFinalizesDowntimeExpiredWindows(t *testing.T) {
 	// The process was down long enough for the window's lateness to expire.
 	clock.Advance(2 * (WindowSize + AllowedLateness))
 	eng2 := newTestEngine(t, clock, nil)
-	stats, err := Recover(store, eng2, nil, clock.Now())
+	stats, err := Recover(store, eng2, nil, clock.Now(), RecoverOptions{})
 	if err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
@@ -175,7 +175,7 @@ func TestCrashAfterACKSurvivesKill9(t *testing.T) {
 	clock := newClock(time.Unix(3_000_000, 0).UTC())
 	store := newTestStoreAt(t, path, StoreConfig{})
 	eng := newTestEngine(t, clock, nil)
-	stats, err := Recover(store, eng, nil, clock.Now())
+	stats, err := Recover(store, eng, nil, clock.Now(), RecoverOptions{})
 	if err != nil {
 		t.Fatalf("Recover after kill -9: %v", err)
 	}
@@ -260,7 +260,7 @@ func TestReopenWithoutCheckpointKeepsAcknowledgedDeltas(t *testing.T) {
 
 	reopened := newTestStoreAt(t, path, StoreConfig{})
 	eng2 := newTestEngine(t, clock, nil)
-	if _, err := Recover(reopened, eng2, nil, clock.Now()); err != nil {
+	if _, err := Recover(reopened, eng2, nil, clock.Now(), RecoverOptions{}); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
 	if count, _ := eng2.Snapshot().Totals(SignalTraceOp); count != 6 {
