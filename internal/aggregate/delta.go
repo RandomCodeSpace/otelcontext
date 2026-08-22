@@ -23,6 +23,24 @@ type AggregateDelta struct {
 	// ERROR for traces, severity ERROR/FATAL for logs. Metrics never set it.
 	ErrorCount uint64
 
+	// RequestCount is the subset of Count that qualifies as a REQUEST: a span
+	// that is a trace root (no parent span) or a SERVER-kind span. Either
+	// qualifies and a span is counted at most once (#197 Q2).
+	//
+	// It exists because Count is per SPAN, and a dashboard that labels a span
+	// total "traces" is lying by a factor of the average trace size. A
+	// distributed trace with several entry points counts once per entry point:
+	// a documented approximation, not a unique-trace-ID count, because trace
+	// IDs are on the permanent banned list (#153, #159) and cannot be counted
+	// without carrying them into aggregate identity.
+	//
+	// Only trace-shaped signals set it; logs and metrics leave it zero.
+	RequestCount uint64
+	// ErrorRequestCount is the error subset of RequestCount. It is the
+	// numerator of the headline dashboard error rate (#197 Q3); per-operation
+	// error rates stay span-based on ErrorCount/Count.
+	ErrorRequestCount uint64
+
 	// --- durations (traces) ---
 
 	// DurationCount is the number of duration observations. It tracks Count
@@ -83,14 +101,24 @@ type AggregateDelta struct {
 	LastTimestamp  time.Time
 }
 
-// ObserveSpan records one span: its count, its error classification and its
-// duration in microseconds. Negative durations are recorded in the counters but
-// clamped to zero for the sketch, which is what Sketch.Observe does with them
-// anyway (latency is non-negative by construction).
-func (d *AggregateDelta) ObserveSpan(durationMicros float64, isError bool) {
+// ObserveSpan records one span: its count, its error classification, whether it
+// is a request entry point, and its duration in microseconds. Negative
+// durations are recorded in the counters but clamped to zero for the sketch,
+// which is what Sketch.Observe does with them anyway (latency is non-negative
+// by construction).
+//
+// isRequest is IsRequestSpan's verdict for the span. It is passed in rather
+// than derived here because the delta never sees the span's parent or kind.
+func (d *AggregateDelta) ObserveSpan(durationMicros float64, isError, isRequest bool) {
 	d.Count++
 	if isError {
 		d.ErrorCount++
+	}
+	if isRequest {
+		d.RequestCount++
+		if isError {
+			d.ErrorRequestCount++
+		}
 	}
 	d.observeDuration(durationMicros)
 }
@@ -163,6 +191,8 @@ func (d *AggregateDelta) Merge(other *AggregateDelta) {
 	}
 	d.Count += other.Count
 	d.ErrorCount += other.ErrorCount
+	d.RequestCount += other.RequestCount
+	d.ErrorRequestCount += other.ErrorRequestCount
 
 	if other.DurationCount > 0 {
 		if d.DurationCount == 0 || other.DurationMin < d.DurationMin {

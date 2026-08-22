@@ -293,7 +293,8 @@ func (s *SQLiteStore) Close() error {
 // table. Both carry the same aggregate payload; only their keys differ.
 const deltaColumnList = `point_count, error_count, duration_count, duration_sum, duration_min, duration_max,
 	gauge_count, gauge_sum, gauge_min, gauge_max, gauge_last, gauge_last_ts,
-	counter_delta, reset_count, log_count, first_ts, last_ts, sketch`
+	counter_delta, reset_count, log_count, first_ts, last_ts, sketch,
+	request_count, error_request_count`
 
 // deltaColumnDDL is deltaColumnList with types, shared by both tables.
 const deltaColumnDDL = `point_count INTEGER NOT NULL,
@@ -313,10 +314,12 @@ const deltaColumnDDL = `point_count INTEGER NOT NULL,
 	log_count INTEGER NOT NULL,
 	first_ts INTEGER NOT NULL,
 	last_ts INTEGER NOT NULL,
-	sketch BLOB`
+	sketch BLOB,
+	request_count INTEGER NOT NULL,
+	error_request_count INTEGER NOT NULL`
 
 // deltaValuePlaceholders matches deltaColumnList's arity.
-const deltaValuePlaceholders = `?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?`
+const deltaValuePlaceholders = `?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?`
 
 // schemaDDL is the complete aggregate schema (#162).
 func schemaDDL() []string {
@@ -762,7 +765,7 @@ func mergeDeltas(tx *sql.Tx, rows []DeltaRow) (int64, error) {
 	var (
 		bytes   int64
 		scratch []byte
-		args    = make([]any, 0, 20)
+		args    = make([]any, 0, 22)
 	)
 	for _, r := range rows {
 		// Merge into a COPY read from the row, never into r.Delta: the caller
@@ -966,7 +969,7 @@ func (s *SQLiteStore) materializeWindow(tx *sql.Tx, windowStart int64, stats *Fi
 
 	var (
 		scratch []byte
-		args    = make([]any, 0, 20)
+		args    = make([]any, 0, 22)
 	)
 	for rows.Next() {
 		var id int64
@@ -1128,55 +1131,221 @@ func (s *SQLiteStore) Analyze() error {
 // ReadBuckets implements Store. The selector's bounds are mandatory and the row
 // cap is enforced here, not by the caller: the worst case is 6,000 series x
 // 2,016 windows and a dashboard is not trusted with it.
-func (s *SQLiteStore) ReadBuckets(sel Selector) ([]Bucket, error) {
+//
+// The cap is no longer allowed to be silent (#194 blocker 4): the query asks
+// for limit+1 rows and the extra row, if it exists, becomes Truncated plus a
+// resume cursor. A caller that needs completeness pages with Selector.After
+// until Truncated is false; a caller that wants a scalar total should not be
+// here at all and should call SumBuckets.
+func (s *SQLiteStore) ReadBuckets(sel Selector) (BucketPage, error) {
 	limit, err := sel.Validate()
 	if err != nil {
-		return nil, err
+		return BucketPage{}, err
 	}
+	page := BucketPage{Limit: limit}
 	var (
 		sb   strings.Builder
 		args []any
 	)
-	sb.WriteString(`SELECT b.window_start, b.series_id, `)
-	for i, col := range strings.Split(deltaColumnList, ",") {
-		if i > 0 {
-			sb.WriteString(", ")
-		}
-		sb.WriteString("b." + strings.TrimSpace(col))
+	sb.WriteString(`SELECT window_start, series_id, src, ` + deltaColumnList + ` FROM (`)
+	args = appendBucketUnion(&sb, sel,
+		`t.window_start AS window_start, t.series_id AS series_id, `+
+			aliasColumns("t.", deltaColumnList), args)
+	sb.WriteString(`)`)
+	if !sel.After.zero() {
+		// Keyset resume over the TOTAL order (window, series, source). The
+		// source component is what makes it total: one window can hold a
+		// materialized bucket and a not-yet-finalized delta row for the same
+		// series, and an OFFSET-free resume must be able to sit between them.
+		sb.WriteString(` WHERE window_start > ?
+			OR (window_start = ? AND (series_id > ? OR (series_id = ? AND src > ?)))`)
+		args = append(args,
+			sel.After.WindowStart, sel.After.WindowStart,
+			int64(sel.After.SeriesID), int64(sel.After.SeriesID), int64(sel.After.Source))
 	}
-	sb.WriteString(` FROM aggregate_buckets b JOIN aggregate_series s ON s.id = b.series_id
-		WHERE b.window_start >= ? AND b.window_start < ? AND s.tenant_id = ?`)
-	args = append(args, sel.Start, sel.End, int64(sel.TenantID))
-	if sel.Signal != SignalUnspecified {
-		sb.WriteString(` AND s.signal = ?`)
-		args = append(args, int64(sel.Signal))
-	}
-	if len(sel.SeriesIDs) > 0 {
-		sb.WriteString(` AND b.series_id IN (` + placeholders(len(sel.SeriesIDs)) + `)`)
-		for _, id := range sel.SeriesIDs {
-			args = append(args, int64(id))
-		}
-	}
-	sb.WriteString(` ORDER BY b.window_start, b.series_id LIMIT ?`)
-	args = append(args, limit)
+	sb.WriteString(` ORDER BY window_start, series_id, src LIMIT ?`)
+	args = append(args, limit+1)
 
 	rows, err := s.reader.Query(sb.String(), args...)
 	if err != nil {
-		return nil, fmt.Errorf("aggregate store: read buckets: %w", err)
+		return BucketPage{}, fmt.Errorf("aggregate store: read buckets: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 	out := make([]Bucket, 0, 64)
 	for rows.Next() {
-		var window, id int64
+		var window, id, src int64
 		d, err := scanDelta(func(dst ...any) error {
-			return rows.Scan(append([]any{&window, &id}, dst...)...)
+			return rows.Scan(append([]any{&window, &id, &src}, dst...)...)
 		}, nil)
 		if err != nil {
-			return nil, fmt.Errorf("aggregate store: read buckets: %w", err)
+			return BucketPage{}, fmt.Errorf("aggregate store: read buckets: %w", err)
 		}
-		out = append(out, Bucket{WindowStart: window, SeriesID: SeriesID(id), Delta: d})
+		if len(out) == limit {
+			// The limit+1'th row. It is never returned; it only proves that
+			// the answer is incomplete.
+			page.Truncated = true
+			last := out[len(out)-1]
+			page.Next = BucketCursor{WindowStart: last.WindowStart, SeriesID: last.SeriesID, Source: last.Source}
+			break
+		}
+		out = append(out, Bucket{
+			WindowStart: window,
+			SeriesID:    SeriesID(id),
+			Delta:       d,
+			Source:      BucketSource(src), // #nosec G115 -- src is a literal 0/1 in the query
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return BucketPage{}, fmt.Errorf("aggregate store: read buckets: %w", err)
+	}
+	page.Buckets = out
+	return page, nil
+}
+
+// sumColumnList is the SUMmable subset of the delta columns, in the order
+// scanSumRow reads them. Sketches are absent on purpose: SQL cannot merge one.
+const sumColumnList = `point_count, error_count, request_count, error_request_count,
+	duration_count, duration_sum, log_count`
+
+// SumBuckets implements Store. It is the scalar-totals path of the #197 read
+// contract: the database does the SUM/COUNT and returns one row per group, so
+// there is no row cap to truncate and no arithmetic for the caller to get
+// wrong on a partial page.
+//
+// The result size is bounded by the GROUPING — at most (windows x services x
+// signals), all three of which are already bounded by the retention horizon and
+// the cardinality limiter — and never by the number of rows scanned. That is
+// the structural difference from ReadBuckets, whose result size IS the row
+// count.
+func (s *SQLiteStore) SumBuckets(sel Selector, by GroupBy) ([]SumRow, error) {
+	if _, err := sel.Validate(); err != nil {
+		return nil, err
+	}
+	var (
+		sb    strings.Builder
+		args  []any
+		group []string
+	)
+	sb.WriteString(`SELECT `)
+	for _, g := range [...]struct {
+		flag GroupBy
+		col  string
+	}{
+		{GroupByWindow, "window_start"},
+		{GroupByService, "service_id"},
+		{GroupBySignal, "signal"},
+	} {
+		if by&g.flag != 0 {
+			sb.WriteString(g.col)
+			group = append(group, g.col)
+		} else {
+			sb.WriteString("0")
+		}
+		sb.WriteString(", ")
+	}
+	sb.WriteString(`COALESCE(SUM(point_count),0), COALESCE(SUM(error_count),0),
+		COALESCE(SUM(request_count),0), COALESCE(SUM(error_request_count),0),
+		COALESCE(SUM(duration_count),0), COALESCE(SUM(duration_sum),0),
+		COALESCE(SUM(log_count),0) FROM (`)
+	args = appendBucketUnion(&sb, sel,
+		`t.window_start AS window_start, s.service_id AS service_id, s.signal AS signal, `+
+			aliasColumns("t.", sumColumnList), args)
+	sb.WriteString(`)`)
+	if len(group) > 0 {
+		sb.WriteString(` GROUP BY ` + strings.Join(group, ", "))
+	}
+
+	rows, err := s.reader.Query(sb.String(), args...)
+	if err != nil {
+		return nil, fmt.Errorf("aggregate store: sum buckets: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []SumRow
+	for rows.Next() {
+		var (
+			r                              SumRow
+			window, service, signal        int64
+			count, errCount, reqs, errReqs int64
+			durCount, logCount             int64
+			durSum                         float64
+		)
+		if err := rows.Scan(&window, &service, &signal,
+			&count, &errCount, &reqs, &errReqs, &durCount, &durSum, &logCount); err != nil {
+			return nil, fmt.Errorf("aggregate store: sum buckets: %w", err)
+		}
+		r.WindowStart = window
+		r.ServiceID = uint32(service)         // #nosec G115 -- dictionary IDs are uint32
+		r.Signal = Signal(signal)             // #nosec G115 -- signal is written from the bounded Signal enum
+		r.Count = uint64(count)               // #nosec G115 -- counters are written from uint64
+		r.ErrorCount = uint64(errCount)       // #nosec G115 -- counters are written from uint64
+		r.RequestCount = uint64(reqs)         // #nosec G115 -- counters are written from uint64
+		r.ErrorRequestCount = uint64(errReqs) // #nosec G115 -- counters are written from uint64
+		r.DurationCount = uint64(durCount)    // #nosec G115 -- counters are written from uint64
+		r.LogCount = uint64(logCount)         // #nosec G115 -- counters are written from uint64
+		r.DurationSum = durSum
+		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// bucketSources are the two durable tables a store-owned row can live in, in
+// scan order. aggregate_buckets holds what finalization materialized;
+// aggregate_delta_log holds what it has not incorporated yet — including a
+// window a forced closed-window eviction handed to the store before the
+// finalizer reached it (#194 blocker 6). FinalizeWindow deletes exactly the
+// delta rows it merges, in the same transaction, so a contribution is visible
+// in exactly one of the two tables and reading both neither double-counts nor
+// omits.
+var bucketSources = [...]struct {
+	table string
+	src   BucketSource
+}{
+	{"aggregate_buckets", SourceFinalized},
+	{"aggregate_delta_log", SourceDelta},
+}
+
+// appendBucketUnion writes the UNION ALL over both durable tables with the
+// given per-row projection and appends its bind arguments. The projection is
+// evaluated against alias `t` (the table) and `s` (its aggregate_series join).
+func appendBucketUnion(sb *strings.Builder, sel Selector, projection string, args []any) []any {
+	for i, src := range bucketSources {
+		if i > 0 {
+			sb.WriteString(` UNION ALL `)
+		}
+		fmt.Fprintf(sb, `SELECT %d AS src, %s FROM %s t
+			JOIN aggregate_series s ON s.id = t.series_id
+			WHERE t.window_start >= ? AND t.window_start < ? AND s.tenant_id = ?`,
+			src.src, projection, src.table)
+		args = append(args, sel.Start, sel.End, int64(sel.TenantID))
+		if sel.Signal != SignalUnspecified {
+			sb.WriteString(` AND s.signal = ?`)
+			args = append(args, int64(sel.Signal))
+		}
+		if len(sel.SeriesIDs) > 0 {
+			sb.WriteString(` AND t.series_id IN (` + placeholders(len(sel.SeriesIDs)) + `)`)
+			for _, id := range sel.SeriesIDs {
+				args = append(args, int64(id))
+			}
+		}
+		if sel.SketchOnly {
+			sb.WriteString(` AND t.sketch IS NOT NULL`)
+		}
+	}
+	return args
+}
+
+// aliasColumns qualifies every column in a comma-separated list with prefix and
+// re-aliases it to its bare name. The alias is not cosmetic: these projections
+// feed a derived table whose columns the outer SELECT addresses by name, and
+// SQLite does not promise a stable result-column name for an unaliased
+// qualified expression.
+func aliasColumns(prefix, list string) string {
+	cols := strings.Split(list, ",")
+	for i, col := range cols {
+		name := strings.TrimSpace(col)
+		cols[i] = prefix + name + " AS " + name
+	}
+	return strings.Join(cols, ", ")
 }
 
 // ReplayMutable implements Store. Only mutable windows are returned: finalized
@@ -1359,6 +1528,7 @@ func scanDelta(scan scanFunc, id *int64) (*AggregateDelta, error) {
 		pointCount, errCnt  int64
 		durCount, gaugeCnt  int64
 		resetCount, logCnt  int64
+		reqCount, errReqCnt int64
 		durSum, durMin      float64
 		durMax, gaugeSum    float64
 		gaugeMin, gaugeMax  float64
@@ -1371,16 +1541,19 @@ func scanDelta(scan scanFunc, id *int64) (*AggregateDelta, error) {
 		&pointCount, &errCnt, &durCount, &durSum, &durMin, &durMax,
 		&gaugeCnt, &gaugeSum, &gaugeMin, &gaugeMax, &gaugeLast, &gaugeLastTS,
 		&counterD, &resetCount, &logCnt, &firstTS, &lastTS, &sketch,
+		&reqCount, &errReqCnt,
 	)
 	if err := scan(dst...); err != nil {
 		return nil, err
 	}
-	d.Count = uint64(pointCount)       // #nosec G115 -- counters are written from uint64
-	d.ErrorCount = uint64(errCnt)      // #nosec G115 -- counters are written from uint64
-	d.DurationCount = uint64(durCount) // #nosec G115 -- counters are written from uint64
-	d.GaugeCount = uint64(gaugeCnt)    // #nosec G115 -- counters are written from uint64
-	d.ResetCount = uint64(resetCount)  // #nosec G115 -- counters are written from uint64
-	d.LogCount = uint64(logCnt)        // #nosec G115 -- counters are written from uint64
+	d.Count = uint64(pointCount)            // #nosec G115 -- counters are written from uint64
+	d.ErrorCount = uint64(errCnt)           // #nosec G115 -- counters are written from uint64
+	d.DurationCount = uint64(durCount)      // #nosec G115 -- counters are written from uint64
+	d.GaugeCount = uint64(gaugeCnt)         // #nosec G115 -- counters are written from uint64
+	d.ResetCount = uint64(resetCount)       // #nosec G115 -- counters are written from uint64
+	d.LogCount = uint64(logCnt)             // #nosec G115 -- counters are written from uint64
+	d.RequestCount = uint64(reqCount)       // #nosec G115 -- counters are written from uint64
+	d.ErrorRequestCount = uint64(errReqCnt) // #nosec G115 -- counters are written from uint64
 	d.DurationSum, d.DurationMin, d.DurationMax = durSum, durMin, durMax
 	d.GaugeSum, d.GaugeMin, d.GaugeMax, d.GaugeLast = gaugeSum, gaugeMin, gaugeMax, gaugeLast
 	d.CounterDelta = counterD
@@ -1412,6 +1585,7 @@ func deltaArgs(d *AggregateDelta, sketch []byte) []any {
 		int64(d.GaugeCount), d.GaugeSum, d.GaugeMin, d.GaugeMax, d.GaugeLast, nanosOf(d.GaugeLastTime), // #nosec G115
 		d.CounterDelta, int64(d.ResetCount), int64(d.LogCount), // #nosec G115
 		nanosOf(d.FirstTimestamp), nanosOf(d.LastTimestamp), blob,
+		int64(d.RequestCount), int64(d.ErrorRequestCount), // #nosec G115 -- counters are bounded by ingest volume
 	}
 }
 

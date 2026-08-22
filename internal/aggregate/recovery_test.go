@@ -120,7 +120,7 @@ func TestRecoveryFinalizesDowntimeExpiredWindows(t *testing.T) {
 	if stats.FinalizedWindows != 1 || stats.ReplayedRows != 0 {
 		t.Fatalf("recovery stats = %+v, want 1 finalized / 0 replayed", stats)
 	}
-	buckets, err := store.ReadBuckets(Selector{
+	page, err := store.ReadBuckets(Selector{
 		TenantID: 1,
 		Start:    WindowStart(clock.Now()) - int64(4*(WindowSize+AllowedLateness)/time.Second),
 		End:      WindowStart(clock.Now()) + 1,
@@ -128,8 +128,11 @@ func TestRecoveryFinalizesDowntimeExpiredWindows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadBuckets: %v", err)
 	}
-	if len(buckets) != 1 || buckets[0].Delta.Count != 7 {
-		t.Fatalf("finalized buckets = %+v, want one bucket with count 7", buckets)
+	if page.Truncated {
+		t.Fatalf("read reported truncation at limit %d for a single-bucket store", page.Limit)
+	}
+	if len(page.Buckets) != 1 || page.Buckets[0].Delta.Count != 7 {
+		t.Fatalf("finalized buckets = %+v, want one bucket with count 7", page.Buckets)
 	}
 	if count, _ := eng2.Snapshot().Totals(SignalTraceOp); count != 0 {
 		t.Fatalf("engine hydrated %d points of finalized history, want 0", count)

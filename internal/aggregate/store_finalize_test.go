@@ -67,10 +67,11 @@ func TestDeltaLogRowsScaleWithSeriesNotCommits(t *testing.T) {
 
 	// Merging is not the same as sampling: every observation has to be in the
 	// bucket. spanDelta(2, _) contributes 2 points and 1 error per commit.
-	buckets, err := store.ReadBuckets(Selector{TenantID: 1, Start: window, End: window + 300})
+	page, err := store.ReadBuckets(Selector{TenantID: 1, Start: window, End: window + 300})
 	if err != nil {
 		t.Fatalf("ReadBuckets: %v", err)
 	}
+	buckets := page.Buckets
 	if len(buckets) != series {
 		t.Fatalf("read %d buckets, want %d", len(buckets), series)
 	}

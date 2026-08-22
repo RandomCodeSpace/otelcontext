@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/RandomCodeSpace/otelcontext/internal/aggregate"
 	"github.com/RandomCodeSpace/otelcontext/internal/graphrag"
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 	"gorm.io/gorm"
@@ -200,5 +201,52 @@ func TestSpanView_PreservesStatus(t *testing.T) {
 	}
 	if !strings.Contains(string(b), `"status":"STATUS_CODE_ERROR"`) {
 		t.Errorf("Span view missing status field in %s", string(b))
+	}
+}
+
+// TestDashboardStatsBasisFields pins the #197 Q3 wire contract in both
+// directions: the aggregate payload states its basis explicitly and puts the
+// REQUEST basis behind the headline names, and the legacy payload is unchanged
+// because every new field is omitempty.
+func TestDashboardStatsBasisFields(t *testing.T) {
+	agg := DashboardStatsFromAggregate(&aggregate.DashboardResult{
+		RequestCount: 7, ErrorRequestCount: 2, RequestErrorRate: 28.5,
+		SpanCount: 140, SpanErrorCount: 30, SpanErrorRate: 21.4,
+		TotalLogs: 9, ActiveServices: 3, P99LatencyMicros: 2500,
+		Coverage: aggregate.CoverageFull,
+	})
+	if agg.TotalTraces != 7 || agg.TotalErrors != 2 || agg.ErrorRate != 28.5 {
+		t.Fatalf("headline trio = %d/%d/%v, want the request basis 7/2/28.5",
+			agg.TotalTraces, agg.TotalErrors, agg.ErrorRate)
+	}
+	if agg.Requests != 7 || agg.RequestErrors != 2 || agg.RequestErrorRate != 28.5 {
+		t.Fatalf("request basis = %d/%d/%v, want 7/2/28.5", agg.Requests, agg.RequestErrors, agg.RequestErrorRate)
+	}
+	if agg.Spans != 140 || agg.SpanErrors != 30 || agg.SpanErrorRate != 21.4 {
+		t.Fatalf("span basis = %d/%d/%v, want 140/30/21.4", agg.Spans, agg.SpanErrors, agg.SpanErrorRate)
+	}
+	b, err := json.Marshal(agg)
+	if err != nil {
+		t.Fatalf("marshal aggregate dashboard: %v", err)
+	}
+	for _, key := range []string{`"requests":7`, `"request_errors":2`, `"request_error_rate":28.5`,
+		`"spans":140`, `"span_errors":30`, `"span_error_rate":21.4`} {
+		if !strings.Contains(string(b), key) {
+			t.Errorf("aggregate dashboard JSON missing %s: %s", key, b)
+		}
+	}
+
+	// Legacy mode: the same struct, none of the additive fields set.
+	legacy, err := json.Marshal(DashboardStatsFromModel(&storage.DashboardStats{
+		TotalTraces: 10, TotalLogs: 5, TotalErrors: 1, ErrorRate: 10, ActiveServices: 2,
+	}))
+	if err != nil {
+		t.Fatalf("marshal legacy dashboard: %v", err)
+	}
+	for _, key := range []string{"requests", "request_errors", "request_error_rate",
+		"spans", "span_errors", "span_error_rate"} {
+		if strings.Contains(string(legacy), `"`+key+`"`) {
+			t.Errorf("legacy dashboard JSON gained %q: %s", key, legacy)
+		}
 	}
 }

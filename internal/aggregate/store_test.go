@@ -43,7 +43,7 @@ func storeKey(n uint32) SeriesKey {
 func spanDelta(count int, micros float64) *AggregateDelta {
 	d := &AggregateDelta{}
 	for i := 0; i < count; i++ {
-		d.ObserveSpan(micros, i%3 == 0)
+		d.ObserveSpan(micros, i%3 == 0, true)
 	}
 	return d
 }
@@ -297,10 +297,11 @@ func TestFinalizeWindowMaterializesAndDeletes(t *testing.T) {
 	assertCount(t, store, "aggregate_delta_log", 0)
 	assertCount(t, store, "aggregate_buckets", 2)
 
-	buckets, err := store.ReadBuckets(Selector{TenantID: 1, Start: 300, End: 900})
+	page, err := store.ReadBuckets(Selector{TenantID: 1, Start: 300, End: 900})
 	if err != nil {
 		t.Fatalf("ReadBuckets: %v", err)
 	}
+	buckets := page.Buckets
 	if len(buckets) != 2 {
 		t.Fatalf("read %d buckets, want 2", len(buckets))
 	}
@@ -343,10 +344,11 @@ func TestFinalizeWindowMergesIntoExistingBucket(t *testing.T) {
 	if _, err := store.FinalizeWindow(600); err != nil {
 		t.Fatalf("second finalize: %v", err)
 	}
-	buckets, err := store.ReadBuckets(Selector{TenantID: 1, Start: 600, End: 900})
+	page, err := store.ReadBuckets(Selector{TenantID: 1, Start: 600, End: 900})
 	if err != nil {
 		t.Fatalf("ReadBuckets: %v", err)
 	}
+	buckets := page.Buckets
 	if len(buckets) != 1 || buckets[0].Delta.Count != 7 {
 		t.Fatalf("merged bucket = %+v, want count 7", buckets)
 	}
@@ -419,24 +421,35 @@ func TestReadBucketsClampsLimitAndScopesTenant(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadBuckets: %v", err)
 	}
-	if len(got) != 3 {
-		t.Fatalf("tenant 1 read %d buckets, want 3 (tenant 2 rows must not leak)", len(got))
+	if len(got.Buckets) != 3 {
+		t.Fatalf("tenant 1 read %d buckets, want 3 (tenant 2 rows must not leak)", len(got.Buckets))
+	}
+	if got.Truncated {
+		t.Fatal("an unlimited read of 3 rows reported truncation")
 	}
 
 	limited, err := store.ReadBuckets(Selector{TenantID: 1, Start: 600, End: 900, Limit: 2})
 	if err != nil {
 		t.Fatalf("ReadBuckets(limit): %v", err)
 	}
-	if len(limited) != 2 {
-		t.Fatalf("limit 2 returned %d rows", len(limited))
+	if len(limited.Buckets) != 2 {
+		t.Fatalf("limit 2 returned %d rows", len(limited.Buckets))
+	}
+	// #194 blocker 4: a clamped read must SAY it was clamped.
+	if !limited.Truncated || limited.Limit != 2 {
+		t.Fatalf("limited read = {truncated:%v limit:%d}, want {true 2}", limited.Truncated, limited.Limit)
+	}
+	last := limited.Buckets[len(limited.Buckets)-1]
+	if limited.Next.WindowStart != last.WindowStart || limited.Next.SeriesID != last.SeriesID {
+		t.Fatalf("resume cursor %+v does not point at the last returned row %+v", limited.Next, last)
 	}
 
 	signalScoped, err := store.ReadBuckets(Selector{TenantID: 1, Start: 600, End: 900, Signal: SignalLog})
 	if err != nil {
 		t.Fatalf("ReadBuckets(signal): %v", err)
 	}
-	if len(signalScoped) != 0 {
-		t.Fatalf("log-scoped read returned %d trace buckets", len(signalScoped))
+	if len(signalScoped.Buckets) != 0 {
+		t.Fatalf("log-scoped read returned %d trace buckets", len(signalScoped.Buckets))
 	}
 }
 

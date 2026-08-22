@@ -116,11 +116,18 @@ type Query struct {
 }
 
 // TrafficPoint is one window of the traffic series.
+//
+// BOTH bases are carried, explicitly named (#197 Q3). Traffic is plotted on the
+// request basis; the span basis stays available because it is what per-operation
+// diagnostics and latency are counted in.
 type TrafficPoint struct {
 	// WindowStart is the UTC start of the five-minute window.
 	WindowStart time.Time
-	// Count is accepted events; ErrorCount is the error subset.
-	Count, ErrorCount int64
+	// RequestCount is accepted request entry points — root or SERVER spans.
+	// ErrorRequestCount is its error subset.
+	RequestCount, ErrorRequestCount int64
+	// SpanCount is accepted spans; SpanErrorCount is its error subset.
+	SpanCount, SpanErrorCount int64
 }
 
 // BucketsResult is the answer to QueryBuckets.
@@ -132,22 +139,42 @@ type BucketsResult struct {
 }
 
 // ServiceStat is one service's aggregate accounting over the queried range.
+//
+// Count/ErrorCount/ErrorRate stay SPAN-based: per-service and per-operation
+// diagnostics are about the work done, not about how many requests entered.
+// RequestCount/ErrorRequestCount are carried alongside for the surfaces that
+// want the entry-point basis.
 type ServiceStat struct {
-	Service      string
-	Count        int64
-	ErrorCount   int64
-	ErrorRate    float64
-	AvgLatencyMs float64
+	Service           string
+	Count             int64
+	ErrorCount        int64
+	ErrorRate         float64
+	AvgLatencyMs      float64
+	RequestCount      int64
+	ErrorRequestCount int64
 }
 
-// DashboardResult is the answer to QueryDashboard. Field names mirror the
-// legacy dashboard payload so the response contract survives the migration.
+// DashboardResult is the answer to QueryDashboard.
+//
+// There is no TotalTraces field: #194 blocker 5 is precisely that the old one
+// carried a SPAN count under a trace name, and a field that has been wrong
+// cannot be fixed by leaving its name in place. Every count here says its basis
+// (#197 Q3), and the headline error rate is the request-basis one.
 type DashboardResult struct {
-	TotalTraces      int64
+	// RequestCount is accepted request entry points over the range;
+	// ErrorRequestCount is its error subset and RequestErrorRate is the
+	// headline dashboard error rate, as a PERCENT.
+	RequestCount      int64
+	ErrorRequestCount int64
+	RequestErrorRate  float64
+	// SpanCount is accepted spans; SpanErrorCount is its error subset and
+	// SpanErrorRate the corresponding PERCENT.
+	SpanCount      int64
+	SpanErrorCount int64
+	SpanErrorRate  float64
+
 	TotalLogs        int64
-	TotalErrors      int64
 	AvgLatencyMs     float64
-	ErrorRate        float64
 	ActiveServices   int64
 	P99LatencyMicros float64
 	TopFailing       []ServiceStat
@@ -191,16 +218,29 @@ func asInt64(v uint64) int64 {
 // into accumulators rather than retaining them.
 type visitFunc func(windowStart int64, key SeriesKey, d *AggregateDelta)
 
-// scan walks every series in the query's range, memory-owned windows from the
-// shards and store-owned windows from the store, and returns the ownership
-// snapshot the walk was consistent with.
-func (e *Engine) scan(q Query, visit visitFunc) (Ownership, error) {
-	var own Ownership
+// plan is the first half of every query: it validates the bounds, visits the
+// memory-owned windows, and returns the sub-range the STORE owns.
+//
+// The three query classes diverge only in what they do with that sub-range
+// (#197 Q1), and they diverge on purpose:
+//
+//	scalar totals  -> SumBuckets: the database sums, one row per group, so no
+//	                  row cap exists to truncate the answer.
+//	percentiles    -> pageStore: sketches cannot be merged in SQL, so every
+//	                  sketch-bearing row is paged to completion.
+//	generic rows   -> ReadBuckets: keeps its row cap and says so.
+//
+// hasStore is false when memory owns the whole range or no store is attached.
+func (e *Engine) plan(q Query, visit visitFunc) (Ownership, Selector, bool, error) {
+	var (
+		own Ownership
+		sel Selector
+	)
 	if q.Tenant == "" {
-		return own, fmt.Errorf("%w: tenant is required", ErrSelectorUnbounded)
+		return own, sel, false, fmt.Errorf("%w: tenant is required", ErrSelectorUnbounded)
 	}
 	if !q.End.After(q.Start) {
-		return own, fmt.Errorf("%w: [%s,%s) is not a bounded forward range",
+		return own, sel, false, fmt.Errorf("%w: [%s,%s) is not a bounded forward range",
 			ErrSelectorUnbounded, q.Start.Format(time.RFC3339), q.End.Format(time.RFC3339))
 	}
 	tenantID := e.cache.InternTenant(q.Tenant)
@@ -223,17 +263,10 @@ func (e *Engine) scan(q Query, visit visitFunc) (Ownership, error) {
 			storeEnd = w
 		}
 	}
-	if storeEnd <= start {
-		return own, nil
+	if storeEnd <= start || e.Store() == nil {
+		return own, sel, false, nil
 	}
-	st := e.Store()
-	if st == nil {
-		return own, nil
-	}
-	if err := e.readFinalized(st, tenantID, start, storeEnd, q.Signal, visit); err != nil {
-		return own, err
-	}
-	return own, nil
+	return own, Selector{TenantID: tenantID, Start: start, End: storeEnd, Signal: q.Signal}, true, nil
 }
 
 // readMutable visits the memory-owned windows in [start, end) and returns the
@@ -264,17 +297,48 @@ func (e *Engine) readMutable(tenantID uint32, start, end int64, signal Signal, v
 	return own
 }
 
-// readFinalized visits the store-owned windows in [start, end).
-func (e *Engine) readFinalized(st Store, tenantID uint32, start, end int64, signal Signal, visit visitFunc) error {
-	buckets, err := st.ReadBuckets(Selector{
-		TenantID: tenantID,
-		Start:    start,
-		End:      end,
-		Signal:   signal,
-	})
-	if err != nil {
-		return err
+// sumStore runs the SQL aggregation over the store-owned sub-range.
+func (e *Engine) sumStore(sel Selector, by GroupBy) ([]SumRow, error) {
+	st := e.Store()
+	if st == nil {
+		return nil, nil
 	}
+	return st.SumBuckets(sel, by)
+}
+
+// pageStore visits every store-owned row matching sel, paging to COMPLETION.
+//
+// The page size is the store's own row cap; the number of pages is bounded by
+// the selector's window range, which Selector.Validate already clamps to the
+// retention horizon. Truncated is the loop condition, never a result: this
+// function returns only when the store says there is nothing left.
+func (e *Engine) pageStore(sel Selector, visit visitFunc) error {
+	st := e.Store()
+	if st == nil {
+		return nil
+	}
+	for {
+		page, err := st.ReadBuckets(sel)
+		if err != nil {
+			return err
+		}
+		if err := e.visitPage(st, page.Buckets, visit); err != nil {
+			return err
+		}
+		if !page.Truncated {
+			return nil
+		}
+		// A store that reports "more rows" without advancing the cursor would
+		// spin this loop forever. Refuse rather than hang a dashboard.
+		if !sel.After.zero() && !sel.After.After(page.Next.WindowStart, page.Next.SeriesID, page.Next.Source) {
+			return fmt.Errorf("aggregate: paged read did not advance past %d/%d", sel.After.WindowStart, sel.After.SeriesID)
+		}
+		sel.After = page.Next
+	}
+}
+
+// visitPage resolves one page's series identities and visits its rows.
+func (e *Engine) visitPage(st Store, buckets []Bucket, visit visitFunc) error {
 	if len(buckets) == 0 {
 		return nil
 	}
@@ -312,7 +376,13 @@ func (e *Engine) readFinalized(st Store, tenantID uint32, start, end int64, sign
 // unresolvable ID yields "" and the caller drops the series from per-service
 // breakdowns; totals still count it.
 func (e *Engine) serviceName(key SeriesKey) string {
-	entry, ok := e.cache.Lookup(key.ServiceID)
+	return e.serviceNameByID(key.ServiceID)
+}
+
+// serviceNameByID is serviceName for the SQL aggregation path, which knows the
+// dictionary ID but never builds a SeriesKey.
+func (e *Engine) serviceNameByID(id uint32) string {
+	entry, ok := e.cache.Lookup(id)
 	if !ok {
 		return ""
 	}
@@ -332,40 +402,89 @@ func serviceFilter(services []string) map[string]struct{} {
 	return set
 }
 
+// trafficCounters accumulates one window's traffic on both bases.
+type trafficCounters struct {
+	requests, errRequests int64
+	spans, spanErrors     int64
+}
+
+// add folds one delta into the window's counters.
+func (c *trafficCounters) add(d *AggregateDelta) {
+	c.requests += asInt64(d.RequestCount)
+	c.errRequests += asInt64(d.ErrorRequestCount)
+	c.spans += asInt64(d.Count)
+	c.spanErrors += asInt64(d.ErrorCount)
+}
+
+// addSum folds one SQL aggregation row into the window's counters.
+func (c *trafficCounters) addSum(r SumRow) {
+	c.requests += asInt64(r.RequestCount)
+	c.errRequests += asInt64(r.ErrorRequestCount)
+	c.spans += asInt64(r.Count)
+	c.spanErrors += asInt64(r.ErrorCount)
+}
+
 // QueryBuckets returns per-window traffic counts. It is the traffic-chart
 // query: one point per five-minute window, never one row per series.
+//
+// The store half is a SQL GROUP BY: the result is one row per window (per
+// service when a service filter forces it), so the 20,000-row read cap cannot
+// reach it. That is #194 blocker 4 for this query class.
 func (e *Engine) QueryBuckets(q Query) (*BucketsResult, error) {
 	if q.Signal == SignalUnspecified {
 		q.Signal = SignalTraceOp
 	}
 	filter := serviceFilter(q.Services)
-	type counters struct{ count, errors int64 }
-	byWindow := make(map[int64]*counters)
+	byWindow := make(map[int64]*trafficCounters)
+	at := func(window int64) *trafficCounters {
+		c := byWindow[window]
+		if c == nil {
+			c = &trafficCounters{}
+			byWindow[window] = c
+		}
+		return c
+	}
 
-	own, err := e.scan(q, func(windowStart int64, key SeriesKey, d *AggregateDelta) {
+	own, sel, hasStore, err := e.plan(q, func(windowStart int64, key SeriesKey, d *AggregateDelta) {
 		if filter != nil {
 			if _, ok := filter[e.serviceName(key)]; !ok {
 				return
 			}
 		}
-		c := byWindow[windowStart]
-		if c == nil {
-			c = &counters{}
-			byWindow[windowStart] = c
-		}
-		c.count += asInt64(d.Count)
-		c.errors += asInt64(d.ErrorCount)
+		at(windowStart).add(d)
 	})
 	if err != nil {
 		return nil, err
+	}
+	if hasStore {
+		// The service dimension is only requested when a filter needs it:
+		// grouping by window alone keeps the result one row per window.
+		by := GroupByWindow
+		if filter != nil {
+			by |= GroupByService
+		}
+		sums, err := e.sumStore(sel, by)
+		if err != nil {
+			return nil, err
+		}
+		for _, r := range sums {
+			if filter != nil {
+				if _, ok := filter[e.serviceNameByID(r.ServiceID)]; !ok {
+					continue
+				}
+			}
+			at(r.WindowStart).addSum(r)
+		}
 	}
 
 	points := make([]TrafficPoint, 0, len(byWindow))
 	for start, c := range byWindow {
 		points = append(points, TrafficPoint{
-			WindowStart: time.Unix(start, 0).UTC(),
-			Count:       c.count,
-			ErrorCount:  c.errors,
+			WindowStart:       time.Unix(start, 0).UTC(),
+			RequestCount:      c.requests,
+			ErrorRequestCount: c.errRequests,
+			SpanCount:         c.spans,
+			SpanErrorCount:    c.spanErrors,
 		})
 	}
 	sort.Slice(points, func(i, j int) bool { return points[i].WindowStart.Before(points[j].WindowStart) })
@@ -379,15 +498,43 @@ func (e *Engine) QueryBuckets(q Query) (*BucketsResult, error) {
 
 // dashAccum accumulates one service's contribution to the dashboard.
 type dashAccum struct {
-	count    uint64
-	errors   uint64
-	durCount uint64
-	durSum   float64
+	count       uint64
+	errors      uint64
+	requests    uint64
+	errRequests uint64
+	durCount    uint64
+	durSum      float64
+}
+
+// addDelta folds one in-memory delta into the accumulator.
+func (a *dashAccum) addDelta(d *AggregateDelta) {
+	a.count += d.Count
+	a.errors += d.ErrorCount
+	a.requests += d.RequestCount
+	a.errRequests += d.ErrorRequestCount
+	a.durCount += d.DurationCount
+	a.durSum += d.DurationSum
+}
+
+// addSum folds one SQL aggregation row into the accumulator.
+func (a *dashAccum) addSum(r SumRow) {
+	a.count += r.Count
+	a.errors += r.ErrorCount
+	a.requests += r.RequestCount
+	a.errRequests += r.ErrorRequestCount
+	a.durCount += r.DurationCount
+	a.durSum += r.DurationSum
 }
 
 // QueryDashboard returns the dashboard summary: totals, averages, active
 // services, the p99 from the merged sketch, and the accuracy metadata that
 // sketch justifies.
+//
+// The store side is read TWICE, on purpose (#197 Q1). The scalar totals come
+// from one SQL aggregation that no row cap can truncate. The p99 cannot: a
+// quantile sketch is not SUMmable, so the sketch-bearing rows are paged to
+// completion and merged in Go. Doing both through one capped read is exactly
+// what made the old dashboard quietly wrong past 20,000 rows.
 func (e *Engine) QueryDashboard(q Query) (*DashboardResult, error) {
 	q.Signal = SignalUnspecified // the scan covers traces and logs in one pass
 	filter := serviceFilter(q.Services)
@@ -399,7 +546,30 @@ func (e *Engine) QueryDashboard(q Query) (*DashboardResult, error) {
 		perSvc   = make(map[string]*dashAccum)
 		services = make(map[uint32]struct{})
 	)
-	own, err := e.scan(q, func(_ int64, key SeriesKey, d *AggregateDelta) {
+	mergeSketch := func(s *Sketch) {
+		if s == nil {
+			return
+		}
+		if merged == nil {
+			merged = NewSketchAtScaleUnchecked(s.Scale())
+		}
+		merged.Merge(s)
+	}
+	accumulate := func(serviceID uint32, name string, r SumRow) {
+		services[serviceID] = struct{}{}
+		total.addSum(r)
+		if name == "" {
+			return
+		}
+		acc := perSvc[name]
+		if acc == nil {
+			acc = &dashAccum{}
+			perSvc[name] = acc
+		}
+		acc.addSum(r)
+	}
+
+	own, sel, hasStore, err := e.plan(q, func(_ int64, key SeriesKey, d *AggregateDelta) {
 		name := e.serviceName(key)
 		if filter != nil {
 			if _, ok := filter[name]; !ok {
@@ -414,47 +584,71 @@ func (e *Engine) QueryDashboard(q Query) (*DashboardResult, error) {
 		default:
 			return
 		}
-		services[key.ServiceID] = struct{}{}
-		total.count += d.Count
-		total.errors += d.ErrorCount
-		total.durCount += d.DurationCount
-		total.durSum += d.DurationSum
-		if d.Sketch != nil {
-			if merged == nil {
-				merged = NewSketchAtScaleUnchecked(d.Sketch.Scale())
-			}
-			merged.Merge(d.Sketch)
-		}
-		if name == "" {
-			return
-		}
-		acc := perSvc[name]
-		if acc == nil {
-			acc = &dashAccum{}
-			perSvc[name] = acc
-		}
-		acc.count += d.Count
-		acc.errors += d.ErrorCount
+		mergeSketch(d.Sketch)
+		accumulate(key.ServiceID, name, SumRow{
+			Count: d.Count, ErrorCount: d.ErrorCount,
+			RequestCount: d.RequestCount, ErrorRequestCount: d.ErrorRequestCount,
+			DurationCount: d.DurationCount, DurationSum: d.DurationSum,
+		})
 	})
 	if err != nil {
 		return nil, err
 	}
+	if hasStore {
+		sums, err := e.sumStore(sel, GroupByService|GroupBySignal)
+		if err != nil {
+			return nil, err
+		}
+		for _, r := range sums {
+			name := e.serviceNameByID(r.ServiceID)
+			if filter != nil {
+				if _, ok := filter[name]; !ok {
+					continue
+				}
+			}
+			switch r.Signal {
+			case SignalLog:
+				logs += r.LogCount
+			case SignalTraceOp:
+				accumulate(r.ServiceID, name, r)
+			}
+		}
+
+		sketchSel := sel
+		sketchSel.Signal = SignalTraceOp
+		sketchSel.SketchOnly = true
+		if err := e.pageStore(sketchSel, func(_ int64, key SeriesKey, d *AggregateDelta) {
+			if filter != nil {
+				if _, ok := filter[e.serviceName(key)]; !ok {
+					return
+				}
+			}
+			mergeSketch(d.Sketch)
+		}); err != nil {
+			return nil, err
+		}
+	}
 
 	res := &DashboardResult{
-		TotalTraces:    asInt64(total.count),
-		TotalLogs:      asInt64(logs),
-		TotalErrors:    asInt64(total.errors),
-		ActiveServices: int64(len(services)),
-		Accuracy:       AccuracyFromSketch(merged),
-		Coverage:       CoverageFull,
-		Epoch:          own.Epoch,
-		Revision:       own.Revision,
+		RequestCount:      asInt64(total.requests),
+		ErrorRequestCount: asInt64(total.errRequests),
+		SpanCount:         asInt64(total.count),
+		SpanErrorCount:    asInt64(total.errors),
+		TotalLogs:         asInt64(logs),
+		ActiveServices:    int64(len(services)),
+		Accuracy:          AccuracyFromSketch(merged),
+		Coverage:          CoverageFull,
+		Epoch:             own.Epoch,
+		Revision:          own.Revision,
 	}
 	if total.durCount > 0 {
 		res.AvgLatencyMs = total.durSum / float64(total.durCount) / 1000.0
 	}
+	if total.requests > 0 {
+		res.RequestErrorRate = float64(total.errRequests) / float64(total.requests) * 100
+	}
 	if total.count > 0 {
-		res.ErrorRate = float64(total.errors) / float64(total.count) * 100
+		res.SpanErrorRate = float64(total.errors) / float64(total.count) * 100
 	}
 	if merged != nil {
 		res.P99LatencyMicros = merged.Quantile(0.99)
@@ -475,10 +669,12 @@ func topFailing(perSvc map[string]*dashAccum, limit int) []ServiceStat {
 			rate = float64(acc.errors) / float64(acc.count)
 		}
 		out = append(out, ServiceStat{
-			Service:    name,
-			Count:      asInt64(acc.count),
-			ErrorCount: asInt64(acc.errors),
-			ErrorRate:  rate,
+			Service:           name,
+			Count:             asInt64(acc.count),
+			ErrorCount:        asInt64(acc.errors),
+			ErrorRate:         rate,
+			RequestCount:      asInt64(acc.requests),
+			ErrorRequestCount: asInt64(acc.errRequests),
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -495,15 +691,23 @@ func topFailing(perSvc map[string]*dashAccum, limit int) []ServiceStat {
 
 // QueryTopology returns the service topology: one node per service with its
 // aggregate accounting, plus whatever caller/callee edge series exist.
+//
+// Like the other two, its store half is a SQL GROUP BY — one row per service,
+// not one per series — so CoverageFull here means what it says.
 func (e *Engine) QueryTopology(q Query) (*TopologyResult, error) {
-	q.Signal = SignalUnspecified
+	q.Signal = SignalTraceOp
 	filter := serviceFilter(q.Services)
 	nodes := make(map[string]*dashAccum)
-
-	own, err := e.scan(q, func(_ int64, key SeriesKey, d *AggregateDelta) {
-		if key.Signal != SignalTraceOp {
-			return
+	at := func(name string) *dashAccum {
+		acc := nodes[name]
+		if acc == nil {
+			acc = &dashAccum{}
+			nodes[name] = acc
 		}
+		return acc
+	}
+
+	own, sel, hasStore, err := e.plan(q, func(_ int64, key SeriesKey, d *AggregateDelta) {
 		name := e.serviceName(key)
 		if name == "" {
 			return
@@ -513,26 +717,38 @@ func (e *Engine) QueryTopology(q Query) (*TopologyResult, error) {
 				return
 			}
 		}
-		acc := nodes[name]
-		if acc == nil {
-			acc = &dashAccum{}
-			nodes[name] = acc
-		}
-		acc.count += d.Count
-		acc.errors += d.ErrorCount
-		acc.durCount += d.DurationCount
-		acc.durSum += d.DurationSum
+		at(name).addDelta(d)
 	})
 	if err != nil {
 		return nil, err
+	}
+	if hasStore {
+		sums, err := e.sumStore(sel, GroupByService)
+		if err != nil {
+			return nil, err
+		}
+		for _, r := range sums {
+			name := e.serviceNameByID(r.ServiceID)
+			if name == "" {
+				continue
+			}
+			if filter != nil {
+				if _, ok := filter[name]; !ok {
+					continue
+				}
+			}
+			at(name).addSum(r)
+		}
 	}
 
 	out := make([]ServiceStat, 0, len(nodes))
 	for name, acc := range nodes {
 		stat := ServiceStat{
-			Service:    name,
-			Count:      asInt64(acc.count),
-			ErrorCount: asInt64(acc.errors),
+			Service:           name,
+			Count:             asInt64(acc.count),
+			ErrorCount:        asInt64(acc.errors),
+			RequestCount:      asInt64(acc.requests),
+			ErrorRequestCount: asInt64(acc.errRequests),
 		}
 		if acc.count > 0 {
 			stat.ErrorRate = float64(acc.errors) / float64(acc.count)

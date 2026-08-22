@@ -92,6 +92,10 @@ type SpanInput struct {
 	// SpanKind and StatusCode are the OTLP numeric values.
 	SpanKind   int32
 	StatusCode int32
+	// Root reports that the span has no parent span, i.e. it starts a trace.
+	// The parent span ID itself is NOT carried: it is on the permanent banned
+	// list (#153, #159) and only its emptiness affects an aggregate.
+	Root bool
 	// Timestamp is the span start time; it selects the window.
 	Timestamp      time.Time
 	DurationMicros float64
@@ -249,6 +253,18 @@ func (r *Reducer) countError(service string) {
 	r.stats.ErrorsByService[service]++
 }
 
+// IsRequestSpan reports whether a span is a request entry point and therefore
+// contributes to AggregateDelta.RequestCount.
+//
+// The contract frozen in #197 Q2 is "root OR server span", and it is
+// deliberately an OR: a root span with no parent starts a request whatever its
+// kind, and a SERVER span is the server side of one even when the caller
+// propagated a parent. Either qualifies, and a span that is both is still one
+// request — the caller increments once per span, never once per condition.
+func IsRequestSpan(root bool, spanKind int32) bool {
+	return root || VariantFromSpanKind(spanKind) == SpanKindServer
+}
+
 // ReduceSpan folds one span into its trace-operation series.
 func (r *Reducer) ReduceSpan(in SpanInput) {
 	window, ok := r.admitPoint(SignalTraceOp, in.Timestamp)
@@ -268,7 +284,7 @@ func (r *Reducer) ReduceSpan(in SpanInput) {
 		Variant:     VariantFromSpanKind(in.SpanKind),
 	}
 	isError := key.StatusClass == StatusError
-	r.delta(key, window).ObserveSpan(in.DurationMicros, isError)
+	r.delta(key, window).ObserveSpan(in.DurationMicros, isError, IsRequestSpan(in.Root, in.SpanKind))
 	r.identify(key, window, topoIdentity{Kind: topoTrace, Tenant: in.Tenant, A: in.Service, B: operation})
 	r.stats.Accepted[SignalTraceOp]++
 	if isError {
@@ -296,6 +312,8 @@ type EdgeInput struct {
 	HTTPStatusCode int
 	SpanKind       int32
 	StatusCode     int32
+	// Root mirrors SpanInput.Root for the callee's span.
+	Root bool
 
 	Timestamp      time.Time
 	DurationMicros float64
@@ -331,7 +349,7 @@ func (r *Reducer) ReduceEdge(in EdgeInput) {
 		Variant:     VariantFromSpanKind(in.SpanKind),
 	}
 	isError := key.StatusClass == StatusError
-	r.delta(key, window).ObserveSpan(in.DurationMicros, isError)
+	r.delta(key, window).ObserveSpan(in.DurationMicros, isError, IsRequestSpan(in.Root, in.SpanKind))
 	r.identify(key, window, topoIdentity{Kind: topoEdge, Tenant: in.Tenant, A: in.Caller, B: in.Callee})
 	r.stats.Accepted[SignalServiceEdge]++
 }

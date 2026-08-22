@@ -67,13 +67,21 @@ func (s *Server) handleGetTrafficMetrics(w http.ResponseWriter, r *http.Request)
 // trafficPointsFromAggregate converts engine traffic buckets into the same
 // wire shape the legacy repository produces. Only the bucket WIDTH changes:
 // five-minute aggregate windows instead of one-minute row scans.
+//
+// count/error_count carry the REQUEST basis, matching what the legacy path
+// counts (one point per trace row). Both bases are restated by name so a client
+// never has to infer which one it is plotting (#197 Q3).
 func trafficPointsFromAggregate(res *aggregate.BucketsResult) []storage.TrafficPoint {
 	points := make([]storage.TrafficPoint, 0, len(res.Points))
 	for _, p := range res.Points {
 		points = append(points, storage.TrafficPoint{
-			Timestamp:  p.WindowStart,
-			Count:      p.Count,
-			ErrorCount: p.ErrorCount,
+			Timestamp:     p.WindowStart,
+			Count:         p.RequestCount,
+			ErrorCount:    p.ErrorRequestCount,
+			Requests:      p.RequestCount,
+			RequestErrors: p.ErrorRequestCount,
+			Spans:         p.SpanCount,
+			SpanErrors:    p.SpanErrorCount,
 		})
 	}
 	return points

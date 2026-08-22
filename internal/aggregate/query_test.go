@@ -2,14 +2,19 @@ package aggregate
 
 import (
 	"math"
+	"sort"
 	"testing"
 	"time"
 )
 
-// stubStore is a Store that serves a fixed set of finalized buckets. It exists
+// stubStore is a Store that serves a fixed set of store-owned rows. It exists
 // so the query facade's ownership rules can be tested without a live SQLite
 // file: what matters here is WHICH source a window is read from, not how the
 // bytes got there.
+//
+// Its ReadBuckets and SumBuckets are also the NAIVE REFERENCE the completeness
+// tests compare the SQLite implementation against: sort in Go, page in Go, sum
+// in Go, no SQL involved.
 type stubStore struct {
 	buckets []Bucket
 	infos   map[SeriesID]SeriesKey
@@ -35,9 +40,9 @@ func (s *stubStore) FinalizeWindow(int64) (FinalizeStats, error) {
 }
 func (s *stubStore) FinalizableWindows(int64, int) ([]int64, error) { return nil, nil }
 func (s *stubStore) PurgeBefore(int64) (PurgeStats, error)          { return PurgeStats{}, nil }
-func (s *stubStore) ReadBuckets(sel Selector) ([]Bucket, error) {
-	s.reads++
-	s.readRanges = append(s.readRanges, [2]int64{sel.Start, sel.End})
+
+// matching returns the selector's rows in (window, series, source) order.
+func (s *stubStore) matching(sel Selector) []Bucket {
 	out := make([]Bucket, 0, len(s.buckets))
 	for _, b := range s.buckets {
 		if b.WindowStart < sel.Start || b.WindowStart >= sel.End {
@@ -50,10 +55,84 @@ func (s *stubStore) ReadBuckets(sel Selector) ([]Bucket, error) {
 		if sel.Signal != SignalUnspecified && key.Signal != sel.Signal {
 			continue
 		}
+		if sel.SketchOnly && (b.Delta == nil || b.Delta.Sketch == nil) {
+			continue
+		}
+		if !sel.After.zero() && !sel.After.After(b.WindowStart, b.SeriesID, b.Source) {
+			continue
+		}
 		out = append(out, b)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].WindowStart != out[j].WindowStart {
+			return out[i].WindowStart < out[j].WindowStart
+		}
+		if out[i].SeriesID != out[j].SeriesID {
+			return out[i].SeriesID < out[j].SeriesID
+		}
+		return out[i].Source < out[j].Source
+	})
+	return out
+}
+
+func (s *stubStore) ReadBuckets(sel Selector) (BucketPage, error) {
+	limit, err := sel.Validate()
+	if err != nil {
+		return BucketPage{}, err
+	}
+	s.reads++
+	s.readRanges = append(s.readRanges, [2]int64{sel.Start, sel.End})
+	out := s.matching(sel)
+	page := BucketPage{Limit: limit}
+	if len(out) > limit {
+		out = out[:limit]
+		page.Truncated = true
+		last := out[len(out)-1]
+		page.Next = BucketCursor{WindowStart: last.WindowStart, SeriesID: last.SeriesID, Source: last.Source}
+	}
+	page.Buckets = out
+	return page, nil
+}
+
+func (s *stubStore) SumBuckets(sel Selector, by GroupBy) ([]SumRow, error) {
+	if _, err := sel.Validate(); err != nil {
+		return nil, err
+	}
+	groups := make(map[SumRow]*SumRow)
+	var order []SumRow
+	for _, b := range s.matching(sel) {
+		key := s.infos[b.SeriesID]
+		var g SumRow
+		if by&GroupByWindow != 0 {
+			g.WindowStart = b.WindowStart
+		}
+		if by&GroupByService != 0 {
+			g.ServiceID = key.ServiceID
+		}
+		if by&GroupBySignal != 0 {
+			g.Signal = key.Signal
+		}
+		acc := groups[g]
+		if acc == nil {
+			acc = &SumRow{WindowStart: g.WindowStart, ServiceID: g.ServiceID, Signal: g.Signal}
+			groups[g] = acc
+			order = append(order, g)
+		}
+		acc.Count += b.Delta.Count
+		acc.ErrorCount += b.Delta.ErrorCount
+		acc.RequestCount += b.Delta.RequestCount
+		acc.ErrorRequestCount += b.Delta.ErrorRequestCount
+		acc.DurationCount += b.Delta.DurationCount
+		acc.DurationSum += b.Delta.DurationSum
+		acc.LogCount += b.Delta.LogCount
+	}
+	out := make([]SumRow, 0, len(order))
+	for _, g := range order {
+		out = append(out, *groups[g])
 	}
 	return out, nil
 }
+
 func (s *stubStore) ReplayMutable(int64) ([]DeltaRow, error)  { return nil, nil }
 func (s *stubStore) LoadBaselines(int) ([]BaselineRow, error) { return nil, nil }
 func (s *stubStore) ResolveSeries(ids []SeriesID) ([]SeriesInfo, error) {
@@ -138,15 +217,18 @@ func TestQueryDashboardFromMutableMemory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("QueryDashboard: %v", err)
 	}
-	if res.TotalTraces != 12 {
-		t.Errorf("TotalTraces = %d, want 12", res.TotalTraces)
+	// spanDelta marks every observation a request entry point, so both bases
+	// agree here; the bases-diverge case has its own test.
+	if res.RequestCount != 12 || res.SpanCount != 12 {
+		t.Errorf("RequestCount/SpanCount = %d/%d, want 12/12", res.RequestCount, res.SpanCount)
 	}
 	if res.TotalLogs != 2 {
 		t.Errorf("TotalLogs = %d, want 2", res.TotalLogs)
 	}
 	// spanDelta marks every third observation an error: 3 of 9 plus 1 of 3.
-	if res.TotalErrors != 4 {
-		t.Errorf("TotalErrors = %d, want 4", res.TotalErrors)
+	if res.ErrorRequestCount != 4 || res.SpanErrorCount != 4 {
+		t.Errorf("ErrorRequestCount/SpanErrorCount = %d/%d, want 4/4",
+			res.ErrorRequestCount, res.SpanErrorCount)
 	}
 	if res.ActiveServices != 2 {
 		t.Errorf("ActiveServices = %d, want 2", res.ActiveServices)
@@ -176,7 +258,7 @@ func TestQueryDashboardPercentileWithinReportedBound(t *testing.T) {
 	f := newQueryFixture(t)
 	d := &AggregateDelta{}
 	for i := 1; i <= 1000; i++ {
-		d.ObserveSpan(float64(i)*100, false)
+		d.ObserveSpan(float64(i)*100, false, true)
 	}
 	f.apply(f.traceKey("checkout", "POST /pay"), f.window(), d)
 
@@ -208,10 +290,10 @@ func TestAccuracyMetadataTracksDownscaledMerge(t *testing.T) {
 	f := newQueryFixture(t)
 
 	fine := &AggregateDelta{}
-	fine.ObserveSpan(1000, false)
+	fine.ObserveSpan(1000, false, true)
 
 	coarse := &AggregateDelta{}
-	coarse.ObserveSpan(1000, false)
+	coarse.ObserveSpan(1000, false, true)
 	sk, err := NewSketchAtScale(1)
 	if err != nil {
 		t.Fatalf("NewSketchAtScale: %v", err)
@@ -271,11 +353,15 @@ func TestQueryBucketsOnePointPerWindow(t *testing.T) {
 	if !res.Points[0].WindowStart.Before(res.Points[1].WindowStart) {
 		t.Error("points are not ordered oldest first")
 	}
-	if res.Points[0].Count != 3 || res.Points[1].Count != 6 {
-		t.Errorf("counts = %d,%d want 3,6", res.Points[0].Count, res.Points[1].Count)
+	if res.Points[0].RequestCount != 3 || res.Points[1].RequestCount != 6 {
+		t.Errorf("request counts = %d,%d want 3,6", res.Points[0].RequestCount, res.Points[1].RequestCount)
 	}
-	if res.Points[1].ErrorCount != 2 {
-		t.Errorf("error count = %d, want 2", res.Points[1].ErrorCount)
+	if res.Points[0].SpanCount != 3 || res.Points[1].SpanCount != 6 {
+		t.Errorf("span counts = %d,%d want 3,6", res.Points[0].SpanCount, res.Points[1].SpanCount)
+	}
+	if res.Points[1].ErrorRequestCount != 2 || res.Points[1].SpanErrorCount != 2 {
+		t.Errorf("error counts = %d,%d want 2,2",
+			res.Points[1].ErrorRequestCount, res.Points[1].SpanErrorCount)
 	}
 }
 
@@ -322,8 +408,8 @@ func TestOwnershipIsExclusivePerWindow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("QueryDashboard: %v", err)
 	}
-	if res.TotalTraces != 10 {
-		t.Fatalf("TotalTraces = %d with a checkpointed mutable window, want 10", res.TotalTraces)
+	if res.SpanCount != 10 {
+		t.Fatalf("SpanCount = %d with a checkpointed mutable window, want 10", res.SpanCount)
 	}
 	for _, r := range st.readRanges {
 		if w >= r[0] && w < r[1] {
@@ -351,8 +437,8 @@ func TestOwnershipIsExclusivePerWindow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("QueryDashboard after finalize: %v", err)
 	}
-	if res.TotalTraces != 10 {
-		t.Fatalf("TotalTraces = %d after finalization, want 10", res.TotalTraces)
+	if res.SpanCount != 10 {
+		t.Fatalf("SpanCount = %d after finalization, want 10", res.SpanCount)
 	}
 }
 

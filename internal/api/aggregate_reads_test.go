@@ -94,7 +94,7 @@ func seedAggregate(t *testing.T, e *aggregate.Engine, tenant, service string, sp
 	}
 	d := &aggregate.AggregateDelta{}
 	for i := 0; i < spans; i++ {
-		d.ObserveSpan(micros, i%3 == 0)
+		d.ObserveSpan(micros, i%3 == 0, true)
 	}
 	logKey := aggregate.SeriesKey{
 		TenantID:  tenantID,

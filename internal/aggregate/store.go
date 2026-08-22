@@ -33,7 +33,14 @@ import (
 // migrated: the rows it holds are unfinalized deltas with a retention horizon
 // measured in minutes, so AGGREGATE_ALLOW_REBUILD loses far less than a
 // migration would risk getting wrong.
-const StoreSchemaVersion = 2
+//
+// v3 added request_count and error_request_count to both aggregate_delta_log
+// and aggregate_buckets (#197 Q5). A v2 file holds only span counts, and there
+// is no way to derive a request count from them after the fact — the parent and
+// kind of every span it summarised are long gone. Backfilling zeros would make
+// every historical window read "0 requests, N spans", which is worse than an
+// operator-acknowledged rebuild, so the fail-closed policy stands unchanged.
+const StoreSchemaVersion = 3
 
 // Store errors.
 var (
@@ -174,11 +181,71 @@ type SeriesInfo struct {
 	Key SeriesKey
 }
 
-// Bucket is one finalized (window, series) row.
+// Bucket is one store-owned (window, series) row.
 type Bucket struct {
 	WindowStart int64
 	SeriesID    SeriesID
 	Delta       *AggregateDelta
+	// Source says which table the row came from. A window may hold a
+	// materialized bucket and a not-yet-finalized delta row for one series;
+	// both are real contributions and both must be counted.
+	Source BucketSource
+}
+
+// BucketPage is one page of a ReadBuckets call.
+type BucketPage struct {
+	// Buckets are the rows of this page, ordered by (window, series, source).
+	Buckets []Bucket
+	// Limit is the row limit that was applied.
+	Limit int
+	// Truncated reports that more rows matched than this page returned. It is
+	// result-completeness metadata and is INDEPENDENT of Coverage: a result
+	// can be full-coverage and truncated at the same time (#197 Q4).
+	Truncated bool
+	// Next resumes the read immediately past the last returned row. Only
+	// meaningful when Truncated.
+	Next BucketCursor
+}
+
+// BucketSource says which durable table a row came from. It exists so a paged
+// read has a TOTAL order to resume from: (window_start, series_id) is unique
+// within each table but a window can legitimately hold a materialized bucket
+// AND a not-yet-finalized delta row for the same series.
+type BucketSource uint8
+
+// BucketSource values, in scan order.
+const (
+	// SourceFinalized is a row from aggregate_buckets.
+	SourceFinalized BucketSource = 0
+	// SourceDelta is a not-yet-finalized row from aggregate_delta_log.
+	SourceDelta BucketSource = 1
+)
+
+// BucketCursor is the keyset position of a paged bucket read. Treat it as
+// opaque: obtain it from BucketPage.Next and hand it back through
+// Selector.After.
+type BucketCursor struct {
+	WindowStart int64
+	SeriesID    SeriesID
+	Source      BucketSource
+}
+
+// zero reports the start-of-range cursor.
+func (c BucketCursor) zero() bool {
+	return c.WindowStart == 0 && c.SeriesID == 0 && c.Source == SourceFinalized
+}
+
+// After reports whether row (window, id, src) sorts strictly after the cursor.
+// It is the Go-side twin of the SQL keyset predicate, so an in-memory Store
+// implementation pages identically to the SQLite one.
+func (c BucketCursor) After(window int64, id SeriesID, src BucketSource) bool {
+	if window != c.WindowStart {
+		return window > c.WindowStart
+	}
+	if id != c.SeriesID {
+		return id > c.SeriesID
+	}
+	return src > c.Source
 }
 
 // Selector bounds a bucket read. Both window bounds and a tenant are
@@ -197,11 +264,58 @@ type Selector struct {
 	// Limit caps returned rows. Zero takes MaxReadRows; anything above it is
 	// clamped down, never up.
 	Limit int
+	// After resumes a paged read immediately past this cursor. The zero value
+	// starts at the beginning of the range.
+	After BucketCursor
+	// SketchOnly restricts the read to rows that carry a sketch. It is the
+	// percentile path's filter: a row with no sketch cannot move a quantile,
+	// so paging past it is wasted work.
+	SketchOnly bool
+}
+
+// GroupBy selects the grouping of a SumBuckets aggregation. Zero groups
+// everything into a single row.
+type GroupBy uint8
+
+// GroupBy flags, combinable.
+const (
+	// GroupByWindow emits one row per window start.
+	GroupByWindow GroupBy = 1 << iota
+	// GroupByService emits one row per service dictionary ID.
+	GroupByService
+	// GroupBySignal emits one row per signal.
+	GroupBySignal
+)
+
+// SumRow is one grouped aggregation over the store's rows. Fields outside the
+// requested grouping are zero.
+//
+// The counters are the SUMmable subset of AggregateDelta: everything a scalar
+// dashboard total is built from. Sketches are deliberately absent — a quantile
+// sketch cannot be merged by SQL, and pretending otherwise is how a p99 turns
+// into an average (#197 Q1).
+type SumRow struct {
+	WindowStart int64
+	ServiceID   uint32
+	Signal      Signal
+
+	Count             uint64
+	ErrorCount        uint64
+	RequestCount      uint64
+	ErrorRequestCount uint64
+	DurationCount     uint64
+	DurationSum       float64
+	LogCount          uint64
 }
 
 // MaxReadRows is the store-side cap on rows returned by one ReadBuckets call
 // and on IDs accepted by one ResolveSeries call.
-const MaxReadRows = 20000
+//
+// Declared as var (not const) so tests can temporarily shrink it and exercise
+// the truncation and paging paths without seeding tens of thousands of rows
+// through a race-instrumented SQLite — same reason storage.sqliteP99RowCap is
+// a var. Nothing outside a test may assign it.
+var MaxReadRows = 20000
 
 // MaxReadWindowSpan bounds the window range one ReadBuckets call may cover: the
 // 168 h retention horizon plus one window of slack, expressed in seconds.
@@ -283,9 +397,22 @@ type Store interface {
 	// PurgeBefore deletes finalized history older than cutoff.
 	PurgeBefore(cutoff int64) (PurgeStats, error)
 
-	// ReadBuckets returns finalized buckets matching sel. The selector's
-	// bounds are mandatory and the row cap is enforced store-side.
-	ReadBuckets(sel Selector) ([]Bucket, error)
+	// ReadBuckets returns the store-owned rows matching sel: materialized
+	// buckets AND any not-yet-finalized delta rows for the same range. Both
+	// are store-owned data once the engine has handed the window over, and
+	// omitting either is exactly the silent omission #194 blocker 4 is about.
+	//
+	// The selector's bounds are mandatory and the row cap is enforced
+	// store-side. The read asks the database for limit+1 rows and reports
+	// Truncated rather than trimming in silence; a caller that needs every row
+	// pages with Selector.After until Truncated is false.
+	ReadBuckets(sel Selector) (BucketPage, error)
+
+	// SumBuckets aggregates the same row set as ReadBuckets in SQL, grouped by
+	// by. NO row cap applies: the result is bounded by the grouping — windows,
+	// services, signals — not by the number of rows scanned, which is what
+	// makes a scalar dashboard total structurally impossible to truncate.
+	SumBuckets(sel Selector, by GroupBy) ([]SumRow, error)
 
 	// ReplayMutable returns the delta-log rows for windows at or after since —
 	// the mutable set only. Finalized history never hydrates into RAM (#160).

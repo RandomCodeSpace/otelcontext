@@ -210,10 +210,13 @@ func observeExemplarLost(m *telemetry.Metrics, signal SignalType, reason string)
 // are on the permanent banned list (#153, #159) and are never carried across.
 func aggregateSpanInput(tenantID, serviceName string, span *tracepb.Span, start, end time.Time) aggregate.SpanInput {
 	in := aggregate.SpanInput{
-		Tenant:         tenantID,
-		Service:        serviceName,
-		SpanName:       span.Name,
-		SpanKind:       int32(span.Kind),
+		Tenant:   tenantID,
+		Service:  serviceName,
+		SpanName: span.Name,
+		SpanKind: int32(span.Kind),
+		// Only the EMPTINESS of the parent span ID crosses into the aggregate
+		// path; the ID itself is on the permanent banned list (#153, #159).
+		Root:           len(span.ParentSpanId) == 0,
 		Timestamp:      start,
 		DurationMicros: float64(end.Sub(start).Microseconds()),
 	}
@@ -265,6 +268,7 @@ func aggregateEdgeInput(caller string, in aggregate.SpanInput) aggregate.EdgeInp
 		HTTPStatusCode: in.HTTPStatusCode,
 		SpanKind:       in.SpanKind,
 		StatusCode:     in.StatusCode,
+		Root:           in.Root,
 		Timestamp:      in.Timestamp,
 		DurationMicros: in.DurationMicros,
 	}

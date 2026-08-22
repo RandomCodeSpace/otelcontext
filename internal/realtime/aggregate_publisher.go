@@ -91,13 +91,21 @@ func (p *EnginePublisher) Snapshot(ctx context.Context, service string) *LiveSna
 
 	if dash, err := p.engine.QueryDashboard(q); err == nil {
 		snap.Dashboard = &storage.DashboardStats{
-			TotalTraces:    dash.TotalTraces,
-			TotalLogs:      dash.TotalLogs,
-			TotalErrors:    dash.TotalErrors,
-			AvgLatencyMs:   dash.AvgLatencyMs,
-			ErrorRate:      dash.ErrorRate,
-			ActiveServices: dash.ActiveServices,
-			P99Latency:     int64(dash.P99LatencyMicros),
+			// Headline trio on the REQUEST basis, restated by name alongside
+			// the span basis — same contract as the HTTP dashboard view.
+			TotalTraces:      dash.RequestCount,
+			TotalErrors:      dash.ErrorRequestCount,
+			ErrorRate:        dash.RequestErrorRate,
+			Requests:         dash.RequestCount,
+			RequestErrors:    dash.ErrorRequestCount,
+			RequestErrorRate: dash.RequestErrorRate,
+			Spans:            dash.SpanCount,
+			SpanErrors:       dash.SpanErrorCount,
+			SpanErrorRate:    dash.SpanErrorRate,
+			TotalLogs:        dash.TotalLogs,
+			AvgLatencyMs:     dash.AvgLatencyMs,
+			ActiveServices:   dash.ActiveServices,
+			P99Latency:       int64(dash.P99LatencyMicros),
 		}
 		for _, s := range dash.TopFailing {
 			snap.Dashboard.TopFailingServices = append(snap.Dashboard.TopFailingServices, storage.ServiceError{
@@ -114,11 +122,7 @@ func (p *EnginePublisher) Snapshot(ctx context.Context, service string) *LiveSna
 	if traffic, err := p.engine.QueryBuckets(q); err == nil {
 		points := make([]storage.TrafficPoint, 0, len(traffic.Points))
 		for _, pt := range traffic.Points {
-			points = append(points, storage.TrafficPoint{
-				Timestamp:  pt.WindowStart,
-				Count:      pt.Count,
-				ErrorCount: pt.ErrorCount,
-			})
+			points = append(points, trafficPointFromAggregate(pt))
 		}
 		snap.Traffic = points
 	} else {
@@ -156,3 +160,18 @@ func (p *EnginePublisher) Snapshot(ctx context.Context, service string) *LiveSna
 
 // compile-time assertion.
 var _ AggregatePublisher = (*EnginePublisher)(nil)
+
+// trafficPointFromAggregate converts one engine traffic bucket into the wire
+// shape. count/error_count carry the REQUEST basis; both bases are also
+// restated by name (#197 Q3).
+func trafficPointFromAggregate(pt aggregate.TrafficPoint) storage.TrafficPoint {
+	return storage.TrafficPoint{
+		Timestamp:     pt.WindowStart,
+		Count:         pt.RequestCount,
+		ErrorCount:    pt.ErrorRequestCount,
+		Requests:      pt.RequestCount,
+		RequestErrors: pt.ErrorRequestCount,
+		Spans:         pt.SpanCount,
+		SpanErrors:    pt.SpanErrorCount,
+	}
+}
