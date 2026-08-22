@@ -122,7 +122,11 @@ func collectProvenance(repoRoot string, binaries gatecore.Binaries) gatecore.Pro
 }
 
 func gitOutput(dir string, args ...string) string {
-	cmd := exec.Command("git", args...) // #nosec G204 -- fixed git subcommands
+	git := systemTool("git")
+	if git == "" {
+		return ""
+	}
+	cmd := exec.Command(git, args...) // #nosec G204 -- absolute path, fixed git subcommands
 	cmd.Dir = dir
 	out, err := cmd.Output()
 	if err != nil {

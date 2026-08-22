@@ -58,15 +58,25 @@ func (g *gate) startServer(label string, mode gatecore.ConfinementMode) (*server
 
 	switch mode {
 	case gatecore.ConfinementCgroup:
+		tool := systemTool("systemd-run")
+		if tool == "" {
+			_ = lf.Close()
+			return nil, fmt.Errorf("systemd-run not found in %v", systemToolDirs)
+		}
 		argv = []string{
-			"systemd-run", "--user", "--scope", "--collect", "--quiet",
+			tool, "--user", "--scope", "--collect", "--quiet",
 			"--unit=" + unit,
 			"-p", fmt.Sprintf("CPUQuota=%d%%", g.cfg.Confinement.CPUQuotaPercent),
 			"-p", "MemoryMax=" + g.cfg.Confinement.MemoryMax,
 			"--", g.abs(g.cfg.Binaries.Server),
 		}
 	case gatecore.ConfinementTaskset:
-		argv = []string{"taskset", "-c", g.cfg.Confinement.FallbackCPUs, g.abs(g.cfg.Binaries.Server)}
+		tool := systemTool("taskset")
+		if tool == "" {
+			_ = lf.Close()
+			return nil, fmt.Errorf("taskset not found in %v", systemToolDirs)
+		}
+		argv = []string{tool, "-c", g.cfg.Confinement.FallbackCPUs, g.abs(g.cfg.Binaries.Server)}
 		env = append(env, fmt.Sprintf("GOMAXPROCS=%d", g.cfg.Confinement.FallbackGOMAXPROCS))
 	default:
 		_ = lf.Close()
@@ -158,18 +168,39 @@ func findScopePath(unit string) (string, error) {
 	return found, nil
 }
 
+// systemToolDirs are the fixed, root-owned directories the gate resolves its
+// external tools from. $PATH is deliberately ignored (sonar go:S4036): the
+// provenance record depends on running the real git and the confinement
+// teardown depends on running the real systemctl, and a writable $PATH entry
+// would let either be substituted without the report noticing.
+var systemToolDirs = []string{"/usr/bin", "/bin", "/usr/sbin", "/sbin", "/usr/local/bin"}
+
+// systemTool resolves an external tool to an absolute path under
+// systemToolDirs, or returns "" when it is not installed in any of them.
+func systemTool(name string) string {
+	for _, dir := range systemToolDirs {
+		abs := filepath.Join(dir, name)
+		fi, err := os.Stat(abs)
+		if err == nil && !fi.IsDir() && fi.Mode()&0o111 != 0 {
+			return abs
+		}
+	}
+	return ""
+}
+
 // cgroupProbe reports whether delegated cgroup control is usable here, so the
 // gate can pick its confinement mode before it commits to a three-hour run.
 func (g *gate) cgroupProbe() error {
 	if _, err := os.Stat(filepath.Join(cgroupRoot, "cgroup.controllers")); err != nil {
 		return fmt.Errorf("no cgroup-v2 unified hierarchy at %s: %w", cgroupRoot, err)
 	}
-	if _, err := exec.LookPath("systemd-run"); err != nil {
-		return fmt.Errorf("systemd-run is not on PATH: %w", err)
+	tool := systemTool("systemd-run")
+	if tool == "" {
+		return fmt.Errorf("systemd-run not found in %v", systemToolDirs)
 	}
 	unit := fmt.Sprintf("%s-%s-probe.scope", g.cfg.Confinement.UnitPrefix, g.cfg.RunID)
 	argv := []string{
-		"systemd-run", "--user", "--scope", "--collect", "--quiet", "--unit=" + unit,
+		tool, "--user", "--scope", "--collect", "--quiet", "--unit=" + unit,
 		"-p", fmt.Sprintf("CPUQuota=%d%%", g.cfg.Confinement.CPUQuotaPercent),
 		"-p", "MemoryMax=" + g.cfg.Confinement.MemoryMax,
 		"--", "/bin/true",
@@ -296,8 +327,8 @@ func (g *gate) stopServer(p *serverProc) error {
 		}
 		<-p.waitErr
 	}
-	if p.unit != "" {
-		stop := exec.Command("systemctl", "--user", "stop", p.unit) // #nosec G204 -- unit name is gate-generated
+	if sc := systemTool("systemctl"); p.unit != "" && sc != "" {
+		stop := exec.Command(sc, "--user", "stop", p.unit) // #nosec G204 -- absolute path, gate-generated unit
 		_ = stop.Run()
 	}
 	if p.logFile != nil {
@@ -315,8 +346,8 @@ func reap(p *serverProc) {
 	case <-p.waitErr:
 	case <-time.After(30 * time.Second):
 	}
-	if p.unit != "" {
-		_ = exec.Command("systemctl", "--user", "stop", p.unit).Run() // #nosec G204 -- unit name is gate-generated
+	if sc := systemTool("systemctl"); p.unit != "" && sc != "" {
+		_ = exec.Command(sc, "--user", "stop", p.unit).Run() // #nosec G204 -- absolute path, gate-generated unit
 	}
 	if p.logFile != nil {
 		_ = p.logFile.Close()
