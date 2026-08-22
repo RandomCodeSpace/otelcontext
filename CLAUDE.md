@@ -44,10 +44,14 @@ Both paths delegate to the same `Export()` methods — zero business logic dupli
 
 ### Multi-tenancy
 
-Tenant identity flows into the request context on every write and read:
+Tenant identity flows into the request context on every write and read. An
+**authenticated tenant key outranks every one of these carriers** — see the
+Authentication section:
+- **Authenticated identity (highest):** a bearer key from `API_TENANT_KEYS_FILE`, or a proxy-injected `X-OtelContext-Tenant` under `AUTH_TRUST_EXTERNAL`. Binding is absolute; contradicting client assertions are ignored and counted on `OtelContext_auth_tenant_conflicts_total{surface,reason}`.
 - **HTTP:** `X-Tenant-ID` header (see `internal/api/tenant_middleware.go`).
 - **gRPC:** `x-tenant-id` metadata key (see `internal/ingest/otlp.go`).
-- **OTLP resource attribute:** `tenant.id` on the resource overrides the header/metadata.
+- **OTLP resource attribute:** `tenant.id` on the resource overrides the header/metadata (only when `OTLP_TRUST_RESOURCE_TENANT=true`).
+- **WebSocket:** one tenant per connection, fixed at the handshake — never a protocol message.
 
 When none are present, `DEFAULT_TENANT` (default `"default"`) is assigned. The
 resolved tenant is stamped on every async-pipeline `Batch`, so
@@ -226,7 +230,13 @@ Key settings in `internal/config/config.go`:
 - `DB_AZURE_AUTH` (false) — see Authentication below
 - `TLS_CERT_FILE`, `TLS_KEY_FILE` — explicit TLS (both or neither)
 - `TLS_AUTO_SELFSIGNED` (false), `TLS_CACHE_DIR` (`./data/tls`) — self-signed bootstrap, ignored if cert files set
-- `API_KEY` — Bearer token gate for `/api/*`, `/v1/*`, `/mcp`. Empty = auth disabled
+- `API_KEY` — operator bearer token gating `/api/*`, `/v1/*`, `/mcp`, `/ws*`, and OTLP gRPC. Empty = auth disabled
+- `API_TENANT_KEYS_FILE` — JSON or YAML (by extension) mapping bearer key → tenant; several keys per tenant allowed. Startup-only load, digest-only in memory, constant-time compare. File must not be group/other readable or writable (>0600 refuses startup, quoting the actual mode). A tenant key BINDS the request: `X-Tenant-ID`, `x-tenant-id` metadata, and `tenant.id` resource attributes are ignored and counted
+- `AUTH_TRUST_EXTERNAL` (false), `AUTH_EXTERNAL_TENANT_HEADER` (`X-OtelContext-Tenant`) — proxy-injected identity; read the mandatory deployment contract in Authentication before enabling
+- `WS_ALLOWED_ORIGINS` (`""` = same-host only) — comma-separated origins (`https://app.example.com`) or bare hosts, enforced on `/ws*` whenever authentication is enabled or `APP_ENV=production`
+- `WS_MAX_CLIENTS` (0 = unlimited) — admission cap on BOTH WebSocket hubs; past the cap the handshake gets 503 before the upgrade
+- `GRPC_REFLECTION` — defaults to true outside production, false in production; set explicitly to override
+- `OTELCONTEXT_ALLOW_INSECURE_GRPC` (false) — waives the production TLS+auth requirement on the OTLP gRPC listener
 - `OTEL_EXPORTER_OTLP_ENDPOINT` — enables self-instrumentation (empty = off)
 - `DEFAULT_TENANT` (`default`) — assigned to rows ingested without explicit tenant
 - `HOT_RETENTION_DAYS` (7) — drives `RetentionScheduler`; range 1..36500
@@ -268,7 +278,36 @@ Also at SQLite startup, `internal/storage/factory.go` applies a fail-closed PRAG
 
 ### Authentication
 
-**API auth (platform).** `API_KEY` gates `/api/*`, OTLP HTTP (`/v1/*`), and the MCP endpoint via `Authorization: Bearer <API_KEY>`. When empty, the middleware is a pass-through (dev only). Unprotected paths: `/live`, `/ready`, `/metrics*`, `/ws*`. A shared `API_KEY` grants access to every tenant — there is no per-tenant-key file in the current code; isolate tenants at the network/auth layer if that matters. (If an `API_TENANT_KEYS_FILE` override lands later, re-check `internal/api/auth.go` for the flag name.)
+Two credential classes, one authenticator (`internal/authn/`), three transports.
+
+**Operator key (`API_KEY`).** Gates `/api/*`, OTLP HTTP (`/v1/*`), the MCP endpoint, `/ws*`, and OTLP gRPC via `Authorization: Bearer <API_KEY>`. It authenticates and nothing more: tenant selection keeps its historical precedence (`X-Tenant-ID` / `x-tenant-id` → trusted `tenant.id` resource attribute → `DEFAULT_TENANT`), so a single-tenant install behaves exactly as before. When empty the middleware is a pass-through (dev only). Always-unprotected paths: `/live`, `/ready`, `/health*`, `/metrics*`, and the UI bundle.
+
+**Tenant keys (`API_TENANT_KEYS_FILE`).** JSON or YAML chosen by extension, mapping bearer key → tenant ID, several keys per tenant (rotation, per-agent keys):
+
+```json
+{"3f7c…": "acme", "9b21…": "acme", "c40d…": "beta"}
+```
+
+Loaded once at startup — a key-file swap is an explicit restart, never a live reload. The process keeps only SHA-256 digests; lookup digests the presented key and compares with `subtle.ConstantTimeCompare` against every entry without exiting early. Startup refuses: unreadable files, files with any group/other permission bit (the refusal quotes the actual mode), unknown extensions, empty files, empty keys, keys containing whitespace or control characters, tenant IDs the storage sanitizer rejects, and duplicate keys. Credentials never appear in a log line or an error message at any level.
+
+A tenant key **binds** the request or connection. Client-asserted tenancy — `X-Tenant-ID`, the `?tenant=` WebSocket parameter, `x-tenant-id` gRPC metadata, and the `tenant.id` OTLP resource attribute — is ignored and counted on `OtelContext_auth_tenant_conflicts_total{surface,reason}`. A non-zero rate means a client is asserting a tenancy it does not hold.
+
+**WebSocket (`/ws*`).** The handshake authenticates (`internal/api/ws_auth.go`) once any credential source is configured. Carriers: `Authorization: Bearer <key>` for non-browser clients, or a `Sec-WebSocket-Protocol` entry `otelcontext.v1, auth.<base64url-token>` for browsers, which cannot set headers on a WebSocket. The server validates the token and echoes **only** `otelcontext.v1`; the protocol header value is never logged. Tokens are never accepted in query strings. One tenant scope per connection: a tenant-key socket is bound, an operator socket selects exactly one tenant via `?tenant=` or `X-Tenant-ID` and otherwise gets `DEFAULT_TENANT`. There is no merged all-tenant stream. Event delivery in both hubs is filtered by that scope, and an event carrying no tenant is invisible to a scoped socket (fail closed). `WS_ALLOWED_ORIGINS` is enforced whenever authentication is enabled or `APP_ENV=production` (empty list = same-host only); a request with no `Origin` header is a non-browser client and still has to authenticate. Both hubs cap admission at `WS_MAX_CLIENTS`, and the event hub now writes through one bounded queue (256 messages) and one writer goroutine per client — **overflow disconnects the client** rather than dropping messages, because the log/metric batches are incremental and a silent gap would misreport as "nothing happened". A reconnect re-seeds with a full snapshot.
+
+**OTLP gRPC.** Unary and stream interceptors (`internal/ingest/grpc_auth.go`) read `authorization` metadata against the same key store. Refusals are `codes.Unauthenticated` with a non-specific message (a prober learns nothing) and are counted on `OtelContext_grpc_auth_failures_total{reason}`. Reflection is disabled when `APP_ENV=production` unless `GRPC_REFLECTION=true`.
+
+**Production fail-closed startup.** With `APP_ENV=production`, startup refuses unless the OTLP gRPC listener has **both** transport protection (`TLS_CERT_FILE`/`TLS_KEY_FILE` or `TLS_AUTO_SELFSIGNED=true`) and authentication (`API_KEY` or `API_TENANT_KEYS_FILE`). Two waivers, each named in the refusal: `AUTH_TRUST_EXTERNAL=true` (the proxy terminates TLS and authenticates) or `OTELCONTEXT_ALLOW_INSECURE_GRPC=true` (explicit acknowledgement that telemetry crosses the network unprotected).
+
+**`AUTH_TRUST_EXTERNAL` — mandatory proxy contract.** The flag trusts a tenant identity injected by a front proxy in `AUTH_EXTERNAL_TENANT_HEADER` (default `X-OtelContext-Tenant`; the gRPC metadata key is its lower-cased form). It is never blind trust of `X-Tenant-ID`, which stays client-controlled and untrusted. All of the following are mandatory deployment conditions:
+
+1. The proxy authenticates every caller (mTLS, OIDC, or its own credential check) before forwarding.
+2. The proxy **strips inbound copies** of the identity header from client requests and injects its own verified value. A configuration that merely appends is a bypass.
+3. The application ports (HTTP and gRPC) are unreachable except through the proxy — network policy, listener binding, or both.
+4. TLS is terminated at the proxy, and the proxy-to-application hop is on a trusted network or separately protected.
+5. The proxy forwards the WebSocket upgrade (`Connection`/`Upgrade`, and the `Sec-WebSocket-Protocol` entries) with the identity header intact.
+6. The proxy forwards gRPC metadata, injecting the identity key on the gRPC path too.
+
+**Without every one of those conditions, `AUTH_TRUST_EXTERNAL=true` is an authentication bypass wearing infrastructure terminology.** Anything that can reach the port becomes any tenant it names.
 
 **Database auth (Azure Entra).** Setting `DB_AZURE_AUTH=true` enables Azure Entra ID (AAD) authentication for PostgreSQL. The driver uses `DefaultAzureCredential`, which resolves identity via the standard probe order (env vars → workload identity → managed identity → Azure CLI → developer credentials). When Azure auth is enabled, strict TLS (`sslmode=require`, `verify-ca`, or `verify-full`) is mandatory; weaker modes are rejected at startup. `DB_CONN_MAX_LIFETIME` is internally capped to 30 minutes to stay inside the token TTL.
 

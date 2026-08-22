@@ -9,11 +9,18 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/RandomCodeSpace/otelcontext/internal/authn"
+	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 	"github.com/coder/websocket"
 )
 
 // LogEntry is a lightweight struct for WebSocket broadcast payloads.
+//
+// Tenant is transport-only: it decides which sockets may see the entry and is
+// never serialized, so the wire payload is unchanged from before per-tenant
+// scoping existed.
 type LogEntry struct {
+	Tenant         string    `json:"-"`
 	ID             uint      `json:"id"`
 	TraceID        string    `json:"trace_id"`
 	SpanID         string    `json:"span_id"`
@@ -26,13 +33,25 @@ type LogEntry struct {
 }
 
 // MetricEntry represents a raw metric point for real-time visualization.
+// Tenant is transport-only — see LogEntry.
 type MetricEntry struct {
+	Tenant      string         `json:"-"`
 	Name        string         `json:"name"`
 	ServiceName string         `json:"service_name"`
 	Value       float64        `json:"value"`
 	Timestamp   time.Time      `json:"timestamp"`
 	Attributes  map[string]any `json:"attributes"`
 }
+
+// tenantTagged is implemented by every entry type that can be delivered to a
+// tenant-scoped socket. It exists so log and metric fan-out share one
+// filtering implementation instead of two that can drift apart.
+type tenantTagged interface {
+	tenantID() string
+}
+
+func (l LogEntry) tenantID() string    { return l.Tenant }
+func (m MetricEntry) tenantID() string { return m.Tenant }
 
 // HubBatch is a unified payload for WebSocket broadcasts.
 type HubBatch struct {
@@ -78,6 +97,12 @@ type Hub struct {
 	writerWg sync.WaitGroup // tracks writer goroutines
 	devMode  bool
 
+	// enforceOrigin and originHosts implement WS_ALLOWED_ORIGINS. Enforcement
+	// is on whenever authentication is enabled or APP_ENV=production; the
+	// empty host list then means same-host only.
+	enforceOrigin bool
+	originHosts   []string
+
 	// onConnectionChange is called when the number of active connections changes.
 	onConnectionChange func(count int)
 
@@ -91,8 +116,13 @@ type Hub struct {
 
 // client represents a single WebSocket connection.
 type client struct {
-	conn   *websocket.Conn
-	send   chan []byte
+	conn *websocket.Conn
+	send chan []byte
+	// tenant is the single tenant this socket is scoped to, resolved from the
+	// authenticated principal at handshake time. Empty means unscoped, which
+	// only happens when authentication is not configured (development) — a
+	// scoped socket never receives another tenant's entries.
+	tenant string
 	closed atomic.Bool // guards against double-close of send channel
 }
 
@@ -210,7 +240,7 @@ func (h *Hub) flush() {
 
 	// Broadcast Logs if any
 	if len(logBatch) > 0 {
-		h.broadcastBatch(HubBatch{Type: "logs", Data: logBatch})
+		broadcastTagged(h, "logs", logBatch)
 		// Recycle logBatch
 		logBatch = logBatch[:0]
 		h.logPool.Put(logBatch) //nolint:staticcheck // SA6002: []T pool; pointer wrap would require broader refactor
@@ -218,25 +248,35 @@ func (h *Hub) flush() {
 
 	// Broadcast Metrics if any
 	if len(metricBatch) > 0 {
-		h.broadcastBatch(HubBatch{Type: "metrics", Data: metricBatch})
+		broadcastTagged(h, "metrics", metricBatch)
 		// Recycle metricBatch
 		metricBatch = metricBatch[:0]
 		h.metricPool.Put(metricBatch) //nolint:staticcheck // SA6002: []T pool; pointer wrap would require broader refactor
 	}
 }
 
-func (h *Hub) broadcastBatch(batch HubBatch) {
-	data, err := json.Marshal(batch)
-	if err != nil {
-		slog.Error("Hub: failed to marshal batch", "error", err, "type", batch.Type)
-		return
-	}
-
+// broadcastTagged fans a batch out to every connected client, filtered by the
+// client's tenant scope. One marshal per distinct scope, not per client: the
+// unscoped payload is built once and each tenant's filtered payload at most
+// once, so a hundred dashboards on one tenant still cost one encode.
+//
+// A client with an empty scope (authentication not configured) keeps the
+// pre-existing behaviour of receiving the whole batch.
+func broadcastTagged[T tenantTagged](h *Hub, batchType string, entries []T) {
+	cache := make(map[string][]byte, 4)
 	sent := 0
 	var slow []*client
 	for c := range h.clients {
+		msg, cached := cache[c.tenant]
+		if !cached {
+			msg = encodeForScope(batchType, c.tenant, entries)
+			cache[c.tenant] = msg
+		}
+		if msg == nil {
+			continue // nothing in this batch belongs to the client's tenant
+		}
 		select {
-		case c.send <- data:
+		case c.send <- msg:
 			sent++
 		default:
 			slow = append(slow, c)
@@ -256,14 +296,47 @@ func (h *Hub) broadcastBatch(batch HubBatch) {
 		}
 	}
 	if sent > 0 && h.onMessageSent != nil {
-		h.onMessageSent(batch.Type)
+		h.onMessageSent(batchType)
 	}
+}
+
+// encodeForScope marshals the batch a single tenant scope may see. It returns
+// nil when the scope has nothing to receive — entries carrying no tenant are
+// invisible to a scoped socket (fail closed).
+func encodeForScope[T tenantTagged](batchType, tenant string, entries []T) []byte {
+	payload := entries
+	if tenant != "" {
+		filtered := make([]T, 0, len(entries))
+		for _, e := range entries {
+			if e.tenantID() == tenant {
+				filtered = append(filtered, e)
+			}
+		}
+		if len(filtered) == 0 {
+			return nil
+		}
+		payload = filtered
+	}
+	data, err := json.Marshal(HubBatch{Type: batchType, Data: payload})
+	if err != nil {
+		slog.Error("Hub: failed to marshal batch", "error", err, "type", batchType)
+		return nil
+	}
+	return data
 }
 
 // SetDevMode controls whether cross-origin WebSocket connections are accepted.
 // Should be true only in development environments.
 func (h *Hub) SetDevMode(devMode bool) {
 	h.devMode = devMode
+}
+
+// SetOriginPolicy configures WebSocket origin enforcement. When enforce is
+// true the browser Origin header must match one of allowedHosts, or the
+// request host when the list is empty. Call once at startup.
+func (h *Hub) SetOriginPolicy(enforce bool, allowedHosts []string) {
+	h.enforceOrigin = enforce
+	h.originHosts = append([]string(nil), allowedHosts...)
 }
 
 // SetMaxClients caps simultaneous WebSocket connections. 0 disables the cap
@@ -354,7 +427,14 @@ func (h *Hub) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		InsecureSkipVerify: h.devMode, // Allow cross-origin in dev mode only
+		// Cross-origin is allowed in dev mode only, and never once the origin
+		// policy is enforced (authenticated or production deployments).
+		InsecureSkipVerify: h.devMode && !h.enforceOrigin,
+		OriginPatterns:     h.originHosts,
+		// Echo ONLY otelcontext.v1. A browser carrying a credential offers
+		// `otelcontext.v1, auth.<base64url>`; selecting the first entry keeps
+		// the token out of the negotiated protocol and out of every log line.
+		Subprotocols: []string{authn.WSSubprotocol},
 	})
 	if err != nil {
 		releaseSlot()
@@ -363,8 +443,9 @@ func (h *Hub) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	c := &client{
-		conn: conn,
-		send: make(chan []byte, 256),
+		conn:   conn,
+		send:   make(chan []byte, 256),
+		tenant: connTenantScope(r),
 	}
 
 	h.register <- c
@@ -414,4 +495,14 @@ func (h *Hub) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	if c.closed.CompareAndSwap(false, true) {
 		close(c.send)
 	}
+}
+
+// connTenantScope reads the tenant the handshake gate pinned onto the request
+// context. Empty means the socket is unscoped, which happens only when
+// authentication is not configured — the gate always pins exactly one tenant.
+func connTenantScope(r *http.Request) string {
+	if r == nil || !storage.HasTenantContext(r.Context()) {
+		return ""
+	}
+	return storage.TenantFromContext(r.Context())
 }

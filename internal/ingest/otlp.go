@@ -12,6 +12,7 @@ import (
 	"runtime"
 
 	"github.com/RandomCodeSpace/otelcontext/internal/aggregate"
+	"github.com/RandomCodeSpace/otelcontext/internal/authn"
 	"github.com/RandomCodeSpace/otelcontext/internal/config"
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 	"github.com/RandomCodeSpace/otelcontext/internal/telemetry"
@@ -74,6 +75,16 @@ func hasStorageTenant(ctx context.Context) bool {
 // "tenant.id" path is gated behind cfg.TrustResourceTenant — disabled by
 // default so a compromised SDK cannot forge another tenant's data.
 func resolveTenant(ctx context.Context, resourceAttrs []*commonpb.KeyValue, fallback string, trustResourceAttr bool) string {
+	// An authenticated tenant key binds absolutely. It outranks metadata, the
+	// resource attribute, and the configured default; a disagreeing
+	// `tenant.id` is counted so operators can see clients asserting a tenancy
+	// they do not hold.
+	if bound, ok := authn.BoundTenantFromContext(ctx); ok {
+		if t := tenantFromResource(resourceAttrs); t != "" && t != bound {
+			authn.RecordConflict("grpc", "resource_attribute")
+		}
+		return bound
+	}
 	if t := tenantFromContext(ctx); t != "" {
 		return t
 	}

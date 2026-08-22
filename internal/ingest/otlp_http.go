@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strconv"
 
+	"github.com/RandomCodeSpace/otelcontext/internal/authn"
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 	collogspb "go.opentelemetry.io/proto/otlp/collector/logs/v1"
 	colmetricspb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
@@ -43,6 +44,14 @@ const headerContentType = "Content-Type" //nolint:goconst // single literal; Son
 // control characters, oversized strings, and empty values are rejected
 // identically regardless of transport.
 func withTenantFromHTTP(r *http.Request) context.Context {
+	// An authenticated tenant key already pinned the tenant. The header is
+	// then a client assertion about someone else's tenancy: ignore and count.
+	if bound, ok := authn.BoundTenantFromContext(r.Context()); ok {
+		if v := r.Header.Get("X-Tenant-ID"); v != "" && storage.SanitizeTenantID(v) != bound {
+			authn.RecordConflict("http", "header")
+		}
+		return r.Context()
+	}
 	if v := r.Header.Get("X-Tenant-ID"); v != "" {
 		if sanitized := storage.SanitizeTenantID(v); sanitized != "" {
 			return storage.WithTenantContext(r.Context(), sanitized)
