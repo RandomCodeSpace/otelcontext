@@ -566,10 +566,10 @@ enforced against summed file sizes reports 60% while `write()` returns ENOSPC.
 
 | Tier | Allocation | Covers |
 |---|---|---|
-| Main relational tier | **4.5 GiB** | Raw trace/span/log exemplars, synthesized logs, investigations and other main-DB metadata, indexes, FTS5, database free pages |
-| `aggregate.db` | **1.5 GiB** | Aggregate buckets, delta log, baselines, identity tables, and their indexes |
+| Main relational tier | **4.0 GiB** | Raw trace/span/log exemplars, synthesized logs, investigations and other main-DB metadata, indexes, FTS5, database free pages |
+| `aggregate.db` | **2.25 GiB** | Aggregate buckets, delta log, baselines, identity tables, and their indexes |
 | DLQ | **0.5 GiB** | Existing `DLQ_MAX_DISK_MB` cap |
-| WAL/SHM + temp | **0.5 GiB** | `-wal`/`-shm` sidecars of both databases, SQLite temp files, TLS material, transient maintenance overhead |
+| WAL/SHM + temp | **0.25 GiB** | `-wal`/`-shm` sidecars of both databases, SQLite temp files, TLS material, transient maintenance overhead |
 | Headroom | **1 GiB** | Mandatory and unused |
 
 **Unused allocation in one tier does not authorize another tier to consume the
@@ -597,9 +597,11 @@ raw rows ARE the dataset and a two-day purge would be data loss.
 
 Arithmetic behind the 3 MiB default: two days = 576 five-minute windows;
 576 × 3 MiB = 1.69 GiB of charged payload; at the provisional 2× DB/index/FTS
-amplification ≈ 3.38 GiB, leaving ≈ 1.12 GiB of margin inside the 4.5 GiB main
-tier. 4 MiB/window consumes the whole tier under the same optimistic assumption
-— it stays configurable, it is not the default until #202 proves it fits.
+amplification ≈ 3.38 GiB, leaving ≈ 0.62 GiB of margin inside the 4.0 GiB main
+tier (rebalanced from 4.5 on 2026-08-22: the seven-day gate measured a
+full-density aggregate.db at 2.08 GiB, so its tier grew to 2.25 GiB). 4 MiB/window projects to 4.5 GiB under the same optimistic assumption,
+exceeding the 4.0 GiB tier outright — it stays configurable, it is not the
+default until a gate run proves it fits.
 Throughput: `otelcontext_exemplar_rows_purged_total{table}`,
 `otelcontext_exemplar_purge_duration_seconds`.
 
@@ -700,8 +702,8 @@ Thresholds (`0` disables that probe):
 | `READY_MAX_FINALIZE_FAILURE_STREAK` | 3 | Same shape, on the finalizer. |
 | `READY_MAX_ADMISSION_RATIO` | 0.9 | Below the 0.95 the DLQ/pipeline probes use: the writer's admission bound is what turns an Export into `RESOURCE_EXHAUSTED`, so readiness says "stop sending" before clients are refused, not while they are. |
 | `READY_MAX_DELTA_LOG_AGE_S` | 1800 | 2× (`WindowSize` 5m + `AllowedLateness` 10m). A window is finalizable 900s after it opens, so a healthy oldest entry tops out just past 900s plus one finalize tick. |
-| `READY_AGGREGATE_DISK_BUDGET_MB` | 1536 | `aggregate.db`'s share of the 8 GiB data budget (#201 Q1). The disk watchdog enforces the **volume**; this enforces the **tier**, so a runaway aggregate file is visible before it eats another tier's allocation. |
-| `READY_MAX_AGGREGATE_DISK_RATIO` | 0.9 | Warn inside the tier before the volume-level ladder starts shedding. |
+| `READY_AGGREGATE_DISK_BUDGET_MB` | 2304 | `aggregate.db`'s share of the 8 GiB data budget (#201 Q1). The disk watchdog enforces the **volume**; this enforces the **tier**, so a runaway aggregate file is visible before it eats another tier's allocation. |
+| `READY_MAX_AGGREGATE_DISK_RATIO` | 1.0 | Readiness fails exactly at the tier allocation. Full-density steady state (~0.92 of the tier) is legitimate; earlier warning is the volume-level watchdog ladder's job. |
 
 ## Security & Supply Chain
 

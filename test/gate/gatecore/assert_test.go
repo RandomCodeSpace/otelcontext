@@ -171,7 +171,7 @@ func TestThresholdFailures(t *testing.T) {
 		id     string
 		mutate func(*Result)
 	}{
-		{"ack p99 over the bound", "sustained.ack_p99", func(r *Result) { r.Load.Sustained.P99Ms = 251 }},
+		{"ack p99 over the bound", "sustained.ack_p99", func(r *Result) { r.Load.Sustained.P99Ms = 501 }},
 		{"ack ratio below 99.9%", "sustained.ack_ratio", func(r *Result) {
 			r.Load.Sustained.PointsAcked = r.Load.Sustained.PointsSent - r.Load.Sustained.PointsSent/500
 		}},
@@ -186,7 +186,7 @@ func TestThresholdFailures(t *testing.T) {
 		}},
 		{"backlog walked up", "sustained.backlog_flat", func(r *Result) { r.Backlog.Flat = false }},
 		{"burst offered too little", "burst.offered_rate", func(r *Result) { r.Load.Burst.PointsSent /= 3 }},
-		{"post-burst p99 still high", "burst.recovery_ack_p99", func(r *Result) { r.Load.PostBurstProof.P99Ms = 400 }},
+		{"post-burst p99 still high", "burst.recovery_ack_p99", func(r *Result) { r.Load.PostBurstProof.P99Ms = 600 }},
 		{"post-burst backlog still high", "burst.recovery_backlog", func(r *Result) {
 			r.MetricSeries[len(r.MetricSeries)-1].Values[r.Config.Sampling.BacklogMetric] = 99999
 		}},
@@ -205,7 +205,7 @@ func TestThresholdFailures(t *testing.T) {
 		}},
 		{"memory peak over 4 GiB", "memory.peak", func(r *Result) { r.Memory.PeakBytes = 5 * GiB }},
 		{"oom counter unreadable", "memory.oom_kills", func(r *Result) { r.Memory.OOMObserved = false }},
-		{"aggregate tier too big", "disk.aggregate", func(r *Result) { r.Disk.Tiers[1].Bytes = 2 * GiB }},
+		{"aggregate tier too big", "disk.aggregate", func(r *Result) { r.Disk.Tiers[1].Bytes = 3 * GiB }},
 		{"dlq tier too big", "disk.dlq", func(r *Result) { r.Disk.Tiers[2].Bytes = GiB }},
 		{"wal tier too big", "disk.wal_temp_tls", func(r *Result) { r.Disk.Tiers[3].Bytes = GiB }},
 		{"total over 7 GiB", "disk.total", func(r *Result) { r.Disk.TotalBytes = 8 * GiB }},

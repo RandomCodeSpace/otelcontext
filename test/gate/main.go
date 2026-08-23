@@ -43,11 +43,21 @@ const gateVersion = "1.0.0"
 // own phase clock do not switch in the same millisecond the gate does.
 const phaseGuard = 5 * time.Second
 
+// ctlTimeout bounds every control-plane request (readiness polls,
+// Prometheus scrapes). Query surfaces use the configurable long timeout.
+const ctlTimeout = 5 * time.Second
+
 type gate struct {
 	cfg gatecore.Config
 	res *gatecore.Result
 
+	// http is the query client: its long timeout exists for the seven-day
+	// completeness surfaces (the dashboard percentile path pages 12.1M
+	// sketch rows). ctl is the control-plane client — readiness polls,
+	// Prometheus scrapes, health GETs — and stays short so the
+	// orchestrator's own deadlines govern, not a hung request.
 	http *http.Client
+	ctl  *http.Client
 	mode gatecore.ConfinementMode
 
 	sampler *sampler
@@ -124,6 +134,7 @@ func newGate(cfg gatecore.Config) *gate {
 	g := &gate{
 		cfg:  cfg,
 		http: &http.Client{Timeout: time.Duration(cfg.Queries.Timeout * float64(time.Second))},
+		ctl:  &http.Client{Timeout: ctlTimeout},
 		res: &gatecore.Result{
 			Schema:      gatecore.Schema,
 			GateVersion: gateVersion,
@@ -694,8 +705,15 @@ func (g *gate) collectDisk() {
 }
 
 func (g *gate) collectQueries(prefill prefillFacts) {
+	// The exact deterministic seeded interval, not first-seeded-window..now:
+	// the latter grows past the engine's read-range cap (7d + one window) as
+	// the protocol runs. [FirstWindow, LastWindow+5m) spans exactly the 2016
+	// seeded windows (7d, inside the cap), excludes the protocol's own live
+	// windows, and HOT_RETENTION_DAYS=8 in the gate config keeps every seeded
+	// window alive through the run — so completeness is missing==0 AND
+	// extra==0 over the full deterministic set.
 	start := time.Unix(prefill.FirstWindow, 0).UTC()
-	end := time.Now().UTC()
+	end := time.Unix(prefill.LastWindow, 0).UTC().Add(5 * time.Minute)
 	expected := windowRange(prefill.FirstWindow, prefill.LastWindow)
 
 	g.res.Queries.PrefillRangeStart = start

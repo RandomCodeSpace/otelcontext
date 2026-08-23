@@ -4,6 +4,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -77,8 +78,9 @@ func (g *gate) runAPICheck(spec gatecore.APICheck, sevenDayStart, sevenDayEnd ti
 			c.Error = perr.Error()
 			return c
 		}
-		returned, missing, _ := gatecore.WindowCoverage(pts, expectedWindows, gatecore.WindowSecs)
+		returned, missing, extra := gatecore.WindowCoverage(pts, expectedWindows, gatecore.WindowSecs)
 		c.WindowsReturned, c.MissingWindows, c.WindowsExpected = returned, missing, len(expectedWindows)
+		c.ExtraWindows = extra
 	}
 	// Whatever coverage marker arrived is always recorded; only surfaces the
 	// config marks as required are gated on it.
@@ -191,15 +193,21 @@ func (g *gate) runMCPTool(spec gatecore.MCPToolSpec, start, end time.Time) gatec
 	return call
 }
 
-// get performs an authorized GET and returns body, status, headers, duration.
+// get performs an authorized GET on the query client (long timeout, for the
+// completeness surfaces).
 func (g *gate) get(u string) ([]byte, int, http.Header, time.Duration, error) {
+	return g.doGet(g.http, context.Background(), u)
+}
+
+// doGet performs an authorized GET on an explicit client, bounded by ctx.
+func (g *gate) doGet(c *http.Client, ctx context.Context, u string) ([]byte, int, http.Header, time.Duration, error) {
 	started := time.Now()
-	req, err := http.NewRequest(http.MethodGet, u, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, 0, nil, 0, err
 	}
 	g.authorize(req)
-	resp, err := g.http.Do(req)
+	resp, err := c.Do(req)
 	if err != nil {
 		return nil, 0, nil, time.Since(started), err
 	}
@@ -215,12 +223,20 @@ func (g *gate) authorize(req *http.Request) {
 	}
 }
 
-// waitReady polls /ready until it answers 200 or the deadline passes.
+// waitReady polls /ready until it answers 200 or the deadline passes. Each
+// request runs on the control client with a context bounded by the remaining
+// overall deadline, so one hung request cannot outlive the loop's budget.
 func (g *gate) waitReady(timeout time.Duration) (time.Time, error) {
 	deadline := time.Now().Add(timeout)
 	var last string
-	for time.Now().Before(deadline) {
-		body, status, _, _, err := g.get(g.baseURL() + "/ready")
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), remaining)
+		body, status, _, _, err := g.doGet(g.ctl, ctx, g.baseURL()+"/ready")
+		cancel()
 		switch {
 		case err != nil:
 			last = err.Error()

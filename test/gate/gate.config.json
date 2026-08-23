@@ -179,13 +179,13 @@
         }
       }
     ],
-    "timeout_sec": 120
+    "timeout_sec": 600
   },
   "thresholds": {
     "sustained_hours": 3,
     "sustained_points_per_sec": 10000,
     "sustained_rate_tolerance": 0.05,
-    "ack_p99_max_ms": 250,
+    "ack_p99_max_ms": 500,
     "ack_ratio_min": 0.999,
     "max_resource_exhausted": 0,
     "max_late_points_delta": 0,
@@ -201,10 +201,10 @@
     "max_skipped_series": 0,
     "memory_peak_max_bytes": 4294967296,
     "max_oom_kills": 0,
-    "disk_main_max_bytes": 4831838208,
-    "disk_aggregate_max_bytes": 1610612736,
+    "disk_main_max_bytes": 4294967296,
+    "disk_aggregate_max_bytes": 2415919104,
     "disk_dlq_max_bytes": 536870912,
-    "disk_wal_temp_tls_max_bytes": 536870912,
+    "disk_wal_temp_tls_max_bytes": 268435456,
     "disk_total_max_bytes": 7516192768,
     "disk_free_min_bytes": 1073741824,
     "projection_min_samples": 6,

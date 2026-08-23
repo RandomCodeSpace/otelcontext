@@ -119,7 +119,7 @@ func DefaultReadinessThresholds() ReadinessThresholds {
 		MaxFinalizeFailureStreak: 3,
 		MaxAdmissionRatio:        0.9,
 		MaxDeltaLogAgeSeconds:    1800,
-		MaxAggregateDiskRatio:    0.9,
+		MaxAggregateDiskRatio:    1.0,
 	}
 }
 

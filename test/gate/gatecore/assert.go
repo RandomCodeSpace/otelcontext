@@ -540,6 +540,10 @@ func queryAssertions(r *Result, t Thresholds) []Assertion {
 				"query surface "+c.Name+" returned every seeded window",
 				c.URL, int64(c.WindowsReturned), int64(c.WindowsExpected),
 				fmt.Sprintf("%d windows missing", c.MissingWindows)))
+			out = append(out, eqInt(id+".windows_extra", catQuery,
+				"query surface "+c.Name+" returned no windows outside the seeded interval",
+				c.URL, int64(c.ExtraWindows), 0,
+				fmt.Sprintf("%d extra windows", c.ExtraWindows)))
 		}
 		if c.CoverageExpected != "" {
 			out = append(out, pass(id+".coverage", catQuery,

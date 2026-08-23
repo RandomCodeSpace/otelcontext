@@ -63,7 +63,7 @@ func TestReadyFlipsOnEachAggregateRuntimeProbe(t *testing.T) {
 		{"finalize failure streak", "aggregate_finalizer", func(rt *AggregateRuntime) { rt.FinalizeFailureStreak = 4 }, "4"},
 		{"admission saturation", "aggregate_admission", func(rt *AggregateRuntime) { rt.AdmissionRatio = 0.91 }, "0.91"},
 		{"delta log age", "aggregate_delta_log", func(rt *AggregateRuntime) { rt.DeltaLogAgeSeconds = 1801 }, "1801"},
-		{"aggregate disk", "aggregate_disk", func(rt *AggregateRuntime) { rt.DiskUsedBytes = 1400 << 20 }, "0.91"},
+		{"aggregate disk", "aggregate_disk", func(rt *AggregateRuntime) { rt.DiskUsedBytes = 1536 << 20 }, "1"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := newTestServer(t)
@@ -211,5 +211,34 @@ func TestLiveUnaffectedByRuntimeProbeFailures(t *testing.T) {
 	}
 	if body["status"] != "alive" {
 		t.Fatalf("/live status = %q, want alive", body["status"])
+	}
+}
+
+// TestAggregateDiskProbeTierBoundary pins the probe to the honest semantics:
+// the budget field IS the tier allocation and the 1.0 default ratio means
+// readiness fails exactly at the boundary — one byte below passes, the
+// boundary itself and anything above it fail.
+func TestAggregateDiskProbeTierBoundary(t *testing.T) {
+	const tier = int64(2304) << 20
+	for _, tc := range []struct {
+		name string
+		used int64
+		want int
+	}{
+		{"one byte below the tier", tier - 1, http.StatusOK},
+		{"exactly at the tier", tier, http.StatusServiceUnavailable},
+		{"one byte above the tier", tier + 1, http.StatusServiceUnavailable},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestServer(t)
+			rt := healthyRuntime()
+			rt.DiskUsedBytes = tc.used
+			rt.DiskBudgetBytes = tier
+			s.SetAggregateRuntimeProbe(func() AggregateRuntime { return rt })
+			if code, checks := readyChecks(t, s); code != tc.want {
+				t.Fatalf("/ready = %d with used=%d budget=%d, want %d (checks: %v)",
+					code, tc.used, tier, tc.want, checks)
+			}
+		})
 	}
 }

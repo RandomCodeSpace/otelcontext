@@ -239,7 +239,7 @@ func (g *gate) scrape() (string, error) {
 		return "", err
 	}
 	g.authorize(req)
-	resp, err := g.http.Do(req)
+	resp, err := g.ctl.Do(req)
 	if err != nil {
 		return "", err
 	}

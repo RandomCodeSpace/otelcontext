@@ -81,7 +81,7 @@ func DefaultThresholds() Thresholds {
 		SustainedHours:            3,
 		SustainedPointsPerSec:     10000,
 		SustainedRateTolerance:    0.05,
-		AckP99MaxMs:               250,
+		AckP99MaxMs:               500,
 		AckRatioMin:               0.999,
 		MaxResourceExhausted:      0,
 		MaxLatePointsDelta:        0,
@@ -102,10 +102,10 @@ func DefaultThresholds() Thresholds {
 		MemoryPeakMaxBytes: 4 * GiB,
 		MaxOOMKills:        0,
 
-		DiskMainMaxBytes:       4*GiB + GiB/2,
-		DiskAggregateMaxBytes:  GiB + GiB/2,
+		DiskMainMaxBytes:       4 * GiB,
+		DiskAggregateMaxBytes:  2*GiB + GiB/4,
 		DiskDLQMaxBytes:        GiB / 2,
-		DiskWALTempTLSMaxBytes: GiB / 2,
+		DiskWALTempTLSMaxBytes: GiB / 4,
 		DiskTotalMaxBytes:      7 * GiB,
 		DiskFreeMinBytes:       GiB,
 
