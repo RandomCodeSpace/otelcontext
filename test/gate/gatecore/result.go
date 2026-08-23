@@ -351,6 +351,7 @@ type QueryCheck struct {
 	WindowsReturned int                `json:"windows_returned,omitempty"`
 	WindowsExpected int                `json:"windows_expected,omitempty"`
 	MissingWindows  int                `json:"missing_windows,omitempty"`
+	ExtraWindows    int                `json:"extra_windows,omitempty"`
 	Scalars         map[string]float64 `json:"scalars,omitempty"`
 	BodyBytes       int                `json:"body_bytes"`
 	Error           string             `json:"error,omitempty"`

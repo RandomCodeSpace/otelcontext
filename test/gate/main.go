@@ -694,22 +694,16 @@ func (g *gate) collectDisk() {
 }
 
 func (g *gate) collectQueries(prefill prefillFacts) {
-	// The trailing true seven-day window, not first-seeded-window..now: after
-	// ~4h of protocol the seeded range spans 7d+4h, which the engine's read
-	// guard refuses (cap: 7d + one window). Retention has also made seeded
-	// windows older than 7d eligible for purge, so they cannot be part of a
-	// completeness expectation. Expected coverage is trimmed to the seeded
-	// windows strictly inside the trailing range.
-	end := time.Now().UTC()
-	start := end.Add(-7 * 24 * time.Hour)
+	// The exact deterministic seeded interval, not first-seeded-window..now:
+	// the latter grows past the engine's read-range cap (7d + one window) as
+	// the protocol runs. [FirstWindow, LastWindow+5m) spans exactly the 2016
+	// seeded windows (7d, inside the cap), excludes the protocol's own live
+	// windows, and HOT_RETENTION_DAYS=8 in the gate config keeps every seeded
+	// window alive through the run — so completeness is missing==0 AND
+	// extra==0 over the full deterministic set.
+	start := time.Unix(prefill.FirstWindow, 0).UTC()
+	end := time.Unix(prefill.LastWindow, 0).UTC().Add(5 * time.Minute)
 	expected := windowRange(prefill.FirstWindow, prefill.LastWindow)
-	trimmed := expected[:0]
-	for _, w := range expected {
-		if w >= start.Unix()+300 {
-			trimmed = append(trimmed, w)
-		}
-	}
-	expected = trimmed
 
 	g.res.Queries.PrefillRangeStart = start
 	g.res.Queries.PrefillRangeEnd = end

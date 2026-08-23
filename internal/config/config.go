@@ -664,9 +664,9 @@ func Load(customPath string) (*Config, error) {
 		ExemplarTracesPerServiceWindow: getEnvInt("EXEMPLAR_TRACES_PER_SERVICE_WINDOW", 25),
 		ExemplarTracesGlobalWindow:     getEnvInt("EXEMPLAR_TRACES_GLOBAL_WINDOW", 1500),
 		ExemplarBytesPerServiceWindow:  getEnvInt("EXEMPLAR_BYTES_PER_SERVICE_WINDOW", 512*1024),
-		// 3 MiB, not 4 (#201 Q2). 4 MiB/window consumes the entire 4.0 GiB
-		// main tier under the optimistic 2x amplification assumption and
-		// leaves no operational margin; it stays configurable, it is not the
+		// 3 MiB, not 4 (#201 Q2). 4 MiB/window projects to 4.5 GiB under the
+		// 2x amplification assumption, exceeding the 4.0 GiB main tier
+		// outright; it stays configurable, it is not the
 		// default until the seven-day gate (#202) proves it fits.
 		ExemplarBytesGlobalWindow:         getEnvInt("EXEMPLAR_BYTES_GLOBAL_WINDOW", 3*1024*1024),
 		ExemplarHealthyRate:               getEnvFloat("EXEMPLAR_HEALTHY_RATE", 0.005),
@@ -700,17 +700,17 @@ func Load(customPath string) (*Config, error) {
 		// readiness should say "stop sending" before clients are being refused,
 		// not while they are.
 		ReadyMaxAdmissionRatio: getEnvFloat("READY_MAX_ADMISSION_RATIO", 0.9),
-		// The aggregate tier allocation is 2.25 GiB (#201 Q1, rebalanced
+		// 2.25 GiB is the aggregate tier allocation (#201 Q1, rebalanced
 		// 2026-08-22 after the gate measured 2.08 GiB at full density). The
-		// probe budget is deliberately 2560 so the 0.90 warn ratio trips at
-		// 0.9 x 2560 MB = 2304 MB — exactly the tier boundary. Full-density
-		// steady state (~0.92 of the tier) is legitimate and must not flip
-		// readiness; crossing the tier allocation must.
+		// field IS the tier budget — no synthetic denominators. Full-density
+		// steady state (~0.92 of the tier) is legitimate, so the ratio below
+		// defaults to 1.0: readiness fails exactly at the tier boundary, and
+		// earlier warning belongs to the volume-level watchdog ladder.
 		// The disk watchdog enforces the VOLUME; this enforces the tier, so a
 		// runaway aggregate file is visible before it eats another tier's
 		// allocation and takes the whole volume past 95% with it.
-		ReadyAggregateDiskBudgetMB: getEnvInt("READY_AGGREGATE_DISK_BUDGET_MB", 2560),
-		ReadyMaxAggregateDiskRatio: getEnvFloat("READY_MAX_AGGREGATE_DISK_RATIO", 0.9),
+		ReadyAggregateDiskBudgetMB: getEnvInt("READY_AGGREGATE_DISK_BUDGET_MB", 2304),
+		ReadyMaxAggregateDiskRatio: getEnvFloat("READY_MAX_AGGREGATE_DISK_RATIO", 1.0),
 	}
 
 	// Parse AGGREGATE_METRIC_DIMS config

@@ -97,8 +97,8 @@ func TestWindowCoverage(t *testing.T) {
 	base := time.Date(2026, 8, 22, 0, 0, 0, 0, time.UTC)
 	pts := []WindowPoint{
 		{Timestamp: base},
-		{Timestamp: base.Add(10 * time.Minute)},
-		{Timestamp: base.Add(30 * time.Minute)}, // outside the expected set
+		{Timestamp: base.Add(10*time.Minute + 42*time.Second)}, // unaligned: same window as base+10m
+		{Timestamp: base.Add(30 * time.Minute)},                // outside the expected set
 	}
 	expected := []int64{base.Unix(), base.Add(5 * time.Minute).Unix(), base.Add(10 * time.Minute).Unix()}
 	returned, missing, extra := WindowCoverage(pts, expected, 300)

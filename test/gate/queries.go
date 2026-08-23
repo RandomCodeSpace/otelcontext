@@ -77,8 +77,9 @@ func (g *gate) runAPICheck(spec gatecore.APICheck, sevenDayStart, sevenDayEnd ti
 			c.Error = perr.Error()
 			return c
 		}
-		returned, missing, _ := gatecore.WindowCoverage(pts, expectedWindows, gatecore.WindowSecs)
+		returned, missing, extra := gatecore.WindowCoverage(pts, expectedWindows, gatecore.WindowSecs)
 		c.WindowsReturned, c.MissingWindows, c.WindowsExpected = returned, missing, len(expectedWindows)
+		c.ExtraWindows = extra
 	}
 	// Whatever coverage marker arrived is always recorded; only surfaces the
 	// config marks as required are gated on it.
