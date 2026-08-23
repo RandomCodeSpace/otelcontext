@@ -694,9 +694,22 @@ func (g *gate) collectDisk() {
 }
 
 func (g *gate) collectQueries(prefill prefillFacts) {
-	start := time.Unix(prefill.FirstWindow, 0).UTC()
+	// The trailing true seven-day window, not first-seeded-window..now: after
+	// ~4h of protocol the seeded range spans 7d+4h, which the engine's read
+	// guard refuses (cap: 7d + one window). Retention has also made seeded
+	// windows older than 7d eligible for purge, so they cannot be part of a
+	// completeness expectation. Expected coverage is trimmed to the seeded
+	// windows strictly inside the trailing range.
 	end := time.Now().UTC()
+	start := end.Add(-7 * 24 * time.Hour)
 	expected := windowRange(prefill.FirstWindow, prefill.LastWindow)
+	trimmed := expected[:0]
+	for _, w := range expected {
+		if w >= start.Unix()+300 {
+			trimmed = append(trimmed, w)
+		}
+	}
+	expected = trimmed
 
 	g.res.Queries.PrefillRangeStart = start
 	g.res.Queries.PrefillRangeEnd = end

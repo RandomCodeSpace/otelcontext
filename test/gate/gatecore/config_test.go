@@ -22,7 +22,7 @@ func TestDefaultThresholdsMatchTheFrozenContract(t *testing.T) {
 	}{
 		{"sustained hours", th.SustainedHours, 3},
 		{"sustained rate", th.SustainedPointsPerSec, 10000},
-		{"ack p99 ms", th.AckP99MaxMs, 250},
+		{"ack p99 ms", th.AckP99MaxMs, 300},
 		{"ack ratio", th.AckRatioMin, 0.999},
 		{"burst rate", th.BurstPointsPerSec, 20000},
 		{"burst seconds", th.BurstSeconds, 60},

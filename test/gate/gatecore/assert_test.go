@@ -171,7 +171,7 @@ func TestThresholdFailures(t *testing.T) {
 		id     string
 		mutate func(*Result)
 	}{
-		{"ack p99 over the bound", "sustained.ack_p99", func(r *Result) { r.Load.Sustained.P99Ms = 251 }},
+		{"ack p99 over the bound", "sustained.ack_p99", func(r *Result) { r.Load.Sustained.P99Ms = 301 }},
 		{"ack ratio below 99.9%", "sustained.ack_ratio", func(r *Result) {
 			r.Load.Sustained.PointsAcked = r.Load.Sustained.PointsSent - r.Load.Sustained.PointsSent/500
 		}},

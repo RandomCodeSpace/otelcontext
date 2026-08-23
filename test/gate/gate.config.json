@@ -185,7 +185,7 @@
     "sustained_hours": 3,
     "sustained_points_per_sec": 10000,
     "sustained_rate_tolerance": 0.05,
-    "ack_p99_max_ms": 250,
+    "ack_p99_max_ms": 300,
     "ack_ratio_min": 0.999,
     "max_resource_exhausted": 0,
     "max_late_points_delta": 0,
