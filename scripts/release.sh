@@ -62,8 +62,10 @@ cleanup() { git reset --hard --quiet "$base"; git clean -fdq -- internal/ui/dist
 trap cleanup EXIT
 
 # --- Build the UI ------------------------------------------------------------
-echo "▸ building UI (npm ci && npm run build)…"
-( cd ui && npm ci && npm run build )
+echo "▸ building UI (npm ci --ignore-scripts && npm run build)…"
+# --ignore-scripts: no dependency lifecycle script runs during a release
+# install. Verified the vite build needs none.
+( cd ui && npm ci --ignore-scripts && npm run build )
 [ -f internal/ui/dist/index.html ] || { echo "error: UI build produced no dist/index.html" >&2; exit 1; }
 touch internal/ui/dist/.gitkeep   # vite emptyOutDir wipes it; keep the placeholder
 

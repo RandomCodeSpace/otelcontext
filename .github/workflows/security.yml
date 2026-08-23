@@ -90,7 +90,9 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install semgrep
-        run: python -m pip install --quiet --upgrade pip semgrep
+        # Pinned: a scanner that silently changes version changes the
+        # merge gate under everyone without a commit saying so.
+        run: python -m pip install --quiet "pip==26.2.1" "semgrep==1.174.0"
       - name: Run semgrep (security-audit + owasp-top-ten + golang)
         run: |
           semgrep scan \
@@ -151,7 +153,10 @@ jobs:
           # function body is ~40-80 tokens; 100 corresponds to a real
           # method body or a non-trivial code block, not import/struct
           # boilerplate that 200+ Go files share by convention.
-          npx --yes jscpd@4 \
+          # Installed with lifecycle scripts disabled and an exact version
+          # rather than resolved on demand by npx.
+          npm install --no-save --ignore-scripts jscpd@4.3.0
+          npx --no-install jscpd \
             --threshold 3 \
             --min-tokens 100 \
             --reporters consoleFull \

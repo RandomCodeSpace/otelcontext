@@ -80,7 +80,9 @@ jobs:
         # goreleaser compiles. `npm run build` emits into internal/ui/dist.
         run: |
           cd ui
-          npm ci
+          # --ignore-scripts: no dependency lifecycle script runs during a
+          # release install. Verified the vite build needs none.
+          npm ci --ignore-scripts
           npm run build
           test -f ../internal/ui/dist/index.html
           # vite's emptyOutDir wipes internal/ui/dist on rebuild, deleting the
