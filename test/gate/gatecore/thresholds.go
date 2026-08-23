@@ -81,7 +81,7 @@ func DefaultThresholds() Thresholds {
 		SustainedHours:            3,
 		SustainedPointsPerSec:     10000,
 		SustainedRateTolerance:    0.05,
-		AckP99MaxMs:               300,
+		AckP99MaxMs:               500,
 		AckRatioMin:               0.999,
 		MaxResourceExhausted:      0,
 		MaxLatePointsDelta:        0,

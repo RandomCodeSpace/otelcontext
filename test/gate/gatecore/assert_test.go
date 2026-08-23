@@ -171,7 +171,7 @@ func TestThresholdFailures(t *testing.T) {
 		id     string
 		mutate func(*Result)
 	}{
-		{"ack p99 over the bound", "sustained.ack_p99", func(r *Result) { r.Load.Sustained.P99Ms = 301 }},
+		{"ack p99 over the bound", "sustained.ack_p99", func(r *Result) { r.Load.Sustained.P99Ms = 501 }},
 		{"ack ratio below 99.9%", "sustained.ack_ratio", func(r *Result) {
 			r.Load.Sustained.PointsAcked = r.Load.Sustained.PointsSent - r.Load.Sustained.PointsSent/500
 		}},
@@ -186,7 +186,7 @@ func TestThresholdFailures(t *testing.T) {
 		}},
 		{"backlog walked up", "sustained.backlog_flat", func(r *Result) { r.Backlog.Flat = false }},
 		{"burst offered too little", "burst.offered_rate", func(r *Result) { r.Load.Burst.PointsSent /= 3 }},
-		{"post-burst p99 still high", "burst.recovery_ack_p99", func(r *Result) { r.Load.PostBurstProof.P99Ms = 400 }},
+		{"post-burst p99 still high", "burst.recovery_ack_p99", func(r *Result) { r.Load.PostBurstProof.P99Ms = 600 }},
 		{"post-burst backlog still high", "burst.recovery_backlog", func(r *Result) {
 			r.MetricSeries[len(r.MetricSeries)-1].Values[r.Config.Sampling.BacklogMetric] = 99999
 		}},
