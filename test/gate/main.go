@@ -43,11 +43,21 @@ const gateVersion = "1.0.0"
 // own phase clock do not switch in the same millisecond the gate does.
 const phaseGuard = 5 * time.Second
 
+// ctlTimeout bounds every control-plane request (readiness polls,
+// Prometheus scrapes). Query surfaces use the configurable long timeout.
+const ctlTimeout = 5 * time.Second
+
 type gate struct {
 	cfg gatecore.Config
 	res *gatecore.Result
 
+	// http is the query client: its long timeout exists for the seven-day
+	// completeness surfaces (the dashboard percentile path pages 12.1M
+	// sketch rows). ctl is the control-plane client — readiness polls,
+	// Prometheus scrapes, health GETs — and stays short so the
+	// orchestrator's own deadlines govern, not a hung request.
 	http *http.Client
+	ctl  *http.Client
 	mode gatecore.ConfinementMode
 
 	sampler *sampler
@@ -124,6 +134,7 @@ func newGate(cfg gatecore.Config) *gate {
 	g := &gate{
 		cfg:  cfg,
 		http: &http.Client{Timeout: time.Duration(cfg.Queries.Timeout * float64(time.Second))},
+		ctl:  &http.Client{Timeout: ctlTimeout},
 		res: &gatecore.Result{
 			Schema:      gatecore.Schema,
 			GateVersion: gateVersion,

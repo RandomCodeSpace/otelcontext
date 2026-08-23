@@ -482,8 +482,8 @@ type Config struct {
 	ReadyMaxFinalizeFailureStreak int     // READY_MAX_FINALIZE_FAILURE_STREAK, default 3
 	ReadyMaxDeltaLogAgeS          int     // READY_MAX_DELTA_LOG_AGE_S, default 1800
 	ReadyMaxAdmissionRatio        float64 // READY_MAX_ADMISSION_RATIO, default 0.9
-	ReadyAggregateDiskBudgetMB    int     // READY_AGGREGATE_DISK_BUDGET_MB, default 1536
-	ReadyMaxAggregateDiskRatio    float64 // READY_MAX_AGGREGATE_DISK_RATIO, default 0.9
+	ReadyAggregateDiskBudgetMB    int     // READY_AGGREGATE_DISK_BUDGET_MB, default 2304 (the 2.25 GiB tier)
+	ReadyMaxAggregateDiskRatio    float64 // READY_MAX_AGGREGATE_DISK_RATIO, default 1.0 (fail at the tier boundary)
 }
 
 func Load(customPath string) (*Config, error) {

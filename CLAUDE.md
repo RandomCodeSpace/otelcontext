@@ -599,8 +599,9 @@ Arithmetic behind the 3 MiB default: two days = 576 five-minute windows;
 576 × 3 MiB = 1.69 GiB of charged payload; at the provisional 2× DB/index/FTS
 amplification ≈ 3.38 GiB, leaving ≈ 0.62 GiB of margin inside the 4.0 GiB main
 tier (rebalanced from 4.5 on 2026-08-22: the seven-day gate measured a
-full-density aggregate.db at 2.08 GiB, so its tier grew to 2.25 GiB). 4 MiB/window consumes the whole tier under the same optimistic assumption
-— it stays configurable, it is not the default until #202 proves it fits.
+full-density aggregate.db at 2.08 GiB, so its tier grew to 2.25 GiB). 4 MiB/window projects to 4.5 GiB under the same optimistic assumption,
+exceeding the 4.0 GiB tier outright — it stays configurable, it is not the
+default until a gate run proves it fits.
 Throughput: `otelcontext_exemplar_rows_purged_total{table}`,
 `otelcontext_exemplar_purge_duration_seconds`.
 
