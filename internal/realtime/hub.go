@@ -91,11 +91,21 @@ type Hub struct {
 	// revision-driven publication the event hub performs (#164).
 	aggregateMode atomic.Bool
 
-	stopCh   chan struct{}
-	stopped  atomic.Bool
-	wg       sync.WaitGroup
-	writerWg sync.WaitGroup // tracks writer goroutines
-	devMode  bool
+	stopCh chan struct{}
+	// runOwner is claimed exactly once, by whichever of Run or Stop gets there
+	// first. It balances the wg count taken in NewHub: Run consumes it when it
+	// starts the loop, Stop consumes it when the hub is stopped without ever
+	// having been run. Taking the count at construction is what makes
+	// wg.Add happen-before wg.Wait, which `go hub.Run()` cannot guarantee.
+	runOwner atomic.Bool
+	// lifecycleMu serialises writerWg.Add against Stop's writerWg.Wait.
+	// Without it the handler can Add from zero while Stop is already
+	// waiting, which is WaitGroup misuse and a real data race.
+	lifecycleMu sync.Mutex
+	closing     bool
+	wg          sync.WaitGroup
+	writerWg    sync.WaitGroup // tracks writer goroutines
+	devMode     bool
 
 	// enforceOrigin and originHosts implement WS_ALLOWED_ORIGINS. Enforcement
 	// is on whenever authentication is enabled or APP_ENV=production; the
@@ -150,12 +160,19 @@ func NewHub(onConnectionChange func(count int)) *Hub {
 	h.logBuffer = h.logPool.Get().([]LogEntry)
 	h.metricBuffer = h.metricPool.Get().([]MetricEntry)
 
+	// Balanced by Run (loop exit) or by Stop (hub never run). See runOwner.
+	h.wg.Add(1)
+
 	return h
 }
 
 // Run starts the hub's main event loop. Should be called in a goroutine.
 func (h *Hub) Run() {
-	h.wg.Add(1)
+	if !h.runOwner.CompareAndSwap(false, true) {
+		// Stop already released the construction-time count, or Run was
+		// called twice. Either way there is no loop to start.
+		return
+	}
 	defer h.wg.Done()
 
 	flushTicker := time.NewTicker(h.flushInterval)
@@ -388,10 +405,31 @@ func (h *Hub) BroadcastMetric(entry MetricEntry) {
 	}
 }
 
+// admitWriter reserves a writer slot on writerWg, refusing once Stop has
+// begun. Every writerWg.Add goes through here so each one is ordered before
+// Stop's Wait by lifecycleMu.
+func (h *Hub) admitWriter() bool {
+	h.lifecycleMu.Lock()
+	defer h.lifecycleMu.Unlock()
+	if h.closing {
+		return false
+	}
+	h.writerWg.Add(1)
+	return true
+}
+
 // Stop gracefully shuts down the hub.
 func (h *Hub) Stop() {
-	h.stopped.Store(true)
+	h.lifecycleMu.Lock()
+	h.closing = true
+	h.lifecycleMu.Unlock()
+
 	close(h.stopCh)
+	if h.runOwner.CompareAndSwap(false, true) {
+		// Run was never called, so nothing will ever call Done for the
+		// construction-time count. Release it here or Wait blocks forever.
+		h.wg.Done()
+	}
 	h.wg.Wait()
 	h.writerWg.Wait()
 	slog.Info("🛑 WebSocket hub stopped")
@@ -448,10 +486,28 @@ func (h *Hub) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		tenant: connTenantScope(r),
 	}
 
-	h.register <- c
+	// Reserve the writer slot before the registration handshake so the
+	// count is taken while the hub is provably still accepting.
+	if !h.admitWriter() {
+		releaseSlot()
+		_ = conn.Close(websocket.StatusGoingAway, "server shutting down")
+		return
+	}
+
+	// Registration races Stop(): once the run loop returns on stopCh nothing
+	// drains h.register, so an unconditional send blocks this goroutine
+	// forever and Stop()'s wg.Wait() never returns. Refuse the connection
+	// instead of joining a hub that is going away.
+	select {
+	case h.register <- c:
+	case <-h.stopCh:
+		h.writerWg.Done()
+		releaseSlot()
+		_ = conn.Close(websocket.StatusGoingAway, "server shutting down")
+		return
+	}
 
 	// Writer goroutine
-	h.writerWg.Add(1)
 	go func() { // #nosec G118 -- long-lived WS writer goroutine outlives HTTP request intentionally
 		defer h.writerWg.Done()
 		// Release the admission slot when the writer exits — the writer
@@ -459,11 +515,18 @@ func (h *Hub) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		// goroutine alive for this client.
 		defer releaseSlot()
 		defer func() {
-			if !h.stopped.Load() {
-				h.unregister <- c
-			} else if c.closed.CompareAndSwap(false, true) {
-				// Hub already stopped; clean up directly.
-				close(c.send)
+			// An unconditional send here is what wedged Stop(): the run loop
+			// returns on stopCh and then nothing drains h.unregister, so this
+			// goroutine blocks forever and writerWg.Wait() never returns.
+			// Select on stopCh so the send is abandoned the moment the drain
+			// side is gone; the CAS guard makes the direct close safe against
+			// the run loop's own stop-path close.
+			select {
+			case h.unregister <- c:
+			case <-h.stopCh:
+				if c.closed.CompareAndSwap(false, true) {
+					close(c.send)
+				}
 			}
 			_ = conn.Close(websocket.StatusNormalClosure, "closing")
 		}()
