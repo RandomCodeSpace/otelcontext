@@ -432,18 +432,20 @@ func TestReadsAreCompleteBeyondTheRowCap(t *testing.T) {
 }
 
 // TestPercentilePathReadsEverySketchBearingRow proves the p99 is not built from
-// the first page: the merged sketch must have observed every seeded duration,
-// across materialized buckets and un-finalized delta rows alike.
+// a truncated read: the merged sketch must have observed every seeded
+// duration, across materialized buckets and un-finalized delta rows alike.
+// Since #219 the path is mergeStoreSketches -> VisitSketches — one unordered
+// streaming pass per table — not the paged, totally-ordered ReadBuckets.
 //
-// The row cap is shrunk rather than the row count raised: what matters is that
-// the read spans more pages than one, not the absolute number, and encoding
-// 20,000 sketches through a race-instrumented SQLite costs minutes.
+// The row cap is shrunk BELOW the row count on purpose: VisitSketches
+// documents that no row cap applies, and this proves it — 500 sketch-bearing
+// rows must all be observed through a 120-row cap.
 func TestPercentilePathReadsEverySketchBearingRow(t *testing.T) {
 	restore := MaxReadRows
 	MaxReadRows = 120
 	t.Cleanup(func() { MaxReadRows = restore })
 
-	const rows = 500 // four pages plus a remainder
+	const rows = 500 // far past the shrunken row cap
 	now := mustTime(t, "2026-08-21T12:02:00Z")
 	e := testEngine(t, now)
 	store := newTestStoreAt(t, filepath.Join(t.TempDir(), "aggregate.db"), StoreConfig{})
@@ -505,25 +507,43 @@ func TestPercentilePathReadsEverySketchBearingRow(t *testing.T) {
 
 	var merged *Sketch
 	visited := 0
-	sel := Selector{TenantID: tenantID, Start: base, End: base + 3*windowSecs, Signal: SignalTraceOp, SketchOnly: true}
-	if err := e.pageStore(sel, func(_ int64, _ SeriesKey, d *AggregateDelta) {
+	sel := Selector{TenantID: tenantID, Start: base, End: base + 3*windowSecs}
+	if err := e.mergeStoreSketches(sel, nil, func(sk *Sketch) {
 		visited++
-		if d.Sketch == nil {
-			t.Error("SketchOnly read returned a row with no sketch")
+		if sk == nil {
+			t.Error("sketch stream delivered a nil sketch")
 			return
 		}
 		if merged == nil {
-			merged = NewSketchAtScaleUnchecked(d.Sketch.Scale())
+			merged = NewSketchAtScaleUnchecked(sk.Scale())
 		}
-		merged.Merge(d.Sketch)
+		merged.Merge(sk)
 	}); err != nil {
-		t.Fatalf("pageStore: %v", err)
+		t.Fatalf("mergeStoreSketches: %v", err)
 	}
 	if visited != rows-withoutSketch {
-		t.Fatalf("paged read visited %d rows, want %d sketch-bearing rows", visited, rows-withoutSketch)
+		t.Fatalf("sketch stream visited %d rows, want %d sketch-bearing rows", visited, rows-withoutSketch)
 	}
 	if merged == nil || merged.Count() != want {
 		t.Fatalf("merged sketch observed %v of %d observations", merged, want)
+	}
+
+	// The service filter is applied per distinct service ID, not per row. A
+	// filter naming the seeded service must observe everything; a filter
+	// naming an absent service must observe nothing.
+	kept := 0
+	if err := e.mergeStoreSketches(sel, map[string]struct{}{"svc": {}}, func(*Sketch) { kept++ }); err != nil {
+		t.Fatalf("mergeStoreSketches(filter=svc): %v", err)
+	}
+	if kept != rows-withoutSketch {
+		t.Fatalf("filter for the seeded service kept %d rows, want %d", kept, rows-withoutSketch)
+	}
+	dropped := 0
+	if err := e.mergeStoreSketches(sel, map[string]struct{}{"absent": {}}, func(*Sketch) { dropped++ }); err != nil {
+		t.Fatalf("mergeStoreSketches(filter=absent): %v", err)
+	}
+	if dropped != 0 {
+		t.Fatalf("filter for an absent service kept %d rows, want 0", dropped)
 	}
 }
 

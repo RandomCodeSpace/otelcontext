@@ -276,8 +276,9 @@ type visitFunc func(windowStart int64, key SeriesKey, d *AggregateDelta)
 //
 //	scalar totals  -> SumBuckets: the database sums, one row per group, so no
 //	                  row cap exists to truncate the answer.
-//	percentiles    -> pageStore: sketches cannot be merged in SQL, so every
-//	                  sketch-bearing row is paged to completion.
+//	percentiles    -> VisitSketches: sketches cannot be merged in SQL, but
+//	                  their merge is order-independent, so every
+//	                  sketch-bearing row is streamed once, unordered.
 //	generic rows   -> ReadBuckets: keeps its row cap and says so.
 //
 // hasStore is false when memory owns the whole range or no store is attached.
@@ -362,70 +363,40 @@ func (e *Engine) sumStore(sel Selector, by GroupBy) ([]SumRow, error) {
 	return st.SumBuckets(sel, by)
 }
 
-// pageStore visits every store-owned row matching sel, paging to COMPLETION.
+// mergeStoreSketches folds every store-owned sketch in sel's range into merge.
 //
-// The page size is the store's own row cap; the number of pages is bounded by
-// the selector's window range, which Selector.Validate already clamps to the
-// retention horizon. Truncated is the loop condition, never a result: this
-// function returns only when the store says there is nothing left.
-func (e *Engine) pageStore(sel Selector, visit visitFunc) error {
+// It is the percentile path of the #197 read contract, restructured for #219:
+// the dashboard used to drain the sketch rows through the totally-ordered,
+// keyset-paged ReadBuckets — a sort per page plus a re-scan per resume, paid
+// hundreds of times over a wide range — and resolved every page's series
+// identities just to apply a service filter. A sketch merge is commutative
+// and associative, so VisitSketches streams the rows once in table order,
+// and the filter memoizes ONE dictionary lookup per distinct service ID.
+func (e *Engine) mergeStoreSketches(sel Selector, filter map[string]struct{}, merge func(*Sketch)) error {
 	st := e.Store()
 	if st == nil {
 		return nil
 	}
-	for {
-		page, err := st.ReadBuckets(sel)
-		if err != nil {
-			return err
-		}
-		if err := e.visitPage(st, page.Buckets, visit); err != nil {
-			return err
-		}
-		if !page.Truncated {
-			return nil
-		}
-		// A store that reports "more rows" without advancing the cursor would
-		// spin this loop forever. Refuse rather than hang a dashboard.
-		if !sel.After.zero() && !sel.After.After(page.Next.WindowStart, page.Next.SeriesID, page.Next.Source) {
-			return fmt.Errorf("aggregate: paged read did not advance past %d/%d", sel.After.WindowStart, sel.After.SeriesID)
-		}
-		sel.After = page.Next
+	sel.Signal = SignalTraceOp
+	sel.SketchOnly = true
+	var verdict map[uint32]bool
+	if filter != nil {
+		verdict = make(map[uint32]bool, len(filter))
 	}
-}
-
-// visitPage resolves one page's series identities and visits its rows.
-func (e *Engine) visitPage(st Store, buckets []Bucket, visit visitFunc) error {
-	if len(buckets) == 0 {
+	return st.VisitSketches(sel, func(serviceID uint32, sk *Sketch) error {
+		if filter != nil {
+			ok, seen := verdict[serviceID]
+			if !seen {
+				_, ok = filter[e.serviceNameByID(serviceID)]
+				verdict[serviceID] = ok
+			}
+			if !ok {
+				return nil
+			}
+		}
+		merge(sk)
 		return nil
-	}
-	ids := make([]SeriesID, 0, len(buckets))
-	seen := make(map[SeriesID]struct{}, len(buckets))
-	for _, b := range buckets {
-		if _, ok := seen[b.SeriesID]; ok {
-			continue
-		}
-		seen[b.SeriesID] = struct{}{}
-		ids = append(ids, b.SeriesID)
-	}
-	infos, err := st.ResolveSeries(ids)
-	if err != nil {
-		return err
-	}
-	keys := make(map[SeriesID]SeriesKey, len(infos))
-	for _, info := range infos {
-		keys[info.ID] = info.Key
-	}
-	for _, b := range buckets {
-		key, ok := keys[b.SeriesID]
-		if !ok {
-			// A bucket whose identity no longer resolves cannot be attributed
-			// to a service. Counting it under an invented name would be worse
-			// than leaving it out of a per-service breakdown.
-			continue
-		}
-		visit(b.WindowStart, key, b.Delta)
-	}
-	return nil
+	})
 }
 
 // serviceName resolves a series' service through the dictionary. An
@@ -601,8 +572,8 @@ func (a *dashAccum) addSum(r SumRow) {
 //
 // The store side is read TWICE, on purpose (#197 Q1). The scalar totals come
 // from one SQL aggregation that no row cap can truncate. The p99 cannot: a
-// quantile sketch is not SUMmable, so the sketch-bearing rows are paged to
-// completion and merged in Go. Doing both through one capped read is exactly
+// quantile sketch is not SUMmable, so the sketch-bearing rows are streamed
+// once and merged in Go (#219). Doing both through one capped read is exactly
 // what made the old dashboard quietly wrong past 20,000 rows.
 func (e *Engine) QueryDashboard(q Query) (*DashboardResult, error) {
 	q.Signal = SignalUnspecified // the scan covers traces and logs in one pass
@@ -683,17 +654,7 @@ func (e *Engine) QueryDashboard(q Query) (*DashboardResult, error) {
 			}
 		}
 
-		sketchSel := sel
-		sketchSel.Signal = SignalTraceOp
-		sketchSel.SketchOnly = true
-		if err := e.pageStore(sketchSel, func(_ int64, key SeriesKey, d *AggregateDelta) {
-			if filter != nil {
-				if _, ok := filter[e.serviceName(key)]; !ok {
-					return
-				}
-			}
-			mergeSketch(d.Sketch)
-		}); err != nil {
+		if err := e.mergeStoreSketches(sel, filter, mergeSketch); err != nil {
 			return nil, err
 		}
 	}

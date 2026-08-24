@@ -1358,6 +1358,74 @@ func (s *SQLiteStore) SumBuckets(sel Selector, by GroupBy) ([]SumRow, error) {
 	return out, rows.Err()
 }
 
+// VisitSketches implements Store. Both durable tables are streamed once, in
+// their natural PRIMARY KEY (window_start, series_id) range order — no ORDER
+// BY, no LIMIT, no keyset resume. ReadBuckets must maintain a total (window,
+// series, source) order across a UNION of both tables, which forces a sort
+// per page and a re-scan per keyset resume; a wide dashboard range paid that
+// price hundreds of times over (#219). A sketch merge is order-independent,
+// so this path pays it zero times.
+func (s *SQLiteStore) VisitSketches(sel Selector, visit func(serviceID uint32, sk *Sketch) error) error {
+	if _, err := sel.Validate(); err != nil {
+		return err
+	}
+	for _, src := range bucketSources {
+		if err := s.visitTableSketches(src.table, sel, visit); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// visitTableSketches streams one table's sketch-bearing rows to visit.
+func (s *SQLiteStore) visitTableSketches(table string, sel Selector, visit func(uint32, *Sketch) error) error {
+	var (
+		sb   strings.Builder
+		args []any
+	)
+	// The table name is one of the two bucketSources literals, never input.
+	fmt.Fprintf(&sb, `SELECT s.service_id, t.sketch FROM %s t
+		JOIN aggregate_series s ON s.id = t.series_id
+		WHERE t.window_start >= ? AND t.window_start < ? AND s.tenant_id = ?
+		AND t.sketch IS NOT NULL`, table)
+	args = append(args, sel.Start, sel.End, int64(sel.TenantID))
+	if sel.Signal != SignalUnspecified {
+		sb.WriteString(` AND s.signal = ?`)
+		args = append(args, int64(sel.Signal))
+	}
+	if len(sel.SeriesIDs) > 0 {
+		sb.WriteString(` AND t.series_id IN (` + placeholders(len(sel.SeriesIDs)) + `)`)
+		for _, id := range sel.SeriesIDs {
+			args = append(args, int64(id))
+		}
+	}
+	rows, err := s.reader.Query(sb.String(), args...)
+	if err != nil {
+		return fmt.Errorf("aggregate store: visit sketches: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var (
+			service int64
+			blob    []byte
+		)
+		if err := rows.Scan(&service, &blob); err != nil {
+			return fmt.Errorf("aggregate store: visit sketches: %w", err)
+		}
+		sk, err := DecodeSketch(blob)
+		if err != nil {
+			return fmt.Errorf("aggregate store: visit sketches: decode: %w", err)
+		}
+		if err := visit(uint32(service), sk); err != nil { // #nosec G115 -- dictionary IDs are uint32
+			return err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("aggregate store: visit sketches: %w", err)
+	}
+	return nil
+}
+
 // bucketSources are the two durable tables a store-owned row can live in, in
 // scan order. aggregate_buckets holds what finalization materialized;
 // aggregate_delta_log holds what it has not incorporated yet — including a
