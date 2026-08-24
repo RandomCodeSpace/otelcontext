@@ -93,13 +93,22 @@ if [ "$MAKE_RELEASE" = "--release" ]; then
   prev="$(git describe --tags --abbrev=0 "${VER}^" 2>/dev/null || true)"
   range="${prev:+${prev}..}${VER}"
   notes="$(git log --pretty='- %s' "$range" 2>/dev/null | grep -vE '^- release:' || true)"
-  gh release create "$VER" --prerelease --title "$VER" --notes \
-"Install (UI embedded):
+  body="Install (UI embedded):
 \`\`\`
 go install github.com/RandomCodeSpace/otelcontext@$VER
 \`\`\`
 
 ### Changes
 $notes"
-  echo "✓ created GitHub pre-release $VER"
+  # Only a tag carrying a pre-release identifier (vX.Y.Z-something) is marked
+  # as a GitHub pre-release — matching GoReleaser's `prerelease: auto`, so the
+  # early release shell and the appended artifacts never disagree. A stable
+  # tag becomes a full release and is eligible for "Latest".
+  if [[ "$VER" == *-* ]]; then
+    gh release create "$VER" --prerelease --title "$VER" --notes "$body"
+    echo "✓ created GitHub pre-release $VER"
+  else
+    gh release create "$VER" --title "$VER" --notes "$body"
+    echo "✓ created GitHub release $VER"
+  fi
 fi
