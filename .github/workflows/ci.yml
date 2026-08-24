@@ -48,3 +48,40 @@ jobs:
 
       - name: gate unit tests
         run: go test -tags gate -race -timeout 60s ./test/gate/...
+
+  ui-build:
+    name: ui · typecheck · build · test
+    runs-on: ubuntu-latest
+    # main is source-only: the SPA is built at tag time and embedded via
+    # //go:embed. Nothing else in CI installs ui/ dependencies, so a frontend
+    # dependency tree that cannot resolve — or code that cannot typecheck —
+    # stays invisible until a release tag fails. That happened: a TypeScript
+    # bump crossed typescript-eslint's peer bound and broke `npm ci` on main
+    # while every Go job stayed green. This job is the guard.
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'   # matches the release workflow's build environment
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      # `npm ci` fails outright on an unsatisfiable peer graph, which is the
+      # failure mode this job exists to catch. --ignore-scripts matches the
+      # release path (scripts/release.sh, release.yml).
+      - name: install (exact lockfile, no lifecycle scripts)
+        run: npm ci --ignore-scripts
+        working-directory: ui
+
+      # `npm run build` is `tsc -b && vite build`: the typecheck catches an API
+      # that a dependency major removed, the bundle catches a broken import.
+      - name: typecheck and build
+        run: npm run build
+        working-directory: ui
+
+      - name: the embedded SPA entrypoint exists
+        run: test -f internal/ui/dist/index.html
+
+      - name: unit tests
+        run: npx --no-install vitest run
+        working-directory: ui
