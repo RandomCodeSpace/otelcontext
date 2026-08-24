@@ -581,6 +581,21 @@ type Store interface {
 	// makes a scalar dashboard total structurally impossible to truncate.
 	SumBuckets(sel Selector, by GroupBy) ([]SumRow, error)
 
+	// VisitSketches streams every sketch-bearing row matching sel — from
+	// BOTH durable tables, like ReadBuckets — to visit, in no particular
+	// order. It is the percentile path of the #197 read contract: a quantile
+	// sketch cannot be SUMmed in SQL, but its merge is commutative and
+	// associative, so no total order and no pagination are needed — one
+	// unordered pass replaces the sorted, keyset-paged drain that made a
+	// wide dashboard range cost O(pages) sorted re-scans (#219).
+	//
+	// The selector's bounds are mandatory (Selector.Validate applies) and
+	// SketchOnly is implied. The row cap is NOT applied: it bounds RESULT
+	// sizes, and this read's result is whatever the caller folds the
+	// visited sketches into; the scan itself is bounded by the validated
+	// window span, the same bound SumBuckets relies on.
+	VisitSketches(sel Selector, visit func(serviceID uint32, sk *Sketch) error) error
+
 	// ReplayMutable returns the delta-log rows for windows at or after since —
 	// the mutable set only. Finalized history never hydrates into RAM (#160).
 	ReplayMutable(since int64) ([]DeltaRow, error)

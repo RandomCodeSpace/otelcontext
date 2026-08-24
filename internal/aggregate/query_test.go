@@ -94,6 +94,21 @@ func (s *stubStore) ReadBuckets(sel Selector) (BucketPage, error) {
 	return page, nil
 }
 
+func (s *stubStore) VisitSketches(sel Selector, visit func(uint32, *Sketch) error) error {
+	if _, err := sel.Validate(); err != nil {
+		return err
+	}
+	s.reads++
+	s.readRanges = append(s.readRanges, [2]int64{sel.Start, sel.End})
+	sel.SketchOnly = true
+	for _, b := range s.matching(sel) {
+		if err := visit(s.infos[b.SeriesID].ServiceID, b.Delta.Sketch); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *stubStore) SumBuckets(sel Selector, by GroupBy) ([]SumRow, error) {
 	if _, err := sel.Validate(); err != nil {
 		return nil, err

@@ -9,9 +9,130 @@ commit on `main` is the canonical version identifier (`git rev-parse HEAD`).
 Per-tag pre-release notes are published on
 [GitHub Releases](https://github.com/RandomCodeSpace/otelcontext/releases).
 This file's `Unreleased` section tracks what has landed on `main` since the
-last published pre-release tag (`v0.3.0-beta.1`).
+most recently published tag.
 
 ## [Unreleased]
+
+### Added — aggregate metrics engine (production-readiness epic #194)
+
+- **Aggregate engine** (`internal/aggregate/`, opt-in via
+  `AGGREGATE_MODE=legacy|aggregate-shadow|aggregate`, default `legacy`):
+  five-minute tumbling windows reduce spans, logs, and metrics into
+  per-series deltas — SeriesKey identity through a durable dictionary,
+  scale-4 exponential latency sketch for percentiles (p99 with a reported
+  accuracy bound), OTLP histogram completeness rules (negative-bucket
+  distributions never publish a fabricated whole-distribution percentile),
+  route normalization, `AGGREGATE_METRIC_DIMS` attribute allowlist, and
+  cardinality caps with `__other__` rerouting.
+- **Durable aggregate store** (SQLite): per-series/window delta log with
+  group commit; the durable aggregate commit IS the OTLP Export ACK; crash
+  recovery replays mutable windows; fail-closed schema
+  (`AGGREGATE_ALLOW_REBUILD=true` to destroy and recreate on mismatch);
+  dictionary GC with persisted high watermarks so IDs are never reused.
+- **Read contract**: scalar totals via SQL SUM (structurally untruncatable),
+  percentiles via sketch merge, generic rows capped with an honest
+  `truncated` flag; responses carry coverage (`OtelContext-Data-Coverage`)
+  and request-basis counts named as such.
+- **Engine-sourced topology**: service-map nodes AND edges from one
+  tenant/range query under one ownership snapshot; bounded finalized-horizon
+  restore at startup; the GraphRAG edge side-channel is gone from aggregate
+  responses.
+- **Aggregate runtime readiness probes** on `/ready`: store reachability,
+  commit-failure streak, admission saturation, finalizer progress, delta-log
+  age, and disk watermark — `/live` stays process-only.
+- **Per-tenant bearer identity** (`API_TENANT_KEYS_FILE`): tenant-bound keys
+  for HTTP, WebSocket (auth subprotocol), and gRPC; only digests are held in
+  memory.
+- **Bounded exemplar retention** replacing the sampler in aggregate mode,
+  with explicit disk-budget arithmetic inside the 8 GiB envelope.
+- **Seven-day durability gate** (`test/gate/`): full-density prefill, 3 h
+  sustained 10k pts/s plus burst and kill -9 under a 2-vCPU/4G cgroup;
+  passing report committed under `docs/gates/`.
+
+### Changed
+
+- Dashboard, traffic, service-map, and WebSocket reads come from the
+  aggregate engine in aggregate mode; the UI shows coverage badges,
+  accuracy labels, and epoch-aware WebSocket state.
+- Legacy TSDB and ring buffer are not started in aggregate mode; GraphRAG
+  consumes aggregates instead of rebuilding from raw spans.
+- TypeScript pinned to 6.0.3 (inside typescript-eslint's peer range) and a
+  new `ui-build` CI job typechecks, builds, and tests the frontend on every
+  PR — frontend breakage is no longer invisible until tag time.
+- `scripts/release.sh --release` marks the GitHub release as a pre-release
+  only when the tag carries a pre-release identifier, matching GoReleaser's
+  `prerelease: auto`.
+- Dependency refresh across 15 update PRs: OTel collector/SDK group, gRPC +
+  protobuf, GORM group, React group, vite group, lucide-react 1.x,
+  Radix tabs, azure azcore, klauspost/compress, glebarez/go-sqlite,
+  prometheus client_golang, x/sync, testcontainers, pinned GitHub Actions.
+
+### Fixed
+
+- **realtime**: WebSocket hub shutdown deadlock and WaitGroup misuse —
+  graceful shutdown could hang forever against connection churn.
+- **api**: aggregate reads whose range exceeds the read-range cap are
+  clamped and declared via `OtelContext-Requested-Start` /
+  `OtelContext-Effective-Start` headers instead of failing with 500; selector
+  errors now map to 400 (#217).
+- **aggregate**: the dashboard percentile path streams sketch rows in one
+  unordered pass instead of a sorted, keyset-paged drain — wide-range
+  dashboard queries no longer take minutes (#219).
+- **ingest**: `Processed` counts completed batches, not picked-up ones;
+  DLQ capture on pipeline DB failure; per-tenant admission; exemplar
+  saturation never fails an acked Export.
+- **aggregate**: request-basis counting and complete reads; commit-failure
+  semantics (staged baselines, admission backoff); delta log pre-merged per
+  series+window with bounded finalize.
+- **storage**: legacy graph error-status matching and tenant-safe trace
+  reads.
+- **ci**: scanner versions pinned (pip, semgrep, jscpd) and dependency
+  lifecycle scripts disabled (`npm ci --ignore-scripts`) in security and
+  release workflows.
+
+## [v0.4.0-beta.1] — 2026-06-19
+
+### Changed
+
+- **Topology scaled to 100–200 services** across GraphRAG, MCP, storage, and
+  the UI, with labelled cardinality overflow.
+
+### Fixed
+
+- **release**: install syft in `release.yml` (GoReleaser SBOM step) and add
+  `workflow_dispatch` recovery so a failed tag-push run can be re-built and
+  signed against the existing immutable tag.
+
+## [v0.3.1] — 2026-06-18
+
+### Changed
+
+- `STORE_MIN_SEVERITY` defaults to `WARN` for **all** database drivers (was
+  SQLite-only): INFO/DEBUG logs still feed in-memory GraphRAG/Drain but are
+  not persisted unless explicitly configured.
+- Dependency refresh (azure group, x/sync, grpc, pgx, websocket, mssqldb,
+  compress, vitest/typescript/eslint groups, pinned actions).
+
+### Added
+
+- goreleaser release + cosign keyless signing workflow (#116): tagged
+  releases ship signed checksums and SPDX/CycloneDX SBOMs.
+- Drain miner fuzz target for Scorecard's Fuzzing check.
+
+### Fixed
+
+- **graphrag**: `SignalStore.LogClusters` bounded (TTL + per-tenant cap).
+- **ui/graphrag**: sunflower service map at scale — flow direction,
+  blast-radius rendering.
+
+## [v0.3.1-beta.1] — 2026-06-18
+
+### Changed
+
+- Service map moved to a dagre layered layout on React Flow: routed edges,
+  level-of-detail, draggable nodes; orphaned hand-rolled map helpers pruned.
+
+## [v0.3.0] — 2026-06-17
 
 ### Changed — map-centric "Service Map" UI redesign
 
