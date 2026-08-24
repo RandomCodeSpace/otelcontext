@@ -37,6 +37,7 @@ func (s *Server) handleGetTrafficMetrics(w http.ResponseWriter, r *http.Request)
 	// carry coverage would silently break every existing client, so coverage
 	// travels in the response header instead (#164).
 	if s.aggregateReads() {
+		start = clampAggregateRange(w, start, end)
 		res, err := s.aggregateEngine.QueryBuckets(aggregate.Query{
 			Tenant:   storage.TenantFromContext(r.Context()),
 			Start:    start,
@@ -45,7 +46,7 @@ func (s *Server) handleGetTrafficMetrics(w http.ResponseWriter, r *http.Request)
 		})
 		if err != nil {
 			slog.Error("Failed to get aggregate traffic metrics", "error", err)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			http.Error(w, err.Error(), aggregateReadStatus(err))
 			return
 		}
 		setCoverage(w, res.Coverage)
@@ -132,15 +133,6 @@ func (s *Server) handleGetLatencyHeatmap(w http.ResponseWriter, r *http.Request)
 // windows never share an entry; oversized queries skip the cache (see
 // maxCacheKeyQueryLen).
 func (s *Server) handleGetDashboardStats(w http.ResponseWriter, r *http.Request) {
-	var cacheKey string
-	if len(r.URL.RawQuery) <= maxCacheKeyQueryLen {
-		cacheKey = "dashboard_stats:" + storage.TenantFromContext(r.Context()) + "?" + r.URL.RawQuery
-		if cached, ok := s.cache.Get(cacheKey); ok {
-			cached.(*cachedJSON).write(w, r, "HIT")
-			return
-		}
-	}
-
 	// Default to last 30 minutes if not specified
 	end := time.Now()
 	start := end.Add(-30 * time.Minute)
@@ -155,13 +147,28 @@ func (s *Server) handleGetDashboardStats(w http.ResponseWriter, r *http.Request)
 			end = t
 		}
 	}
+	// Clamp BEFORE the cache lookup so the clamp headers are stamped on
+	// cache hits too — the cached payload was produced from the clamped
+	// range, and the headers must say so every time it is served (#217).
+	if s.aggregateReads() {
+		start = clampAggregateRange(w, start, end)
+	}
+
+	var cacheKey string
+	if len(r.URL.RawQuery) <= maxCacheKeyQueryLen {
+		cacheKey = "dashboard_stats:" + storage.TenantFromContext(r.Context()) + "?" + r.URL.RawQuery
+		if cached, ok := s.cache.Get(cacheKey); ok {
+			cached.(*cachedJSON).write(w, r, "HIT")
+			return
+		}
+	}
 
 	serviceNames := r.URL.Query()["service_name"]
 
 	view, err := s.dashboardView(r, start, end, serviceNames)
 	if err != nil {
 		slog.Error("Failed to get dashboard stats", "error", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, err.Error(), aggregateReadStatus(err))
 		return
 	}
 
@@ -213,13 +220,6 @@ func (s *Server) handleGetServiceMapMetrics(w http.ResponseWriter, r *http.Reque
 	endStr := r.URL.Query().Get("end")
 	cacheKey := "service_map:" + storage.TenantFromContext(r.Context()) + ":" + startStr + ":" + endStr
 
-	if cached, ok := s.cache.Get(cacheKey); ok {
-		w.Header().Set(httpconst.HeaderContentType, httpconst.ContentTypeJSON)
-		w.Header().Set("X-Cache", "HIT")
-		_ = json.NewEncoder(w).Encode(cached)
-		return
-	}
-
 	end := time.Now()
 	start := end.Add(-30 * time.Minute)
 	if startStr != "" {
@@ -232,11 +232,24 @@ func (s *Server) handleGetServiceMapMetrics(w http.ResponseWriter, r *http.Reque
 			end = t
 		}
 	}
+	// Clamp BEFORE the cache lookup so the clamp headers are stamped on
+	// cache hits too (#217); the cache key is the raw start/end params, so
+	// every hit was produced from the same clamped range.
+	if s.aggregateReads() {
+		start = clampAggregateRange(w, start, end)
+	}
+
+	if cached, ok := s.cache.Get(cacheKey); ok {
+		w.Header().Set(httpconst.HeaderContentType, httpconst.ContentTypeJSON)
+		w.Header().Set("X-Cache", "HIT")
+		_ = json.NewEncoder(w).Encode(cached)
+		return
+	}
 
 	resp, err := s.serviceMapView(r, start, end)
 	if err != nil {
 		slog.Error("Failed to get service map metrics", "error", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, err.Error(), aggregateReadStatus(err))
 		return
 	}
 	s.cache.Set(cacheKey, resp, cacheTTL)
