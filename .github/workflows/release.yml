@@ -95,6 +95,14 @@ jobs:
         # sigstore/cosign-installer v3.9.2 — provides `cosign` for the keyless
         # signing step in .goreleaser.yaml (signs: cmd: cosign).
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
+        with:
+          # Pin the cosign BINARY, not just the installer action: without this
+          # the action installs the latest cosign, and cosign v3 flipped
+          # --new-bundle-format on by default, ignoring the --output-signature/
+          # --output-certificate flags .goreleaser.yaml relies on and failing
+          # the sign step (v0.4.0-beta.2 tag-push run). v2 keeps the .sig+.pem
+          # output contract Scorecard Signed-Releases is checked against.
+          cosign-release: 'v2.6.5'
 
       - name: Install syft
         # anchore/sbom-action v0.24.0 (download-syft sub-action) — puts `syft`
