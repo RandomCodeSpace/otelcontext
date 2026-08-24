@@ -60,7 +60,7 @@ jobs:
     # while every Go job stayed green. This job is the guard.
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: '24'   # matches the release workflow's build environment
           cache: npm
