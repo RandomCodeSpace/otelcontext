@@ -251,7 +251,7 @@ verify_archive() {
   [[ "$version_output" == "OtelContext version $expected_version" ]] || die "$label version is $version_output, want OtelContext version $expected_version"
   go version -m "$extract_dir/otelcontext" >"$proof_dir/$label-go-build.txt"
   if [[ -n "$expected_sha" ]]; then
-    grep -Eq "vcs.revision[[:space:]]+$expected_sha$" "$proof_dir/$label-go-build.txt" || die "$label binary is not bound to commit $expected_sha"
+    grep -Eq "vcs\.revision(=|[[:space:]]+)$expected_sha$" "$proof_dir/$label-go-build.txt" || die "$label binary is not bound to commit $expected_sha"
   fi
   archive_sha="$(sha256sum "$release_archive" | awk '{print $1}')"
   binary_sha="$(sha256sum "$extract_dir/otelcontext" | awk '{print $1}')"
