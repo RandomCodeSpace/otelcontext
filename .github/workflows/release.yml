@@ -17,8 +17,16 @@ permissions:
   contents: read
 
 jobs:
+  database-proof:
+    name: Database lifecycle gate
+    uses: ./.github/workflows/database-proof.yml
+    with:
+      run_all: true
+      candidate_ref: ${{ inputs.tag || github.ref }}
+
   goreleaser:
     name: GoReleaser (build · sbom · sign)
+    needs: database-proof
     runs-on: ubuntu-latest
     permissions:
       contents: write

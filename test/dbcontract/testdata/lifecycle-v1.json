@@ -1,0 +1,123 @@
+{
+  "schema_version": "otelcontext.db-lifecycle-fixture.v1",
+  "services": [
+    "gateway",
+    "orders",
+    "payments",
+    "inventory",
+    "notifications"
+  ],
+  "traces": [
+    {
+      "trace_id": "11111111111111111111111111111111",
+      "transport": "grpc",
+      "spans": [
+        {
+          "span_id": "1000000000000001",
+          "service": "gateway",
+          "operation": "POST /checkout",
+          "status": "ok"
+        },
+        {
+          "span_id": "1000000000000002",
+          "parent_span_id": "1000000000000001",
+          "service": "orders",
+          "operation": "create-order",
+          "status": "error"
+        },
+        {
+          "span_id": "1000000000000003",
+          "parent_span_id": "1000000000000002",
+          "service": "payments",
+          "operation": "charge-card",
+          "status": "error"
+        }
+      ]
+    },
+    {
+      "trace_id": "22222222222222222222222222222222",
+      "transport": "http",
+      "spans": [
+        {
+          "span_id": "2000000000000001",
+          "service": "gateway",
+          "operation": "GET /catalog",
+          "status": "ok"
+        },
+        {
+          "span_id": "2000000000000002",
+          "parent_span_id": "2000000000000001",
+          "service": "inventory",
+          "operation": "reserve-stock",
+          "status": "ok"
+        },
+        {
+          "span_id": "2000000000000003",
+          "parent_span_id": "2000000000000002",
+          "service": "notifications",
+          "operation": "publish-stock-event",
+          "status": "ok"
+        }
+      ]
+    }
+  ],
+  "logs": [
+    {
+      "service": "gateway",
+      "body": "dbcontract gateway accepted checkout",
+      "transport": "grpc",
+      "trace_id": "11111111111111111111111111111111",
+      "span_id": "1000000000000001"
+    },
+    {
+      "service": "orders",
+      "body": "dbcontract order write failed",
+      "transport": "grpc",
+      "trace_id": "11111111111111111111111111111111",
+      "span_id": "1000000000000002"
+    },
+    {
+      "service": "payments",
+      "body": "dbcontract payment declined",
+      "transport": "grpc",
+      "trace_id": "11111111111111111111111111111111",
+      "span_id": "1000000000000003"
+    },
+    {
+      "service": "gateway",
+      "body": "dbcontract catalog request accepted",
+      "transport": "http",
+      "trace_id": "22222222222222222222222222222222",
+      "span_id": "2000000000000001"
+    },
+    {
+      "service": "inventory",
+      "body": "dbcontract stock reserved",
+      "transport": "http",
+      "trace_id": "22222222222222222222222222222222",
+      "span_id": "2000000000000002"
+    },
+    {
+      "service": "notifications",
+      "body": "dbcontract stock event published",
+      "transport": "http",
+      "trace_id": "22222222222222222222222222222222",
+      "span_id": "2000000000000003"
+    }
+  ],
+  "metrics": [
+    {"service": "gateway", "name": "dbcontract_gateway_requests", "transport": "grpc", "value": 11},
+    {"service": "orders", "name": "dbcontract_orders_total", "transport": "grpc", "value": 12},
+    {"service": "payments", "name": "dbcontract_payments_total", "transport": "grpc", "value": 13},
+    {"service": "gateway", "name": "dbcontract_catalog_requests", "transport": "http", "value": 21},
+    {"service": "inventory", "name": "dbcontract_inventory_total", "transport": "http", "value": 22},
+    {"service": "notifications", "name": "dbcontract_notifications_total", "transport": "http", "value": 23}
+  ],
+  "stale": {
+    "service": "gateway",
+    "trace_id": "ffffffffffffffffffffffffffffffff",
+    "span_id": "f000000000000001",
+    "log_body": "dbcontract stale row must be purged",
+    "metric_name": "dbcontract_stale_metric"
+  }
+}

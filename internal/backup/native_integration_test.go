@@ -34,6 +34,12 @@ type containerRunner struct {
 	fixture *nativeFixture
 }
 
+const (
+	postgresProofImage = "postgres:16.15-alpine3.24@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685"
+	mysqlProofImage    = "mysql:8.4.11@sha256:b3b90af2a6552ae30c266fdb7d5dd55f3afb72404bb78d37fe8a23eb857fd3fb"
+	mssqlProofImage    = "mcr.microsoft.com/mssql/server:2022-CU26-ubuntu-22.04@sha256:ba4c8329f48fb8f02e1416be6a930ebfd71268caee78aa985f3af4315e457c89"
+)
+
 func (runner containerRunner) Run(ctx context.Context, command Command) (CommandResult, error) {
 	if err := runner.fixture.chmodShared(ctx); err != nil {
 		return CommandResult{ExitCode: -1}, err
@@ -116,17 +122,17 @@ func startNativeFixture(t *testing.T, adapter string) *nativeFixture {
 	}
 	switch adapter {
 	case "postgres":
-		request.Image = "postgres:16-alpine"
+		request.Image = postgresProofImage
 		request.Env = map[string]string{"POSTGRES_USER": "otel", "POSTGRES_PASSWORD": "otel", "POSTGRES_DB": "postgres"}
 		request.ExposedPorts = []string{"5432/tcp"}
 		request.WaitingFor = wait.ForLog("database system is ready to accept connections").WithOccurrence(2).WithStartupTimeout(2 * time.Minute)
 	case "mysql":
-		request.Image = "mysql:8.4"
+		request.Image = mysqlProofImage
 		request.Env = map[string]string{"MYSQL_ROOT_PASSWORD": "OtelContext-248"}
 		request.ExposedPorts = []string{"3306/tcp"}
 		request.WaitingFor = wait.ForLog("ready for connections").WithOccurrence(2).WithStartupTimeout(3 * time.Minute)
 	case "mssql":
-		request.Image = "mcr.microsoft.com/mssql/server:2022-latest"
+		request.Image = mssqlProofImage
 		request.Env = map[string]string{
 			"ACCEPT_EULA":           "Y",
 			"MSSQL_SA_PASSWORD":     "OtelContext!248Proof",
@@ -335,10 +341,7 @@ func TestNativeBackupRestoreLifecycle(t *testing.T) {
 	fixture := startNativeFixture(t, adapter)
 	prepareNativeSource(t, fixture)
 	sourceLatency := inspectNativeLatency(t, adapter, fixture.sourceDSN)
-	candidate, err := CurrentCandidate("integration-test")
-	if err != nil {
-		t.Fatal(err)
-	}
+	candidate := nativeProofCandidate(t)
 	sourceCfg := nativeConfig(fixture.root, adapter, fixture.sourceDSN, "source")
 	writeNativeShutdownProof(t, sourceCfg, candidate)
 	runner := containerRunner{fixture: fixture}
@@ -416,7 +419,7 @@ func TestNativeBackupRestoreLifecycle(t *testing.T) {
 	proof := nativeProof{
 		SchemaVersion:     "otelcontext.native-backup-proof/v1",
 		Adapter:           adapter,
-		CandidateSHA:      os.Getenv("GITHUB_SHA"),
+		CandidateSHA:      candidate.Commit,
 		EngineVersion:     manifest.Main.EngineVersion,
 		MigrationState:    manifest.Main.MigrationState,
 		SourceLifecycle:   manifest.Main.LifecycleFingerprint,
@@ -444,4 +447,28 @@ func TestNativeBackupRestoreLifecycle(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+}
+
+func nativeProofCandidate(t *testing.T) Candidate {
+	t.Helper()
+	binary := os.Getenv("OTELCONTEXT_TEST_BINARY")
+	if binary == "" {
+		candidate, err := CurrentCandidate("integration-test")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return candidate
+	}
+	digest, _, err := hashFile(binary)
+	if err != nil {
+		t.Fatalf("hash exact candidate binary: %v", err)
+	}
+	commit := os.Getenv("OTELCONTEXT_TEST_CANDIDATE_SHA")
+	if commit == "" {
+		commit = os.Getenv("GITHUB_SHA")
+	}
+	if commit == "" {
+		commit = "unknown"
+	}
+	return Candidate{Version: "database-proof", Commit: commit, BinarySHA256: digest}
 }

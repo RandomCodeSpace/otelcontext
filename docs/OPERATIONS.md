@@ -34,6 +34,17 @@ DB_AUTOMIGRATE=false API_KEY="$(openssl rand -hex 32)" ./otelcontext
 
 Set `DB_AUTOMIGRATE=false` in production after `otelcontext migrate status` reports `result=ready`. The binary owns the ordered SQLite and unpartitioned PostgreSQL 16 migrations; no separate migration tool is required. Daily PostgreSQL partitioning remains on the preview AutoMigrate path.
 
+### Database support tiers
+
+| Database | Support tier | Intended use |
+|---|---|---|
+| PostgreSQL 16 | Primary | Production deployments |
+| SQLite | Bounded opt-in | One process, at most five services, and a low write rate |
+| MySQL 8.4 | Preview | Evaluation with weekly lifecycle proof; keep a tested rollback |
+| SQL Server 2022 | Experimental | Evaluation only; keep a tested rollback |
+
+All four adapters remain available. The tier describes the strength and frequency of lifecycle proof, not feature removal.
+
 ### TLS
 
 Two paths:
@@ -75,7 +86,7 @@ DB_DSN="host=my-server.postgres.database.azure.com user=my-mi@tenant.onmicrosoft
 
 ### Must set
 - `API_KEY` — long random string. Without it, anyone on the network can query or ingest.
-- `DB_DRIVER=postgres` (or another persistent driver). SQLite is fine for small single-node deployments; plan for it accordingly.
+- `DB_DRIVER=postgres` with PostgreSQL 16 for the primary production path. Alternatives retain the support tiers above.
 - `DB_DSN` — with strict TLS when crossing a network boundary.
 - `TLS_CERT_FILE` + `TLS_KEY_FILE` (or `TLS_AUTO_SELFSIGNED=true` for internal-only deployments).
 - `HOT_RETENTION_DAYS` — pick a value you can defend. Default 7 is reasonable; range is 1..36500.
@@ -99,7 +110,7 @@ DB_DSN="host=my-server.postgres.database.azure.com user=my-mi@tenant.onmicrosoft
 - `MCP_MAX_CONCURRENT=32`, `MCP_CALL_TIMEOUT_MS=30000`, `MCP_CACHE_TTL_MS=5000` — MCP HTTP streamable robustness. Concurrent `tools/call` invocations are gated by a counting semaphore (returns JSON-RPC `-32000` "server overloaded" past the cap). Per-call deadlines abort runaway tool handlers (returns JSON-RPC `-32001` "call timeout"). Cheap GraphRAG tools (`get_service_map`, `impact_analysis`, `root_cause_analysis`, `get_anomaly_timeline`, `get_service_health`) are memoized for the TTL window, keyed by `(tenant, tool, args)`. Setting any of these to `0` disables that protection.
 
 ### SQLite in production
-SQLite is rejected at startup when `APP_ENV=production` unless you explicitly opt in with `OTELCONTEXT_ALLOW_SQLITE_PROD=true`. The guard exists because SQLite uses a single writer lock — fine for < ~10 services at low QPS, miserable at scale. Prefer Postgres for anything resembling production.
+SQLite is rejected at startup when `APP_ENV=production` unless you explicitly opt in with `OTELCONTEXT_ALLOW_SQLITE_PROD=true`. The guard exists because SQLite uses a single writer lock. Keep it to one process, at most five services, and a low write rate. Use PostgreSQL 16 beyond that bound.
 
 ---
 

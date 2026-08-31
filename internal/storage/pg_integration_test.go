@@ -23,12 +23,18 @@ package storage
 import (
 	"context"
 	"fmt"
+	"net/url"
+	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
+	"gorm.io/gorm"
 )
+
+var workflowDatabaseSequence atomic.Int64
 
 // setupPGContainer boots a throwaway Postgres 16 container, wires up a GORM
 // repository against it, and returns a teardown closure. If Docker is not
@@ -37,8 +43,14 @@ import (
 func setupPGContainer(t *testing.T) (*Repository, func()) {
 	t.Helper()
 	ctx := context.Background()
+	if os.Getenv("OTELCONTEXT_TEST_DRIVER") == "postgres" && os.Getenv("OTELCONTEXT_TEST_DSN") != "" {
+		return setupRequiredPostgres(t, os.Getenv("OTELCONTEXT_TEST_DSN"))
+	}
+	if os.Getenv("OTELCONTEXT_TEST_REQUIRE_DB") == "1" {
+		t.Fatal("required PostgreSQL storage proof is missing OTELCONTEXT_TEST_DSN")
+	}
 
-	pgContainer, err := postgres.Run(ctx, "postgres:16-alpine",
+	pgContainer, err := postgres.Run(ctx, "postgres:16.15-alpine3.24@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685",
 		postgres.WithDatabase("otel_test"),
 		postgres.WithUsername("otel"),
 		postgres.WithPassword("otel"),
@@ -70,6 +82,57 @@ func setupPGContainer(t *testing.T) (*Repository, func()) {
 		_ = pgContainer.Terminate(ctx)
 	}
 	return repo, teardown
+}
+
+func setupRequiredPostgres(t *testing.T, sourceDSN string) (*Repository, func()) {
+	t.Helper()
+	parsed, err := url.Parse(sourceDSN)
+	if err != nil || parsed.Scheme == "" {
+		t.Fatalf("required PostgreSQL DSN must be a URL: %q (%v)", sourceDSN, err)
+	}
+	name := fmt.Sprintf("storage_contract_%d", workflowDatabaseSequence.Add(1))
+	adminURL := *parsed
+	adminURL.Path = "/postgres"
+	admin, err := NewDatabase("postgres", adminURL.String())
+	if err != nil {
+		t.Fatalf("connect required PostgreSQL admin database: %v", err)
+	}
+	if err := admin.Exec("CREATE DATABASE \"" + name + "\"").Error; err != nil { //nolint:gosec // generated identifier.
+		closeIntegrationDB(admin)
+		t.Fatalf("create isolated PostgreSQL database: %v", err)
+	}
+	closeIntegrationDB(admin)
+	targetURL := *parsed
+	targetURL.Path = "/" + name
+	db, err := NewDatabase("postgres", targetURL.String())
+	if err != nil {
+		t.Fatalf("connect isolated PostgreSQL database: %v", err)
+	}
+	if err := AutoMigrateModels(db, "postgres"); err != nil {
+		closeIntegrationDB(db)
+		t.Fatalf("AutoMigrateModels(postgres): %v", err)
+	}
+	repo := NewRepositoryFromDB(db, "postgres")
+	teardown := func() {
+		_ = repo.Close()
+		admin, openErr := NewDatabase("postgres", adminURL.String())
+		if openErr != nil {
+			return
+		}
+		_ = admin.Exec("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = ?", name).Error
+		_ = admin.Exec("DROP DATABASE IF EXISTS \"" + name + "\"").Error //nolint:gosec // generated identifier.
+		closeIntegrationDB(admin)
+	}
+	return repo, teardown
+}
+
+func closeIntegrationDB(db *gorm.DB) {
+	if db == nil {
+		return
+	}
+	if sqlDB, err := db.DB(); err == nil {
+		_ = sqlDB.Close()
+	}
 }
 
 // TestPG_ILIKE_CaseInsensitiveSearch proves that SearchLogs uses the
@@ -177,13 +240,17 @@ func TestPG_PgTrgm_SubstringQueryUsesGIN(t *testing.T) {
 	repo, teardown := setupPGContainer(t)
 	defer teardown()
 
-	// Seed enough rows that the planner prefers the index over a seq scan.
+	// Keep the substring selective so the planner has a reason to use the index.
 	now := time.Now().UTC()
 	batch := make([]Log, 0, 2000)
 	for i := 0; i < 2000; i++ {
+		body := fmt.Sprintf("request %d: upstream healthy", i)
+		if i%1000 == 0 {
+			body = fmt.Sprintf("request %d: connection-refused-dbcontract", i)
+		}
 		batch = append(batch, Log{
 			Severity:    "INFO",
-			Body:        fmt.Sprintf("request %d: connection refused by upstream-%d", i, i%37),
+			Body:        body,
 			ServiceName: fmt.Sprintf("svc-%d", i%11),
 			Timestamp:   now,
 		})
@@ -196,9 +263,17 @@ func TestPG_PgTrgm_SubstringQueryUsesGIN(t *testing.T) {
 		t.Fatalf("analyze: %v", err)
 	}
 
-	rows, err := repo.db.Raw(
+	planDB := repo.db.Begin()
+	if planDB.Error != nil {
+		t.Fatalf("begin planner proof: %v", planDB.Error)
+	}
+	defer planDB.Rollback()
+	if err := planDB.Exec("SET LOCAL enable_seqscan = off").Error; err != nil {
+		t.Fatalf("disable sequential scans for planner proof: %v", err)
+	}
+	rows, err := planDB.Raw(
 		"EXPLAIN SELECT id FROM logs WHERE body ILIKE ?",
-		"%connection%",
+		"%connection-refused-dbcontract%",
 	).Rows()
 	if err != nil {
 		t.Fatalf("EXPLAIN: %v", err)

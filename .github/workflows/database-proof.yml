@@ -1,0 +1,460 @@
+name: Database proof
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    - cron: '17 3 * * 1'
+  workflow_call:
+    inputs:
+      run_all:
+        description: Run preview and experimental adapters as release blockers.
+        type: boolean
+        default: false
+      candidate_ref:
+        description: Exact tag or commit to prove.
+        type: string
+        default: ''
+  workflow_dispatch:
+    inputs:
+      run_all:
+        description: Run all four retained adapters.
+        type: boolean
+        default: true
+      candidate_ref:
+        description: Exact tag or commit to prove; defaults to the event SHA.
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  sqlite:
+    name: database proof · sqlite
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      CGO_ENABLED: '1'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.candidate_ref || github.sha }}
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install cosign for signed baselines
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
+        with:
+          cosign-release: 'v2.6.5'
+
+      - name: Resolve exact candidate
+        id: source
+        run: echo "sha=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
+
+      - name: Build candidate once
+        run: |
+          mkdir -p "${RUNNER_TEMP}/database-proof" "${RUNNER_TEMP}/signed-baselines"
+          go build -trimpath -o "${RUNNER_TEMP}/otelcontext" .
+          sha256sum "${RUNNER_TEMP}/otelcontext" > "${RUNNER_TEMP}/database-proof/binary.sha256"
+
+      - name: Verify and extract signed baseline binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          manifest="${RUNNER_TEMP}/signed-baselines/manifest.json"
+          printf '%s\n' '{"schema_version":"otelcontext.signed-baselines.v1","releases":[]}' > "${manifest}"
+          for spec in 'v0.3.1 otelcontext_0.3.1_linux_amd64.tar.gz' 'v0.4.0-beta.2 otelcontext_0.4.0-beta.2_linux_amd64.tar.gz'; do
+            read -r release archive <<< "${spec}"
+            root="${RUNNER_TEMP}/signed-baselines/${release}"
+            mkdir -p "${root}/extracted"
+            gh release download "${release}" --repo "${GITHUB_REPOSITORY}" --dir "${root}" \
+              --pattern "${archive}" --pattern checksums.txt --pattern checksums.txt.sig --pattern checksums.txt.pem
+            (
+              cd "${root}"
+              grep " ${archive}$" checksums.txt | sha256sum --check -
+              base64 --decode checksums.txt.pem > checksums.decoded.pem
+              cosign verify-blob \
+                --certificate checksums.decoded.pem \
+                --signature checksums.txt.sig \
+                --certificate-identity 'https://github.com/RandomCodeSpace/otelcontext/.github/workflows/release.yml@refs/heads/main' \
+                --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+                checksums.txt
+              tar -xzf "${archive}" -C extracted
+            )
+            binary="$(find "${root}/extracted" -type f -name otelcontext -print -quit)"
+            test -n "${binary}"
+            chmod 0755 "${binary}"
+            archive_sha="$(sha256sum "${root}/${archive}" | awk '{print $1}')"
+            binary_sha="$(sha256sum "${binary}" | awk '{print $1}')"
+            jq --arg release "${release}" --arg binary "${binary}" --arg archive_sha "${archive_sha}" --arg binary_sha "${binary_sha}" \
+              '.releases += [{release:$release,binary_path:$binary,archive_sha256:$archive_sha,binary_sha256:$binary_sha,signature_verified:true}]' \
+              "${manifest}" > "${manifest}.next"
+            mv "${manifest}.next" "${manifest}"
+          done
+          cp "${manifest}" "${RUNNER_TEMP}/database-proof/signed-baselines-v1.json"
+
+      - name: Run full SQLite lifecycle contract
+        env:
+          OTELCONTEXT_TEST_BINARY: ${{ runner.temp }}/otelcontext
+          OTELCONTEXT_TEST_DRIVER: sqlite
+          OTELCONTEXT_TEST_DSN: ${{ runner.temp }}/otelcontext.db
+          OTELCONTEXT_TEST_REQUIRE_DB: '1'
+          OTELCONTEXT_PROOF_DIR: ${{ runner.temp }}/database-proof
+          OTELCONTEXT_TEST_BASELINE_MANIFEST: ${{ runner.temp }}/signed-baselines/manifest.json
+          OTELCONTEXT_TEST_CANDIDATE_SHA: ${{ steps.source.outputs.sha }}
+          OTELCONTEXT_TEST_ENGINE_IMAGE: modernc.org/sqlite@v1.55.0 (SQLite 3.53.3)
+        run: |
+          set -o pipefail
+          go test -race -count=1 -timeout=10m -tags=dbcontract -json ./test/dbcontract 2>&1 \
+            | tee "${RUNNER_TEMP}/database-proof/go-test.json"
+          jq -e '
+            .schema_version == "otelcontext.database-proof.v1" and
+            .driver == "sqlite" and
+            .tier == "bounded-opt-in" and
+            .migration.state == "exact" and
+            (.baselines | length) == 2 and
+            .post_restart_fingerprint.traces == 2 and
+            .post_restart_fingerprint.spans == 6 and
+            .post_restart_fingerprint.logs == 6 and
+            .post_restart_fingerprint.metric_buckets == 6 and
+            (.surfaces.mcp_tools | length) == 7 and
+            (.surfaces.mcp_calls | length) == 7 and
+            .restore.source_fingerprint == .restore.restored_fingerprint and
+            all(.assertions[]; .passed == true)
+          ' "${RUNNER_TEMP}/database-proof/database-proof-v1.json"
+
+      - name: Upload SQLite database proof
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: database-proof-sqlite-${{ steps.source.outputs.sha }}
+          path: ${{ runner.temp }}/database-proof
+          if-no-files-found: error
+          retention-days: ${{ github.event_name == 'schedule' && 30 || github.event_name == 'workflow_call' && 90 || 14 }}
+
+  postgres:
+    name: database proof · postgres-16
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CGO_ENABLED: '1'
+    services:
+      postgres:
+        image: postgres:16.15-alpine3.24@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
+        env:
+          POSTGRES_USER: otel
+          POSTGRES_PASSWORD: otel
+          POSTGRES_DB: otelcontext
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U otel -d otelcontext"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 18
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.candidate_ref || github.sha }}
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install cosign for signed baselines
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
+        with:
+          cosign-release: 'v2.6.5'
+
+      - name: Install PostgreSQL 16 client
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes postgresql-client
+          pg_dump --version | grep ' 16\.'
+
+      - name: Resolve exact candidate
+        id: source
+        run: echo "sha=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
+
+      - name: Require PostgreSQL 16 and prepare fresh restore target
+        env:
+          PGPASSWORD: otel
+        run: |
+          psql --host=127.0.0.1 --username=otel --dbname=otelcontext --tuples-only --command='SHOW server_version' | grep '16\.'
+          createdb --host=127.0.0.1 --username=otel otelcontext_restore
+
+      - name: Build candidate once
+        run: |
+          mkdir -p "${RUNNER_TEMP}/database-proof" "${RUNNER_TEMP}/signed-baselines"
+          go build -trimpath -o "${RUNNER_TEMP}/otelcontext" .
+          sha256sum "${RUNNER_TEMP}/otelcontext" > "${RUNNER_TEMP}/database-proof/binary.sha256"
+
+      - name: Verify and extract signed baseline binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          manifest="${RUNNER_TEMP}/signed-baselines/manifest.json"
+          printf '%s\n' '{"schema_version":"otelcontext.signed-baselines.v1","releases":[]}' > "${manifest}"
+          for spec in 'v0.3.1 otelcontext_0.3.1_linux_amd64.tar.gz' 'v0.4.0-beta.2 otelcontext_0.4.0-beta.2_linux_amd64.tar.gz'; do
+            read -r release archive <<< "${spec}"
+            root="${RUNNER_TEMP}/signed-baselines/${release}"
+            mkdir -p "${root}/extracted"
+            gh release download "${release}" --repo "${GITHUB_REPOSITORY}" --dir "${root}" \
+              --pattern "${archive}" --pattern checksums.txt --pattern checksums.txt.sig --pattern checksums.txt.pem
+            (
+              cd "${root}"
+              grep " ${archive}$" checksums.txt | sha256sum --check -
+              base64 --decode checksums.txt.pem > checksums.decoded.pem
+              cosign verify-blob \
+                --certificate checksums.decoded.pem \
+                --signature checksums.txt.sig \
+                --certificate-identity 'https://github.com/RandomCodeSpace/otelcontext/.github/workflows/release.yml@refs/heads/main' \
+                --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+                checksums.txt
+              tar -xzf "${archive}" -C extracted
+            )
+            binary="$(find "${root}/extracted" -type f -name otelcontext -print -quit)"
+            test -n "${binary}"
+            chmod 0755 "${binary}"
+            archive_sha="$(sha256sum "${root}/${archive}" | awk '{print $1}')"
+            binary_sha="$(sha256sum "${binary}" | awk '{print $1}')"
+            jq --arg release "${release}" --arg binary "${binary}" --arg archive_sha "${archive_sha}" --arg binary_sha "${binary_sha}" \
+              '.releases += [{release:$release,binary_path:$binary,archive_sha256:$archive_sha,binary_sha256:$binary_sha,signature_verified:true}]' \
+              "${manifest}" > "${manifest}.next"
+            mv "${manifest}.next" "${manifest}"
+          done
+          cp "${manifest}" "${RUNNER_TEMP}/database-proof/signed-baselines-v1.json"
+
+      - name: Run full PostgreSQL lifecycle contract
+        env:
+          OTELCONTEXT_TEST_BINARY: ${{ runner.temp }}/otelcontext
+          OTELCONTEXT_TEST_DRIVER: postgres
+          OTELCONTEXT_TEST_DSN: postgres://otel:otel@127.0.0.1:5432/otelcontext?sslmode=disable
+          OTELCONTEXT_TEST_RESTORE_DSN: postgres://otel:otel@127.0.0.1:5432/otelcontext_restore?sslmode=disable
+          OTELCONTEXT_TEST_REQUIRE_DB: '1'
+          OTELCONTEXT_PROOF_DIR: ${{ runner.temp }}/database-proof
+          OTELCONTEXT_TEST_BASELINE_MANIFEST: ${{ runner.temp }}/signed-baselines/manifest.json
+          OTELCONTEXT_TEST_CANDIDATE_SHA: ${{ steps.source.outputs.sha }}
+          OTELCONTEXT_TEST_ENGINE_IMAGE: postgres:16.15-alpine3.24@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
+        run: |
+          set -o pipefail
+          go test -race -count=1 -timeout=10m -tags=dbcontract -json ./test/dbcontract 2>&1 \
+            | tee "${RUNNER_TEMP}/database-proof/go-test.json"
+          jq -e '
+            .schema_version == "otelcontext.database-proof.v1" and
+            .driver == "postgres" and
+            .tier == "primary" and
+            .migration.state == "exact" and
+            (.baselines | length) == 2 and
+            .post_restart_fingerprint.traces == 2 and
+            .post_restart_fingerprint.spans == 6 and
+            .post_restart_fingerprint.logs == 6 and
+            .post_restart_fingerprint.metric_buckets == 6 and
+            (.surfaces.mcp_tools | length) == 7 and
+            (.surfaces.mcp_calls | length) == 7 and
+            .restore.source_fingerprint == .restore.restored_fingerprint and
+            all(.assertions[]; .passed == true)
+          ' "${RUNNER_TEMP}/database-proof/database-proof-v1.json"
+
+      - name: Run nearest PostgreSQL migration and storage contracts
+        env:
+          OTELCONTEXT_TEST_DRIVER: postgres
+          OTELCONTEXT_TEST_DSN: postgres://otel:otel@127.0.0.1:5432/otelcontext?sslmode=disable
+          OTELCONTEXT_TEST_REQUIRE_DB: '1'
+        run: |
+          set -o pipefail
+          go test -race -count=1 -timeout=10m -tags=integration -json ./internal/migrate ./internal/storage 2>&1 \
+            | tee "${RUNNER_TEMP}/database-proof/storage-integration.json"
+
+      - name: Upload PostgreSQL 16 database proof
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: database-proof-postgres-16-${{ steps.source.outputs.sha }}
+          path: ${{ runner.temp }}/database-proof
+          if-no-files-found: error
+          retention-days: ${{ github.event_name == 'schedule' && 30 || github.event_name == 'workflow_call' && 90 || 14 }}
+
+  mysql:
+    name: database proof · mysql-8.4
+    if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_call' && inputs.run_all) || (github.event_name == 'workflow_dispatch' && inputs.run_all) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CGO_ENABLED: '1'
+    services:
+      mysql:
+        image: mysql:8.4.11@sha256:b3b90af2a6552ae30c266fdb7d5dd55f3afb72404bb78d37fe8a23eb857fd3fb
+        env:
+          MYSQL_ROOT_PASSWORD: proof-${{ github.run_id }}
+          MYSQL_DATABASE: otelcontext
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "MYSQL_PWD=$MYSQL_ROOT_PASSWORD mysqladmin ping --host=127.0.0.1 --user=root"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 24
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.candidate_ref || github.sha }}
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Resolve exact candidate
+        id: source
+        run: echo "sha=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
+
+      - name: Build candidate once
+        run: |
+          mkdir -p "${RUNNER_TEMP}/database-proof/native"
+          go build -trimpath -o "${RUNNER_TEMP}/otelcontext" .
+          sha256sum "${RUNNER_TEMP}/otelcontext" > "${RUNNER_TEMP}/database-proof/binary.sha256"
+
+      - name: Run candidate-bound native fresh-target restore proof
+        env:
+          OTELCONTEXT_BACKUP_ADAPTER: mysql
+          OTELCONTEXT_NATIVE_BACKUP_PROOF_DIR: ${{ runner.temp }}/database-proof/native
+          OTELCONTEXT_TEST_BINARY: ${{ runner.temp }}/otelcontext
+          OTELCONTEXT_TEST_CANDIDATE_SHA: ${{ steps.source.outputs.sha }}
+        run: go test -race -count=1 -timeout=22m -tags=integration -run '^TestNativeBackupRestoreLifecycle$' ./internal/backup
+
+      - name: Run full MySQL lifecycle contract
+        env:
+          OTELCONTEXT_TEST_BINARY: ${{ runner.temp }}/otelcontext
+          OTELCONTEXT_TEST_DRIVER: mysql
+          OTELCONTEXT_TEST_DSN: root:proof-${{ github.run_id }}@tcp(127.0.0.1:3306)/otelcontext?charset=utf8mb4&parseTime=True&loc=UTC
+          OTELCONTEXT_TEST_REQUIRE_DB: '1'
+          OTELCONTEXT_PROOF_DIR: ${{ runner.temp }}/database-proof
+          OTELCONTEXT_TEST_NATIVE_RESTORE_PROOF: ${{ runner.temp }}/database-proof/native/mysql.json
+          OTELCONTEXT_TEST_CANDIDATE_SHA: ${{ steps.source.outputs.sha }}
+          OTELCONTEXT_TEST_ENGINE_IMAGE: mysql:8.4.11@sha256:b3b90af2a6552ae30c266fdb7d5dd55f3afb72404bb78d37fe8a23eb857fd3fb
+        run: |
+          set -o pipefail
+          go test -race -count=1 -timeout=10m -tags=dbcontract -json ./test/dbcontract 2>&1 \
+            | tee "${RUNNER_TEMP}/database-proof/go-test.json"
+          jq -e '
+            .schema_version == "otelcontext.database-proof.v1" and
+            .driver == "mysql" and
+            .tier == "preview" and
+            .migration.state == "unverified-preview" and
+            (.surfaces.mcp_tools | length) == 7 and
+            (.surfaces.mcp_calls | length) == 7 and
+            .restore.kind == "native-fresh-target" and
+            .restore.source_fingerprint == .restore.restored_fingerprint and
+            all(.assertions[]; .passed == true)
+          ' "${RUNNER_TEMP}/database-proof/database-proof-v1.json"
+
+      - name: Upload MySQL 8.4 database proof
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: database-proof-mysql-8.4-${{ steps.source.outputs.sha }}
+          path: ${{ runner.temp }}/database-proof
+          if-no-files-found: error
+          retention-days: ${{ github.event_name == 'schedule' && 30 || 90 }}
+
+  sqlserver:
+    name: database proof · sqlserver-2022
+    if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_call' && inputs.run_all) || (github.event_name == 'workflow_dispatch' && inputs.run_all) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CGO_ENABLED: '1'
+    services:
+      sqlserver:
+        image: mcr.microsoft.com/mssql/server:2022-CU26-ubuntu-22.04@sha256:ba4c8329f48fb8f02e1416be6a930ebfd71268caee78aa985f3af4315e457c89
+        env:
+          ACCEPT_EULA: Y
+          MSSQL_SA_PASSWORD: Otc-${{ github.run_id }}-Proof!
+          MSSQL_PID: Developer
+          MSSQL_MEMORY_LIMIT_MB: '2048'
+        ports:
+          - 1433:1433
+        options: >-
+          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -S 127.0.0.1 -U sa -P 'Otc-${{ github.run_id }}-Proof!' -C -Q 'SELECT 1'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.candidate_ref || github.sha }}
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Resolve exact candidate
+        id: source
+        run: echo "sha=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
+
+      - name: Require SQL Server 2022 and create lifecycle database
+        env:
+          SQLSERVER_ID: ${{ job.services.sqlserver.id }}
+        run: |
+          docker exec "${SQLSERVER_ID}" /opt/mssql-tools18/bin/sqlcmd -S 127.0.0.1 -U sa -P 'Otc-${{ github.run_id }}-Proof!' -C -b -Q "SELECT CONVERT(varchar(128), SERVERPROPERTY('ProductVersion'))" | grep '16.0.4265.3'
+          docker exec "${SQLSERVER_ID}" /opt/mssql-tools18/bin/sqlcmd -S 127.0.0.1 -U sa -P 'Otc-${{ github.run_id }}-Proof!' -C -b -Q "CREATE DATABASE [otelcontext]"
+
+      - name: Build candidate once
+        run: |
+          mkdir -p "${RUNNER_TEMP}/database-proof/native"
+          go build -trimpath -o "${RUNNER_TEMP}/otelcontext" .
+          sha256sum "${RUNNER_TEMP}/otelcontext" > "${RUNNER_TEMP}/database-proof/binary.sha256"
+
+      - name: Run candidate-bound native fresh-target restore proof
+        env:
+          OTELCONTEXT_BACKUP_ADAPTER: mssql
+          OTELCONTEXT_NATIVE_BACKUP_PROOF_DIR: ${{ runner.temp }}/database-proof/native
+          OTELCONTEXT_TEST_BINARY: ${{ runner.temp }}/otelcontext
+          OTELCONTEXT_TEST_CANDIDATE_SHA: ${{ steps.source.outputs.sha }}
+        run: go test -race -count=1 -timeout=32m -tags=integration -run '^TestNativeBackupRestoreLifecycle$' ./internal/backup
+
+      - name: Run full SQL Server lifecycle contract
+        env:
+          OTELCONTEXT_TEST_BINARY: ${{ runner.temp }}/otelcontext
+          OTELCONTEXT_TEST_DRIVER: mssql
+          OTELCONTEXT_TEST_DSN: sqlserver://sa:Otc-${{ github.run_id }}-Proof%21@127.0.0.1:1433?database=otelcontext&encrypt=disable&TrustServerCertificate=true
+          OTELCONTEXT_TEST_REQUIRE_DB: '1'
+          OTELCONTEXT_PROOF_DIR: ${{ runner.temp }}/database-proof
+          OTELCONTEXT_TEST_NATIVE_RESTORE_PROOF: ${{ runner.temp }}/database-proof/native/mssql.json
+          OTELCONTEXT_TEST_CANDIDATE_SHA: ${{ steps.source.outputs.sha }}
+          OTELCONTEXT_TEST_ENGINE_IMAGE: mcr.microsoft.com/mssql/server:2022-CU26-ubuntu-22.04@sha256:ba4c8329f48fb8f02e1416be6a930ebfd71268caee78aa985f3af4315e457c89
+        run: |
+          set -o pipefail
+          go test -race -count=1 -timeout=10m -tags=dbcontract -json ./test/dbcontract 2>&1 \
+            | tee "${RUNNER_TEMP}/database-proof/go-test.json"
+          jq -e '
+            .schema_version == "otelcontext.database-proof.v1" and
+            .driver == "mssql" and
+            .tier == "experimental" and
+            .migration.state == "unverified-preview" and
+            (.surfaces.mcp_tools | length) == 7 and
+            (.surfaces.mcp_calls | length) == 7 and
+            .restore.kind == "native-fresh-target" and
+            .restore.source_fingerprint == .restore.restored_fingerprint and
+            all(.assertions[]; .passed == true)
+          ' "${RUNNER_TEMP}/database-proof/database-proof-v1.json"
+
+      - name: Upload SQL Server 2022 database proof
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: database-proof-sqlserver-2022-${{ steps.source.outputs.sha }}
+          path: ${{ runner.temp }}/database-proof
+          if-no-files-found: error
+          retention-days: ${{ github.event_name == 'schedule' && 30 || 90 }}
