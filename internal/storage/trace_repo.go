@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/RandomCodeSpace/otelcontext/internal/latency"
 	"golang.org/x/sync/errgroup"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -23,10 +24,12 @@ type TracesResponse struct {
 
 // ServiceMapNode represents a single service node on the service map.
 type ServiceMapNode struct {
-	Name         string  `json:"name"`
-	TotalTraces  int64   `json:"total_traces"`
-	ErrorCount   int64   `json:"error_count"`
-	AvgLatencyMs float64 `json:"avg_latency_ms"`
+	Name              string              `json:"name"`
+	TotalTraces       int64               `json:"total_traces"`
+	ErrorCount        int64               `json:"error_count"`
+	AvgLatencyMs      float64             `json:"avg_latency_ms"`
+	P99LatencyMs      float64             `json:"p99_latency_ms,omitempty"`
+	LatencyProvenance *latency.Provenance `json:"latency_provenance,omitempty"`
 }
 
 // ServiceMapEdge represents a connection between two services.
@@ -412,12 +415,22 @@ func (r *Repository) GetServiceMapMetrics(ctx context.Context, start, end time.T
 
 	nodes := make([]ServiceMapNode, 0, len(nodeRows))
 	for _, nr := range nodeRows {
+		avgLatencyMs := math.Round(nr.AvgDuration/1000.0*100) / 100
+		sampleCount := uint64(nr.SpanCount) // #nosec G115 -- grouped database counts cannot be negative.
 		nodes = append(nodes, ServiceMapNode{
 			Name:        nr.ServiceName,
 			TotalTraces: nr.SpanCount,
 			ErrorCount:  nr.ErrorCount,
 			// AVG(duration) is microseconds; convert to ms and round to 2dp.
-			AvgLatencyMs: math.Round(nr.AvgDuration/1000.0*100) / 100,
+			AvgLatencyMs: avgLatencyMs,
+			P99LatencyMs: avgLatencyMs * 2.5,
+			LatencyProvenance: &latency.Provenance{P99: &latency.Percentile{
+				Status:         latency.StatusEstimated,
+				Method:         latency.MethodAverageMultiplier,
+				SampleCount:    sampleCount,
+				LowSample:      sampleCount < latency.LowSampleThreshold,
+				EstimateFactor: 2.5,
+			}},
 		})
 	}
 

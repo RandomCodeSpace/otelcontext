@@ -220,14 +220,23 @@ func latencyAnomaly(service string, current aggregate.TopologyWindow, baseline [
 	if current.P99Micros <= threshold || mean <= 0 {
 		return AnomalyNode{}, false
 	}
+	accuracy := "DDSketch accuracy unavailable"
+	if current.LatencyProvenance != nil && current.LatencyProvenance.P99 != nil {
+		p99 := current.LatencyProvenance.P99
+		if p99.Degraded {
+			accuracy = "DDSketch degraded"
+		} else if p99.RelativeErrorBound > 0 {
+			accuracy = fmt.Sprintf("DDSketch ±%.1f%%", p99.RelativeErrorBound*100)
+		}
+	}
 	return AnomalyNode{
 		ID:       fmt.Sprintf("anom_%s_lat", service),
 		Type:     AnomalyLatencySpike,
 		Severity: relativeSeverity(current.P99Micros, mean),
 		Service:  service,
 		Evidence: fmt.Sprintf(
-			"p99 %.0fms (p95 %.0fms) vs %.0fms baseline (sd %.0fms) over %d finalized windows",
-			current.P99Micros/1000, current.P95Micros/1000, mean/1000, stddev/1000, len(samples),
+			"approx. p99 %.0fms (p95 %.0fms; %s) vs %.0fms baseline (sd %.0fms) over %d finalized windows",
+			current.P99Micros/1000, current.P95Micros/1000, accuracy, mean/1000, stddev/1000, len(samples),
 		),
 		Timestamp: now,
 	}, true

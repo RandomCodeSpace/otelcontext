@@ -503,15 +503,16 @@ func (s *Server) topologyNotification(ctx context.Context, last topology.Identit
 			alerts = []string{}
 		}
 		payload.Nodes[node.Name] = &graph.ServiceNode{
-			Name:           node.Name,
-			HealthScore:    node.HealthScore,
-			Status:         node.Status,
-			RequestRateRPS: node.RequestRateRPS,
-			ErrorRate:      node.ErrorRate,
-			AvgLatencyMs:   node.AvgLatencyMs,
-			P99LatencyMs:   node.P99LatencyMs,
-			SpanCount:      node.SpanCount,
-			Alerts:         alerts,
+			Name:              node.Name,
+			HealthScore:       node.HealthScore,
+			Status:            node.Status,
+			RequestRateRPS:    node.RequestRateRPS,
+			ErrorRate:         node.ErrorRate,
+			AvgLatencyMs:      node.AvgLatencyMs,
+			P99LatencyMs:      node.P99LatencyMs,
+			LatencyProvenance: node.LatencyProvenance,
+			SpanCount:         node.SpanCount,
+			Alerts:            alerts,
 		}
 	}
 	for _, edge := range snapshot.Edges {

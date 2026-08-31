@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/RandomCodeSpace/otelcontext/internal/aggregate"
+	"github.com/RandomCodeSpace/otelcontext/internal/latency"
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 	"gorm.io/gorm"
 )
@@ -51,6 +52,8 @@ func (f *fakeAggregateSource) PruneTopology() { f.prunes.Add(1) }
 
 // aggWindow builds one finalized topology window.
 func aggWindow(start time.Time, count, errors uint64, p99Micros float64) aggregate.TopologyWindow {
+	p95 := &latency.Percentile{Status: latency.StatusApproximate, Method: latency.MethodDDSketch, SampleCount: count, RelativeErrorBound: 0.0217}
+	p99 := *p95
 	return aggregate.TopologyWindow{
 		Start:             start,
 		End:               start.Add(aggregate.WindowSize),
@@ -63,6 +66,7 @@ func aggWindow(start time.Time, count, errors uint64, p99Micros float64) aggrega
 		DurationSumMicros: float64(count) * 1000,
 		P95Micros:         p99Micros * 0.8,
 		P99Micros:         p99Micros,
+		LatencyProvenance: &latency.Provenance{P95: p95, P99: &p99},
 	}
 }
 
@@ -124,6 +128,13 @@ func TestReconcileReplacesRatherThanAccumulates(t *testing.T) {
 	svc, ok := stores.service.GetService("checkout")
 	if !ok || svc.CallCount != 100 || svc.ErrorCount != 5 {
 		t.Fatalf("after first reconcile: %+v, want CallCount 100 / ErrorCount 5", svc)
+	}
+	if svc.P99Latency != 4 || svc.P95Latency != 3.2 || svc.LatencyProvenance == nil || svc.LatencyProvenance.P99.SampleCount != 100 {
+		t.Fatalf("service latency projection = %+v provenance=%+v", svc, svc.LatencyProvenance)
+	}
+	ops := stores.service.OperationsForService("checkout")
+	if len(ops) != 1 || ops[0].LatencyProvenance == nil || ops[0].LatencyProvenance.P50.Status != latency.StatusUnavailable || ops[0].LatencyProvenance.P99.Reason != latency.ReasonPercentileNotRecorded {
+		t.Fatalf("operation latency projection = %+v", ops)
 	}
 
 	// Force a re-render of the identical snapshot by bumping only the epoch's

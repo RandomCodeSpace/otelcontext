@@ -8,7 +8,11 @@ import (
 	"math"
 	"sync"
 	"time"
+
+	"github.com/RandomCodeSpace/otelcontext/internal/latency"
 )
+
+const serviceLatencySampleLimit = 1000
 
 // SpanRow is the minimal span data needed to build the graph.
 // Callers supply this via the DataProvider to decouple the graph from GORM.
@@ -39,7 +43,7 @@ type edgeStats struct {
 	totalMs    float64
 	minMs      float64
 	maxMs      float64
-	latencies  []float64 // capped at 1000 samples for p99
+	latencies  []float64 // capped at serviceLatencySampleLimit for p99
 }
 
 // ServiceNode holds aggregated health data for a single service.
@@ -48,12 +52,13 @@ type ServiceNode struct {
 	HealthScore float64 // 0.0–1.0
 	Status      string  // "healthy" | "degraded" | "critical"
 
-	RequestRateRPS float64
-	ErrorRate      float64
-	AvgLatencyMs   float64
-	P99LatencyMs   float64
-	SpanCount      int64
-	LogErrorCount  int64 // set externally by callers if needed
+	RequestRateRPS    float64
+	ErrorRate         float64
+	AvgLatencyMs      float64
+	P99LatencyMs      float64
+	LatencyProvenance *latency.Provenance `json:"latency_provenance,omitempty"`
+	SpanCount         int64
+	LogErrorCount     int64 // set externally by callers if needed
 
 	Alerts []string
 }
@@ -178,7 +183,7 @@ func (g *Graph) rebuild() {
 		if r.IsError {
 			n.errorCount++
 		}
-		if len(n.latencies) < 1000 {
+		if len(n.latencies) < serviceLatencySampleLimit {
 			n.latencies = append(n.latencies, r.DurationMs)
 		}
 		if r.Timestamp.Before(n.firstSeen) {
@@ -209,7 +214,7 @@ func (g *Graph) rebuild() {
 				if r.IsError {
 					e.errorCount++
 				}
-				if len(e.latencies) < 1000 {
+				if len(e.latencies) < serviceLatencySampleLimit {
 					e.latencies = append(e.latencies, r.DurationMs)
 				}
 			}
@@ -227,22 +232,36 @@ func (g *Graph) rebuild() {
 			errorRate = float64(acc.errorCount) / float64(acc.spanCount)
 		}
 		p99Ms = percentile(acc.latencies, 99)
+		sampleCount := uint64(len(acc.latencies))
+		p99Provenance := &latency.Percentile{
+			Status:      latency.StatusMeasured,
+			Method:      latency.MethodNearestRank,
+			SampleCount: sampleCount,
+			LowSample:   sampleCount < latency.LowSampleThreshold,
+		}
+		if acc.spanCount > int64(len(acc.latencies)) {
+			p99Provenance.Status = latency.StatusBounded
+			p99Provenance.Method = latency.MethodRetainedPrefix
+			p99Provenance.PopulationCount = uint64(acc.spanCount) // #nosec G115 -- spanCount is increment-only.
+			p99Provenance.SampleLimit = serviceLatencySampleLimit
+		}
 
 		rps := float64(acc.spanCount) / windowSeconds
 
 		score, status := healthScore(errorRate, avgMs)
-		alerts := buildAlerts(name, errorRate, p99Ms)
+		alerts := buildAlerts(name, errorRate, p99Ms, p99Provenance.Status)
 
 		resultNodes[name] = &ServiceNode{
-			Name:           name,
-			HealthScore:    score,
-			Status:         status,
-			RequestRateRPS: rps,
-			ErrorRate:      errorRate,
-			AvgLatencyMs:   avgMs,
-			P99LatencyMs:   p99Ms,
-			SpanCount:      acc.spanCount,
-			Alerts:         alerts,
+			Name:              name,
+			HealthScore:       score,
+			Status:            status,
+			RequestRateRPS:    rps,
+			ErrorRate:         errorRate,
+			AvgLatencyMs:      avgMs,
+			P99LatencyMs:      p99Ms,
+			LatencyProvenance: &latency.Provenance{P99: p99Provenance},
+			SpanCount:         acc.spanCount,
+			Alerts:            alerts,
 		}
 	}
 
@@ -293,13 +312,17 @@ func healthScore(errorRate, avgLatencyMs float64) (float64, string) {
 }
 
 // buildAlerts generates human-readable alert strings for AI agent consumption.
-func buildAlerts(service string, errorRate, p99Ms float64) []string {
+func buildAlerts(service string, errorRate, p99Ms float64, status latency.Status) []string {
 	var alerts []string
 	if errorRate > 0.05 {
 		alerts = append(alerts, "high error rate: "+pctStr(errorRate))
 	}
 	if p99Ms > 500 {
-		alerts = append(alerts, "p99 latency exceeds 500ms")
+		if status == latency.StatusBounded {
+			alerts = append(alerts, "sample p99 latency exceeds 500ms")
+		} else {
+			alerts = append(alerts, "p99 latency exceeds 500ms")
+		}
 	}
 	return alerts
 }

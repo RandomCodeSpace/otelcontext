@@ -21,6 +21,7 @@ import (
 	"github.com/RandomCodeSpace/otelcontext/internal/aggregate"
 	"github.com/RandomCodeSpace/otelcontext/internal/api"
 	"github.com/RandomCodeSpace/otelcontext/internal/graphrag"
+	"github.com/RandomCodeSpace/otelcontext/internal/latency"
 	"github.com/RandomCodeSpace/otelcontext/internal/mcp"
 	"github.com/RandomCodeSpace/otelcontext/internal/realtime"
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
@@ -200,10 +201,22 @@ func topologySnapshot(source topology.Source, epoch string, revision uint64, tar
 	if empty {
 		return topology.Snapshot{Nodes: []topology.Node{}, Edges: []topology.Edge{}, Meta: meta}
 	}
+	p99 := &latency.Percentile{
+		Status: latency.StatusEstimated, Method: latency.MethodAverageMultiplier,
+		SampleCount: 1000, EstimateFactor: 2.5,
+	}
+	p99LatencyMs := 52.225
+	if source == topology.SourceAggregate {
+		p99 = &latency.Percentile{
+			Status: latency.StatusApproximate, Method: latency.MethodDDSketch,
+			SampleCount: 1000, SketchScale: aggregate.SketchDefaultScale, RelativeErrorBound: 0.0217,
+		}
+		p99LatencyMs = 1000
+	}
 	return topology.Snapshot{
 		Nodes: []topology.Node{
-			{Name: "gateway", TotalTraces: 10, SpanCount: 10, HealthScore: 100, Status: "healthy"},
-			{Name: target, TotalTraces: 10, SpanCount: 10, HealthScore: 100, Status: "healthy"},
+			{Name: "gateway", TotalTraces: 1000, AvgLatencyMs: 20.89, P99LatencyMs: p99LatencyMs, LatencyProvenance: &latency.Provenance{P99: p99}, SpanCount: 1000, HealthScore: 100, Status: "healthy"},
+			{Name: target, TotalTraces: 1000, AvgLatencyMs: 20.89, P99LatencyMs: p99LatencyMs, LatencyProvenance: &latency.Provenance{P99: p99}, SpanCount: 1000, HealthScore: 100, Status: "healthy"},
 		},
 		Edges: []topology.Edge{{Source: "gateway", Target: target, CallCount: 10, AvgLatencyMs: 4, Status: "healthy"}},
 		Meta:  meta,
@@ -231,11 +244,16 @@ func aggregateSnapshot(epoch, revision uint64, target string, empty bool) aggreg
 		Closed:            true,
 		Final:             true,
 		Elapsed:           aggregate.WindowSize,
-		Count:             10,
-		DurationCount:     10,
-		DurationSumMicros: 40_000,
-		P95Micros:         5_000,
-		P99Micros:         6_000,
+		Count:             1000,
+		DurationCount:     1000,
+		DurationSumMicros: 20_890_000,
+		P95Micros:         10_000,
+		P99Micros:         1_000_000,
+		LatencyProvenance: &latency.Provenance{P95: &latency.Percentile{
+			Status: latency.StatusApproximate, Method: latency.MethodDDSketch, SampleCount: 1000, SketchScale: aggregate.SketchDefaultScale, RelativeErrorBound: 0.0217,
+		}, P99: &latency.Percentile{
+			Status: latency.StatusApproximate, Method: latency.MethodDDSketch, SampleCount: 1000, SketchScale: aggregate.SketchDefaultScale, RelativeErrorBound: 0.0217,
+		}},
 	}
 	base.Services = []aggregate.TopologyService{
 		{Name: "gateway", FirstSeen: now, LastSeen: window.End, Windows: []aggregate.TopologyWindow{window}},
@@ -263,7 +281,7 @@ func (p providerPublisher) Snapshot(ctx context.Context, _ string) *realtime.Liv
 	}
 	nodes := make([]storage.ServiceMapNode, len(snapshot.Nodes))
 	for i, node := range snapshot.Nodes {
-		nodes[i] = storage.ServiceMapNode{Name: node.Name, TotalTraces: node.TotalTraces, ErrorCount: node.ErrorCount, AvgLatencyMs: node.AvgLatencyMs}
+		nodes[i] = storage.ServiceMapNode{Name: node.Name, TotalTraces: node.TotalTraces, ErrorCount: node.ErrorCount, AvgLatencyMs: node.AvgLatencyMs, P99LatencyMs: node.P99LatencyMs, LatencyProvenance: node.LatencyProvenance}
 	}
 	edges := make([]storage.ServiceMapEdge, len(snapshot.Edges))
 	for i, edge := range snapshot.Edges {

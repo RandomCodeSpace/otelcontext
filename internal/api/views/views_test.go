@@ -8,6 +8,7 @@ import (
 
 	"github.com/RandomCodeSpace/otelcontext/internal/aggregate"
 	"github.com/RandomCodeSpace/otelcontext/internal/graphrag"
+	"github.com/RandomCodeSpace/otelcontext/internal/latency"
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 	"gorm.io/gorm"
 )
@@ -213,7 +214,8 @@ func TestDashboardStatsBasisFields(t *testing.T) {
 		RequestCount: 7, ErrorRequestCount: 2, RequestErrorRate: 28.5,
 		SpanCount: 140, SpanErrorCount: 30, SpanErrorRate: 21.4,
 		TotalLogs: 9, ActiveServices: 3, P99LatencyMicros: 2500,
-		Coverage: aggregate.CoverageFull,
+		LatencyProvenance: latency.Provenance{P99: &latency.Percentile{Status: latency.StatusApproximate, Method: latency.MethodDDSketch, SampleCount: 140}},
+		Coverage:          aggregate.CoverageFull,
 	})
 	if agg.TotalTraces != 7 || agg.TotalErrors != 2 || agg.ErrorRate != 28.5 {
 		t.Fatalf("headline trio = %d/%d/%v, want the request basis 7/2/28.5",
@@ -230,7 +232,7 @@ func TestDashboardStatsBasisFields(t *testing.T) {
 		t.Fatalf("marshal aggregate dashboard: %v", err)
 	}
 	for _, key := range []string{`"requests":7`, `"request_errors":2`, `"request_error_rate":28.5`,
-		`"spans":140`, `"span_errors":30`, `"span_error_rate":21.4`} {
+		`"spans":140`, `"span_errors":30`, `"span_error_rate":21.4`, `"latency_provenance":{"p99":{"status":"approximate"`} {
 		if !strings.Contains(string(b), key) {
 			t.Errorf("aggregate dashboard JSON missing %s: %s", key, b)
 		}

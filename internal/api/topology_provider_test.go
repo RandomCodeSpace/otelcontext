@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/RandomCodeSpace/otelcontext/internal/api/views"
+	"github.com/RandomCodeSpace/otelcontext/internal/latency"
 	"github.com/RandomCodeSpace/otelcontext/internal/topology"
 )
 
@@ -30,7 +31,7 @@ func TestAggregateTopologyProviderOwnsBothRESTGraphs(t *testing.T) {
 		source:   topology.SourceAggregate,
 		identity: topology.Identity{Epoch: "boot-a", Revision: 7},
 		snapshot: topology.Snapshot{
-			Nodes: []topology.Node{{Name: "gateway"}, {Name: "aggregate-payments"}},
+			Nodes: []topology.Node{{Name: "gateway", P99LatencyMs: 1000, LatencyProvenance: &latency.Provenance{P99: &latency.Percentile{Status: latency.StatusApproximate, Method: latency.MethodDDSketch, SampleCount: 1000}}}, {Name: "aggregate-payments"}},
 			Edges: []topology.Edge{{Source: "gateway", Target: "aggregate-payments", CallCount: 4}},
 			Meta: topology.Metadata{
 				Source:   topology.SourceAggregate,
@@ -59,6 +60,9 @@ func TestAggregateTopologyProviderOwnsBothRESTGraphs(t *testing.T) {
 	if serviceMap.Epoch != "boot-a" || serviceMap.Revision != 7 {
 		t.Fatalf("service map identity = %q/%d, want boot-a/7", serviceMap.Epoch, serviceMap.Revision)
 	}
+	if serviceMap.Nodes[0].P99LatencyMs != 1000 || serviceMap.Nodes[0].LatencyProvenance == nil || serviceMap.Nodes[0].LatencyProvenance.P99.Status != latency.StatusApproximate {
+		t.Fatalf("service map latency = %+v", serviceMap.Nodes[0])
+	}
 
 	systemReq := httptest.NewRequest("GET", "/api/system/graph", nil)
 	systemRec := httptest.NewRecorder()
@@ -75,6 +79,9 @@ func TestAggregateTopologyProviderOwnsBothRESTGraphs(t *testing.T) {
 	}
 	if systemGraph.Epoch != "boot-a" || systemGraph.Revision != 7 {
 		t.Fatalf("system graph identity = %q/%d, want boot-a/7", systemGraph.Epoch, systemGraph.Revision)
+	}
+	if systemGraph.Nodes[0].Metrics.P99LatencyMs != 1000 || systemGraph.Nodes[0].Metrics.LatencyProvenance == nil || systemGraph.Nodes[0].Metrics.LatencyProvenance.P99.SampleCount != 1000 {
+		t.Fatalf("system graph latency = %+v", systemGraph.Nodes[0].Metrics)
 	}
 }
 

@@ -770,6 +770,9 @@ func assertNoUnexpectedBrowserEvents(t *testing.T, recorder *eventRecorder) {
 }
 
 func TestProtectedBrowserWorkflow(t *testing.T) {
+	if browserCase := strings.TrimSpace(os.Getenv("OTELCONTEXT_BROWSER_CASE")); browserCase != "" && browserCase != "protected" {
+		t.Skip("OTELCONTEXT_BROWSER_CASE selects " + browserCase)
+	}
 	binary := requiredBinary(t)
 	chrome := requiredChrome(t)
 	artifacts := artifactDirectory(t)
@@ -1111,4 +1114,96 @@ func TestProtectedBrowserWorkflow(t *testing.T) {
 
 	smoke.validateInventory()
 	assertNoUnexpectedBrowserEvents(t, recorder)
+}
+
+func TestLatencyLabels(t *testing.T) {
+	if strings.TrimSpace(os.Getenv("OTELCONTEXT_BROWSER_CASE")) != "latency" {
+		t.Skip("set OTELCONTEXT_BROWSER_CASE=latency")
+	}
+	binary := requiredBinary(t)
+	chrome := requiredChrome(t)
+	app := newAppProcess(t, binary)
+	if err := app.start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = app.stop() })
+	readyCtx, readyCancel := context.WithTimeout(context.Background(), readyTimeout)
+	if err := waitReady(readyCtx, app.baseURL()); err != nil {
+		readyCancel()
+		t.Fatalf("application did not become ready: %v\n%s", err, app.log.Bytes())
+	}
+	readyCancel()
+
+	allocatorOptions := append([]chromedp.ExecAllocatorOption{}, chromedp.DefaultExecAllocatorOptions[:]...)
+	allocatorOptions = append(allocatorOptions, chromedp.ExecPath(chrome), chromedp.Flag("disable-dev-shm-usage", true))
+	if os.Geteuid() == 0 {
+		allocatorOptions = append(allocatorOptions, chromedp.NoSandbox)
+	}
+	allocatorCtx, cancelAllocator := chromedp.NewExecAllocator(context.Background(), allocatorOptions...)
+	defer cancelAllocator()
+	browserCtx, cancelBrowser := chromedp.NewContext(allocatorCtx)
+	defer cancelBrowser()
+	ctx, cancel := context.WithTimeout(browserCtx, 60*time.Second)
+	defer cancel()
+	if err := chromedp.Run(ctx, chromedp.Navigate(app.baseURL()+"/")); err != nil {
+		t.Fatal(err)
+	}
+	requireJS(t, ctx, `document.readyState === "complete" && !!document.querySelector('script[type="module"][src="/static/app.js"]')`, 10*time.Second)
+
+	var raw string
+	if err := chromedp.Run(ctx, chromedp.Evaluate(`
+		(async () => {
+			const ui = await import("/static/app.js");
+			return JSON.stringify({
+				cases: [
+					ui.formatP99(1000, {p99:{status:"measured",method:"ordered_rank",sample_count:1000}}),
+					ui.formatP99(980, {p99:{status:"approximate",method:"ddsketch",sample_count:1000,relative_error_bound:0.0217}}),
+					ui.formatP99(52, {p99:{status:"estimated",method:"average_multiplier",sample_count:1000,estimate_factor:2.5}}),
+					ui.formatP99(1000, {p99:{status:"bounded",method:"retained_prefix",sample_count:1000,population_count:1001,sample_limit:1000}}),
+					ui.formatP99(0, {p99:{status:"unavailable",reason:"no_observations"}}),
+					ui.formatP99(42, null),
+					ui.formatP99(10, {p99:{status:"measured",method:"ordered_rank",sample_count:99,low_sample:true}})
+				],
+				estimatedPulse: ui.formatPulseLatency(
+					{avg_latency_ms:21},
+					{p99_latency_ms:52,latency_provenance:{p99:{status:"estimated",method:"average_multiplier",sample_count:1000,estimate_factor:2.5}}}
+				),
+				averagePulse: ui.formatPulseLatency({avg_latency_ms:21}, {})
+			});
+		})()
+	`, &raw, func(params *cdpruntime.EvaluateParams) *cdpruntime.EvaluateParams {
+		return params.WithAwaitPromise(true)
+	})); err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Cases []struct {
+			Label       string `json:"label"`
+			Value       string `json:"value"`
+			Explanation string `json:"explanation"`
+		} `json:"cases"`
+		EstimatedPulse struct {
+			Label string `json:"label"`
+			Value string `json:"value"`
+		} `json:"estimatedPulse"`
+		AveragePulse struct {
+			Label string `json:"label"`
+			Value string `json:"value"`
+		} `json:"averagePulse"`
+	}
+	if err := json.Unmarshal([]byte(raw), &got); err != nil {
+		t.Fatal(err)
+	}
+	wantLabels := []string{"P99", "Approx. p99", "Estimated tail", "Sample p99", "P99 unavailable", "Reported p99", "P99"}
+	for i, label := range wantLabels {
+		if got.Cases[i].Label != label {
+			t.Fatalf("case %d label=%q, want %q", i, got.Cases[i].Label, label)
+		}
+	}
+	if got.Cases[2].Value != "~52ms" || got.Cases[4].Value != "—" || !strings.Contains(got.Cases[1].Explanation, "±2.2%") || !strings.Contains(got.Cases[6].Explanation, "low sample") {
+		t.Fatalf("formatter cases = %+v", got.Cases)
+	}
+	if got.EstimatedPulse.Label != "Estimated tail" || got.EstimatedPulse.Value != "~52ms" || got.AveragePulse.Label != "Average" || got.AveragePulse.Value != "21ms" {
+		t.Fatalf("pulse cases = estimated %+v average %+v", got.EstimatedPulse, got.AveragePulse)
+	}
 }

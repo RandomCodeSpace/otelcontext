@@ -125,22 +125,24 @@ func (p *EnginePublisher) Snapshot(ctx context.Context, service string) *LiveSna
 	}
 
 	if dash, err := p.engine.QueryDashboard(q); err == nil {
+		provenance := dash.LatencyProvenance
 		snap.Dashboard = &storage.DashboardStats{
 			// Headline trio on the REQUEST basis, restated by name alongside
 			// the span basis — same contract as the HTTP dashboard view.
-			TotalTraces:      dash.RequestCount,
-			TotalErrors:      dash.ErrorRequestCount,
-			ErrorRate:        dash.RequestErrorRate,
-			Requests:         dash.RequestCount,
-			RequestErrors:    dash.ErrorRequestCount,
-			RequestErrorRate: dash.RequestErrorRate,
-			Spans:            dash.SpanCount,
-			SpanErrors:       dash.SpanErrorCount,
-			SpanErrorRate:    dash.SpanErrorRate,
-			TotalLogs:        dash.TotalLogs,
-			AvgLatencyMs:     dash.AvgLatencyMs,
-			ActiveServices:   dash.ActiveServices,
-			P99Latency:       int64(dash.P99LatencyMicros),
+			TotalTraces:       dash.RequestCount,
+			TotalErrors:       dash.ErrorRequestCount,
+			ErrorRate:         dash.RequestErrorRate,
+			Requests:          dash.RequestCount,
+			RequestErrors:     dash.ErrorRequestCount,
+			RequestErrorRate:  dash.RequestErrorRate,
+			Spans:             dash.SpanCount,
+			SpanErrors:        dash.SpanErrorCount,
+			SpanErrorRate:     dash.SpanErrorRate,
+			TotalLogs:         dash.TotalLogs,
+			AvgLatencyMs:      dash.AvgLatencyMs,
+			ActiveServices:    dash.ActiveServices,
+			P99Latency:        int64(dash.P99LatencyMicros),
+			LatencyProvenance: &provenance,
 		}
 		for _, s := range dash.TopFailing {
 			snap.Dashboard.TopFailingServices = append(snap.Dashboard.TopFailingServices, storage.ServiceError{
@@ -171,10 +173,12 @@ func (p *EnginePublisher) Snapshot(ctx context.Context, service string) *LiveSna
 		}
 		for _, n := range topologySnapshot.Nodes {
 			sm.Nodes = append(sm.Nodes, storage.ServiceMapNode{
-				Name:         n.Name,
-				TotalTraces:  n.TotalTraces,
-				ErrorCount:   n.ErrorCount,
-				AvgLatencyMs: n.AvgLatencyMs,
+				Name:              n.Name,
+				TotalTraces:       n.TotalTraces,
+				ErrorCount:        n.ErrorCount,
+				AvgLatencyMs:      n.AvgLatencyMs,
+				P99LatencyMs:      n.P99LatencyMs,
+				LatencyProvenance: n.LatencyProvenance,
 			})
 		}
 		for _, e := range topologySnapshot.Edges {

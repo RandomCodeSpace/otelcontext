@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/RandomCodeSpace/otelcontext/internal/aggregate"
+	"github.com/RandomCodeSpace/otelcontext/internal/latency"
 )
 
 // tenantStores bundles one tenant's slice of the four layered in-memory
@@ -193,6 +194,15 @@ func (s *ServiceStore) UpsertService(name string, durationMs float64, isError bo
 		svc.FirstSeen = ts
 	}
 	svc.AvgLatency = svc.TotalMs / float64(svc.CallCount)
+	svc.P99Latency = svc.AvgLatency * 2.5
+	sampleCount := uint64(svc.CallCount) // #nosec G115 -- call count is increment-only.
+	svc.LatencyProvenance = &latency.Provenance{P99: &latency.Percentile{
+		Status:         latency.StatusEstimated,
+		Method:         latency.MethodAverageMultiplier,
+		SampleCount:    sampleCount,
+		LowSample:      sampleCount < latency.LowSampleThreshold,
+		EstimateFactor: 2.5,
+	}}
 	svc.ErrorRate = float64(svc.ErrorCount) / float64(svc.CallCount)
 	svc.HealthScore = computeHealth(svc.ErrorRate, svc.AvgLatency)
 }
@@ -223,6 +233,7 @@ func (s *ServiceStore) UpsertOperation(service, operation string, durationMs flo
 		op.LastSeen = ts
 	}
 	op.AvgLatency = op.TotalMs / float64(op.CallCount)
+	op.LatencyProvenance = unavailableOperationLatency()
 	op.ErrorRate = float64(op.ErrorCount) / float64(op.CallCount)
 	op.HealthScore = computeHealth(op.ErrorRate, op.AvgLatency)
 
@@ -236,6 +247,16 @@ func (s *ServiceStore) UpsertOperation(service, operation string, durationMs flo
 			UpdatedAt: ts,
 		}
 	}
+}
+
+func unavailableOperationLatency() *latency.Provenance {
+	percentile := func() *latency.Percentile {
+		return &latency.Percentile{
+			Status: latency.StatusUnavailable,
+			Reason: latency.ReasonPercentileNotRecorded,
+		}
+	}
+	return &latency.Provenance{P50: percentile(), P95: percentile(), P99: percentile()}
 }
 
 func (s *ServiceStore) UpsertCallEdge(source, target string, durationMs float64, isError bool, ts time.Time) {
@@ -287,6 +308,11 @@ func (s *ServiceStore) EnsureService(name string, ts time.Time) bool {
 		Name:      name,
 		FirstSeen: ts,
 		LastSeen:  ts,
+		LatencyProvenance: &latency.Provenance{P99: &latency.Percentile{
+			Status: latency.StatusUnavailable,
+			Method: latency.MethodAverageMultiplier,
+			Reason: latency.ReasonNoObservations,
+		}},
 	}
 	return true
 }

@@ -3,11 +3,15 @@ package telemetry
 import (
 	"database/sql"
 	"encoding/json"
+	"math"
 	"net/http"
 	"runtime"
+	"sort"
+	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/RandomCodeSpace/otelcontext/internal/latency"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -349,11 +353,16 @@ type Metrics struct {
 	ExemplarPurgeDurationSeconds prometheus.Histogram
 
 	// Atomic counters for JSON health endpoint (avoids scraping Prometheus)
-	totalIngested  atomic.Int64
-	activeConns    atomic.Int64
-	dlqFileCount   atomic.Int64
-	dbLatencyP99Ms atomic.Int64
-	startTime      time.Time
+	totalIngested     atomic.Int64
+	activeConns       atomic.Int64
+	dlqFileCount      atomic.Int64
+	dbLatencyMu       sync.Mutex
+	dbLatencyRing     [1024]float64
+	dbLatencyNext     int
+	dbLatencyLen      int
+	dbLatencyObserved uint64
+	dbLatencyLastMs   float64
+	startTime         time.Time
 }
 
 // New creates and registers all OtelContext internal metrics.
@@ -946,33 +955,75 @@ func (m *Metrics) SetDLQSize(n int) {
 
 func (m *Metrics) ObserveDBLatency(seconds float64) {
 	m.DBLatency.Observe(seconds)
-	m.dbLatencyP99Ms.Store(int64(seconds * 1000))
+	m.dbLatencyMu.Lock()
+	m.dbLatencyLastMs = seconds * 1000
+	m.dbLatencyRing[m.dbLatencyNext] = m.dbLatencyLastMs
+	m.dbLatencyNext = (m.dbLatencyNext + 1) % len(m.dbLatencyRing)
+	if m.dbLatencyLen < len(m.dbLatencyRing) {
+		m.dbLatencyLen++
+	}
+	m.dbLatencyObserved++
+	m.dbLatencyMu.Unlock()
 }
 
 // --- Health endpoint ---
 
 // HealthStats is the JSON response for GET /api/health.
 type HealthStats struct {
-	IngestionRate  int64   `json:"ingestion_rate"`
-	DLQSize        int64   `json:"dlq_size"`
-	ActiveConns    int64   `json:"active_connections"`
-	DBLatencyP99Ms float64 `json:"db_latency_p99_ms"`
-	Goroutines     int     `json:"goroutines"`
-	HeapAllocMB    float64 `json:"heap_alloc_mb"`
-	UptimeSeconds  float64 `json:"uptime_seconds"`
+	IngestionRate     int64               `json:"ingestion_rate"`
+	DLQSize           int64               `json:"dlq_size"`
+	ActiveConns       int64               `json:"active_connections"`
+	DBLatencyP99Ms    float64             `json:"db_latency_p99_ms"`
+	DBLatencyLastMs   float64             `json:"db_latency_last_ms"`
+	LatencyProvenance *latency.Provenance `json:"latency_provenance,omitempty"`
+	Goroutines        int                 `json:"goroutines"`
+	HeapAllocMB       float64             `json:"heap_alloc_mb"`
+	UptimeSeconds     float64             `json:"uptime_seconds"`
+}
+
+func (m *Metrics) dbLatencySnapshot() (float64, float64, *latency.Provenance) {
+	m.dbLatencyMu.Lock()
+	values := append([]float64(nil), m.dbLatencyRing[:m.dbLatencyLen]...)
+	observed := m.dbLatencyObserved
+	last := m.dbLatencyLastMs
+	m.dbLatencyMu.Unlock()
+
+	percentile := &latency.Percentile{
+		Status: latency.StatusUnavailable,
+		Method: latency.MethodRollingObservationWindow,
+		Reason: latency.ReasonNoObservations,
+	}
+	if len(values) == 0 {
+		return 0, last, &latency.Provenance{P99: percentile}
+	}
+	sort.Float64s(values)
+	index := int(math.Ceil(float64(len(values))*0.99)) - 1
+	percentile.Status = latency.StatusMeasured
+	percentile.SampleCount = uint64(len(values))
+	percentile.LowSample = percentile.SampleCount < latency.LowSampleThreshold
+	percentile.Reason = ""
+	if observed > uint64(len(m.dbLatencyRing)) {
+		percentile.Status = latency.StatusBounded
+		percentile.PopulationCount = observed
+		percentile.SampleLimit = uint64(len(m.dbLatencyRing))
+	}
+	return values[index], last, &latency.Provenance{P99: percentile}
 }
 
 func (m *Metrics) GetHealthStats() HealthStats {
 	var ms runtime.MemStats
 	runtime.ReadMemStats(&ms)
+	dbP99, dbLast, provenance := m.dbLatencySnapshot()
 	return HealthStats{
-		IngestionRate:  m.totalIngested.Load(),
-		DLQSize:        m.dlqFileCount.Load(),
-		ActiveConns:    m.activeConns.Load(),
-		DBLatencyP99Ms: float64(m.dbLatencyP99Ms.Load()),
-		Goroutines:     runtime.NumGoroutine(),
-		HeapAllocMB:    float64(ms.HeapAlloc) / 1024 / 1024,
-		UptimeSeconds:  time.Since(m.startTime).Seconds(),
+		IngestionRate:     m.totalIngested.Load(),
+		DLQSize:           m.dlqFileCount.Load(),
+		ActiveConns:       m.activeConns.Load(),
+		DBLatencyP99Ms:    dbP99,
+		DBLatencyLastMs:   dbLast,
+		LatencyProvenance: provenance,
+		Goroutines:        runtime.NumGoroutine(),
+		HeapAllocMB:       float64(ms.HeapAlloc) / 1024 / 1024,
+		UptimeSeconds:     time.Since(m.startTime).Seconds(),
 	}
 }
 

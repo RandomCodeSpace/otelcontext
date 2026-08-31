@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/RandomCodeSpace/otelcontext/internal/aggregate"
+	"github.com/RandomCodeSpace/otelcontext/internal/latency"
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 )
 
@@ -21,7 +22,7 @@ func (f fakeLegacyRepository) GetServiceMapMetrics(context.Context, time.Time, t
 func TestLegacyProviderExplicitRangeUsesLegacyTopology(t *testing.T) {
 	repo := fakeLegacyRepository{result: &storage.ServiceMapMetrics{
 		Nodes: []storage.ServiceMapNode{
-			{Name: "gateway", TotalTraces: 4},
+			{Name: "gateway", TotalTraces: 4, P99LatencyMs: 52, LatencyProvenance: &latency.Provenance{P99: &latency.Percentile{Status: latency.StatusEstimated, Method: latency.MethodAverageMultiplier, SampleCount: 4, EstimateFactor: 2.5}}},
 			{Name: "legacy-payments", TotalTraces: 3},
 		},
 		Edges: []storage.ServiceMapEdge{{Source: "gateway", Target: "legacy-payments", CallCount: 3}},
@@ -45,6 +46,27 @@ func TestLegacyProviderExplicitRangeUsesLegacyTopology(t *testing.T) {
 	}
 	if got := snapshot.Edges[0]; got.Source != "gateway" || got.Target != "legacy-payments" {
 		t.Fatalf("edge = %+v, want gateway -> legacy-payments", got)
+	}
+	if got := snapshot.Nodes[0]; got.P99LatencyMs != 52 || got.LatencyProvenance == nil || got.LatencyProvenance.P99.Status != latency.StatusEstimated {
+		t.Fatalf("latency contract = %+v", got)
+	}
+}
+
+func TestAggregateProjectionCarriesLatestSketchProvenance(t *testing.T) {
+	p99 := &latency.Percentile{Status: latency.StatusApproximate, Method: latency.MethodDDSketch, SampleCount: 1000, SketchScale: 4, RelativeErrorBound: 0.0217}
+	snapshot := fromAggregateProjection(aggregate.TopologySnapshot{Services: []aggregate.TopologyService{{
+		Name: "checkout",
+		Windows: []aggregate.TopologyWindow{{
+			Count: 1000, DurationCount: 1000, P99Micros: 1_000_000,
+			LatencyProvenance: &latency.Provenance{P99: p99},
+		}},
+	}}})
+	if len(snapshot.Nodes) != 1 {
+		t.Fatalf("nodes = %+v", snapshot.Nodes)
+	}
+	node := snapshot.Nodes[0]
+	if node.P99LatencyMs != 1000 || node.LatencyProvenance == nil || node.LatencyProvenance.P99.SampleCount != 1000 || node.LatencyProvenance.P99.RelativeErrorBound != 0.0217 {
+		t.Fatalf("node latency = %+v", node)
 	}
 }
 

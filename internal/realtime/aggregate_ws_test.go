@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/RandomCodeSpace/otelcontext/internal/latency"
+	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 	"github.com/coder/websocket"
 )
 
@@ -309,5 +311,30 @@ func TestAggregateSnapshotNeverCarriesTraces(t *testing.T) {
 	snap := pub.Snapshot(context.Background(), "")
 	if snap.Traces != nil {
 		t.Fatal("coalesced aggregate snapshot carries raw traces")
+	}
+}
+
+func TestWebSocketDashboardPreservesMicrosecondsAndProvenance(t *testing.T) {
+	snap := LiveSnapshot{Dashboard: &storage.DashboardStats{
+		P99Latency: 1_000_000,
+		LatencyProvenance: &latency.Provenance{P99: &latency.Percentile{
+			Status: latency.StatusApproximate, Method: latency.MethodDDSketch, SampleCount: 1000,
+		}},
+	}}
+	data, err := json.Marshal(snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire struct {
+		Dashboard struct {
+			P99               int64              `json:"p99_latency"`
+			LatencyProvenance latency.Provenance `json:"latency_provenance"`
+		} `json:"dashboard"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		t.Fatal(err)
+	}
+	if wire.Dashboard.P99 != 1_000_000 || wire.Dashboard.LatencyProvenance.P99.Status != latency.StatusApproximate {
+		t.Fatalf("wire dashboard = %+v", wire.Dashboard)
 	}
 }

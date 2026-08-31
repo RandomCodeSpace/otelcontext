@@ -5,6 +5,8 @@ package graphrag
 
 import (
 	"time"
+
+	"github.com/RandomCodeSpace/otelcontext/internal/latency"
 )
 
 // --- Node Types ---
@@ -30,11 +32,14 @@ type ServiceNode struct {
 	LastSeen    time.Time `json:"last_seen"`
 	HealthScore float64   `json:"health_score"` // 0.0–1.0
 
-	CallCount  int64   `json:"call_count"`
-	ErrorCount int64   `json:"error_count"`
-	ErrorRate  float64 `json:"error_rate"`
-	AvgLatency float64 `json:"avg_latency_ms"`
-	TotalMs    float64 `json:"-"` // for computing avg
+	CallCount         int64               `json:"call_count"`
+	ErrorCount        int64               `json:"error_count"`
+	ErrorRate         float64             `json:"error_rate"`
+	AvgLatency        float64             `json:"avg_latency_ms"`
+	P95Latency        float64             `json:"p95_latency_ms,omitempty"`
+	P99Latency        float64             `json:"p99_latency_ms,omitempty"`
+	LatencyProvenance *latency.Provenance `json:"latency_provenance,omitempty"`
+	TotalMs           float64             `json:"-"` // for computing avg
 }
 
 // OperationNode represents an endpoint/RPC within a service.
@@ -46,14 +51,15 @@ type OperationNode struct {
 	LastSeen    time.Time `json:"last_seen"`
 	HealthScore float64   `json:"health_score"`
 
-	CallCount  int64   `json:"call_count"`
-	ErrorCount int64   `json:"error_count"`
-	ErrorRate  float64 `json:"error_rate"`
-	AvgLatency float64 `json:"avg_latency_ms"`
-	P50Latency float64 `json:"p50_latency_ms"`
-	P95Latency float64 `json:"p95_latency_ms"`
-	P99Latency float64 `json:"p99_latency_ms"`
-	TotalMs    float64 `json:"-"`
+	CallCount         int64               `json:"call_count"`
+	ErrorCount        int64               `json:"error_count"`
+	ErrorRate         float64             `json:"error_rate"`
+	AvgLatency        float64             `json:"avg_latency_ms"`
+	P50Latency        float64             `json:"p50_latency_ms"`
+	P95Latency        float64             `json:"p95_latency_ms"`
+	P99Latency        float64             `json:"p99_latency_ms"`
+	LatencyProvenance *latency.Provenance `json:"latency_provenance,omitempty"`
+	TotalMs           float64             `json:"-"`
 }
 
 // TraceNode represents a distributed trace.
