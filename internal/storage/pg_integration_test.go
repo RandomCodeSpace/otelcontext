@@ -263,7 +263,15 @@ func TestPG_PgTrgm_SubstringQueryUsesGIN(t *testing.T) {
 		t.Fatalf("analyze: %v", err)
 	}
 
-	rows, err := repo.db.Raw(
+	planDB := repo.db.Begin()
+	if planDB.Error != nil {
+		t.Fatalf("begin planner proof: %v", planDB.Error)
+	}
+	defer planDB.Rollback()
+	if err := planDB.Exec("SET LOCAL enable_seqscan = off").Error; err != nil {
+		t.Fatalf("disable sequential scans for planner proof: %v", err)
+	}
+	rows, err := planDB.Raw(
 		"EXPLAIN SELECT id FROM logs WHERE body ILIKE ?",
 		"%connection-refused-dbcontract%",
 	).Rows()
