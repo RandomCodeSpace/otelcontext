@@ -11,6 +11,7 @@ import (
 
 	"github.com/RandomCodeSpace/otelcontext/internal/authn"
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
+	"github.com/RandomCodeSpace/otelcontext/internal/topology"
 	"github.com/coder/websocket"
 )
 
@@ -59,6 +60,13 @@ type HubBatch struct {
 	Data any    `json:"data"` // Slice of entries
 }
 
+type topologyRefresh struct {
+	Source   string `json:"source"`
+	Epoch    string `json:"epoch"`
+	Revision uint64 `json:"revision"`
+	Reset    bool   `json:"reset,omitempty"`
+}
+
 // Hub is a buffered WebSocket broadcast hub.
 //
 // Instead of broadcasting each log individually (which would freeze the UI at high throughput),
@@ -90,6 +98,13 @@ type Hub struct {
 	// re-broadcasting every event would contradict the coalesced,
 	// revision-driven publication the event hub performs (#164).
 	aggregateMode atomic.Bool
+	// topology emits one small browser wake-up for each coalesced aggregate
+	// replacement. The browser then refetches the provider-owned REST view.
+	topology          topology.Provider
+	topologyFloor     time.Duration
+	topologyEpoch     string
+	topologyRevision  uint64
+	topologyPublished bool
 
 	stopCh chan struct{}
 	// runOwner is claimed exactly once, by whichever of Run or Stop gets there
@@ -177,6 +192,17 @@ func (h *Hub) Run() {
 
 	flushTicker := time.NewTicker(h.flushInterval)
 	defer flushTicker.Stop()
+	var topologyTicker *time.Ticker
+	var topologyC <-chan time.Time
+	if h.aggregateMode.Load() && h.topology != nil && h.topology.Source() == topology.SourceAggregate {
+		floor := h.topologyFloor
+		if floor <= 0 {
+			floor = DefaultPublishFloor
+		}
+		topologyTicker = time.NewTicker(floor)
+		topologyC = topologyTicker.C
+		defer topologyTicker.Stop()
+	}
 
 	for {
 		select {
@@ -196,6 +222,19 @@ func (h *Hub) Run() {
 
 		case c := <-h.register:
 			h.clients[c] = struct{}{}
+			if msg, id, ok := h.topologyRefreshMessage(c.tenant, true); ok {
+				if h.topologyPublished && h.topologyEpoch == id.Epoch && id.Revision < h.topologyRevision {
+					id = topology.Identity{Epoch: h.topologyEpoch, Revision: h.topologyRevision}
+					msg, _ = json.Marshal(HubBatch{Type: "topology_refresh", Data: topologyRefresh{
+						Source: string(h.topology.Source()), Epoch: id.Epoch, Revision: id.Revision, Reset: true,
+					}})
+				}
+				select {
+				case c.send <- msg:
+					h.topologyEpoch, h.topologyRevision, h.topologyPublished = id.Epoch, id.Revision, true
+				default:
+				}
+			}
 			slog.Info("🔌 WebSocket client connected", "total", len(h.clients))
 			if h.onConnectionChange != nil {
 				h.onConnectionChange(len(h.clients))
@@ -235,7 +274,100 @@ func (h *Hub) Run() {
 
 		case <-flushTicker.C:
 			h.flush()
+
+		case <-topologyC:
+			h.publishTopologyRefresh()
 		}
+	}
+}
+
+// SetTopologyProvider installs the construction-time provider used only for
+// aggregate browser refresh notifications. Legacy raw batches are unchanged.
+func (h *Hub) SetTopologyProvider(provider topology.Provider, floor time.Duration) {
+	if provider == nil {
+		return
+	}
+	if floor <= 0 {
+		floor = DefaultPublishFloor
+	}
+	h.topology = provider
+	h.topologyFloor = floor
+}
+
+func (h *Hub) topologyRefreshMessage(tenant string, reset bool) ([]byte, topology.Identity, bool) {
+	if !h.aggregateMode.Load() || h.topology == nil || h.topology.Source() != topology.SourceAggregate {
+		return nil, topology.Identity{}, false
+	}
+	ctx := context.Background()
+	if tenant != "" {
+		ctx = storage.WithTenantContext(ctx, tenant)
+	}
+	snapshot, err := h.topology.Snapshot(ctx, topology.Query{})
+	if err != nil {
+		slog.Debug("topology refresh skipped: provider failed", "error", err)
+		return nil, topology.Identity{}, false
+	}
+	id := snapshot.Meta.Identity()
+	if id.Epoch == "" {
+		id = h.topology.Identity(ctx)
+	}
+	message, err := json.Marshal(HubBatch{Type: "topology_refresh", Data: topologyRefresh{
+		Source:   string(h.topology.Source()),
+		Epoch:    id.Epoch,
+		Revision: id.Revision,
+		Reset:    reset,
+	}})
+	if err != nil {
+		return nil, topology.Identity{}, false
+	}
+	return message, id, true
+}
+
+func (h *Hub) publishTopologyRefresh() {
+	if h.topology == nil || len(h.clients) == 0 {
+		return
+	}
+	id := h.topology.Identity(context.Background())
+	if h.topologyPublished && h.topologyEpoch == id.Epoch && h.topologyRevision == id.Revision {
+		return
+	}
+	if h.topologyPublished && h.topologyEpoch == id.Epoch && id.Revision < h.topologyRevision {
+		return
+	}
+	reset := h.topologyPublished && h.topologyEpoch != id.Epoch
+	message, rendered, ok := h.topologyRefreshMessage("", reset)
+	if !ok {
+		return
+	}
+	if h.topologyPublished && h.topologyEpoch == rendered.Epoch && rendered.Revision < h.topologyRevision {
+		return
+	}
+	h.topologyEpoch, h.topologyRevision, h.topologyPublished = rendered.Epoch, rendered.Revision, true
+	sent := 0
+	var slow []*client
+	for client := range h.clients {
+		select {
+		case client.send <- message:
+			sent++
+		default:
+			slow = append(slow, client)
+		}
+	}
+	for _, client := range slow {
+		delete(h.clients, client)
+		if client.closed.CompareAndSwap(false, true) {
+			close(client.send)
+		}
+		slog.Warn("Hub: slow client removed", "total", len(h.clients))
+		if h.onConnectionChange != nil {
+			h.onConnectionChange(len(h.clients))
+		}
+		if h.onSlowClientDrop != nil {
+			h.onSlowClientDrop()
+		}
+	}
+	if sent > 0 && h.onMessageSent != nil {
+		h.onMessageSent("topology_refresh")
 	}
 }
 

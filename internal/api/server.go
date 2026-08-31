@@ -13,6 +13,7 @@ import (
 	"github.com/RandomCodeSpace/otelcontext/internal/realtime"
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 	"github.com/RandomCodeSpace/otelcontext/internal/telemetry"
+	"github.com/RandomCodeSpace/otelcontext/internal/topology"
 )
 
 // Server handles HTTP API requests.
@@ -24,6 +25,9 @@ type Server struct {
 	cache    *cache.TTLCache
 	graph    *graph.Graph       // in-memory service dependency graph (may be nil before first build)
 	graphRAG *graphrag.GraphRAG // layered GraphRAG for advanced queries
+	// topology is selected once from AGGREGATE_MODE before listeners start.
+	// It owns every service-map and system-graph read.
+	topology topology.Provider
 
 	// Saturation probes consulted by /ready. Each returns a fullness
 	// fraction in [0.0, 1.0]; nil disables the corresponding check.
@@ -150,6 +154,16 @@ func (s *Server) SetGraph(g *graph.Graph) {
 // SetGraphRAG wires the GraphRAG instance for advanced queries.
 func (s *Server) SetGraphRAG(g *graphrag.GraphRAG) {
 	s.graphRAG = g
+}
+
+// SetTopologyProvider installs the construction-time mode owner used by both
+// REST topology endpoints.
+func (s *Server) SetTopologyProvider(provider topology.Provider) {
+	s.topology = provider
+}
+
+func (s *Server) aggregateTopology() bool {
+	return s.topology != nil && s.topology.Source() == topology.SourceAggregate
 }
 
 // SetDLQSaturationProbe registers a callback returning DLQ disk fullness as

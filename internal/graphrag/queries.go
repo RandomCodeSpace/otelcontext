@@ -165,6 +165,7 @@ func (g *GraphRAG) ImpactAnalysis(ctx context.Context, service string, maxDepth 
 		maxDepth = 5
 	}
 
+	g.ensureTopologyCurrent()
 	stores := g.storesFor(ctx)
 
 	result := &ImpactResult{Service: service}
@@ -308,6 +309,7 @@ type CorrelatedSignalsResult struct {
 }
 
 func (g *GraphRAG) CorrelatedSignals(ctx context.Context, service string, since time.Time) *CorrelatedSignalsResult {
+	g.ensureTopologyCurrent()
 	stores := g.storesFor(ctx)
 	result := &CorrelatedSignalsResult{Service: service}
 
@@ -339,6 +341,7 @@ func (g *GraphRAG) CorrelatedSignals(ctx context.Context, service string, since 
 
 // ShortestPath finds the shortest path between two services using Dijkstra.
 func (g *GraphRAG) ShortestPath(ctx context.Context, from, to string) []string {
+	g.ensureTopologyCurrent()
 	stores := g.storesFor(ctx)
 	// Build adjacency from CALLS edges
 	stores.service.mu.RLock()
@@ -430,6 +433,7 @@ func (g *GraphRAG) AnomaliesForService(ctx context.Context, service string, sinc
 // Kept as a narrow helper so API handlers do not need to traverse the
 // tenantStores composite themselves.
 func (g *GraphRAG) AllServiceEdges(ctx context.Context) []*Edge {
+	g.ensureTopologyCurrent()
 	return g.storesFor(ctx).service.AllEdges()
 }
 
@@ -438,6 +442,7 @@ func (g *GraphRAG) AllServiceEdges(ctx context.Context) []*Edge {
 // DB scan. Used by /api/metadata/services so the dropdown matches the
 // system map exactly (both are sourced from the same store).
 func (g *GraphRAG) ServiceNames(ctx context.Context) []string {
+	g.ensureTopologyCurrent()
 	services := g.storesFor(ctx).service.AllServices()
 	names := make([]string, 0, len(services))
 	for _, svc := range services {
@@ -456,6 +461,7 @@ type ServiceMapEntry struct {
 }
 
 func (g *GraphRAG) ServiceMap(ctx context.Context, depth int) []ServiceMapEntry {
+	g.ensureTopologyCurrent()
 	stores := g.storesFor(ctx)
 	services := stores.service.AllServices()
 	result := make([]ServiceMapEntry, 0, len(services))
@@ -487,6 +493,7 @@ func (g *GraphRAG) ServiceMapAround(ctx context.Context, seed string, depth int)
 	if depth <= 0 {
 		depth = 1
 	}
+	g.ensureTopologyCurrent()
 	stores := g.storesFor(ctx)
 	if _, ok := stores.service.GetService(seed); !ok {
 		return nil

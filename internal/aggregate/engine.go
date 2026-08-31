@@ -344,7 +344,9 @@ func NewEngine(cfg EngineConfig) (*Engine, error) {
 	}
 	e.own.mutable = make(map[int64]struct{})
 	e.own.closed = make(map[int64]struct{})
-	e.own.epoch = newEpoch(cfg.Now())
+	// The query facade and the topology projection expose two encodings of
+	// this one process generation. They must never mint independent epochs.
+	e.own.epoch = strconv.FormatUint(epoch, 36)
 	var a Applier = directApplier{e}
 	e.applier.Store(&a)
 	return e, nil
@@ -387,10 +389,12 @@ func (e *Engine) TopologySnapshot(tenant string) TopologySnapshot {
 	return e.topology.Snapshot(tenant, e.now())
 }
 
-// PruneTopology drops topology windows past the retention horizon. The fold
-// path prunes the tenants it touches; this is what bounds a tenant that has
-// gone silent.
-func (e *Engine) PruneTopology() { e.topology.Prune(e.now()) }
+// PruneTopology drops topology windows past the retention horizon. A visible
+// expiry is a new full-replacement state, so it advances the same engine
+// revision used by commits and leaves an empty tenant tombstone for consumers.
+func (e *Engine) PruneTopology() {
+	e.topology.Prune(e.now(), func() uint64 { return e.revision.Add(1) })
+}
 
 // TopologyHorizon is how much finalized history the projection retains behind
 // the mutable set. Startup restore reads no further back than this: a window
@@ -548,13 +552,6 @@ func (e *Engine) evictWindowLocked(start int64) []SeriesWindowKey {
 		sh.mu.Unlock()
 	}
 	return released
-}
-
-// newEpoch derives a process generation identifier. It only has to differ from
-// the previous generation of the same process lineage, which a boot timestamp
-// in base 36 does without pulling in a UUID dependency.
-func newEpoch(now time.Time) string {
-	return strconv.FormatInt(now.UnixNano(), 36)
 }
 
 // SetApplier replaces the apply path. Phase 2 uses it to insert the

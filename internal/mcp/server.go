@@ -16,6 +16,7 @@ import (
 	"github.com/RandomCodeSpace/otelcontext/internal/httpconst"
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 	"github.com/RandomCodeSpace/otelcontext/internal/telemetry"
+	"github.com/RandomCodeSpace/otelcontext/internal/topology"
 )
 
 const (
@@ -68,7 +69,7 @@ const (
 type Server struct {
 	repo          *storage.Repository
 	metrics       *telemetry.Metrics
-	svcGraph      *graph.Graph
+	topology      topology.Provider
 	graphRAG      *graphrag.GraphRAG
 	defaultTenant string
 
@@ -109,7 +110,7 @@ func New(
 	defaultTenant string,
 	repo *storage.Repository,
 	metrics *telemetry.Metrics,
-	svcGraph *graph.Graph,
+	topologyProvider topology.Provider,
 ) *Server {
 	if defaultTenant == "" {
 		defaultTenant = storage.DefaultTenantID
@@ -117,7 +118,7 @@ func New(
 	return &Server{
 		repo:          repo,
 		metrics:       metrics,
-		svcGraph:      svcGraph,
+		topology:      topologyProvider,
 		defaultTenant: defaultTenant,
 		callSlots:     make(chan struct{}, defaultMaxConcurrentCalls),
 		callTimeout:   defaultCallTimeout,
@@ -295,11 +296,12 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request) {
 		if tenant == "" {
 			tenant = s.defaultTenant
 		}
+		cacheTenant := s.topologyCacheScope(r.Context(), tenant, params.Name)
 
 		// Cache fast-path: cheap, idempotent GraphRAG tools are memoized
 		// for a few seconds so polling agent clients don't cripple the
 		// in-memory store under load.
-		if cached, hit := s.cache.Get(tenant, params.Name, params.Arguments); hit {
+		if cached, hit := s.cache.Get(cacheTenant, params.Name, params.Arguments); hit {
 			s.cacheHits.Add(1)
 			result = cached
 			break
@@ -344,7 +346,7 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request) {
 		}
 		s.callsServiced.Add(1)
 		if !toolResult.IsError {
-			s.cache.Set(tenant, params.Name, params.Arguments, toolResult)
+			s.cache.Set(cacheTenant, params.Name, params.Arguments, toolResult)
 		}
 		result = toolResult
 
@@ -386,6 +388,17 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 
 	// Send initial endpoint event per MCP Streamable HTTP spec.
 	writeSSE(w, flusher, "endpoint", `{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}`)
+	tenant := strings.TrimSpace(r.Header.Get(mcpTenantHeader))
+	if tenant == "" {
+		tenant = s.defaultTenant
+	}
+	ctx := storage.WithTenantContext(r.Context(), tenant)
+	lastIdentity := topology.Identity{}
+	haveIdentity := false
+	if data, identity, ok := s.topologyNotification(ctx, lastIdentity, haveIdentity); ok {
+		writeSSE(w, flusher, "message", data)
+		lastIdentity, haveIdentity = identity, true
+	}
 
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
@@ -408,26 +421,135 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 			_, _ = fmt.Fprintf(w, ": keep-alive\n\n")
 			flusher.Flush()
 		case <-ticker.C:
-			if s.svcGraph == nil {
+			if s.topology == nil {
 				continue
 			}
-			snap := s.svcGraph.Snapshot()
-			data, err := json.Marshal(snap)
-			if err != nil {
+			if s.topology.Source() == topology.SourceAggregate {
+				identity := s.topology.Identity(ctx)
+				if haveIdentity && identity.Epoch == lastIdentity.Epoch && identity.Revision == lastIdentity.Revision {
+					continue
+				}
+				if haveIdentity && identity.Epoch == lastIdentity.Epoch && identity.Revision < lastIdentity.Revision {
+					continue
+				}
+			}
+			data, identity, ok := s.topologyNotification(ctx, lastIdentity, haveIdentity)
+			if !ok {
 				continue
 			}
-			notification := map[string]any{
-				"jsonrpc": "2.0",
-				"method":  "notifications/resources/updated",
-				"params": map[string]any{
-					"uri":  "OtelContext://system/graph",
-					"data": string(data),
-				},
-			}
-			notifData, _ := json.Marshal(notification)
-			writeSSE(w, flusher, "message", string(notifData))
+			writeSSE(w, flusher, "message", data)
+			lastIdentity, haveIdentity = identity, true
 		}
 	}
+}
+
+type mcpTopologyPayload struct {
+	Nodes     map[string]*graph.ServiceNode
+	Edges     []graph.ServiceEdge
+	UpdatedAt time.Time
+
+	Source       string `json:"source,omitempty"`
+	Coverage     string `json:"coverage,omitempty"`
+	CoverageNote string `json:"coverage_note,omitempty"`
+	Epoch        string `json:"epoch,omitempty"`
+	Revision     uint64 `json:"revision,omitempty"`
+	Reset        bool   `json:"reset,omitempty"`
+	Truncated    bool   `json:"truncated,omitempty"`
+
+	DroppedServices   uint64 `json:"dropped_services,omitempty"`
+	DroppedOperations uint64 `json:"dropped_operations,omitempty"`
+	DroppedEdges      uint64 `json:"dropped_edges,omitempty"`
+	DroppedMetrics    uint64 `json:"dropped_metrics,omitempty"`
+}
+
+func (s *Server) topologyNotification(ctx context.Context, last topology.Identity, haveLast bool) (string, topology.Identity, bool) {
+	if s.topology == nil {
+		return "", topology.Identity{}, false
+	}
+	snapshot, err := s.topology.Snapshot(ctx, topology.Query{})
+	if err != nil {
+		slog.Debug("MCP topology update retained last good state", "error", err)
+		return "", topology.Identity{}, false
+	}
+	identity := snapshot.Meta.Identity()
+	if identity.Epoch == "" && s.topology.Source() == topology.SourceAggregate {
+		identity = s.topology.Identity(ctx)
+	}
+	if haveLast && identity.Epoch == last.Epoch && identity.Revision < last.Revision {
+		return "", topology.Identity{}, false
+	}
+	payload := mcpTopologyPayload{
+		Nodes:             make(map[string]*graph.ServiceNode, len(snapshot.Nodes)),
+		Edges:             make([]graph.ServiceEdge, 0, len(snapshot.Edges)),
+		UpdatedAt:         snapshot.Meta.End,
+		Source:            string(snapshot.Meta.Source),
+		Coverage:          snapshot.Meta.Coverage,
+		CoverageNote:      snapshot.Meta.CoverageNote,
+		Epoch:             identity.Epoch,
+		Revision:          identity.Revision,
+		Reset:             !haveLast || identity.Epoch != last.Epoch,
+		Truncated:         snapshot.Meta.Truncated,
+		DroppedServices:   snapshot.Meta.DroppedServices,
+		DroppedOperations: snapshot.Meta.DroppedOperations,
+		DroppedEdges:      snapshot.Meta.DroppedEdges,
+		DroppedMetrics:    snapshot.Meta.DroppedMetrics,
+	}
+	if payload.UpdatedAt.IsZero() {
+		payload.UpdatedAt = time.Now().UTC()
+	}
+	for _, node := range snapshot.Nodes {
+		alerts := append([]string(nil), node.Alerts...)
+		if alerts == nil {
+			alerts = []string{}
+		}
+		payload.Nodes[node.Name] = &graph.ServiceNode{
+			Name:           node.Name,
+			HealthScore:    node.HealthScore,
+			Status:         node.Status,
+			RequestRateRPS: node.RequestRateRPS,
+			ErrorRate:      node.ErrorRate,
+			AvgLatencyMs:   node.AvgLatencyMs,
+			P99LatencyMs:   node.P99LatencyMs,
+			SpanCount:      node.SpanCount,
+			Alerts:         alerts,
+		}
+	}
+	for _, edge := range snapshot.Edges {
+		payload.Edges = append(payload.Edges, graph.ServiceEdge{
+			Source:       edge.Source,
+			Target:       edge.Target,
+			CallCount:    edge.CallCount,
+			AvgLatencyMs: edge.AvgLatencyMs,
+			ErrorRate:    edge.ErrorRate,
+			Status:       edge.Status,
+		})
+	}
+	payloadJSON, err := json.Marshal(payload)
+	if err != nil {
+		return "", topology.Identity{}, false
+	}
+	notification := map[string]any{
+		"jsonrpc": "2.0",
+		"method":  "notifications/resources/updated",
+		"params": map[string]any{
+			"uri":  "OtelContext://system/graph",
+			"data": string(payloadJSON),
+		},
+	}
+	notificationJSON, err := json.Marshal(notification)
+	if err != nil {
+		return "", topology.Identity{}, false
+	}
+	return string(notificationJSON), identity, true
+}
+
+func (s *Server) topologyCacheScope(ctx context.Context, tenant, tool string) string {
+	if s.topology == nil || s.topology.Source() != topology.SourceAggregate ||
+		(tool != "get_service_map" && tool != "get_service_health") {
+		return tenant
+	}
+	ctx = storage.WithTenantContext(ctx, tenant)
+	return tenant + "\x00topology=" + s.topology.Identity(ctx).String()
 }
 
 // writeSSE writes a single SSE event.

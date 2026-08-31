@@ -163,6 +163,10 @@ type GraphRAG struct {
 	// aggSource is the aggregate engine's topology projection, consulted only
 	// in aggregate mode.
 	aggSource AggregateSource
+	// topologyMu serializes the periodic backstop with read-through freshness.
+	// Without it, an older render could replace a newer revision under two
+	// concurrent topology-dependent reads.
+	topologyMu sync.Mutex
 }
 
 // SetMetrics wires the Prometheus registry so GraphRAG event drops are

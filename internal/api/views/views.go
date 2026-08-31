@@ -17,6 +17,7 @@ import (
 	"github.com/RandomCodeSpace/otelcontext/internal/aggregate"
 	"github.com/RandomCodeSpace/otelcontext/internal/graphrag"
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
+	"github.com/RandomCodeSpace/otelcontext/internal/topology"
 )
 
 // --- Primary entity views ---
@@ -153,10 +154,17 @@ type ServiceMapMetrics struct {
 	Nodes []ServiceMapNode `json:"nodes"`
 	Edges []ServiceMapEdge `json:"edges"`
 
+	Source       string `json:"source,omitempty"`
 	Coverage     string `json:"coverage,omitempty"`
 	CoverageNote string `json:"coverage_note,omitempty"`
 	Epoch        string `json:"epoch,omitempty"`
 	Revision     uint64 `json:"revision,omitempty"`
+	Truncated    bool   `json:"truncated,omitempty"`
+
+	DroppedServices   uint64 `json:"dropped_services,omitempty"`
+	DroppedOperations uint64 `json:"dropped_operations,omitempty"`
+	DroppedEdges      uint64 `json:"dropped_edges,omitempty"`
+	DroppedMetrics    uint64 `json:"dropped_metrics,omitempty"`
 }
 
 // --- GraphRAG views ---
@@ -465,6 +473,44 @@ func ServiceMapMetricsFromAggregate(r *aggregate.TopologyResult) ServiceMapMetri
 		Epoch:        r.Epoch,
 		Revision:     r.Revision,
 	}
+}
+
+// ServiceMapMetricsFromTopology converts the mode-selected provider snapshot
+// without exposing its owning package on the HTTP wire.
+func ServiceMapMetricsFromTopology(snapshot topology.Snapshot) ServiceMapMetrics {
+	nodes := make([]ServiceMapNode, len(snapshot.Nodes))
+	for i, node := range snapshot.Nodes {
+		nodes[i] = ServiceMapNode{
+			Name:         node.Name,
+			TotalTraces:  node.TotalTraces,
+			ErrorCount:   node.ErrorCount,
+			AvgLatencyMs: node.AvgLatencyMs,
+		}
+	}
+	edges := make([]ServiceMapEdge, len(snapshot.Edges))
+	for i, edge := range snapshot.Edges {
+		edges[i] = ServiceMapEdge{
+			Source:       edge.Source,
+			Target:       edge.Target,
+			CallCount:    edge.CallCount,
+			AvgLatencyMs: edge.AvgLatencyMs,
+			ErrorRate:    edge.ErrorRate,
+		}
+	}
+	out := ServiceMapMetrics{Nodes: nodes, Edges: edges}
+	if snapshot.Meta.Source == topology.SourceAggregate {
+		out.Source = string(snapshot.Meta.Source)
+		out.Coverage = snapshot.Meta.Coverage
+		out.CoverageNote = snapshot.Meta.CoverageNote
+		out.Epoch = snapshot.Meta.Epoch
+		out.Revision = snapshot.Meta.Revision
+		out.Truncated = snapshot.Meta.Truncated
+		out.DroppedServices = snapshot.Meta.DroppedServices
+		out.DroppedOperations = snapshot.Meta.DroppedOperations
+		out.DroppedEdges = snapshot.Meta.DroppedEdges
+		out.DroppedMetrics = snapshot.Meta.DroppedMetrics
+	}
+	return out
 }
 
 // ServiceMapMetricsFromModel converts repo topology into the view form.

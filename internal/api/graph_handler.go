@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
+	"github.com/RandomCodeSpace/otelcontext/internal/topology"
 )
 
 // SystemSummary is the top-level system health summary.
@@ -57,6 +58,18 @@ type SystemGraphResponse struct {
 	System    SystemSummary `json:"system"`
 	Nodes     []GraphNode   `json:"nodes"`
 	Edges     []GraphEdge   `json:"edges"`
+
+	Source       string `json:"source,omitempty"`
+	Coverage     string `json:"coverage,omitempty"`
+	CoverageNote string `json:"coverage_note,omitempty"`
+	Epoch        string `json:"epoch,omitempty"`
+	Revision     uint64 `json:"revision,omitempty"`
+	Truncated    bool   `json:"truncated,omitempty"`
+
+	DroppedServices   uint64 `json:"dropped_services,omitempty"`
+	DroppedOperations uint64 `json:"dropped_operations,omitempty"`
+	DroppedEdges      uint64 `json:"dropped_edges,omitempty"`
+	DroppedMetrics    uint64 `json:"dropped_metrics,omitempty"`
 }
 
 var OtelContextStartTime = time.Now()
@@ -71,19 +84,32 @@ var OtelContextStartTime = time.Now()
 func (s *Server) handleGetSystemGraph(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	cacheKey := "system_graph:" + storage.TenantFromContext(ctx)
+	if s.aggregateTopology() {
+		cacheKey += ":" + s.topology.Identity(ctx).String()
+	}
 
 	if cached, ok := s.cache.Get(cacheKey); ok {
 		cached.(*cachedJSON).write(w, r, "HIT")
 		return
 	}
 
-	resp := s.buildGraphFromMemory(ctx)
-	if resp == nil {
-		// Graph not yet hydrated — fall back to DB path.
-		resp = s.buildGraphFromDB(ctx)
-		if resp == nil {
+	var resp *SystemGraphResponse
+	if s.topology != nil {
+		snapshot, err := s.topology.Snapshot(ctx, topology.Query{})
+		if err != nil {
 			http.Error(w, "failed to build system graph", http.StatusInternalServerError)
 			return
+		}
+		resp = buildGraphFromTopology(snapshot)
+	} else {
+		resp = s.buildGraphFromMemory(ctx)
+		if resp == nil {
+			// Graph not yet hydrated — fall back to DB path.
+			resp = s.buildGraphFromDB(ctx)
+			if resp == nil {
+				http.Error(w, "failed to build system graph", http.StatusInternalServerError)
+				return
+			}
 		}
 	}
 
@@ -94,6 +120,68 @@ func (s *Server) handleGetSystemGraph(w http.ResponseWriter, r *http.Request) {
 	}
 	s.cache.Set(cacheKey, cj, hotPollCacheTTL)
 	cj.write(w, r, "MISS")
+}
+
+func buildGraphFromTopology(snapshot topology.Snapshot) *SystemGraphResponse {
+	nodes := make([]GraphNode, 0, len(snapshot.Nodes))
+	var totalErrorRate, totalLatency float64
+	for _, node := range snapshot.Nodes {
+		health := node.HealthScore
+		status := node.Status
+		if status == "" {
+			health = computeHealthScore(node.ErrorRate, node.AvgLatencyMs)
+			status = healthStatus(health)
+		}
+		alerts := append([]string(nil), node.Alerts...)
+		if alerts == nil {
+			alerts = []string{}
+		}
+		nodes = append(nodes, GraphNode{
+			ID:          node.Name,
+			Type:        "service",
+			HealthScore: math.Round(health*100) / 100,
+			Status:      status,
+			Metrics: NodeMetrics{
+				RequestRateRPS: math.Round(node.RequestRateRPS*100) / 100,
+				ErrorRate:      math.Round(node.ErrorRate*1000000) / 1000000,
+				AvgLatencyMs:   math.Round(node.AvgLatencyMs*100) / 100,
+				P99LatencyMs:   math.Round(node.P99LatencyMs*100) / 100,
+				SpanCount1H:    node.SpanCount,
+			},
+			Alerts: alerts,
+		})
+		totalErrorRate += node.ErrorRate
+		totalLatency += node.AvgLatencyMs
+	}
+	edges := make([]GraphEdge, 0, len(snapshot.Edges))
+	for _, edge := range snapshot.Edges {
+		status := edge.Status
+		if status == "" {
+			status = healthStatus(computeHealthScore(edge.ErrorRate, edge.AvgLatencyMs))
+		}
+		edges = append(edges, GraphEdge{
+			Source:       edge.Source,
+			Target:       edge.Target,
+			CallCount:    edge.CallCount,
+			AvgLatencyMs: math.Round(edge.AvgLatencyMs*100) / 100,
+			ErrorRate:    math.Round(edge.ErrorRate*1000000) / 1000000,
+			Status:       status,
+		})
+	}
+	resp := buildSummaryResponse(nodes, edges, totalErrorRate, totalLatency)
+	if snapshot.Meta.Source == topology.SourceAggregate {
+		resp.Source = string(snapshot.Meta.Source)
+		resp.Coverage = snapshot.Meta.Coverage
+		resp.CoverageNote = snapshot.Meta.CoverageNote
+		resp.Epoch = snapshot.Meta.Epoch
+		resp.Revision = snapshot.Meta.Revision
+		resp.Truncated = snapshot.Meta.Truncated
+		resp.DroppedServices = snapshot.Meta.DroppedServices
+		resp.DroppedOperations = snapshot.Meta.DroppedOperations
+		resp.DroppedEdges = snapshot.Meta.DroppedEdges
+		resp.DroppedMetrics = snapshot.Meta.DroppedMetrics
+	}
+	return resp
 }
 
 // buildGraphFromMemory converts the in-memory graph snapshot to the API response.

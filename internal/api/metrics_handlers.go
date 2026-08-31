@@ -12,6 +12,7 @@ import (
 	"github.com/RandomCodeSpace/otelcontext/internal/api/views"
 	"github.com/RandomCodeSpace/otelcontext/internal/httpconst"
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
+	"github.com/RandomCodeSpace/otelcontext/internal/topology"
 )
 
 // handleGetTrafficMetrics handles GET /api/metrics/traffic
@@ -219,6 +220,9 @@ func (s *Server) handleGetServiceMapMetrics(w http.ResponseWriter, r *http.Reque
 	startStr := r.URL.Query().Get("start")
 	endStr := r.URL.Query().Get("end")
 	cacheKey := "service_map:" + storage.TenantFromContext(r.Context()) + ":" + startStr + ":" + endStr
+	if s.aggregateTopology() {
+		cacheKey += ":" + s.topology.Identity(r.Context()).String()
+	}
 
 	end := time.Now()
 	start := end.Add(-30 * time.Minute)
@@ -235,7 +239,7 @@ func (s *Server) handleGetServiceMapMetrics(w http.ResponseWriter, r *http.Reque
 	// Clamp BEFORE the cache lookup so the clamp headers are stamped on
 	// cache hits too (#217); the cache key is the raw start/end params, so
 	// every hit was produced from the same clamped range.
-	if s.aggregateReads() {
+	if s.aggregateReads() || s.aggregateTopology() {
 		start = clampAggregateRange(w, start, end)
 	}
 
@@ -267,6 +271,13 @@ func (s *Server) handleGetServiceMapMetrics(w http.ResponseWriter, r *http.Reque
 // series the reducer emits made that side-channel unnecessary, so the coverage
 // the engine reports is the coverage the response carries.
 func (s *Server) serviceMapView(r *http.Request, start, end time.Time) (views.ServiceMapMetrics, error) {
+	if s.topology != nil {
+		snapshot, err := s.topology.Snapshot(r.Context(), topology.Query{Start: start, End: end})
+		if err != nil {
+			return views.ServiceMapMetrics{}, err
+		}
+		return views.ServiceMapMetricsFromTopology(snapshot), nil
+	}
 	if !s.aggregateReads() {
 		metrics, err := s.repo.GetServiceMapMetrics(r.Context(), start, end)
 		if err != nil {

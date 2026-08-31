@@ -10,6 +10,7 @@ import (
 	"github.com/RandomCodeSpace/otelcontext/internal/graphrag"
 	"github.com/RandomCodeSpace/otelcontext/internal/httpconst"
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
+	"github.com/RandomCodeSpace/otelcontext/internal/topology"
 )
 
 const (
@@ -135,7 +136,11 @@ func (s *Server) toolHandler(ctx context.Context, name string, args map[string]a
 		"search_logs":          s.toolSearchLogs,
 	}
 	if fn, ok := dispatch[name]; ok {
-		return s.withCoverage(fn(ctx, args), toolCoverage[name])
+		result := fn(ctx, args)
+		if name == "get_service_map" || name == "get_service_health" {
+			return s.withTopologyCoverage(ctx, result)
+		}
+		return s.withCoverage(result, toolCoverage[name])
 	}
 	return errorResult(fmt.Sprintf("unknown tool: %s", name))
 }
@@ -159,8 +164,47 @@ var toolCoverage = map[string]aggregate.Coverage{
 // coverageMeta is the body metadata appended to every successful tool result
 // in aggregate mode.
 type coverageMeta struct {
-	Coverage string `json:"coverage"`
-	Note     string `json:"coverage_note,omitempty"`
+	Coverage  string `json:"coverage"`
+	Note      string `json:"coverage_note,omitempty"`
+	Source    string `json:"source,omitempty"`
+	Epoch     string `json:"epoch,omitempty"`
+	Revision  uint64 `json:"revision,omitempty"`
+	Truncated bool   `json:"truncated,omitempty"`
+
+	DroppedServices   uint64 `json:"dropped_services,omitempty"`
+	DroppedOperations uint64 `json:"dropped_operations,omitempty"`
+	DroppedEdges      uint64 `json:"dropped_edges,omitempty"`
+	DroppedMetrics    uint64 `json:"dropped_metrics,omitempty"`
+}
+
+func (s *Server) withTopologyCoverage(ctx context.Context, result ToolCallResult) ToolCallResult {
+	if s == nil || !s.aggregateMode || result.IsError || s.topology == nil || s.topology.Source() != topology.SourceAggregate {
+		return result
+	}
+	snapshot, err := s.topology.Snapshot(ctx, topology.Query{})
+	if err != nil {
+		return errorResult("topology provider unavailable")
+	}
+	coverage := snapshot.Meta.Coverage
+	if coverage == "" {
+		coverage = string(aggregate.CoverageFull)
+	}
+	data, err := json.Marshal(coverageMeta{
+		Coverage:          coverage,
+		Note:              snapshot.Meta.CoverageNote,
+		Source:            string(snapshot.Meta.Source),
+		Epoch:             snapshot.Meta.Epoch,
+		Revision:          snapshot.Meta.Revision,
+		Truncated:         snapshot.Meta.Truncated,
+		DroppedServices:   snapshot.Meta.DroppedServices,
+		DroppedOperations: snapshot.Meta.DroppedOperations,
+		DroppedEdges:      snapshot.Meta.DroppedEdges,
+		DroppedMetrics:    snapshot.Meta.DroppedMetrics,
+	})
+	if err == nil {
+		result.Content = append(result.Content, ContentItem{Type: "text", Text: string(data)})
+	}
+	return result
 }
 
 // withCoverage appends coverage metadata as an ADDITIONAL content item.

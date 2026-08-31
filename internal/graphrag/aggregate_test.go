@@ -174,6 +174,40 @@ func TestReconcileSkipsUnchangedRevision(t *testing.T) {
 	}
 }
 
+func TestTopologyReadReconcilesMovedAndEmptyRevision(t *testing.T) {
+	src := &fakeAggregateSource{
+		epoch: 7,
+		snaps: map[string]aggregate.TopologySnapshot{
+			storage.DefaultTenantID: oneServiceSnapshot(1, 10, 0),
+		},
+	}
+	g := aggregateGraphRAG(t, newTestRepo(t), src)
+	ctx := storage.WithTenantContext(context.Background(), storage.DefaultTenantID)
+
+	if got := g.ServiceMap(ctx, 0); len(got) != 1 || got[0].Service.Name != "checkout" {
+		t.Fatalf("first topology-dependent read did not reconcile provider state: %+v", got)
+	}
+
+	empty := aggregate.TopologySnapshot{
+		Tenant:     storage.DefaultTenantID,
+		Revision:   2,
+		Services:   []aggregate.TopologyService{},
+		Operations: []aggregate.TopologyOperation{},
+		Edges:      []aggregate.SnapshotEdge{},
+		Metrics:    []aggregate.TopologyMetric{},
+	}
+	src.snaps[storage.DefaultTenantID] = empty
+	if got := g.ServiceMap(ctx, 0); len(got) != 0 {
+		t.Fatalf("empty replacement left stale GraphRAG services: %+v", got)
+	}
+	if edges := g.AllServiceEdges(ctx); len(edges) != 0 {
+		t.Fatalf("empty replacement left stale GraphRAG edges: %+v", edges)
+	}
+	if got := src.renders.Load(); got != 2 {
+		t.Fatalf("topology reads rendered %d snapshots, want one per moved revision", got)
+	}
+}
+
 // TestReconcileHandlesEpochReset proves a restarted engine — new epoch, revision
 // counter back to a LOWER number — is applied rather than skipped as "already
 // seen".

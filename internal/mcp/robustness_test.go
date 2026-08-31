@@ -271,7 +271,7 @@ func TestRobustness_TimeoutHoldsSemaphoreSlot(t *testing.T) {
 
 // TestRobustness_SSEHeartbeat_KeepsConnectionAlive verifies that the SSE
 // stream emits a `: keep-alive` comment within a short window even when
-// the periodic graph snapshot path has nothing to send (svcGraph nil).
+// the periodic graph snapshot path has nothing to send (provider nil).
 func TestRobustness_SSEHeartbeat_KeepsConnectionAlive(t *testing.T) {
 	srv := minimalServer(t)
 

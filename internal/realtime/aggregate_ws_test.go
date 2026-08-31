@@ -17,6 +17,7 @@ type fakePublisher struct {
 	epoch atomic.Value // string
 	rev   atomic.Uint64
 	calls atomic.Int64
+	fail  atomic.Bool
 }
 
 func newFakePublisher(epoch string) *fakePublisher {
@@ -29,6 +30,9 @@ func (p *fakePublisher) Epoch() string    { return p.epoch.Load().(string) }
 func (p *fakePublisher) Revision() uint64 { return p.rev.Load() }
 func (p *fakePublisher) Snapshot(context.Context, string) *LiveSnapshot {
 	p.calls.Add(1)
+	if p.fail.Load() {
+		return nil
+	}
 	return &LiveSnapshot{
 		Type:     "live_snapshot",
 		Epoch:    p.Epoch(),
@@ -124,6 +128,25 @@ func TestAggregateWSTrailingEdgeDelivery(t *testing.T) {
 	}
 }
 
+func TestAggregateWSSameEpochRevisionNeverDecreases(t *testing.T) {
+	hub := NewEventHub(nil, nil, nil)
+	pub := newFakePublisher("epoch-1")
+	pub.rev.Store(6)
+	hub.SetAggregatePublisher(pub, time.Second)
+	hub.published = true
+	hub.lastEpoch = "epoch-1"
+	hub.lastRev = 7
+
+	hub.publishIfChanged()
+
+	if hub.lastRev != 7 {
+		t.Fatalf("published revision regressed to %d", hub.lastRev)
+	}
+	if pub.calls.Load() != 0 {
+		t.Fatalf("rendered %d stale replacement(s)", pub.calls.Load())
+	}
+}
+
 // TestAggregateWSPublishesOnlyOnRevisionChange: an idle engine produces no
 // data messages, however many spacing intervals elapse.
 func TestAggregateWSPublishesOnlyOnRevisionChange(t *testing.T) {
@@ -145,6 +168,82 @@ func TestAggregateWSPublishesOnlyOnRevisionChange(t *testing.T) {
 	hub.publishIfChanged()
 	if hub.lastRev != 4 {
 		t.Fatalf("lastRev = %d after a change, want 4", hub.lastRev)
+	}
+}
+
+func TestAggregateWSProviderErrorRetainsLastGoodIdentity(t *testing.T) {
+	hub := NewEventHub(nil, nil, nil)
+	pub := newFakePublisher("epoch-1")
+	hub.SetAggregatePublisher(pub, time.Hour)
+	pub.rev.Store(2)
+	pub.fail.Store(true)
+	hub.published = true
+	hub.lastEpoch = "epoch-1"
+	hub.lastRev = 1
+	client := &clientFilter{send: make(chan []byte, 1)}
+	hub.clients[nil] = client
+
+	hub.publishIfChanged()
+	if hub.lastRev != 1 {
+		t.Fatalf("provider error advanced last good revision to %d", hub.lastRev)
+	}
+	if len(client.send) != 0 {
+		t.Fatal("provider error published a replacement")
+	}
+}
+
+func TestAggregateWSReconnectRetriesObservedRevisionAfterProviderRecovery(t *testing.T) {
+	hub := NewEventHub(nil, nil, nil)
+	pub := newFakePublisher("epoch-1")
+	pub.rev.Store(2)
+	pub.fail.Store(true)
+	hub.SetAggregatePublisher(pub, 20*time.Millisecond)
+	// Observe the revision while idle, without rendering it.
+	hub.publishIfChanged()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go hub.Start(ctx, time.Hour, time.Hour)
+	server := httptest.NewServer(http.HandlerFunc(hub.HandleWebSocket))
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	conn, response, err := websocket.Dial(dialCtx, "ws"+server.URL[len("http"):], nil)
+	dialCancel()
+	if response != nil && response.Body != nil {
+		_ = response.Body.Close()
+	}
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = conn.Close(websocket.StatusNormalClosure, "test")
+		cancel()
+		hub.Stop()
+		server.Close()
+	})
+
+	deadline := time.Now().Add(2 * time.Second)
+	for pub.calls.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if pub.calls.Load() == 0 {
+		t.Fatal("reconnect did not attempt an immediate snapshot")
+	}
+	pub.fail.Store(false)
+
+	readCtx, readCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer readCancel()
+	_, message, err := conn.Read(readCtx)
+	if err != nil {
+		t.Fatalf("read recovered snapshot: %v", err)
+	}
+	var snapshot LiveSnapshot
+	if err := json.Unmarshal(message, &snapshot); err != nil {
+		t.Fatalf("decode recovered snapshot: %v", err)
+	}
+	if snapshot.Revision != 2 {
+		t.Fatalf("recovered revision = %d, want 2", snapshot.Revision)
+	}
+	if !snapshot.Reset {
+		t.Fatal("recovered reconnect snapshot is not flagged reset")
 	}
 }
 
