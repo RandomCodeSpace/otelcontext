@@ -686,34 +686,34 @@ func tracePayload(service, spanID, parentSpanID string, start, end int64) map[st
 func injectTopology(t *testing.T, baseURL string) {
 	t.Helper()
 	now := time.Now().UTC().UnixNano()
-	payload := map[string]any{
-		"resourceSpans": []map[string]any{
-			tracePayload("gateway", "1111111111111111", "", now, now+int64(12*time.Millisecond)),
-			tracePayload("checkout", "2222222222222222", "1111111111111111", now+int64(time.Millisecond), now+int64(10*time.Millisecond)),
-		},
+	resources := []map[string]any{
+		tracePayload("gateway", "1111111111111111", "", now, now+int64(12*time.Millisecond)),
+		tracePayload("checkout", "2222222222222222", "1111111111111111", now+int64(time.Millisecond), now+int64(10*time.Millisecond)),
 	}
-	body, err := json.Marshal(payload)
-	if err != nil {
-		t.Fatalf("marshal OTLP trace: %v", err)
-	}
-	req, err := http.NewRequest(http.MethodPost, baseURL+"/v1/traces", bytes.NewReader(body))
-	if err != nil {
-		t.Fatalf("create OTLP request: %v", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
 	client := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{Proxy: nil}}
-	resp, err := client.Do(req)
-	if err != nil {
-		t.Fatalf("export OTLP trace: %v", err)
-	}
-	responseBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
-	_ = resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		t.Fatalf("export OTLP trace = %d: %s", resp.StatusCode, strings.TrimSpace(string(responseBody)))
-	}
-	if len(bytes.TrimSpace(responseBody)) > 0 {
-		t.Logf("OTLP trace response: %s", strings.TrimSpace(string(responseBody)))
+	for _, resource := range resources {
+		body, err := json.Marshal(map[string]any{"resourceSpans": []map[string]any{resource}})
+		if err != nil {
+			t.Fatalf("marshal OTLP trace: %v", err)
+		}
+		req, err := http.NewRequest(http.MethodPost, baseURL+"/v1/traces", bytes.NewReader(body))
+		if err != nil {
+			t.Fatalf("create OTLP request: %v", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json")
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("export OTLP trace: %v", err)
+		}
+		responseBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		_ = resp.Body.Close()
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			t.Fatalf("export OTLP trace = %d: %s", resp.StatusCode, strings.TrimSpace(string(responseBody)))
+		}
+		if len(bytes.TrimSpace(responseBody)) > 0 {
+			t.Logf("OTLP trace response: %s", strings.TrimSpace(string(responseBody)))
+		}
 	}
 }
 
