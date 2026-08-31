@@ -11,8 +11,18 @@ const dom = {
   pulseErrors: byId("pulse-errors"),
   pulseP99: byId("pulse-p99"),
   pulseServices: byId("pulse-services"),
+  pulseUptime: byId("pulse-uptime"),
   pulseDB: byId("pulse-db"),
   coverage: byId("coverage-badge"),
+  commandButton: byId("command-button"),
+  commandDialog: byId("command-dialog"),
+  commandSearch: byId("command-search"),
+  commandResults: byId("command-results"),
+  closeCommand: byId("close-command-button"),
+  shortcutDialog: byId("shortcut-dialog"),
+  closeShortcuts: byId("close-shortcut-button"),
+  connectEndpoints: byId("connect-endpoints"),
+  emptyEndpoints: byId("empty-endpoints"),
   refresh: byId("refresh-button"),
   theme: byId("theme-button"),
   search: byId("service-search"),
@@ -30,6 +40,11 @@ const dom = {
   rings: byId("graph-rings"),
   edges: byId("graph-edges"),
   nodes: byId("graph-nodes"),
+  minimapButton: byId("minimap-button"),
+  minimap: byId("service-minimap"),
+  minimapEdges: byId("minimap-edges"),
+  minimapNodes: byId("minimap-nodes"),
+  minimapViewport: byId("minimap-viewport"),
   zoomIn: byId("zoom-in-button"),
   zoomOut: byId("zoom-out-button"),
   fit: byId("fit-button"),
@@ -67,6 +82,10 @@ const state = {
   tools: new Map(),
   apiCache: new Map(),
   viewBox: { x: 0, y: 0, width: 1000, height: 1000 },
+  uptimeBase: null,
+  uptimeObservedAt: 0,
+  uptimeAuthoritative: null,
+  commandMode: null,
 };
 
 function textElement(tag, className, text) {
@@ -246,6 +265,177 @@ function showToast(message) {
   }, 3600);
 }
 
+function connectionEndpoints() {
+  return [
+    { key: "mcp", label: "MCP URL", value: window.location.origin + "/mcp" },
+    { key: "grpc", label: "OTLP gRPC", value: window.location.hostname + ":4317" },
+    { key: "http", label: "OTLP HTTP", value: window.location.origin + "/v1/" },
+  ];
+}
+
+async function copyEndpoint(button, value) {
+  window.clearTimeout(button.resetTimer);
+  try {
+    await navigator.clipboard.writeText(value);
+    button.textContent = "Copied";
+  } catch (_) {
+    const code = button.parentElement.querySelector("code");
+    const selection = window.getSelection();
+    if (code && selection) {
+      const range = document.createRange();
+      range.selectNodeContents(code);
+      selection.removeAllRanges();
+      selection.addRange(range);
+      button.textContent = "Selected";
+    }
+  }
+  button.resetTimer = window.setTimeout(() => {
+    button.textContent = "Copy";
+  }, 1500);
+}
+
+function endpointRow(endpoint) {
+  const row = document.createElement("div");
+  row.className = "endpoint-row";
+  row.append(
+    textElement("span", "endpoint-label", endpoint.label),
+    textElement("code", "endpoint-value", endpoint.value)
+  );
+  const copy = textElement("button", "endpoint-copy", "Copy");
+  copy.type = "button";
+  copy.dataset.copyEndpoint = endpoint.key;
+  copy.setAttribute("aria-label", "Copy " + endpoint.label);
+  copy.addEventListener("click", () => copyEndpoint(copy, endpoint.value));
+  row.appendChild(copy);
+  return row;
+}
+
+function renderConnectionEndpoints() {
+  for (const container of [dom.connectEndpoints, dom.emptyEndpoints]) {
+    const fragment = document.createDocumentFragment();
+    for (const endpoint of connectionEndpoints()) fragment.appendChild(endpointRow(endpoint));
+    container.replaceChildren(fragment);
+  }
+}
+
+function commandItem(label, hint, attribute, value, run) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "command-item";
+  button.dataset.commandLabel = (label + " " + hint).toLowerCase();
+  if (attribute) button.dataset[attribute] = value;
+  button.append(textElement("strong", "", label), textElement("span", "", hint));
+  button.addEventListener("click", run);
+  return button;
+}
+
+function commandGroup(label, items) {
+  if (!items.length) return null;
+  const section = document.createElement("section");
+  section.className = "command-group";
+  section.setAttribute("aria-label", label);
+  section.appendChild(textElement("h3", "", label));
+  for (const item of items) section.appendChild(item);
+  return section;
+}
+
+function commandMatches(label, hint) {
+  const query = dom.commandSearch.value.trim().toLowerCase();
+  return !query || (label + " " + hint).toLowerCase().includes(query);
+}
+
+function chooseCommandService(service) {
+  const mode = state.commandMode;
+  dom.commandDialog.close();
+  openInspector(service);
+  if (mode === "root-cause" || mode === "impact") {
+    const tab = mode === "root-cause" ? "why" : "impact";
+    const tool = mode === "root-cause" ? "root_cause_analysis" : "impact_analysis";
+    selectTab(tab, false);
+    runTool(tool, service);
+  }
+}
+
+async function copyMCPURL() {
+  const value = window.location.origin + "/mcp";
+  try {
+    await navigator.clipboard.writeText(value);
+    showToast("MCP URL copied.");
+  } catch (_) {
+    showToast("Copy unavailable. MCP URL: " + value);
+  }
+}
+
+function renderCommandMenu() {
+  const fragment = document.createDocumentFragment();
+  if (state.commandMode) {
+    const label = state.commandMode === "root-cause" ? "Root-cause analysis" : "Impact analysis";
+    const services = [];
+    for (const node of sortedNodes()) {
+      if (!commandMatches(node.id, label)) continue;
+      services.push(commandItem(node.id, label, "commandService", node.id, () => chooseCommandService(node.id)));
+    }
+    const group = commandGroup("Choose a service for " + label.toLowerCase(), services);
+    if (group) fragment.appendChild(group);
+  } else {
+    const actions = [
+      ["Root-cause analysis", "Choose a service and open Why", "root-cause"],
+      ["Impact analysis", "Choose a service and map its blast radius", "impact"],
+    ].filter((item) => commandMatches(item[0], item[1])).map((item) =>
+      commandItem(item[0], item[1], "commandAction", item[2], () => {
+        state.commandMode = item[2];
+        dom.commandSearch.value = "";
+        dom.commandSearch.placeholder = "Choose a service…";
+        renderCommandMenu();
+        dom.commandSearch.focus();
+      })
+    );
+    const services = [];
+    for (const node of sortedNodes()) {
+      if (!commandMatches(node.id, "Open service inspector")) continue;
+      services.push(commandItem(node.id, "Open service inspector", "commandService", node.id, () => chooseCommandService(node.id)));
+    }
+    const utilities = [
+      ["Toggle theme", "Switch between light and dark", "toggle-theme", () => {
+        dom.commandDialog.close();
+        setTheme(document.documentElement.dataset.theme === "light" ? "dark" : "light", true);
+      }],
+      ["Copy MCP URL", window.location.origin + "/mcp", "copy-mcp", () => {
+        dom.commandDialog.close();
+        copyMCPURL();
+      }],
+    ].filter((item) => commandMatches(item[0], item[1])).map((item) =>
+      commandItem(item[0], item[1], "command", item[2], item[3])
+    );
+    for (const group of [commandGroup("Investigate", actions), commandGroup("Services", services), commandGroup("Utilities", utilities)]) {
+      if (group) fragment.appendChild(group);
+    }
+  }
+  if (!fragment.childNodes.length) {
+    fragment.appendChild(textElement("p", "command-empty", "No matching commands or services."));
+  }
+  dom.commandResults.replaceChildren(fragment);
+}
+
+function openCommandMenu() {
+  if (dom.shortcutDialog.open) dom.shortcutDialog.close();
+  if (dom.commandDialog.open) {
+    dom.commandDialog.close();
+    return;
+  }
+  state.commandMode = null;
+  dom.commandSearch.value = "";
+  dom.commandSearch.placeholder = "Search commands and services…";
+  renderCommandMenu();
+  dom.commandDialog.showModal();
+  window.setTimeout(() => dom.commandSearch.focus(), 0);
+}
+
+function openShortcutSheet() {
+  if (dom.commandDialog.open) dom.commandDialog.close();
+  if (!dom.shortcutDialog.open) dom.shortcutDialog.showModal();
+}
+
 async function refresh(options) {
   const silent = options && options.silent;
   if (state.refreshing) return;
@@ -266,7 +456,7 @@ async function refresh(options) {
   if (results[0].status === "fulfilled") {
     state.graph = normalizeGraph(results[0].value);
     state.error = "";
-  } else if (!state.graph) {
+  } else if (!state.graph || (!silent && state.graph.nodes.length === 0)) {
     state.error = results[0].reason && results[0].reason.message ? results[0].reason.message : "Unknown response";
   } else if (!silent) {
     showToast("Refresh failed; keeping the last service graph.");
@@ -319,6 +509,13 @@ function renderPulse() {
     ? formatMs(dashboard.p99_latency_ms)
     : formatMs(summary.avg_latency_ms);
   dom.pulseServices.textContent = formatCount(summary.total_services);
+  const uptime = Number(summary.uptime_seconds);
+  if (Number.isFinite(uptime) && uptime !== state.uptimeAuthoritative) {
+    state.uptimeAuthoritative = uptime;
+    state.uptimeBase = uptime;
+    state.uptimeObservedAt = Date.now();
+  }
+  renderUptime();
   const dbSize = stats.DBSizeMB !== undefined ? stats.DBSizeMB : stats.db_size_mb;
   dom.pulseDB.textContent = formatMB(dbSize);
   if (dashboard.coverage) {
@@ -328,6 +525,23 @@ function renderPulse() {
   } else {
     dom.coverage.hidden = true;
   }
+}
+
+function renderUptime() {
+  if (!Number.isFinite(state.uptimeBase)) {
+    dom.pulseUptime.textContent = "—";
+    return;
+  }
+  const seconds = Math.max(0, Math.floor(state.uptimeBase + (Date.now() - state.uptimeObservedAt) / 1000));
+  const days = Math.floor(seconds / 86400);
+  const hours = Math.floor(seconds % 86400 / 3600);
+  const minutes = Math.floor(seconds % 3600 / 60);
+  const remainder = seconds % 60;
+  dom.pulseUptime.textContent = days + "d "
+    + String(hours).padStart(2, "0") + ":"
+    + String(minutes).padStart(2, "0") + ":"
+    + String(remainder).padStart(2, "0");
+  dom.pulseUptime.setAttribute("aria-label", "Process uptime " + dom.pulseUptime.textContent);
 }
 
 function summaryItem(status, value, label) {
@@ -488,6 +702,8 @@ function renderGraph() {
   dom.rings.replaceChildren();
   dom.edges.replaceChildren();
   dom.nodes.replaceChildren();
+  dom.minimapEdges.replaceChildren();
+  dom.minimapNodes.replaceChildren();
   if (!state.graph || state.graph.nodes.length === 0) return;
 
   const edges = cleanEdges(state.graph.nodes, state.graph.edges);
@@ -514,6 +730,8 @@ function renderGraph() {
     if (!source || !target) continue;
     const line = svgElement("line", {
       class: "graph-edge",
+      "data-source": edge.source,
+      "data-target": edge.target,
       x1: source.x,
       y1: source.y,
       x2: target.x,
@@ -533,6 +751,13 @@ function renderGraph() {
       line.style.opacity = "0.08";
     }
     edgeFragment.appendChild(line);
+    dom.minimapEdges.appendChild(svgElement("line", {
+      class: "minimap-edge",
+      x1: source.x,
+      y1: source.y,
+      x2: target.x,
+      y2: target.y,
+    }));
   }
   dom.edges.appendChild(edgeFragment);
 
@@ -587,8 +812,16 @@ function renderGraph() {
       }
     });
     nodeFragment.appendChild(group);
+    dom.minimapNodes.appendChild(svgElement("circle", {
+      class: "minimap-node",
+      cx: point.x,
+      cy: point.y,
+      r: count > 70 ? 16 : 22,
+      "data-status": status,
+    }));
   }
   dom.nodes.appendChild(nodeFragment);
+  renderMinimapViewport();
 }
 
 function renderImpactBanner() {
@@ -1043,6 +1276,14 @@ function setViewBox(next) {
   const height = Math.max(minSize, Math.min(maxSize, next.height));
   state.viewBox = { x: next.x, y: next.y, width: width, height: height };
   dom.map.setAttribute("viewBox", [state.viewBox.x, state.viewBox.y, width, height].join(" "));
+  renderMinimapViewport();
+}
+
+function renderMinimapViewport() {
+  dom.minimapViewport.setAttribute("x", String(state.viewBox.x));
+  dom.minimapViewport.setAttribute("y", String(state.viewBox.y));
+  dom.minimapViewport.setAttribute("width", String(state.viewBox.width));
+  dom.minimapViewport.setAttribute("height", String(state.viewBox.height));
 }
 
 function zoomAt(factor, clientX, clientY) {
@@ -1185,7 +1426,50 @@ async function refreshAnomalies() {
   }
 }
 
+function isEditableTarget(target) {
+  return Boolean(target && target.closest && target.closest("input, textarea, select, [contenteditable=true]"));
+}
+
 function bindEvents() {
+  dom.commandButton.addEventListener("click", openCommandMenu);
+  dom.closeCommand.addEventListener("click", () => dom.commandDialog.close());
+  dom.closeShortcuts.addEventListener("click", () => dom.shortcutDialog.close());
+  dom.commandSearch.addEventListener("input", renderCommandMenu);
+  dom.commandDialog.addEventListener("close", () => {
+    state.commandMode = null;
+    dom.commandSearch.value = "";
+    dom.commandSearch.placeholder = "Search commands and services…";
+  });
+  dom.commandDialog.addEventListener("cancel", (event) => {
+    if (!state.commandMode) return;
+    event.preventDefault();
+    state.commandMode = null;
+    dom.commandSearch.value = "";
+    dom.commandSearch.placeholder = "Search commands and services…";
+    renderCommandMenu();
+    dom.commandSearch.focus();
+  });
+  for (const dialog of [dom.commandDialog, dom.shortcutDialog]) {
+    dialog.addEventListener("click", (event) => {
+      if (event.target === dialog) dialog.close();
+    });
+  }
+  dom.commandDialog.addEventListener("keydown", (event) => {
+    const items = Array.from(dom.commandResults.querySelectorAll(".command-item"));
+    if (!items.length) return;
+    if (event.key === "Enter" && event.target === dom.commandSearch) {
+      event.preventDefault();
+      items[0].click();
+      return;
+    }
+    if (!["ArrowDown", "ArrowUp"].includes(event.key)) return;
+    event.preventDefault();
+    const current = items.indexOf(document.activeElement);
+    const next = event.key === "ArrowDown"
+      ? (current + 1) % items.length
+      : (current <= 0 ? items.length - 1 : current - 1);
+    items[next].focus();
+  });
   dom.refresh.addEventListener("click", () => refresh({ silent: false }));
   dom.retry.addEventListener("click", () => refresh({ silent: false }));
   dom.theme.addEventListener("click", () => {
@@ -1201,6 +1485,21 @@ function bindEvents() {
   dom.zoomIn.addEventListener("click", () => zoomAt(0.8));
   dom.zoomOut.addEventListener("click", () => zoomAt(1.25));
   dom.fit.addEventListener("click", () => setViewBox({ x: 0, y: 0, width: 1000, height: 1000 }));
+  dom.minimapButton.addEventListener("click", (event) => {
+    if (!event.detail) {
+      setViewBox({ x: 0, y: 0, width: 1000, height: 1000 });
+      return;
+    }
+    const rect = dom.minimap.getBoundingClientRect();
+    const centerX = (event.clientX - rect.left) / rect.width * 1000;
+    const centerY = (event.clientY - rect.top) / rect.height * 1000;
+    setViewBox({
+      x: centerX - state.viewBox.width / 2,
+      y: centerY - state.viewBox.height / 2,
+      width: state.viewBox.width,
+      height: state.viewBox.height,
+    });
+  });
   dom.clearImpact.addEventListener("click", () => {
     state.impactRoot = null;
     updateURL({ impact: null });
@@ -1224,11 +1523,28 @@ function bindEvents() {
     });
   }
   document.addEventListener("keydown", (event) => {
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
+      event.preventDefault();
+      openCommandMenu();
+      return;
+    }
+    if (dom.commandDialog.open || dom.shortcutDialog.open) return;
+    const editable = isEditableTarget(event.target) || isEditableTarget(document.activeElement);
+    if (event.key === "?" && !editable) {
+      event.preventDefault();
+      openShortcutSheet();
+      return;
+    }
+    if (event.key.toLowerCase() === "f" && !editable && !event.ctrlKey && !event.metaKey && !event.altKey) {
+      event.preventDefault();
+      setViewBox({ x: 0, y: 0, width: 1000, height: 1000 });
+      return;
+    }
     if (event.key === "Escape" && state.selected) {
       event.preventDefault();
       closeInspector();
     }
-    if (event.key === "/" && !["INPUT", "TEXTAREA"].includes(document.activeElement.tagName)) {
+    if (event.key === "/" && !editable) {
       event.preventDefault();
       dom.search.focus();
     }
@@ -1252,6 +1568,7 @@ function bindEvents() {
 }
 
 function startPolling() {
+  window.setInterval(renderUptime, 1000);
   window.setInterval(() => {
     if (document.visibilityState === "visible") refresh({ silent: true });
   }, POLL_INTERVAL_MS);
@@ -1262,6 +1579,7 @@ function startPolling() {
 
 initializeTheme();
 readURL();
+renderConnectionEndpoints();
 bindEvents();
 setViewBox(state.viewBox);
 renderAll();

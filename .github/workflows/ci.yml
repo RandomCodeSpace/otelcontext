@@ -46,3 +46,38 @@ jobs:
 
       - name: gate unit tests
         run: go test -tags gate -race -timeout 60s ./test/gate/...
+
+  browser-smoke:
+    name: browser smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      CGO_ENABLED: "1"
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: build exact browser-test binary
+        run: |
+          mkdir -p "${RUNNER_TEMP}/browser-smoke"
+          go build -o "${RUNNER_TEMP}/browser-smoke/otelcontext" .
+
+      - name: run protected browser workflow
+        env:
+          OTELCONTEXT_BINARY: ${{ runner.temp }}/browser-smoke/otelcontext
+          CHROME_BIN: google-chrome
+          BROWSER_SMOKE_ARTIFACTS: ${{ runner.temp }}/browser-smoke/artifacts
+        run: go test -tags=browser -count=1 -timeout 150s -run '^TestProtectedBrowserWorkflow$' ./test/browser
+
+      - name: upload browser diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: browser-smoke-${{ github.sha }}
+          path: ${{ runner.temp }}/browser-smoke/artifacts
+          if-no-files-found: warn
+          retention-days: 14

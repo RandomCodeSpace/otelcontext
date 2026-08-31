@@ -42,6 +42,10 @@
             <dt>Services</dt>
             <dd id="pulse-services">—</dd>
           </div>
+          <div class="pulse-up">
+            <dt>Uptime</dt>
+            <dd id="pulse-uptime">—</dd>
+          </div>
           <div class="pulse-db">
             <dt>Database</dt>
             <dd id="pulse-db">—</dd>
@@ -50,6 +54,16 @@
 
         <div class="header-actions">
           <span class="coverage-badge" id="coverage-badge" hidden></span>
+          <button class="icon-button" id="command-button" type="button" aria-label="Open command menu" aria-keyshortcuts="Control+K Meta+K" title="Open command menu (Ctrl+K)">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 7h8M8 12h8M8 17h5"/><circle cx="5" cy="7" r="1"/><circle cx="5" cy="12" r="1"/><circle cx="5" cy="17" r="1"/></svg>
+          </button>
+          <details class="connect-menu" id="connect-menu">
+            <summary id="connect-toggle" aria-label="Show connection endpoints">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 12h8M5 8v8m14-8v8M3 12h2m14 0h2"/></svg>
+              <span>Connect</span>
+            </summary>
+            <div class="connect-popover" id="connect-endpoints" aria-label="Connection endpoints"></div>
+          </details>
           <button class="icon-button" id="refresh-button" type="button" aria-label="Refresh data" title="Refresh data">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.34 5.66M20 4v7h-7"/></svg>
           </button>
@@ -101,8 +115,8 @@
                 <span></span><span></span><span></span>
               </div>
               <p class="state-title">Waiting for telemetry</p>
-              <p>Point an OpenTelemetry exporter at this server. Services appear here as soon as spans arrive.</p>
-              <code>http://localhost:4318</code>
+              <p>Point an OpenTelemetry exporter or MCP client at this server. Services appear here as soon as spans arrive.</p>
+              <div class="empty-endpoints" id="empty-endpoints" aria-label="Connection endpoints"></div>
             </div>
 
             <div class="canvas-wrap" id="canvas-wrap" hidden>
@@ -120,6 +134,13 @@
                   <g id="graph-nodes"></g>
                 </g>
               </svg>
+              <button class="minimap-button" id="minimap-button" type="button" aria-label="Center map from minimap">
+                <svg id="service-minimap" viewBox="0 0 1000 1000" role="img" aria-label="Service map minimap">
+                  <g id="minimap-edges" aria-hidden="true"></g>
+                  <g id="minimap-nodes" aria-hidden="true"></g>
+                  <rect id="minimap-viewport" aria-hidden="true"></rect>
+                </svg>
+              </button>
               <div class="map-controls" aria-label="Map controls">
                 <button id="zoom-in-button" type="button" aria-label="Zoom in">+</button>
                 <button id="zoom-out-button" type="button" aria-label="Zoom out">−</button>
@@ -171,6 +192,50 @@
       </div>
       <div class="inspector-body" id="inspector-body" role="tabpanel" tabindex="0"></div>
     </aside>
+
+    <dialog class="command-dialog" id="command-dialog" aria-labelledby="command-title">
+      <div class="dialog-shell">
+        <header class="dialog-header">
+          <div>
+            <p class="eyebrow">Quick navigation</p>
+            <h2 id="command-title">Command menu</h2>
+          </div>
+          <button class="icon-button" id="close-command-button" type="button" aria-label="Close command menu">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg>
+          </button>
+        </header>
+        <label class="command-search">
+          <span class="sr-only">Filter commands</span>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.2-3.2"/></svg>
+          <input id="command-search" type="search" placeholder="Search commands and services…" autocomplete="off">
+        </label>
+        <div class="command-results" id="command-results"></div>
+        <p class="dialog-hint"><kbd>↑</kbd><kbd>↓</kbd> move <kbd>Enter</kbd> open <kbd>Esc</kbd> close</p>
+      </div>
+    </dialog>
+
+    <dialog class="shortcut-dialog" id="shortcut-dialog" aria-labelledby="shortcut-title">
+      <div class="dialog-shell">
+        <header class="dialog-header">
+          <div>
+            <p class="eyebrow">Reference</p>
+            <h2 id="shortcut-title">Keyboard shortcuts</h2>
+          </div>
+          <button class="icon-button" id="close-shortcut-button" type="button" aria-label="Close keyboard shortcuts">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg>
+          </button>
+        </header>
+        <dl class="shortcut-list">
+          <div><dt><kbd>Ctrl</kbd> / <kbd>⌘</kbd> + <kbd>K</kbd></dt><dd>Open the command menu</dd></div>
+          <div><dt><kbd>/</kbd></dt><dd>Find a service</dd></div>
+          <div><dt><kbd>?</kbd></dt><dd>Show this shortcut sheet</dd></div>
+          <div><dt><kbd>F</kbd></dt><dd>Fit the service map</dd></div>
+          <div><dt><kbd>Enter</kbd></dt><dd>Open a focused service</dd></div>
+          <div><dt><kbd>←</kbd> / <kbd>→</kbd></dt><dd>Move between inspector tabs</dd></div>
+          <div><dt><kbd>Esc</kbd></dt><dd>Close the open panel</dd></div>
+        </dl>
+      </div>
+    </dialog>
 
     <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
     <noscript>

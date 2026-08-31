@@ -236,6 +236,102 @@ a {
   gap: 8px;
 }
 
+.connect-menu {
+  position: relative;
+}
+
+.connect-menu summary {
+  display: inline-flex;
+  min-height: 34px;
+  align-items: center;
+  gap: 7px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 700;
+  list-style: none;
+}
+
+.connect-menu summary::-webkit-details-marker {
+  display: none;
+}
+
+.connect-menu summary:hover,
+.connect-menu[open] summary {
+  border-color: var(--line-strong);
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+.connect-menu summary svg {
+  width: 15px;
+  height: 15px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-width: 1.8;
+}
+
+.connect-popover {
+  position: absolute;
+  z-index: 2;
+  top: calc(100% + 8px);
+  right: 0;
+  width: min(370px, calc(100vw - 24px));
+  padding: 8px;
+  border: 1px solid var(--line-strong);
+  border-radius: 9px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.endpoint-row {
+  display: grid;
+  grid-template-columns: 74px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 6px;
+}
+
+.endpoint-row + .endpoint-row {
+  border-top: 1px solid var(--line);
+}
+
+.endpoint-label {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.endpoint-value {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.endpoint-copy {
+  min-height: 30px;
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.endpoint-copy:hover {
+  border-color: var(--line-strong);
+}
+
 .coverage-badge {
   padding: 3px 7px;
   border: 1px solid var(--line-strong);
@@ -285,6 +381,203 @@ a {
 
 [data-theme="light"] .moon-icon {
   display: block;
+}
+
+.command-dialog,
+.shortcut-dialog {
+  width: min(620px, calc(100vw - 28px));
+  max-height: min(760px, calc(100dvh - 28px));
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid var(--line-strong);
+  border-radius: 12px;
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: var(--shadow);
+}
+
+.shortcut-dialog {
+  width: min(520px, calc(100vw - 28px));
+}
+
+.command-dialog::backdrop,
+.shortcut-dialog::backdrop {
+  background: rgb(0 0 0 / 0.58);
+  backdrop-filter: blur(4px);
+}
+
+.dialog-shell {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  max-height: min(760px, calc(100dvh - 28px));
+}
+
+.shortcut-dialog .dialog-shell {
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+.dialog-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 18px 18px 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.dialog-header h2 {
+  margin: 3px 0 0;
+  font-size: 17px;
+}
+
+.dialog-header .eyebrow {
+  margin: 0;
+}
+
+.command-search {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin: 14px;
+  padding: 0 11px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface-2);
+  color: var(--faint);
+}
+
+.command-search:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.command-search svg {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.8;
+}
+
+.command-search input {
+  width: 100%;
+  min-width: 0;
+  height: 40px;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--text);
+}
+
+.command-results {
+  min-height: 0;
+  padding: 0 8px 8px;
+  overflow: auto;
+}
+
+.command-group + .command-group {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
+
+.command-group h3 {
+  margin: 0;
+  padding: 6px 8px;
+  color: var(--faint);
+  font-size: 9px;
+  font-weight: 750;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.command-item {
+  display: grid;
+  width: 100%;
+  min-height: 46px;
+  padding: 7px 9px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  text-align: left;
+}
+
+.command-item:hover,
+.command-item:focus-visible {
+  background: var(--surface-2);
+}
+
+.command-item strong {
+  font-size: 12px;
+}
+
+.command-item span {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.command-empty {
+  margin: 0;
+  padding: 22px 12px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.dialog-hint {
+  margin: 0;
+  padding: 10px 14px;
+  border-top: 1px solid var(--line);
+  color: var(--faint);
+  font-size: 9px;
+}
+
+kbd {
+  display: inline-block;
+  min-width: 20px;
+  margin: 0 2px;
+  padding: 2px 5px;
+  border: 1px solid var(--line-strong);
+  border-radius: 4px;
+  background: var(--surface-2);
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  line-height: 1.3;
+  text-align: center;
+}
+
+.shortcut-list {
+  margin: 0;
+  padding: 8px 18px 18px;
+  overflow: auto;
+}
+
+.shortcut-list > div {
+  display: grid;
+  grid-template-columns: minmax(130px, 0.8fr) minmax(0, 1.2fr);
+  align-items: center;
+  gap: 18px;
+  min-height: 44px;
+  border-bottom: 1px solid var(--line);
+}
+
+.shortcut-list > div:last-child {
+  border-bottom: 0;
+}
+
+.shortcut-list dt,
+.shortcut-list dd {
+  margin: 0;
+}
+
+.shortcut-list dd {
+  color: var(--muted);
+  font-size: 11px;
 }
 
 .workspace {
@@ -470,7 +763,6 @@ h2 {
 }
 
 .error-state button,
-.empty-state code,
 .inspector-body .action-button {
   margin-top: 10px;
 }
@@ -498,15 +790,13 @@ h2 {
   filter: brightness(1.08);
 }
 
-.empty-state code {
-  display: inline-block;
-  padding: 6px 9px;
+.empty-endpoints {
+  width: min(500px, 100%);
+  margin-top: 10px;
   border: 1px solid var(--line);
-  border-radius: 5px;
+  border-radius: 8px;
   background: var(--surface);
-  color: var(--accent);
-  font-family: var(--font-mono);
-  font-size: 11px;
+  text-align: left;
 }
 
 .empty-mark {
@@ -671,6 +961,53 @@ h2 {
 
 .service-node.is-impact {
   --node-color: var(--critical);
+}
+
+.minimap-button {
+  position: absolute;
+  right: 12px;
+  bottom: 56px;
+  width: 112px;
+  height: 88px;
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--surface) 94%, transparent);
+  box-shadow: 0 5px 20px rgb(0 0 0 / 0.18);
+}
+
+#service-minimap {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.minimap-edge {
+  stroke: var(--line-strong);
+  stroke-width: 8;
+}
+
+.minimap-node {
+  fill: var(--unknown);
+}
+
+.minimap-node[data-status="healthy"] {
+  fill: var(--healthy);
+}
+
+.minimap-node[data-status="degraded"] {
+  fill: var(--degraded);
+}
+
+.minimap-node[data-status="critical"] {
+  fill: var(--critical);
+}
+
+#minimap-viewport {
+  fill: color-mix(in srgb, var(--accent) 12%, transparent);
+  stroke: var(--accent);
+  stroke-width: 10;
 }
 
 .map-controls {
@@ -1307,6 +1644,16 @@ h2 {
     gap: 0;
   }
 
+  .connect-menu summary {
+    width: 34px;
+    padding: 0;
+    justify-content: center;
+  }
+
+  .connect-menu summary span {
+    display: none;
+  }
+
   .workspace {
     display: block;
     min-height: 0;
@@ -1349,6 +1696,10 @@ h2 {
   }
 
   .map-legend {
+    display: none;
+  }
+
+  .minimap-button {
     display: none;
   }
 

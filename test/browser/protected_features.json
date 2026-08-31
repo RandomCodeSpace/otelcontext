@@ -1,0 +1,97 @@
+{
+  "schema_version": 1,
+  "baseline_commit": "126b1d241078b8ff3a3326f1e9295a8340537744",
+  "replacement_baseline_commit": "b212d66f3cd1c4953687ede6ee5471596fdc913d",
+  "features": [
+    {
+      "id": "page-and-assets",
+      "proof": "browser",
+      "phase": "page-and-assets",
+      "contract": "The built binary serves the document, CSS, JavaScript, and favicon without external runtime requests or JavaScript errors."
+    },
+    {
+      "id": "loading-empty-error-retry",
+      "proof": "browser",
+      "phase": "loading-empty-error-retry",
+      "contract": "Loading, empty, failed graph, visible retry, and recovery states remain operable."
+    },
+    {
+      "id": "connect-guidance",
+      "proof": "browser",
+      "phase": "connect-guidance",
+      "contract": "The header and empty state expose copyable MCP, OTLP gRPC, and OTLP HTTP endpoints."
+    },
+    {
+      "id": "live-pulse-and-topology",
+      "proof": "browser",
+      "phase": "live-pulse-and-topology",
+      "contract": "The pulse and map show deterministic gateway to checkout telemetry, including the process uptime readout."
+    },
+    {
+      "id": "map-overview-navigation",
+      "proof": "browser",
+      "phase": "live-pulse-and-topology",
+      "contract": "The map retains zoom, fit, and minimap overview navigation."
+    },
+    {
+      "id": "search-selection-and-url",
+      "proof": "browser",
+      "phase": "search-selection-and-url",
+      "contract": "Search filters services, selection opens the inspector, and selection survives in URL state."
+    },
+    {
+      "id": "overview-and-dependencies",
+      "proof": "browser",
+      "phase": "overview-and-dependencies",
+      "contract": "Overview metrics and dependency direction remain available in the inspector."
+    },
+    {
+      "id": "why-and-impact",
+      "proof": "browser",
+      "phase": "why-and-impact",
+      "contract": "Why and Impact call the real MCP tools, and Impact can hand the downstream cone back to the map."
+    },
+    {
+      "id": "command-palette",
+      "proof": "browser",
+      "phase": "command-palette-and-keyboard",
+      "contract": "The command palette retains navigation, service selection, triage actions, theme toggle, and MCP URL copy commands."
+    },
+    {
+      "id": "keyboard-and-accessibility",
+      "proof": "browser",
+      "phase": "command-palette-and-keyboard",
+      "contract": "Named controls, search focus, inspector tabs, service activation, and the shortcut sheet remain keyboard operable."
+    },
+    {
+      "id": "websocket-recovery",
+      "proof": "browser",
+      "phase": "websocket-recovery",
+      "contract": "The UI reports a dropped server, reconnects to the same binary and database, and retains the topology after refetch."
+    },
+    {
+      "id": "theme-persistence",
+      "proof": "browser",
+      "phase": "theme-persistence",
+      "contract": "Light and dark themes use the project token system and persist across reload."
+    },
+    {
+      "id": "mobile-map-list-inspector",
+      "proof": "browser",
+      "phase": "mobile-map-list-inspector",
+      "contract": "At 390 by 844, map and list navigation plus the inspector remain operable without page overflow."
+    },
+    {
+      "id": "node-free-client-source",
+      "proof": "source",
+      "phase": "source-contract",
+      "contract": "The tracked client has no Node manifest, lockfile, frontend build, generated bundle, remote font, CDN import, or external design-system package."
+    },
+    {
+      "id": "user-readme",
+      "proof": "source",
+      "phase": "source-contract",
+      "contract": "The README remains user focused and covers install, first telemetry, UI, MCP, common configuration, and production links."
+    }
+  ]
+}
