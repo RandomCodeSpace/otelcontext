@@ -111,12 +111,8 @@ func ensureDrainTemplatesCompositePK(db *gorm.DB) error {
 // install, so we don't have to hand-maintain a parallel CREATE TABLE.
 func ensureDrainPKSQLite(db *gorm.DB) error {
 	type pragmaCol struct {
-		Cid       int    `gorm:"column:cid"`
-		Name      string `gorm:"column:name"`
-		Type      string `gorm:"column:type"`
-		Notnull   int    `gorm:"column:notnull"`
-		DfltValue any    `gorm:"column:dflt_value"`
-		Pk        int    `gorm:"column:pk"`
+		Name string `gorm:"column:name"`
+		Pk   int    `gorm:"column:pk"`
 	}
 	var cols []pragmaCol
 	if err := db.Raw(`PRAGMA table_info('drain_templates')`).Scan(&cols).Error; err != nil {

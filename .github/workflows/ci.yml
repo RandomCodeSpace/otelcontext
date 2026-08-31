@@ -81,3 +81,62 @@ jobs:
           path: ${{ runner.temp }}/browser-smoke/artifacts
           if-no-files-found: warn
           retention-days: 14
+
+  database-sqlite:
+    name: database proof · sqlite
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      CGO_ENABLED: "1"
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: run SQLite migration and affected-contract proof
+        run: |
+          mkdir -p "${RUNNER_TEMP}/database-proof"
+          go test -race -count=1 -v ./internal/migrate ./internal/storage ./internal/graphrag 2>&1 \
+            | tee "${RUNNER_TEMP}/database-proof/sqlite.log"
+
+      - name: upload SQLite proof
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: database-proof-sqlite-${{ github.sha }}
+          path: ${{ runner.temp }}/database-proof/sqlite.log
+          if-no-files-found: error
+          retention-days: 14
+
+  database-postgres-16:
+    name: database proof · postgres-16
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      CGO_ENABLED: "1"
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: run PostgreSQL 16 migration lifecycle proof
+        run: |
+          mkdir -p "${RUNNER_TEMP}/database-proof"
+          go test -race -count=1 -v -tags=integration -timeout=8m \
+            -run '^TestPostgres16MigrationLifecycle$' ./internal/migrate 2>&1 \
+            | tee "${RUNNER_TEMP}/database-proof/postgres-16.log"
+
+      - name: upload PostgreSQL 16 proof
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: database-proof-postgres-16-${{ github.sha }}
+          path: ${{ runner.temp }}/database-proof/postgres-16.log
+          if-no-files-found: error
+          retention-days: 14
