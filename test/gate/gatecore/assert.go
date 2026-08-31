@@ -2,6 +2,7 @@ package gatecore
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 )
@@ -14,6 +15,7 @@ import (
 
 const (
 	catPhase       = "phase"
+	catProvenance  = "provenance"
 	catConfinement = "confinement"
 	catSustained   = "sustained"
 	catBurst       = "burst"
@@ -29,6 +31,7 @@ func Evaluate(r *Result) []Assertion {
 	t := r.Config.Thresholds
 	var a []Assertion
 
+	a = append(a, certificationAssertions(r)...)
 	a = append(a, phaseAssertions(r)...)
 	a = append(a, confinementAssertions(r, t)...)
 	a = append(a, sustainedAssertions(r, t)...)
@@ -38,7 +41,119 @@ func Evaluate(r *Result) []Assertion {
 	a = append(a, diskAssertions(r, t)...)
 	a = append(a, projectionAssertions(r, t)...)
 	a = append(a, queryAssertions(r, t)...)
+	if r.Config.Certification.Required {
+		degraded := 0
+		for _, assertion := range a {
+			if assertion.Degraded {
+				degraded++
+			}
+		}
+		a = append(a, eqInt("certification.degraded_evidence", catProvenance,
+			"a certifying run used no degraded evidence basis", "assertion table",
+			int64(degraded), 0, "diagnostic fallbacks cannot approve a release"))
+	}
 	return a
+}
+
+func certificationAssertions(r *Result) []Assertion {
+	if !r.Config.Certification.Required {
+		return nil
+	}
+	p := r.Provenance
+	out := []Assertion{
+		boolAssert("candidate.commit", catProvenance, "checkout commit matches the expected candidate commit",
+			"git rev-parse HEAD", p.CommitSHA != "" && p.CommitSHA == p.ExpectedCommitSHA,
+			fmt.Sprintf("checkout=%s expected=%s", p.CommitSHA, p.ExpectedCommitSHA)),
+		boolAssert("candidate.tag", catProvenance, "candidate tag resolves to the expected commit",
+			"git rev-parse tag^{commit}", p.TagCommitSHA != "" && p.TagCommitSHA == p.ExpectedCommitSHA,
+			fmt.Sprintf("tag=%s resolved=%s expected=%s", p.CandidateTag, p.TagCommitSHA, p.ExpectedCommitSHA)),
+		boolAssert("candidate.clean", catProvenance, "candidate source checkout is clean",
+			"git status --porcelain --untracked-files=all", !p.DirtyTree,
+			strings.Join(p.DirtyFiles, ", ")),
+		boolAssert("candidate.archive_digest", catProvenance, "release archive matches its signed expected digest",
+			p.ArchivePath, p.ArchiveSHA256 != "" && p.ArchiveSHA256 == p.ExpectedArchiveSHA256,
+			fmt.Sprintf("actual=%s expected=%s", p.ArchiveSHA256, p.ExpectedArchiveSHA256)),
+		boolAssert("candidate.server_digest", catProvenance, "extracted server matches its expected archive-bound digest",
+			"sha256 candidate server", p.BinarySHA256["server"] != "" && p.BinarySHA256["server"] == p.ExpectedServerSHA256,
+			fmt.Sprintf("actual=%s expected=%s", p.BinarySHA256["server"], p.ExpectedServerSHA256)),
+		boolAssert("candidate.version", catProvenance, "candidate server reports the candidate tag",
+			"candidate --version", p.ServerVersion != "" && p.ServerVersion == p.CandidateTag,
+			fmt.Sprintf("version=%s tag=%s", p.ServerVersion, p.CandidateTag)),
+		boolAssert("candidate.config_digest", catProvenance, "committed certifying config digest was recorded",
+			p.ConfigPath, len(p.ConfigSHA256) == 64, p.ConfigSHA256),
+		boolAssert("candidate.host", catProvenance, "aggregate approval is Linux amd64 on cgroup v2",
+			"host inspection", r.Host.OS == "linux" && r.Host.Arch == "amd64" && r.Host.CgroupV2,
+			fmt.Sprintf("%s/%s cgroup_v2=%t", r.Host.OS, r.Host.Arch, r.Host.CgroupV2)),
+		boolAssert("candidate.filesystem", catProvenance, "gate data is on the required ext4 volume",
+			"/proc/self/mounts", r.Host.DataDirFSType == "ext4",
+			fmt.Sprintf("path=%s device=%s mount=%s fs=%s", r.Host.DataDir, r.Host.DataDirDevice, r.Host.DataDirMount, r.Host.DataDirFSType)),
+	}
+	for _, name := range []string{"gate", "loadsim", "prefill"} {
+		digest := p.BinarySHA256[name]
+		out = append(out, boolAssert("candidate.tool_digest."+name, catProvenance,
+			"gate tool digest was recorded: "+name, "sha256", len(digest) == 64, digest))
+	}
+
+	wantPhases := []string{"prefill", "server_start", "main_load", "post_burst", "quiet_gap", "crash_run", "latency_sentinel", "measure"}
+	for _, name := range wantPhases {
+		found := false
+		for _, phase := range r.Phases {
+			if phase.Name == name {
+				found = true
+				break
+			}
+		}
+		out = append(out, boolAssert("candidate.phase."+name, catProvenance,
+			"required protocol phase was recorded: "+name, "phase inventory", found, ""))
+	}
+	wantCommands := []struct {
+		name        string
+		requireZero bool
+	}{
+		{"prefill", true}, {"server-initial", false}, {"main_load", true},
+		{"post_burst", true}, {"crash_run", true}, {"server-restarted", false}, {"latency_sentinel", true},
+	}
+	for _, want := range wantCommands {
+		found, valid := false, false
+		for _, command := range r.Commands {
+			if command.Phase != want.name {
+				continue
+			}
+			found = true
+			valid = len(command.Argv) > 0 && command.Error == "" && (!want.requireZero || command.ExitCode == 0)
+			break
+		}
+		out = append(out, boolAssert("candidate.command."+want.name, catProvenance,
+			"required command was recorded: "+want.name, "command inventory", found && valid, ""))
+	}
+	for _, metric := range r.Config.Sampling.RequiredMetrics {
+		samples, missing := metricPresenceInPhase(r.MetricSeries, "sustained", metric)
+		out = append(out, boolAssert("candidate.metric."+metric, catProvenance,
+			"required metric was present in every sustained-phase scrape", "Prometheus scrapes",
+			samples > 0 && missing == 0,
+			fmt.Sprintf("metric=%s sustained_scrapes=%d missing_scrapes=%d", metric, samples, missing)))
+	}
+	return out
+}
+
+func metricPresenceInPhase(samples []MetricSample, phase, name string) (total, missing int) {
+	for _, sample := range samples {
+		if sample.Phase != phase {
+			continue
+		}
+		total++
+		found := false
+		for key := range sample.Values {
+			if key == name || strings.HasPrefix(key, name+"{") {
+				found = true
+				break
+			}
+		}
+		if !found {
+			missing++
+		}
+	}
+	return total, missing
 }
 
 // Finalize stamps the verdict onto the result from its own assertion table.
@@ -199,6 +314,7 @@ func sustainedAssertions(r *Result, t Thresholds) []Assertion {
 		{"sustained.late_points", "otelcontext_aggregate_late_points_total", t.MaxLatePointsDelta},
 		{"sustained.admission_rejected", "otelcontext_aggregate_admission_rejected_total", t.MaxAdmissionRejectedDelta},
 		{"sustained.identity_overflow", "otelcontext_aggregate_identity_overflow_total", t.MaxIdentityOverflowDelta},
+		{"sustained.ingest_pipeline_dropped", "otelcontext_ingest_pipeline_dropped_total", t.MaxIngestPipelineDropDelta},
 	} {
 		delta, verdict := MetricDeltaWitnessed(r.MetricSeries, "sustained", m.key, DropCounterWitness)
 		if verdict == MetricAbsent {
@@ -211,7 +327,11 @@ func sustainedAssertions(r *Result, t Thresholds) []Assertion {
 		a := lte(m.id, catSustained,
 			"no silent aggregate drops: "+m.key+" did not move", "prometheus counter delta",
 			delta, m.limit, Float, "delta across the sustained phase")
-		if verdict == MetricEmptyVector {
+		if verdict == MetricEmptyVector && r.Config.Certification.Required {
+			a.Pass = false
+			a.Actual = "absent"
+			a.Detail = "a certifying run requires an explicit zero-valued counter series"
+		} else if verdict == MetricEmptyVector {
 			a.Basis = "prometheus counter vector with no children"
 			a.Degraded = true
 			a.Detail = "the counter vector had no child series in any sustained-phase scrape, which for a " +
@@ -551,6 +671,33 @@ func queryAssertions(r *Result, t Thresholds) []Assertion {
 				"==", c.CoverageExpected, c.Coverage, c.CoverageSource,
 				c.Coverage == c.CoverageExpected, ""))
 		}
+		if r.Config.Certification.Required && len(c.ExpectedScalars) > 0 {
+			keys := make([]string, 0, len(c.ExpectedScalars))
+			for key := range c.ExpectedScalars {
+				keys = append(keys, key)
+			}
+			sort.Strings(keys)
+			for _, key := range keys {
+				expected := c.ExpectedScalars[key]
+				actual, found := c.Scalars[key]
+				out = append(out, boolAssert(id+".scalar."+key, catQuery,
+					"query surface "+c.Name+" returned the generator-derived scalar "+key,
+					c.URL, found && actual == expected,
+					fmt.Sprintf("expected=%v actual=%v present=%t", expected, actual, found)))
+			}
+		}
+		if r.Config.Certification.Required && (c.Name == "dashboard_seven_day" || c.Name == "traffic_seven_day" || c.Name == "service_map_seven_day") {
+			out = append(out, lte(id+".latency", catQuery,
+				"seven-day query completed inside the user-facing latency bound", c.URL,
+				c.DurationSec, t.SevenDayQueryMaxSeconds, Secs, "single uncached full-range request"))
+		}
+	}
+	if r.Config.Certification.Required {
+		out = append(out,
+			eqInt("query.prefill.windows", catQuery, "deterministic prefill window count is exact", "prefill report", int64(q.PrefillWindows), int64(t.PrefillWindows), ""),
+			eqInt("query.prefill.series", catQuery, "deterministic prefill series count is exact", "prefill report", int64(q.PrefillSeries), int64(t.PrefillSeries), ""),
+			eqInt("query.prefill.services", catQuery, "deterministic prefill service count is exact", "prefill report", int64(q.PrefillServices), int64(t.PrefillServices), ""),
+		)
 	}
 
 	if len(q.MCPTools) == 0 {
@@ -569,8 +716,88 @@ func queryAssertions(r *Result, t Thresholds) []Assertion {
 		out = append(out, boolAssert(id, catQuery,
 			"MCP tool "+m.Tool+" answered over the full seven-day range", "POST "+r.Config.MCPPath,
 			ok, detail))
+		if r.Config.Certification.Required {
+			out = append(out, lte(id+".latency", catQuery,
+				"MCP tool completed inside the latency bound", "POST "+r.Config.MCPPath,
+				m.DurationSec, t.MCPQueryMaxSeconds, Secs, detail))
+		}
+	}
+	if r.Config.Certification.Required {
+		out = append(out, queryLatencyAssertions(q.LatencyChecks, t)...)
+		out = append(out, latencySentinelAssertions(q.LatencySentinel)...)
 	}
 	return out
+}
+
+func queryLatencyAssertions(checks []QueryLatencyCheck, t Thresholds) []Assertion {
+	byName := make(map[string]QueryLatencyCheck, len(checks))
+	for _, check := range checks {
+		byName[check.Name] = check
+	}
+	var out []Assertion
+	for _, name := range []string{"default_dashboard", "system_graph"} {
+		check, ok := byName[name]
+		out = append(out, boolAssert("query.latency."+name+".present", catQuery,
+			"query latency samples were recorded for "+name, "orchestrator", ok && check.Error == "" && check.Status == 200 && check.ColdCache == "MISS",
+			fmt.Sprintf("error=%s first_cache=%s", check.Error, check.ColdCache)))
+		out = append(out, lte("query.latency."+name+".cold", catQuery,
+			"first uncached "+name+" request completed inside the bound", check.URL,
+			check.ColdSeconds, t.ColdQueryMaxSeconds, Secs, "cache="+check.ColdCache))
+		out = append(out, eqInt("query.latency."+name+".warm_samples", catQuery,
+			"twenty sequential warm requests were recorded", check.URL,
+			int64(len(check.WarmSeconds)), 20, ""))
+		out = append(out, eqInt("query.latency."+name+".warm_cache_hits", catQuery,
+			"all sequential warm requests were served from the response cache", check.URL,
+			int64(check.WarmCacheHits), 20, ""))
+		out = append(out, lte("query.latency."+name+".warm_p95", catQuery,
+			"warm request p95 completed inside the bound", check.URL,
+			check.WarmP95, t.WarmQueryP95MaxSeconds, Secs,
+			fmt.Sprintf("p50=%.3fs p95=%.3fs max=%.3fs", check.WarmP50, check.WarmP95, check.WarmMax)))
+	}
+	for _, name := range []string{"live", "ready"} {
+		check, ok := byName[name]
+		out = append(out, boolAssert("query.latency."+name+".present", catQuery,
+			"probe latency was recorded for "+name, "orchestrator", ok && check.Error == "" && check.Status == 200, check.Error))
+		out = append(out, lte("query.latency."+name, catQuery,
+			"probe completed inside the latency bound", check.URL,
+			check.ColdSeconds, t.ProbeMaxSeconds, Secs, ""))
+	}
+	return out
+}
+
+func latencySentinelAssertions(proof LatencySentinelProof) []Assertion {
+	wantNames := []string{"rest_dashboard", "rest_system_graph", "websocket_dashboard", "graphrag_service", "mcp_get_service_map", "mcp_get_service_health"}
+	byName := make(map[string]LatencySurface, len(proof.Surfaces))
+	for _, surface := range proof.Surfaces {
+		byName[surface.Name] = surface
+	}
+	out := []Assertion{
+		boolAssert("latency_sentinel.fixture", catQuery,
+			"contradictory latency fixture is exactly 989x10ms plus 11x1000ms",
+			"loadsim sentinel report", proof.Service == "latency-sentinel" && proof.LowCount == 989 && proof.LowMS == 10 && proof.TailCount == 11 && proof.TailMS == 1000,
+			fmt.Sprintf("service=%s low=%dx%.0fms tail=%dx%.0fms", proof.Service, proof.LowCount, proof.LowMS, proof.TailCount, proof.TailMS)),
+	}
+	for _, name := range wantNames {
+		surface, ok := byName[name]
+		bound := surface.RelativeErrorBound
+		expectedBound := sketchRelativeError(4)
+		within := math.Abs(surface.ValueMS-proof.TailMS) <= proof.TailMS*bound
+		valid := ok && surface.Error == "" && surface.Status == "approximate" && surface.Method == "ddsketch" &&
+			surface.SampleCount == uint64(proof.LowCount+proof.TailCount) && surface.SketchScale == 4 &&
+			math.Abs(bound-expectedBound) <= 1e-12 &&
+			within && !surface.Degraded && !surface.Collapsed && surface.Saturations == 0
+		out = append(out, boolAssert("latency_sentinel."+name, catQuery,
+			"latency sentinel remains within its reported scale-4 sketch bound on "+name,
+			"consumer response provenance", valid,
+			fmt.Sprintf("value=%.3fms target=%.0fms bound=%.5f status=%s method=%s samples=%d error=%s",
+				surface.ValueMS, proof.TailMS, bound, surface.Status, surface.Method, surface.SampleCount, surface.Error)))
+	}
+	return out
+}
+
+func sketchRelativeError(scale uint8) float64 {
+	gamma := math.Exp2(math.Ldexp(1, -int(scale)))
+	return (gamma - 1) / (gamma + 1)
 }
 
 // missing renders a FAILED assertion for evidence that never arrived. The

@@ -82,6 +82,14 @@ const (
 
 var signalNames = [kindCount]string{"spans", "logs", "metrics"}
 
+const (
+	latencySentinelService   = "latency-sentinel"
+	latencySentinelLowCount  = 989
+	latencySentinelTailCount = 11
+	latencySentinelLow       = 10 * time.Millisecond
+	latencySentinelTail      = time.Second
+)
+
 // routes are the (method, route) pairs the synthetic services serve. They are
 // derived from the existing operations pool so span names stay identical to
 // the SDK producer's.
@@ -399,6 +407,79 @@ func (e *directEmitter) buildSpans(n int) (*coltracepb.ExportTraceServiceRequest
 			}},
 		}},
 	}, contrib
+}
+
+type latencySentinelReport struct {
+	SchemaVersion string  `json:"schema_version"`
+	Service       string  `json:"service"`
+	LowCount      int     `json:"low_count"`
+	LowMS         float64 `json:"low_ms"`
+	TailCount     int     `json:"tail_count"`
+	TailMS        float64 `json:"tail_ms"`
+	ExportMS      float64 `json:"export_ms"`
+}
+
+func emitLatencySentinel(ctx context.Context, endpoint, tenantID string, useInsecure bool, reportPath string) error {
+	dialOpts := []grpc.DialOption{grpc.WithDefaultCallOptions(grpc.MaxCallSendMsgSize(16 << 20))}
+	if useInsecure {
+		dialOpts = append(dialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	}
+	conn, err := grpc.NewClient(endpoint, dialOpts...)
+	if err != nil {
+		return fmt.Errorf("dial: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	end := time.Now().UTC()
+	req := latencySentinelRequest(end)
+	if tenantID != "" {
+		ctx = metadata.AppendToOutgoingContext(ctx, "x-tenant-id", tenantID)
+	}
+	started := time.Now()
+	if _, err := coltracepb.NewTraceServiceClient(conn).Export(ctx, req); err != nil {
+		return fmt.Errorf("export: %w", err)
+	}
+	report := latencySentinelReport{
+		SchemaVersion: "otelcontext.latency-sentinel.v1", Service: latencySentinelService,
+		LowCount: latencySentinelLowCount, LowMS: float64(latencySentinelLow / time.Millisecond),
+		TailCount: latencySentinelTailCount, TailMS: float64(latencySentinelTail / time.Millisecond),
+		ExportMS: float64(time.Since(started)) / float64(time.Millisecond),
+	}
+	if reportPath != "" {
+		body, err := json.MarshalIndent(report, "", "  ")
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(reportPath, append(body, '\n'), 0o600); err != nil {
+			return err
+		}
+	}
+	fmt.Printf("latency sentinel: service=%s low=%dx%.0fms tail=%dx%.0fms export=%.1fms\n",
+		report.Service, report.LowCount, report.LowMS, report.TailCount, report.TailMS, report.ExportMS)
+	return nil
+}
+
+func latencySentinelRequest(end time.Time) *coltracepb.ExportTraceServiceRequest {
+	spans := make([]*tracepb.Span, 0, latencySentinelLowCount+latencySentinelTailCount)
+	for i := 0; i < latencySentinelLowCount+latencySentinelTailCount; i++ {
+		duration := latencySentinelLow
+		if i >= latencySentinelLowCount {
+			duration = latencySentinelTail
+		}
+		spans = append(spans, &tracepb.Span{
+			TraceId: randomID(16), SpanId: randomID(8), Name: "GET /latency",
+			Kind:              tracepb.Span_SPAN_KIND_SERVER,
+			StartTimeUnixNano: uint64(end.Add(-duration).UnixNano()), // #nosec G115 -- current wall clock
+			EndTimeUnixNano:   uint64(end.UnixNano()),                // #nosec G115 -- current wall clock
+			Status:            &tracepb.Status{Code: tracepb.Status_STATUS_CODE_OK},
+		})
+	}
+	return &coltracepb.ExportTraceServiceRequest{ResourceSpans: []*tracepb.ResourceSpans{{
+		Resource: newResource(latencySentinelService, latencySentinelService+"-instance-0"),
+		ScopeSpans: []*tracepb.ScopeSpans{{
+			Scope: &commonpb.InstrumentationScope{Name: "otelcontext-release-gate"}, Spans: spans,
+		}},
+	}}}
 }
 
 func (e *directEmitter) randomDur() time.Duration {

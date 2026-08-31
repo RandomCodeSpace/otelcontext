@@ -83,6 +83,36 @@ func TestSpanFactory(t *testing.T) {
 	}
 }
 
+func TestLatencySentinelRequestIsContradictoryAndExact(t *testing.T) {
+	end := time.Date(2026, 8, 31, 12, 0, 0, 0, time.UTC)
+	req := latencySentinelRequest(end)
+	if len(req.ResourceSpans) != 1 || len(req.ResourceSpans[0].ScopeSpans) != 1 {
+		t.Fatalf("sentinel request shape = %+v", req.ResourceSpans)
+	}
+	spans := req.ResourceSpans[0].ScopeSpans[0].Spans
+	if len(spans) != 1000 {
+		t.Fatalf("sentinel spans = %d, want 1000", len(spans))
+	}
+	low, tail := 0, 0
+	for _, span := range spans {
+		duration := time.Duration(span.EndTimeUnixNano - span.StartTimeUnixNano)
+		switch duration {
+		case latencySentinelLow:
+			low++
+		case latencySentinelTail:
+			tail++
+		default:
+			t.Fatalf("unexpected sentinel duration %s", duration)
+		}
+		if span.Kind.String() != "SPAN_KIND_SERVER" || len(span.ParentSpanId) != 0 {
+			t.Fatalf("sentinel span is not an independent server request: %+v", span)
+		}
+	}
+	if low != 989 || tail != 11 {
+		t.Fatalf("sentinel distribution = %d low / %d tail, want 989 / 11", low, tail)
+	}
+}
+
 // TestRateLimiter drives the ticker-based limiter for ~1 second and checks throughput.
 func TestRateLimiter(t *testing.T) {
 	const targetRPS = 50

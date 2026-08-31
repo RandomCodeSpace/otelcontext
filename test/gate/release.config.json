@@ -1,0 +1,11 @@
+{
+  "certification": {
+    "required": true
+  },
+  "confinement": {
+    "allow_fallback": false
+  },
+  "queries": {
+    "timeout_sec": 20
+  }
+}

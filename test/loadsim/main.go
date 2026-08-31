@@ -588,9 +588,18 @@ func main() {
 	batchInterval := flag.Duration("batch-interval", 250*time.Millisecond, "Direct engine: per-emitter batch tick")
 	callTimeout := flag.Duration("call-timeout", 30*time.Second, "Direct engine: per-Export deadline")
 	reportPath := flag.String("report", "", "Direct engine: write the JSON latency/throughput report to this path")
+	latencySentinel := flag.Bool("latency-sentinel", false, "Emit the deterministic 989x10ms + 11x1000ms aggregate latency fixture and exit")
 	ackLedgerPath := flag.String("ack-ledger", "", "Direct engine: persist the per-window attempted/ACKed contribution ledger to this path (required by the #202 recovery gate)")
 	ackLedgerFlush := flag.Duration("ack-ledger-flush", 2*time.Second, "Direct engine: how often the ACK ledger is fsynced to disk")
 	flag.Parse()
+	if *latencySentinel {
+		ctx, cancel := context.WithTimeout(context.Background(), *callTimeout)
+		defer cancel()
+		if err := emitLatencySentinel(ctx, *endpoint, *tenantID, *insecure, *reportPath); err != nil {
+			log.Fatalf("latency sentinel: %v", err)
+		}
+		return
+	}
 
 	// Apply profile if set.
 	if *profile != "" {

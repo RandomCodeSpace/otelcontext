@@ -111,6 +111,10 @@ func renderProvenance(b *strings.Builder, r *Result) {
 	p := r.Provenance
 	b.WriteString("## Provenance\n\n| | |\n|---|---|\n")
 	fmt.Fprintf(b, "| Commit | `%s` |\n", p.CommitSHA)
+	if p.CandidateTag != "" {
+		fmt.Fprintf(b, "| Candidate | `%s` -> `%s` |\n", p.CandidateTag, p.TagCommitSHA)
+		fmt.Fprintf(b, "| Expected commit | `%s` |\n", p.ExpectedCommitSHA)
+	}
 	fmt.Fprintf(b, "| Branch | `%s` |\n", p.Branch)
 	fmt.Fprintf(b, "| Dirty tree | %t |\n", p.DirtyTree)
 	if len(p.DirtyFiles) > 0 {
@@ -119,6 +123,17 @@ func renderProvenance(b *strings.Builder, r *Result) {
 	fmt.Fprintf(b, "| Go | `%s` |\n", p.GoVersion)
 	for _, name := range sortedKeys(p.BinarySHA256) {
 		fmt.Fprintf(b, "| sha256 `%s` | `%s` |\n", name, p.BinarySHA256[name])
+	}
+	if p.ArchivePath != "" {
+		fmt.Fprintf(b, "| Archive | `%s` |\n", p.ArchivePath)
+		fmt.Fprintf(b, "| Archive sha256 | `%s` |\n", p.ArchiveSHA256)
+	}
+	if p.ConfigPath != "" {
+		fmt.Fprintf(b, "| Config | `%s` |\n", p.ConfigPath)
+		fmt.Fprintf(b, "| Config sha256 | `%s` |\n", p.ConfigSHA256)
+	}
+	if p.ServerVersion != "" {
+		fmt.Fprintf(b, "| Candidate version | `%s` |\n", p.ServerVersion)
 	}
 	h := r.Host
 	fmt.Fprintf(b, "| Host | `%s` (%s/%s, %d CPU, %s RAM) |\n",
@@ -421,9 +436,9 @@ func renderProjection(b *strings.Builder, r *Result) {
 func renderQueries(b *strings.Builder, r *Result) {
 	q := r.Queries
 	b.WriteString("## Query completeness\n\n")
-	fmt.Fprintf(b, "Seven-day range: %s .. %s (%d seeded windows expected).\n\n",
+	fmt.Fprintf(b, "Seven-day range: %s .. %s (%d seeded windows, %d series, %d services).\n\n",
 		q.PrefillRangeStart.UTC().Format(time.RFC3339), q.PrefillRangeEnd.UTC().Format(time.RFC3339),
-		q.PrefillWindows)
+		q.PrefillWindows, q.PrefillSeries, q.PrefillServices)
 	b.WriteString("| Surface | Status | Time | Coverage | Windows | truncated flag | Scalars |\n")
 	b.WriteString("|---|---|---|---|---|---|---|\n")
 	for _, c := range q.Checks {
@@ -452,6 +467,29 @@ func renderQueries(b *strings.Builder, r *Result) {
 		}
 		fmt.Fprintf(b, "| `%s` | `%s` | %d | %.2f s | %d | %s | %s |\n",
 			m.Tool, mdEscape(m.Arguments), m.Status, m.DurationSec, m.ResultBytes, trunc, mdEscape(orDash(e)))
+	}
+	if len(q.LatencyChecks) > 0 {
+		b.WriteString("\n### User-facing query latency\n\n")
+		b.WriteString("| Surface | Cold | Cache | Warm samples | Warm p50 | Warm p95 | Warm max |\n")
+		b.WriteString("|---|---:|---|---:|---:|---:|---:|\n")
+		for _, check := range q.LatencyChecks {
+			fmt.Fprintf(b, "| `%s` | %.3f s | %s | %d | %.3f s | %.3f s | %.3f s |\n",
+				check.Name, check.ColdSeconds, orDash(check.ColdCache), len(check.WarmSeconds),
+				check.WarmP50, check.WarmP95, check.WarmMax)
+		}
+	}
+	if len(q.LatencySentinel.Surfaces) > 0 {
+		s := q.LatencySentinel
+		b.WriteString("\n### Contradictory latency sentinel\n\n")
+		fmt.Fprintf(b, "Fixture: `%s`, %d × %.0f ms plus %d × %.0f ms.\n\n",
+			s.Service, s.LowCount, s.LowMS, s.TailCount, s.TailMS)
+		b.WriteString("| Consumer | P99 | Status | Method | Samples | Scale | Relative error | Degraded |\n")
+		b.WriteString("|---|---:|---|---|---:|---:|---:|---|\n")
+		for _, surface := range s.Surfaces {
+			fmt.Fprintf(b, "| `%s` | %.3f ms | %s | %s | %d | %d | %.3f%% | %t |\n",
+				surface.Name, surface.ValueMS, orDash(surface.Status), orDash(surface.Method),
+				surface.SampleCount, surface.SketchScale, surface.RelativeErrorBound*100, surface.Degraded)
+		}
 	}
 	b.WriteString("\n")
 }

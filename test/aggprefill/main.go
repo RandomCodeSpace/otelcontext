@@ -76,13 +76,18 @@ type seriesSpec struct {
 }
 
 type workerStats struct {
-	sketchN      int64
-	sketchBytes  int64
-	binCountSum  int64
-	maxSize      int
-	maxBins      int
-	sizeHist     [sizeHistBuckets]int64
-	observations int64
+	sketchN       int64
+	sketchBytes   int64
+	binCountSum   int64
+	maxSize       int
+	maxBins       int
+	sizeHist      [sizeHistBuckets]int64
+	observations  int64
+	requests      uint64
+	requestErrors uint64
+	spans         uint64
+	spanErrors    uint64
+	logs          uint64
 }
 
 func main() {
@@ -221,6 +226,14 @@ func main() {
 	}
 
 	elapsed := time.Since(start)
+	var requests, requestErrors, spans, spanErrors, logs uint64
+	for _, st := range stats {
+		requests += st.requests
+		requestErrors += st.requestErrors
+		spans += st.spans
+		spanErrors += st.spanErrors
+		logs += st.logs
+	}
 
 	// Pre-checkpoint sizes, store still open.
 	db, wal, shm, sum := dbSizes(*dbPath)
@@ -230,6 +243,13 @@ func main() {
 	fmt.Printf("bucket_rows_written: %d\n", totalBuckets)
 	fmt.Printf("delta_rows_incorporated: %d\n", totalDeltaRows)
 	fmt.Printf("first_window: %d  last_window: %d\n", firstWindow, endWindow)
+	fmt.Printf("series_total: %d\n", len(specs))
+	fmt.Printf("services_total: %d\n", numServices)
+	fmt.Printf("dashboard_requests: %d\n", requests)
+	fmt.Printf("dashboard_request_errors: %d\n", requestErrors)
+	fmt.Printf("dashboard_spans: %d\n", spans)
+	fmt.Printf("dashboard_span_errors: %d\n", spanErrors)
+	fmt.Printf("dashboard_logs: %d\n", logs)
 	fmt.Printf("PRE-CLOSE sizes: db=%d wal=%d shm=%d sum=%d\n", db, wal, shm, sum)
 
 	if err := store.Close(); err != nil {
@@ -344,6 +364,15 @@ func buildRange(specs []seriesSpec, deltas []aggregate.AggregateDelta, sketches 
 			d.Sketch = nil
 		}
 		rows[i] = aggregate.DeltaRow{SeriesID: sp.id, WindowStart: windowStart, Delta: d}
+		switch sp.key.Signal {
+		case aggregate.SignalTraceOp:
+			st.requests += d.RequestCount
+			st.requestErrors += d.ErrorRequestCount
+			st.spans += d.Count
+			st.spanErrors += d.ErrorCount
+		case aggregate.SignalLog:
+			st.logs += d.LogCount
+		}
 	}
 }
 

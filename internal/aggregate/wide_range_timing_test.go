@@ -122,3 +122,72 @@ func TestManualWideRangeTiming(t *testing.T) {
 	}
 	t.Logf("speedup: %.1fx", float64(oldDur)/float64(newDur))
 }
+
+// BenchmarkQueryDashboardSevenDay measures the production dashboard query
+// over the same seven-day, 5-minute-window horizon used by the release gate.
+// The signed-candidate gate owns the exact 6,000-series threshold; this focused
+// benchmark keeps a stable 1,000-series local regression signal affordable.
+func BenchmarkQueryDashboardSevenDay(b *testing.B) {
+	const (
+		seriesN  = 1000
+		windowsN = 2016
+	)
+	now := mustTime(b, "2026-08-21T12:02:00Z")
+	e := testEngine(b, now)
+	store := newTestStoreAt(b, filepath.Join(b.TempDir(), "aggregate.db"), StoreConfig{})
+	e.SetStore(store)
+
+	tenantID, _ := e.TenantID("default")
+	windowSecs := int64(WindowSize / time.Second)
+	base := WindowStart(now) - int64(windowsN+2)*windowSecs
+	series := make([]SeriesRow, 0, seriesN)
+	deltas := make([]*AggregateDelta, 0, seriesN)
+	for i := 0; i < seriesN; i++ {
+		id := SeriesID(i + 1)
+		series = append(series, SeriesRow{ID: id, Key: SeriesKey{
+			TenantID:  tenantID,
+			ServiceID: e.Cache().Intern(tenantID, KindService, fmt.Sprintf("svc-%03d", i%120)),
+			NameID:    e.Cache().Intern(tenantID, KindOperation, fmt.Sprintf("op-%05d", i)),
+			Signal:    SignalTraceOp,
+			Variant:   SpanKindServer,
+		}})
+		d := &AggregateDelta{}
+		d.ObserveSpan(float64(100+i%900), false, true)
+		deltas = append(deltas, d)
+	}
+
+	tx, err := store.writer.Begin()
+	if err != nil {
+		b.Fatalf("begin seed tx: %v", err)
+	}
+	seedSeries(b, tx, series)
+	ids := make([]SeriesID, seriesN)
+	wins := make([]int64, seriesN)
+	for w := 0; w < windowsN; w++ {
+		for i := 0; i < seriesN; i++ {
+			ids[i] = SeriesID(i + 1)
+			wins[i] = base + int64(w)*windowSecs
+		}
+		insertRows(b, tx, "aggregate_buckets", ids, wins, deltas)
+	}
+	if err := tx.Commit(); err != nil {
+		b.Fatalf("commit seed tx: %v", err)
+	}
+
+	q := Query{
+		Tenant: "default",
+		Start:  time.Unix(base, 0).UTC(),
+		End:    time.Unix(base+int64(windowsN)*windowSecs, 0).UTC(),
+	}
+	b.ReportMetric(float64(seriesN*windowsN), "rows/query")
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		result, err := e.QueryDashboard(q)
+		if err != nil {
+			b.Fatalf("QueryDashboard: %v", err)
+		}
+		if result.SpanCount != int64(seriesN*windowsN) {
+			b.Fatalf("span count = %d, want %d", result.SpanCount, seriesN*windowsN)
+		}
+	}
+}

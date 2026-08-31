@@ -10,7 +10,12 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
+	"strconv"
+	"strings"
 	"time"
+
+	"github.com/coder/websocket"
 
 	"github.com/RandomCodeSpace/otelcontext/internal/aggregate"
 	"github.com/RandomCodeSpace/otelcontext/test/gate/gatecore"
@@ -31,7 +36,7 @@ func (g *gate) runAPIChecks(start, end time.Time, expectedWindows []int64) []gat
 }
 
 func (g *gate) runAPICheck(spec gatecore.APICheck, sevenDayStart, sevenDayEnd time.Time, expectedWindows []int64) gatecore.QueryCheck {
-	c := gatecore.QueryCheck{Name: spec.Name}
+	c := gatecore.QueryCheck{Name: spec.Name, CoverageExpected: spec.ExpectCoverage}
 
 	u := g.baseURL() + spec.Path
 	q := url.Values{}
@@ -72,6 +77,18 @@ func (g *gate) runAPICheck(spec gatecore.APICheck, sevenDayStart, sevenDayEnd ti
 	if len(spec.ScalarKeys) > 0 {
 		c.Scalars = gatecore.TopLevelScalars(decoded, spec.ScalarKeys)
 	}
+	if spec.Name == "service_map_seven_day" {
+		object, objectOK := decoded.(map[string]any)
+		nodes, nodesOK := object["nodes"].([]any)
+		if !objectOK || !nodesOK {
+			c.Error = "service-map response does not carry a top-level nodes array"
+			return c
+		}
+		if c.Scalars == nil {
+			c.Scalars = map[string]float64{}
+		}
+		c.Scalars["services"] = float64(len(nodes))
+	}
 	if spec.PerWindow && len(expectedWindows) > 0 {
 		pts, perr := gatecore.ParseWindowPoints(body)
 		if perr != nil {
@@ -82,9 +99,6 @@ func (g *gate) runAPICheck(spec gatecore.APICheck, sevenDayStart, sevenDayEnd ti
 		c.WindowsReturned, c.MissingWindows, c.WindowsExpected = returned, missing, len(expectedWindows)
 		c.ExtraWindows = extra
 	}
-	// Whatever coverage marker arrived is always recorded; only surfaces the
-	// config marks as required are gated on it.
-	c.CoverageExpected = spec.ExpectCoverage
 	return c
 }
 
@@ -175,8 +189,15 @@ func (g *gate) runMCPTool(spec gatecore.MCPToolSpec, start, end time.Time) gatec
 	call.Status, call.ResultBytes = resp.StatusCode, len(body)
 
 	var envelope struct {
-		Result any `json:"result"`
-		Error  *struct {
+		Result struct {
+			Content []struct {
+				Text     string `json:"text"`
+				Resource *struct {
+					Text string `json:"text"`
+				} `json:"resource"`
+			} `json:"content"`
+		} `json:"result"`
+		Error *struct {
 			Code    int    `json:"code"`
 			Message string `json:"message"`
 		} `json:"error"`
@@ -189,8 +210,286 @@ func (g *gate) runMCPTool(spec gatecore.MCPToolSpec, start, end time.Time) gatec
 		call.RPCError = fmt.Sprintf("%d %s", envelope.Error.Code, envelope.Error.Message)
 		return call
 	}
+	if len(envelope.Result.Content) > 0 {
+		call.PrimaryText = envelope.Result.Content[0].Text
+		if call.PrimaryText == "" && envelope.Result.Content[0].Resource != nil {
+			call.PrimaryText = envelope.Result.Content[0].Resource.Text
+		}
+	}
 	call.TruncatedFound, call.TruncatedTrue = gatecore.ScanTruncated(envelope.Result)
 	return call
+}
+
+func (g *gate) runQueryLatencyChecks() []gatecore.QueryLatencyCheck {
+	checks := []struct {
+		name string
+		path string
+		warm int
+	}{
+		{"default_dashboard", "/api/metrics/dashboard", 20},
+		{"system_graph", "/api/system/graph", 20},
+		{"live", "/live", 0},
+		{"ready", "/ready", 0},
+	}
+	out := make([]gatecore.QueryLatencyCheck, 0, len(checks))
+	for _, spec := range checks {
+		check := gatecore.QueryLatencyCheck{Name: spec.name, URL: g.baseURL() + spec.path}
+		_, status, header, elapsed, err := g.get(check.URL)
+		check.Status, check.ColdSeconds = status, elapsed.Seconds()
+		if header != nil {
+			check.ColdCache = header.Get("X-Cache")
+		}
+		if err != nil || status != http.StatusOK {
+			if err != nil {
+				check.Error = err.Error()
+			} else {
+				check.Error = fmt.Sprintf("HTTP %d", status)
+			}
+			out = append(out, check)
+			continue
+		}
+		for i := 0; i < spec.warm; i++ {
+			_, warmStatus, warmHeader, warmElapsed, warmErr := g.get(check.URL)
+			if warmErr != nil || warmStatus != http.StatusOK {
+				if warmErr != nil {
+					check.Error = warmErr.Error()
+				} else {
+					check.Error = fmt.Sprintf("warm request %d: HTTP %d", i+1, warmStatus)
+				}
+				break
+			}
+			if warmHeader.Get("X-Cache") == "HIT" {
+				check.WarmCacheHits++
+			}
+			check.WarmSeconds = append(check.WarmSeconds, warmElapsed.Seconds())
+		}
+		check.WarmP50 = nearestRank(check.WarmSeconds, 0.50)
+		check.WarmP95 = nearestRank(check.WarmSeconds, 0.95)
+		check.WarmMax = nearestRank(check.WarmSeconds, 1)
+		out = append(out, check)
+	}
+	return out
+}
+
+// waitLatencySentinel keeps the async ingest pipeline from turning a valid
+// fixture into a timing race. Each probe has a unique ignored query parameter,
+// so a zero-result response cannot poison the dashboard response cache.
+func (g *gate) waitLatencySentinel(service string, want uint64, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	last := "no response"
+	for time.Now().Before(deadline) {
+		q := url.Values{
+			"service_name": {service},
+			"_gate_wait":   {strconv.FormatInt(time.Now().UnixNano(), 10)},
+		}
+		u := g.baseURL() + "/api/metrics/dashboard?" + q.Encode()
+		remaining := time.Until(deadline)
+		ctx, cancel := context.WithTimeout(context.Background(), remaining)
+		body, status, _, _, err := g.doGet(g.ctl, ctx, u)
+		cancel()
+		if err == nil && status == http.StatusOK {
+			var payload struct {
+				Provenance *latencyProvenanceWire `json:"latency_provenance"`
+			}
+			if decodeErr := json.Unmarshal(body, &payload); decodeErr != nil {
+				last = decodeErr.Error()
+			} else if payload.Provenance != nil && payload.Provenance.P99 != nil {
+				got := payload.Provenance.P99.SampleCount
+				if got == want {
+					return nil
+				}
+				last = fmt.Sprintf("sample_count=%d, want %d", got, want)
+			} else {
+				last = "p99 latency provenance is absent"
+			}
+		} else {
+			last = requestError(status, err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return fmt.Errorf("latency sentinel did not become query-visible within %s (last: %s)", timeout, last)
+}
+
+func nearestRank(values []float64, q float64) float64 {
+	if len(values) == 0 {
+		return 0
+	}
+	sorted := append([]float64(nil), values...)
+	sort.Float64s(sorted)
+	idx := int(float64(len(sorted))*q+0.999999999) - 1
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= len(sorted) {
+		idx = len(sorted) - 1
+	}
+	return sorted[idx]
+}
+
+type latencyPercentileWire struct {
+	Status             string  `json:"status"`
+	Method             string  `json:"method"`
+	SampleCount        uint64  `json:"sample_count"`
+	SketchScale        uint8   `json:"sketch_scale"`
+	RelativeErrorBound float64 `json:"relative_error_bound"`
+	Degraded           bool    `json:"degraded"`
+	Collapsed          bool    `json:"collapsed"`
+	Saturations        uint64  `json:"saturations"`
+}
+
+type latencyProvenanceWire struct {
+	P99 *latencyPercentileWire `json:"p99"`
+}
+
+type latencyServiceWire struct {
+	Name              string                 `json:"name"`
+	P99LatencyMS      float64                `json:"p99_latency_ms"`
+	LatencyProvenance *latencyProvenanceWire `json:"latency_provenance"`
+}
+
+func latencySurface(name string, value float64, provenance *latencyProvenanceWire) gatecore.LatencySurface {
+	surface := gatecore.LatencySurface{Name: name, ValueMS: value}
+	if provenance == nil || provenance.P99 == nil {
+		surface.Error = "p99 latency provenance is absent"
+		return surface
+	}
+	p := provenance.P99
+	surface.Status, surface.Method, surface.SampleCount = p.Status, p.Method, p.SampleCount
+	surface.SketchScale, surface.RelativeErrorBound = p.SketchScale, p.RelativeErrorBound
+	surface.Degraded, surface.Collapsed, surface.Saturations = p.Degraded, p.Collapsed, p.Saturations
+	return surface
+}
+
+func (g *gate) collectLatencySentinel() []gatecore.LatencySurface {
+	service := g.res.Queries.LatencySentinel.Service
+	var out []gatecore.LatencySurface
+
+	dashboardURL := g.baseURL() + "/api/metrics/dashboard?service_name=" + url.QueryEscape(service)
+	if body, status, _, _, err := g.get(dashboardURL); err != nil || status != http.StatusOK {
+		out = append(out, gatecore.LatencySurface{Name: "rest_dashboard", Error: requestError(status, err)})
+	} else {
+		var payload struct {
+			P99LatencyMS float64                `json:"p99_latency_ms"`
+			Provenance   *latencyProvenanceWire `json:"latency_provenance"`
+		}
+		if err := json.Unmarshal(body, &payload); err != nil {
+			out = append(out, gatecore.LatencySurface{Name: "rest_dashboard", Error: err.Error()})
+		} else {
+			out = append(out, latencySurface("rest_dashboard", payload.P99LatencyMS, payload.Provenance))
+		}
+	}
+
+	graphURL := g.baseURL() + "/api/system/graph"
+	if body, status, _, _, err := g.get(graphURL); err != nil || status != http.StatusOK {
+		out = append(out, gatecore.LatencySurface{Name: "rest_system_graph", Error: requestError(status, err)})
+	} else {
+		var payload struct {
+			Nodes []struct {
+				ID      string `json:"id"`
+				Metrics struct {
+					P99LatencyMS float64                `json:"p99_latency_ms"`
+					Provenance   *latencyProvenanceWire `json:"latency_provenance"`
+				} `json:"metrics"`
+			} `json:"nodes"`
+		}
+		if err := json.Unmarshal(body, &payload); err != nil {
+			out = append(out, gatecore.LatencySurface{Name: "rest_system_graph", Error: err.Error()})
+		} else {
+			found := false
+			for _, node := range payload.Nodes {
+				if node.ID == service {
+					out = append(out, latencySurface("rest_system_graph", node.Metrics.P99LatencyMS, node.Metrics.Provenance))
+					found = true
+					break
+				}
+			}
+			if !found {
+				out = append(out, gatecore.LatencySurface{Name: "rest_system_graph", Error: "sentinel service is absent"})
+			}
+		}
+	}
+
+	out = append(out, g.websocketLatencySurface(service))
+	mapCall := g.runMCPTool(gatecore.MCPToolSpec{Name: "get_service_map", Arguments: map[string]any{"service": service, "depth": 1}}, time.Time{}, time.Time{})
+	mapSurface := latencySurfaceFromMCP("mcp_get_service_map", service, mapCall.PrimaryText)
+	out = append(out, mapSurface)
+	graphRAGSurface := mapSurface
+	graphRAGSurface.Name = "graphrag_service"
+	out = append(out, graphRAGSurface)
+	healthCall := g.runMCPTool(gatecore.MCPToolSpec{Name: "get_service_health", Arguments: map[string]any{"service_name": service}}, time.Time{}, time.Time{})
+	out = append(out, latencySurfaceFromMCP("mcp_get_service_health", service, healthCall.PrimaryText))
+	return out
+}
+
+func (g *gate) websocketLatencySurface(service string) gatecore.LatencySurface {
+	name := "websocket_dashboard"
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	header := http.Header{}
+	if g.cfg.APIKey != "" {
+		header.Set("Authorization", "Bearer "+g.cfg.APIKey)
+	}
+	u := "ws" + strings.TrimPrefix(g.baseURL(), "http") + "/ws/events?service=" + url.QueryEscape(service)
+	conn, response, err := websocket.Dial(ctx, u, &websocket.DialOptions{HTTPHeader: header})
+	if response != nil && response.Body != nil {
+		_ = response.Body.Close()
+	}
+	if err != nil {
+		return gatecore.LatencySurface{Name: name, Error: err.Error()}
+	}
+	defer func() { _ = conn.Close(websocket.StatusNormalClosure, "gate proof complete") }()
+	_, body, err := conn.Read(ctx)
+	if err != nil {
+		return gatecore.LatencySurface{Name: name, Error: err.Error()}
+	}
+	var payload struct {
+		Dashboard *struct {
+			P99Micros  int64                  `json:"p99_latency"`
+			Provenance *latencyProvenanceWire `json:"latency_provenance"`
+		} `json:"dashboard"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return gatecore.LatencySurface{Name: name, Error: err.Error()}
+	}
+	if payload.Dashboard == nil {
+		return gatecore.LatencySurface{Name: name, Error: "dashboard is absent"}
+	}
+	return latencySurface(name, float64(payload.Dashboard.P99Micros)/1000, payload.Dashboard.Provenance)
+}
+
+func latencySurfaceFromMCP(name, service, text string) gatecore.LatencySurface {
+	if text == "" {
+		return gatecore.LatencySurface{Name: name, Error: "MCP primary result text is absent"}
+	}
+	var entries []struct {
+		Service *latencyServiceWire `json:"service"`
+	}
+	if strings.HasPrefix(strings.TrimSpace(text), "[") {
+		if err := json.Unmarshal([]byte(text), &entries); err != nil {
+			return gatecore.LatencySurface{Name: name, Error: err.Error()}
+		}
+	} else {
+		var entry struct {
+			Service *latencyServiceWire `json:"service"`
+		}
+		if err := json.Unmarshal([]byte(text), &entry); err != nil {
+			return gatecore.LatencySurface{Name: name, Error: err.Error()}
+		}
+		entries = append(entries, entry)
+	}
+	for _, entry := range entries {
+		if entry.Service != nil && entry.Service.Name == service {
+			return latencySurface(name, entry.Service.P99LatencyMS, entry.Service.LatencyProvenance)
+		}
+	}
+	return gatecore.LatencySurface{Name: name, Error: "sentinel service is absent"}
+}
+
+func requestError(status int, err error) string {
+	if err != nil {
+		return err.Error()
+	}
+	return fmt.Sprintf("HTTP %d", status)
 }
 
 // get performs an authorized GET on the query client (long timeout, for the

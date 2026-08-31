@@ -74,14 +74,24 @@ type Result struct {
 
 // Provenance identifies exactly what was measured.
 type Provenance struct {
-	CommitSHA       string            `json:"commit_sha"`
-	Branch          string            `json:"branch"`
-	DirtyTree       bool              `json:"dirty_tree"`
-	DirtyFiles      []string          `json:"dirty_files,omitempty"`
-	GoVersion       string            `json:"go_version"`
-	BinarySHA256    map[string]string `json:"binary_sha256"`
-	BuiltAt         time.Time         `json:"built_at"`
-	OrchestratorPID int               `json:"orchestrator_pid"`
+	CommitSHA             string            `json:"commit_sha"`
+	ExpectedCommitSHA     string            `json:"expected_commit_sha,omitempty"`
+	CandidateTag          string            `json:"candidate_tag,omitempty"`
+	TagCommitSHA          string            `json:"tag_commit_sha,omitempty"`
+	Branch                string            `json:"branch"`
+	DirtyTree             bool              `json:"dirty_tree"`
+	DirtyFiles            []string          `json:"dirty_files,omitempty"`
+	GoVersion             string            `json:"go_version"`
+	BinarySHA256          map[string]string `json:"binary_sha256"`
+	ExpectedServerSHA256  string            `json:"expected_server_sha256,omitempty"`
+	ArchivePath           string            `json:"archive_path,omitempty"`
+	ArchiveSHA256         string            `json:"archive_sha256,omitempty"`
+	ExpectedArchiveSHA256 string            `json:"expected_archive_sha256,omitempty"`
+	ConfigPath            string            `json:"config_path,omitempty"`
+	ConfigSHA256          string            `json:"config_sha256,omitempty"`
+	ServerVersion         string            `json:"server_version,omitempty"`
+	BuiltAt               time.Time         `json:"built_at"`
+	OrchestratorPID       int               `json:"orchestrator_pid"`
 }
 
 // HostInfo is the machine the numbers came off.
@@ -327,11 +337,15 @@ type DiskTier struct {
 
 // QueryResults is the completeness evidence.
 type QueryResults struct {
-	PrefillRangeStart time.Time     `json:"prefill_range_start"`
-	PrefillRangeEnd   time.Time     `json:"prefill_range_end"`
-	PrefillWindows    int           `json:"prefill_windows_expected"`
-	Checks            []QueryCheck  `json:"checks"`
-	MCPTools          []MCPToolCall `json:"mcp_tools"`
+	PrefillRangeStart time.Time            `json:"prefill_range_start"`
+	PrefillRangeEnd   time.Time            `json:"prefill_range_end"`
+	PrefillWindows    int                  `json:"prefill_windows_expected"`
+	PrefillSeries     int                  `json:"prefill_series"`
+	PrefillServices   int                  `json:"prefill_services"`
+	Checks            []QueryCheck         `json:"checks"`
+	MCPTools          []MCPToolCall        `json:"mcp_tools"`
+	LatencyChecks     []QueryLatencyCheck  `json:"latency_checks"`
+	LatencySentinel   LatencySentinelProof `json:"latency_sentinel"`
 }
 
 // QueryCheck is one HTTP query surface answered over the seven-day range.
@@ -353,8 +367,51 @@ type QueryCheck struct {
 	MissingWindows  int                `json:"missing_windows,omitempty"`
 	ExtraWindows    int                `json:"extra_windows,omitempty"`
 	Scalars         map[string]float64 `json:"scalars,omitempty"`
+	ExpectedScalars map[string]float64 `json:"expected_scalars,omitempty"`
 	BodyBytes       int                `json:"body_bytes"`
 	Error           string             `json:"error,omitempty"`
+}
+
+// QueryLatencyCheck records the first uncached request and the sequential
+// warm samples for one user-facing surface.
+type QueryLatencyCheck struct {
+	Name          string    `json:"name"`
+	URL           string    `json:"url"`
+	Status        int       `json:"status"`
+	ColdSeconds   float64   `json:"cold_seconds"`
+	ColdCache     string    `json:"cold_cache,omitempty"`
+	WarmSeconds   []float64 `json:"warm_seconds,omitempty"`
+	WarmCacheHits int       `json:"warm_cache_hits,omitempty"`
+	WarmP50       float64   `json:"warm_p50_seconds,omitempty"`
+	WarmP95       float64   `json:"warm_p95_seconds,omitempty"`
+	WarmMax       float64   `json:"warm_max_seconds,omitempty"`
+	Error         string    `json:"error,omitempty"`
+}
+
+// LatencySentinelProof carries the contradictory 989x10ms + 11x1000ms
+// fixture through every aggregate consumer named by the release contract.
+type LatencySentinelProof struct {
+	Service   string           `json:"service"`
+	LowCount  int              `json:"low_count"`
+	LowMS     float64          `json:"low_ms"`
+	TailCount int              `json:"tail_count"`
+	TailMS    float64          `json:"tail_ms"`
+	Surfaces  []LatencySurface `json:"surfaces"`
+}
+
+// LatencySurface is one consumer's value and the provenance that bounds it.
+type LatencySurface struct {
+	Name               string  `json:"name"`
+	ValueMS            float64 `json:"value_ms"`
+	Status             string  `json:"status"`
+	Method             string  `json:"method"`
+	SampleCount        uint64  `json:"sample_count"`
+	SketchScale        uint8   `json:"sketch_scale"`
+	RelativeErrorBound float64 `json:"relative_error_bound"`
+	Degraded           bool    `json:"degraded"`
+	Collapsed          bool    `json:"collapsed"`
+	Saturations        uint64  `json:"saturations"`
+	Error              string  `json:"error,omitempty"`
 }
 
 // MCPToolCall is one aggregate-backed MCP tool answered over the full range.
@@ -368,6 +425,7 @@ type MCPToolCall struct {
 	TruncatedTrue  bool    `json:"truncated_true"`
 	ResultBytes    int     `json:"result_bytes"`
 	Error          string  `json:"error,omitempty"`
+	PrimaryText    string  `json:"-"`
 }
 
 // MetricSample is one Prometheus scrape, reduced to the metrics the gate

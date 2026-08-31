@@ -25,6 +25,7 @@ builds:
       - -trimpath
     ldflags:
       - -s -w
+      - -X main.Version={{ .Tag }}
 
 archives:
   - id: otelcontext

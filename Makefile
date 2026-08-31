@@ -1,4 +1,4 @@
-.PHONY: build test vet check setup-hooks loadtest loadtest-build release gate-build gate-run
+.PHONY: build test vet check setup-hooks loadtest loadtest-build release gate-tools gate-build gate-run
 
 build:
 	CGO_ENABLED=0 go build ./...
@@ -19,14 +19,21 @@ loadtest: loadtest-build
 	@echo "Running 200-service load simulator (60s) against localhost:4317..."
 	./bin/loadsim
 
-## gate-build builds every binary the seven-day release gate drives.
+GATE_BIN_DIR ?= bin
+
+## gate-tools builds the source-bound test tools without rebuilding the signed
+## server candidate consumed by a certifying release run.
+gate-tools:
+	install -d "$(GATE_BIN_DIR)"
+	CGO_ENABLED=0 go build -trimpath -tags loadtest -o "$(GATE_BIN_DIR)/loadsim" ./test/loadsim
+	CGO_ENABLED=1 go build -trimpath -tags prefill -o "$(GATE_BIN_DIR)/aggprefill" ./test/aggprefill
+	CGO_ENABLED=0 go build -trimpath -tags gate -o "$(GATE_BIN_DIR)/gate" ./test/gate
+
+## gate-build builds every binary the historical diagnostic gate drives.
 ## The gate itself is behind the gate build tag, so ordinary Go commands
 ## ignore it.
-gate-build:
-	CGO_ENABLED=1 go build -o bin/otelcontext .
-	CGO_ENABLED=0 go build -tags loadtest -o bin/loadsim ./test/loadsim
-	CGO_ENABLED=1 go build -tags prefill -o bin/aggprefill ./test/aggprefill
-	CGO_ENABLED=0 go build -tags gate -o bin/gate ./test/gate
+gate-build: gate-tools
+	CGO_ENABLED=1 go build -o "$(GATE_BIN_DIR)/otelcontext" .
 
 ## gate-run executes the manual seven-day gate protocol. It writes reports
 ## under docs/gates and exits non-zero unless every assertion passes.

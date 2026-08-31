@@ -1,0 +1,176 @@
+name: Aggregate signed-candidate gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Immutable signed release tag to certify (for example v0.5.0)
+        required: true
+        type: string
+      sha:
+        description: Dereferenced 40-character commit SHA for the tag
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  aggregate:
+    name: aggregate gate · linux-amd64 · 2 CPU · 4 GiB
+    runs-on: [self-hosted, linux, x64, otelcontext-aggregate-gate]
+    timeout-minutes: 420
+    env:
+      TAG: ${{ inputs.tag }}
+      SHA: ${{ inputs.sha }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Initialize external evidence path
+        run: |
+          set -euo pipefail
+          proof_root="${RUNNER_TEMP}/otelcontext-aggregate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          case "${proof_root}" in
+            "${GITHUB_WORKSPACE}"|"${GITHUB_WORKSPACE}"/*)
+              echo "proof root must be outside the checkout" >&2
+              exit 1
+              ;;
+          esac
+          install -d -m 0755 "${proof_root}/aggregate/report"
+          echo "PROOF_ROOT=${proof_root}" >> "${GITHUB_ENV}"
+
+      - name: Checkout exact tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
+        with:
+          cosign-release: 'v2.6.5'
+
+      - name: Verify immutable candidate identity
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${SHA}"
+          test "$(git rev-parse "${TAG}^{commit}")" = "${SHA}"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          install -d -m 0755 \
+            "${PROOF_ROOT}/release" \
+            "${PROOF_ROOT}/extracted" \
+            "${PROOF_ROOT}/bin" \
+            "${PROOF_ROOT}/aggregate/work" \
+            "${PROOF_ROOT}/aggregate/report"
+
+      - name: Download and verify signed Linux archive
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          archive="otelcontext_${version}_linux_amd64.tar.gz"
+          gh release download "${TAG}" --repo "${GITHUB_REPOSITORY}" --dir "${PROOF_ROOT}/release" \
+            --pattern "${archive}" \
+            --pattern checksums.txt \
+            --pattern checksums.txt.sig \
+            --pattern checksums.txt.pem
+          cd "${PROOF_ROOT}/release"
+          grep " ${archive}$" checksums.txt | sha256sum --check -
+          if grep -q '^-----BEGIN CERTIFICATE-----' checksums.txt.pem; then
+            cp checksums.txt.pem checksums-certificate.pem
+          else
+            base64 --decode checksums.txt.pem > checksums-certificate.pem
+          fi
+          cosign verify-blob \
+            --certificate checksums-certificate.pem \
+            --signature checksums.txt.sig \
+            --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/${TAG}" \
+            --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+            checksums.txt
+          tar -xzf "${archive}" -C "${PROOF_ROOT}/extracted"
+          candidate="$(find "${PROOF_ROOT}/extracted" -type f -name otelcontext -print -quit)"
+          test -n "${candidate}"
+          chmod 0755 "${candidate}"
+          test "$("${candidate}" --version)" = "OtelContext version ${TAG}"
+          archive_sha="$(awk -v name="${archive}" '$2 == name {print $1}' checksums.txt)"
+          test "${#archive_sha}" -eq 64
+          candidate_sha="$(sha256sum "${candidate}" | awk '{print $1}')"
+          {
+            echo "ARCHIVE=${PROOF_ROOT}/release/${archive}"
+            echo "ARCHIVE_SHA=${archive_sha}"
+            echo "CANDIDATE=${candidate}"
+            echo "CANDIDATE_SHA=${candidate_sha}"
+          } >> "${GITHUB_ENV}"
+
+      - name: Build source-bound gate tools only
+        run: |
+          set -euo pipefail
+          make gate-tools GATE_BIN_DIR="${PROOF_ROOT}/bin"
+          sha256sum \
+            "${PROOF_ROOT}/bin/gate" \
+            "${PROOF_ROOT}/bin/loadsim" \
+            "${PROOF_ROOT}/bin/aggprefill" \
+            > "${PROOF_ROOT}/aggregate/tool-digests.txt"
+          cp test/gate/release.config.json "${PROOF_ROOT}/aggregate/release.config.json"
+
+      - name: Run aggregate certification protocol
+        id: gate
+        run: |
+          set +e
+          "${PROOF_ROOT}/bin/gate" \
+            -config "${GITHUB_WORKSPACE}/test/gate/release.config.json" \
+            -server "${CANDIDATE}" \
+            -expected-server-sha256 "${CANDIDATE_SHA}" \
+            -loadsim "${PROOF_ROOT}/bin/loadsim" \
+            -prefill "${PROOF_ROOT}/bin/aggprefill" \
+            -tag "${TAG}" \
+            -expected-commit-sha "${SHA}" \
+            -archive "${ARCHIVE}" \
+            -expected-archive-sha256 "${ARCHIVE_SHA}" \
+            -work-dir "${PROOF_ROOT}/aggregate/work" \
+            -out "${PROOF_ROOT}/aggregate/report" \
+            > "${PROOF_ROOT}/aggregate/gate.stdout.log" 2>&1
+          status=$?
+          printf '%s\n' "${status}" > "${PROOF_ROOT}/aggregate/gate.exit-code"
+          exit 0
+
+      - name: Record workflow evidence
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          jq -n \
+            --arg schema_version 'otelcontext.aggregate-workflow.v1' \
+            --arg tag "${TAG}" \
+            --arg sha "${SHA}" \
+            --arg run_id "${GITHUB_RUN_ID}" \
+            --arg run_attempt "${GITHUB_RUN_ATTEMPT}" \
+            --arg run_url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            '{schema_version:$schema_version,tag:$tag,sha:$sha,run_id:$run_id,run_attempt:$run_attempt,run_url:$run_url}' \
+            > "${PROOF_ROOT}/aggregate/workflow-evidence.json"
+          find "${PROOF_ROOT}/aggregate" -type f ! -name artifact-digests.txt -print0 2>/dev/null \
+            | sort -z \
+            | xargs -0 -r sha256sum \
+            > "${PROOF_ROOT}/aggregate/artifact-digests.txt"
+
+      - name: Upload aggregate evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: aggregate-gate-${{ inputs.tag }}-${{ inputs.sha }}
+          path: ${{ env.PROOF_ROOT }}/aggregate
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Enforce aggregate verdict
+        if: ${{ always() }}
+        run: |
+          test -f "${PROOF_ROOT}/aggregate/gate.exit-code"
+          test "$(cat "${PROOF_ROOT}/aggregate/gate.exit-code")" -eq 0
+          report="$(find "${PROOF_ROOT}/aggregate/report" -maxdepth 1 -name '*-aggregate-7day-gate.json' -print -quit)"
+          test -n "${report}"
+          jq -e '.passed == true and all(.assertions[]; .pass == true)' "${report}"
