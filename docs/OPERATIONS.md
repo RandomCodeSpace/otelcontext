@@ -165,41 +165,86 @@ Phase 3b will add Postgres declarative partitioning as an opt-in adapter; at tha
 
 ## Backup & Restore
 
-### SQLite
+OtelContext creates one stopped, manifest-bound bundle. Do not back up the main database, aggregate database, DLQ, or generated TLS files independently: mixing capture points can produce a set that looks complete but cannot be recovered consistently.
 
-Online backup (does not block writers):
+This is an **offline** workflow. It does not provide online backup, point-in-time recovery, retention, encryption, or an RPO/RTO promise.
+
+### What is in a bundle
+
+| Durable owner | `legacy` | `aggregate-shadow` | `aggregate` |
+|---|---:|---:|---:|
+| Main SQLite/PostgreSQL/MySQL/SQL Server database | Yes | Yes | Yes |
+| Separate aggregate SQLite database and identity/version metadata | No | Yes | Yes |
+| Dead-letter queue JSON files | Yes | Yes | Yes |
+| Generated self-signed certificate and key | When enabled | When enabled | When enabled |
+| Candidate, configuration, migration, hash, shutdown, fingerprint, and timing manifest | Yes | Yes | Yes |
+
+Explicit `TLS_CERT_FILE` and `TLS_KEY_FILE` values are operator-owned and are not copied. Back those files up through the system that owns them.
+
+### Native database tools
+
+The commands use SQLite support built into the binary. Server databases require the matching native client on `PATH`:
+
+| Database | Required client | Captured form |
+|---|---|---|
+| SQLite | None | `VACUUM INTO`, then integrity and foreign-key checks |
+| PostgreSQL 16 | `pg_dump` and `pg_restore` 16 | Custom archive without owner or privilege statements |
+| MySQL 8.4 | `mysqldump` and `mysql` 8.4 | Single-transaction logical dump |
+| SQL Server 2022 | `sqlcmd` 18 | Full `COPY_ONLY` backup with checksum |
+
+The command stops with a clear error when a client is missing or from the wrong major version. SQL Server must be able to see the absolute bundle path at the same path inside the database host or container because the server reads and writes the backup file itself.
+
+### Create a bundle
+
+1. Record the exact binary, environment, and configuration used by the service.
+2. Stop OtelContext cleanly and wait for the process to exit. A forced or incomplete stop does not qualify.
+3. Run that same binary with the same environment and an absolute output directory:
+
+   ```bash
+   /usr/local/bin/otelcontext backup create --out /var/backups/otelcontext
+   ```
+
+4. Keep only a directory reported with `"status":"created"`. A failed capture leaves a uniquely named `.partial` directory for diagnosis; it is not restorable.
+5. Record the reported `manifest_sha256` with the copied bundle, then copy the completed directory to the operator-owned backup location.
+
+The create command refuses to run while a runtime marker is active, after an unclean stop, with a shutdown proof from another binary, or when a required owner cannot be inspected. `quiesce_seconds` and `capture_seconds` are measurements from this run, not service-level promises.
+
+### Restore to fresh targets
+
+Never restore over the source. Prepare a candidate configuration that keeps the same database adapter, aggregate mode, PostgreSQL partitioning mode, and TLS ownership mode while pointing every restored owner at a fresh target:
+
+- SQLite main and aggregate paths must not exist.
+- PostgreSQL and MySQL target databases must exist but contain no user tables.
+- The SQL Server target database must not exist.
+- `DLQ_PATH` and a generated `TLS_CACHE_DIR` must not exist.
+- Mount the completed bundle read-only where practical. Never pass a `.partial` directory.
+
+With the service still stopped, run the candidate binary in that environment:
 
 ```bash
-sqlite3 otelcontext.db ".backup /backups/otelcontext-$(date +%F).db"
-# or
-sqlite3 otelcontext.db "VACUUM INTO '/backups/otelcontext-$(date +%F).db'"
+/usr/local/bin/otelcontext backup restore \
+  --bundle /var/backups/otelcontext/otelcontext-backup-YYYYMMDDTHHMMSSZ-ID
 ```
 
-Restore:
+Before writing, restore verifies the schema, complete artifact set, sizes and hashes, mode, migration state, aggregate identity and versions, DLQ and TLS inventory, database artifact, source identities, and every fresh-target condition. It restores with automatic migrations and aggregate rebuild disabled, inspects the restored durability metadata, starts the exact candidate, waits up to 60 seconds for `/ready`, and then shuts it down cleanly.
 
-```bash
-sqlite3 /backups/otelcontext-YYYY-MM-DD.db "VACUUM INTO './otelcontext.db'"
-```
+A successful report includes `"status":"restored"`, the manifest lifecycle fingerprint, measured backup age, restore time, and `ready_seconds`. The readiness drill stops the candidate; start the service normally only after checking the report.
 
-### Postgres
+If a restore fails after writing begins, discard the new target set and retry with another fresh set. Do not point the previous service at a partially populated target.
 
-Operator-owned:
+### Drill and rollback
 
-```bash
-pg_dump -Fc -d otelcontext -f /backups/otelcontext-$(date +%F).dump
-```
+For each release candidate and on the recovery cadence your operation requires:
 
-Restore:
+1. Restore the newest completed bundle to isolated fresh targets.
+2. Start the candidate and wait for `/ready`.
+3. Verify the UI and REST, all seven MCP tools, WebSocket updates, DLQ inventory/replay, migration status, and durable fingerprints relevant to your deployment.
+4. Record the bundle manifest, manifest digest, redacted command records, measured timings, and validation result.
+5. Keep the previous binary, configuration, main target, aggregate file, DLQ, generated TLS directory, and bundle until the candidate has passed.
 
-```bash
-pg_restore -d otelcontext --clean --if-exists /backups/otelcontext-YYYY-MM-DD.dump
-```
+Rollback is pointer-based: stop the candidate and switch the service back to the previous binary, configuration, and untouched target set. There are no in-place restores and no down migrations.
 
-### Cadence
-
-- Hourly purge removes rows outside the retention window. If you care about data from within the last hour, back up **before the top of the hour**.
-- Daily is fine for the platform use case (platform state is not the same as user application data).
-- Test restore quarterly against a scratch instance.
+Choose backup and drill frequency from the amount of telemetry your operation can afford to lose and the recovery time it has measured. The command reports backup age and elapsed durations; it does not turn those observations into an RPO or RTO claim.
 
 ---
 

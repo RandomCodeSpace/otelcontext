@@ -19,6 +19,7 @@ import (
 	"github.com/RandomCodeSpace/otelcontext/internal/ai"
 	"github.com/RandomCodeSpace/otelcontext/internal/api"
 	"github.com/RandomCodeSpace/otelcontext/internal/authn"
+	"github.com/RandomCodeSpace/otelcontext/internal/backup"
 	"github.com/RandomCodeSpace/otelcontext/internal/config"
 	"github.com/RandomCodeSpace/otelcontext/internal/graph"
 	"github.com/RandomCodeSpace/otelcontext/internal/graphrag"
@@ -119,6 +120,9 @@ func fatal(msg string, err error, kv ...any) {
 }
 
 func main() {
+	if handled, code := maybeRunBackupCommand(os.Args[1:], os.Stdout, os.Stderr); handled {
+		os.Exit(code)
+	}
 	if handled, code := maybeRunMigrationCommand(os.Args[1:], os.Stdout, os.Stderr); handled {
 		os.Exit(code)
 	}
@@ -158,6 +162,14 @@ func main() {
 	cfg.GuardSelfInstrumentation()
 	if err := cfg.ValidateDBForEnv(); err != nil {
 		fatal("DB/Env validation", err)
+	}
+	runtimeCandidate, err := backup.CurrentCandidate(Version)
+	if err != nil {
+		fatal("identify runtime candidate", err)
+	}
+	runtimeHandle, err := backup.BeginRuntime(backupConfig(cfg), runtimeCandidate, time.Now())
+	if err != nil {
+		fatal("write active runtime marker", err)
 	}
 	// Authenticated tenant identity (#194 blockers 7 + 8). Loaded once, at
 	// startup: swapping the key file is an explicit restart, never a live
@@ -1585,6 +1597,9 @@ func main() {
 			"version", Version,
 			"proof", string(proof),
 		)
+	}
+	if _, err := backup.CompleteRuntime(backupConfig(cfg), runtimeHandle, report); err != nil {
+		fatal("shutdown proof persistence failed", err)
 	}
 
 	slog.Info("shutdown_complete",

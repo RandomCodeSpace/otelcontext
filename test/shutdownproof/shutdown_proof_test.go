@@ -86,6 +86,7 @@ type appProcess struct {
 	mainDBPath    string
 	aggregatePath string
 	dlqPath       string
+	autoMigrate   string
 }
 
 func newAppProcess(t *testing.T, binary, mode string) *appProcess {
@@ -101,6 +102,7 @@ func newAppProcess(t *testing.T, binary, mode string) *appProcess {
 		mainDBPath:    filepath.Join(dir, "otelcontext.db"),
 		aggregatePath: filepath.Join(dir, "aggregate.db"),
 		dlqPath:       filepath.Join(dir, "dlq"),
+		autoMigrate:   "true",
 	}
 }
 
@@ -127,7 +129,7 @@ func (a *appProcess) environment() []string {
 		"APP_ENV":                    "development",
 		"DATA_DISK_BUDGET_MB":        "1000000",
 		"DATA_DISK_PATH":             a.dir,
-		"DB_AUTOMIGRATE":             "true",
+		"DB_AUTOMIGRATE":             a.autoMigrate,
 		"DB_DRIVER":                  "sqlite",
 		"DB_DSN":                     a.mainDBPath,
 		"DLQ_PATH":                   a.dlqPath,

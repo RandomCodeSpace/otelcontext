@@ -158,7 +158,23 @@ If the database came from an older release that predates migration tracking, ide
 ./otelcontext migrate up
 ```
 
-The baseline command validates the database first; it does not repair or guess. Back up the main database and aggregate database file, and keep the previous signed binary until `migrate status` reports `result=ready`. Versioned production checks are available for SQLite and unpartitioned PostgreSQL 16. MySQL, SQL Server, and PostgreSQL daily partitioning keep their existing preview AutoMigrate path.
+The baseline command validates the database first; it does not repair or guess. Create a complete OtelContext backup before upgrading, and keep the previous signed binary until `migrate status` reports `result=ready`. Versioned production checks are available for SQLite and unpartitioned PostgreSQL 16. MySQL, SQL Server, and PostgreSQL daily partitioning keep their existing preview AutoMigrate path.
+
+## Back up and restore
+
+After stopping OtelContext cleanly, use the same binary and environment as the service:
+
+```bash
+otelcontext backup create --out /absolute/path/to/backups
+```
+
+The published bundle keeps the main database, any mode-required aggregate database, the dead-letter queue, generated TLS identity, and a hashed manifest together. Restore into new database and sidecar paths; the command will not overwrite the source or an existing target:
+
+```bash
+otelcontext backup restore --bundle /absolute/path/to/backups/otelcontext-backup-...
+```
+
+Restore starts the same candidate briefly, waits for `/ready`, and shuts it down again. Keep the old binary, configuration, data, and bundle until the restored deployment passes your checks. The [backup and restore runbook](docs/OPERATIONS.md#backup--restore) covers database-specific tools, fresh-target setup, validation, and rollback.
 
 ## Secure a deployment
 
