@@ -1,37 +1,12 @@
 #!/usr/bin/env bash
 #
-# scripts/release.sh — cut a release tag whose git tree contains the built UI.
-#
-# Why this exists
-# ---------------
-# The binary embeds the React UI via `//go:embed all:dist` in internal/ui, but
-# the built dist is intentionally NOT committed to main (main is source-only;
-# only internal/ui/dist/.gitkeep is tracked). `go install <module>@<tag>` only
-# compiles Go — it never runs vite — so for an installed binary to be
-# UI-complete, the *tagged commit* must carry the built dist.
-#
-# This script builds the UI, creates a DETACHED release commit that includes
-# internal/ui/dist, tags it, and pushes ONLY the tag. main is left untouched —
-# the release commit is reachable solely through the tag, so no build artifact
-# ever lands on the branch.
-#
-# Division of labour with .github/workflows/release.yml
-# -----------------------------------------------------
-# Pushing the tag (below) triggers release.yml, which owns release ARTIFACTS +
-# SIGNING: GoReleaser builds the cross-platform binaries, emits checksums +
-# SBOMs, and cosign keyless-signs the checksums file (.sig + .pem). This script
-# only builds the UI and pushes the tag; it does NOT upload any binaries.
-#
-# `--release` here creates the GitHub release shell EARLY (title + install
-# notes, NO artifacts) so humans see notes immediately. GoReleaser is configured
-# with `release.mode: append` (.goreleaser.yaml), so when its run finishes it
-# ADDS its signed artifacts to this same release rather than failing on
-# "release already exists" — no race. Omit `--release` and GoReleaser creates
-# the release itself from scratch.
+# Cut and push an OtelContext release tag. The browser UI is committed source
+# embedded by Go, so releases do not require a frontend build or detached
+# release commit.
 #
 # Usage:
-#   scripts/release.sh vX.Y.Z[-pre]            # build + push tag (release.yml does the rest)
-#   scripts/release.sh vX.Y.Z[-pre] --release  # also create the GitHub release shell (notes only)
+#   scripts/release.sh vX.Y.Z[-pre]
+#   scripts/release.sh vX.Y.Z[-pre] --release
 #
 set -euo pipefail
 
@@ -45,10 +20,10 @@ MAKE_RELEASE="${2:-}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-# --- Preconditions -----------------------------------------------------------
 branch="$(git rev-parse --abbrev-ref HEAD)"
 [ "$branch" = "main" ] || { echo "error: must be on main (currently '$branch')" >&2; exit 1; }
-git diff --quiet && git diff --cached --quiet || { echo "error: working tree not clean" >&2; exit 1; }
+tracked_status="$(git status --porcelain --untracked-files=no)"
+[ -z "$tracked_status" ] || { echo "error: working tree has tracked changes" >&2; exit 1; }
 git fetch origin main --tags --quiet
 [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ] || { echo "error: local main is not in sync with origin/main" >&2; exit 1; }
 if git rev-parse -q --verify "refs/tags/$VER" >/dev/null 2>&1 || git ls-remote --exit-code --tags origin "$VER" >/dev/null 2>&1; then
@@ -56,54 +31,26 @@ if git rev-parse -q --verify "refs/tags/$VER" >/dev/null 2>&1 || git ls-remote -
   exit 1
 fi
 
-base="$(git rev-parse HEAD)"
-# Always restore main to its source-only state, even on failure.
-cleanup() { git reset --hard --quiet "$base"; git clean -fdq -- internal/ui/dist >/dev/null 2>&1 || true; }
-trap cleanup EXIT
+CHECK_BIN="$(mktemp "${TMPDIR:-/tmp}/otelcontext-release-check.XXXXXX")"
+trap 'rm -f "$CHECK_BIN"' EXIT
 
-# --- Build the UI ------------------------------------------------------------
-echo "▸ building UI (npm ci --ignore-scripts && npm run build)…"
-# --ignore-scripts: no dependency lifecycle script runs during a release
-# install. Verified the vite build needs none.
-( cd ui && npm ci --ignore-scripts && npm run build )
-[ -f internal/ui/dist/index.html ] || { echo "error: UI build produced no dist/index.html" >&2; exit 1; }
-touch internal/ui/dist/.gitkeep   # vite emptyOutDir wipes it; keep the placeholder
+echo "▸ verifying embedded UI and release build…"
+CGO_ENABLED=0 go build -o "$CHECK_BIN" .
 
-# --- Sanity: the binary compiles with the freshly built dist embedded --------
-echo "▸ verifying the binary embeds the UI…"
-go build -o /tmp/otelctx-release-check . && rm -f /tmp/otelctx-release-check
-
-# --- Detached release commit carrying the built dist -------------------------
-echo "▸ creating release commit + tag $VER…"
-git add -f internal/ui/dist
-git commit -q -m "release: $VER (built UI embedded; not merged to main)"
 git tag -a "$VER" -m "$VER"
-
-# --- Push ONLY the tag (its commit + dist travel with it; main stays clean) ---
 git push origin "refs/tags/$VER"
 echo "✓ pushed tag $VER -> $(git rev-parse --short "$VER")"
 
-# (the EXIT trap now restores main to the source-only state)
-
-# --- Optional GitHub pre-release (shell only; release.yml appends artifacts) -
-# Creates the release with title + notes and NO artifacts. The tag push above
-# triggers .github/workflows/release.yml, whose GoReleaser run (release.mode:
-# append) attaches the signed binaries, checksums, and SBOMs to this release.
 if [ "$MAKE_RELEASE" = "--release" ]; then
   prev="$(git describe --tags --abbrev=0 "${VER}^" 2>/dev/null || true)"
   range="${prev:+${prev}..}${VER}"
-  notes="$(git log --pretty='- %s' "$range" 2>/dev/null | grep -vE '^- release:' || true)"
-  body="Install (UI embedded):
-\`\`\`
-go install github.com/RandomCodeSpace/otelcontext@$VER
-\`\`\`
+  notes="$(git log --pretty='- %s' "$range" 2>/dev/null || true)"
+  body="Install:
+
+    go install github.com/RandomCodeSpace/otelcontext@$VER
 
 ### Changes
 $notes"
-  # Only a tag carrying a pre-release identifier (vX.Y.Z-something) is marked
-  # as a GitHub pre-release — matching GoReleaser's `prerelease: auto`, so the
-  # early release shell and the appended artifacts never disagree. A stable
-  # tag becomes a full release and is eligible for "Latest".
   if [[ "$VER" == *-* ]]; then
     gh release create "$VER" --prerelease --title "$VER" --notes "$body"
     echo "✓ created GitHub pre-release $VER"

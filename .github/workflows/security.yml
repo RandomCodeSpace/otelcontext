@@ -5,7 +5,7 @@ name: Security (OSS-CLI)
 # 2026-04-28 (board reversal); it runs via the SonarCloud GitHub App,
 # not as a job in this workflow.
 #
-# Six independent jobs — fail-fast off so all signals surface on a single run.
+# Five independent jobs surface supply-chain and static-analysis signals.
 # All actions SHA-pinned per Scorecard `Pinned-Dependencies`. Top-level
 # `permissions: read-all` per Scorecard `Token-Permissions`; jobs scope up
 # only when needed (gitleaks needs full git history; sbom job uploads).
@@ -47,22 +47,8 @@ jobs:
           mv osv-scanner_linux_amd64 osv-scanner
           chmod +x osv-scanner
           ./osv-scanner --version
-      - name: Run osv-scanner (Go module + npm lockfile)
-        # Go's `gomod` lockfile parser in osv-scanner is stable (unlike v2's
-        # `pomxml` plugin which depends on the deps.dev gRPC service). Both
-        # ecosystems are covered here directly.
-        #
-        # The repo-root `package-lock.json` is an empty stub (no root
-        # package.json exists) and is intentionally excluded — scanning it
-        # only adds noise without coverage.
-        #
-        # AC §5 ("Zero High/Critical CVEs in dependency tree") is satisfied
-        # by the union of OSV-Scanner (Go + ui/ npm) + Trivy (filesystem, OS) +
-        # Dependabot (cross-ecosystem advisories on the Security tab).
-        run: |
-          ./osv-scanner \
-            --lockfile=go.mod \
-            --lockfile=ui/package-lock.json
+      - name: Run osv-scanner (Go module)
+        run: ./osv-scanner --lockfile=go.mod
 
   trivy:
     name: Trivy (filesystem + container scan)
@@ -128,41 +114,6 @@ jobs:
           chmod +x gitleaks
       - name: Run gitleaks (full git history)
         run: ./gitleaks detect --source . --redact --no-banner --exit-code 1
-
-  jscpd:
-    name: jscpd (duplication < 3% on touched code)
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4.2.2
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: '20'
-      - run: |
-          # Scope jscpd to production code only:
-          #   - internal/   — Go production code
-          #   - ui/src/     — React/TS production code
-          # Tests, generated code, vendored deps, build artifacts, and the
-          # legacy internal/graph/ package (CLAUDE.md: "use internal/graphrag/
-          # for all new graph work") are excluded — they would otherwise
-          # surface intentional shape-parallelism rather than refactoring
-          # opportunities.
-          #
-          # `--min-tokens 100` is a sensible Go floor: a meaningful Go
-          # function body is ~40-80 tokens; 100 corresponds to a real
-          # method body or a non-trivial code block, not import/struct
-          # boilerplate that 200+ Go files share by convention.
-          # Installed with lifecycle scripts disabled and an exact version
-          # rather than resolved on demand by npx.
-          npm install --no-save --ignore-scripts jscpd@4.3.0
-          npx --no-install jscpd \
-            --threshold 3 \
-            --min-tokens 100 \
-            --reporters consoleFull \
-            --format "go,javascript,typescript,tsx" \
-            --ignore "**/vendor/**,**/node_modules/**,**/dist/**,**/build/**,**/coverage/**,**/internal/graph/**,**/*_test.go,**/*.test.ts,**/*.test.tsx,**/*.spec.ts,**/*.spec.tsx,**/internal/ui/embed_*.go" \
-            internal ui/src
 
   sbom:
     name: SBOM (SPDX + CycloneDX)

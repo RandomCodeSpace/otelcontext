@@ -1,39 +1,18 @@
 name: Release (artifacts + signing)
-# Builds release artifacts and signs them when a `v*` tag is pushed.
-#
-# The tag itself is cut by scripts/release.sh: it builds the React UI, makes a
-# DETACHED commit embedding internal/ui/dist, tags it, and pushes ONLY the tag
-# (main stays source-only). This workflow runs on that tag push and owns
-# release ARTIFACTS + SIGNING — GoReleaser builds the cross-platform binaries,
-# emits checksums + SBOMs, and cosign keyless-signs the checksums file so a
-# .sig + .pem pair attaches to the release. That satisfies Scorecard's
-# Packaging (a publishing workflow is detected) and Signed-Releases checks.
-#
-# release.sh embeds internal/ui/dist into the detached tagged commit, but this
-# workflow rebuilds the UI (npm ci && npm run build) BEFORE invoking goreleaser
-# anyway: `go build` only recompiles Go (never runs vite), so rebuilding here
-# guarantees the embedded dist is present and current regardless of how the tag
-# was produced.
-#
-# All third-party actions are SHA-pinned per Scorecard Pinned-Dependencies;
-# pins are reused verbatim from security.yml / scorecard.yml where they overlap.
+
+# Builds release artifacts and signs them when a version tag is pushed. The
+# browser-native UI is committed under internal/ui/static and Go embeds it
+# directly, so release jobs need only the Go toolchain.
 on:
   push:
     tags:
       - 'v*'
-  # Manual re-release: run the CURRENT (default-branch) workflow against an
-  # already-pushed tag. GoReleaser's `release: mode: append` adds artifacts to
-  # the existing release WITHOUT mutating the immutable tag — used to recover a
-  # release whose original tag-push run failed.
   workflow_dispatch:
     inputs:
       tag:
         description: 'Existing tag to (re)build + sign (e.g. v0.3.1)'
         required: true
 
-# Workflow-level default: minimum needed for actions/checkout. The release job
-# escalates to contents: write (create/append the GitHub release + upload
-# assets) and id-token: write (cosign keyless OIDC).
 permissions:
   contents: read
 
@@ -55,9 +34,6 @@ jobs:
         # actions/checkout v4.2.2
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          # On workflow_dispatch, build the supplied existing tag; on a tag
-          # push, the pushed ref. Full history so goreleaser version detection
-          # works.
           ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
           persist-credentials: false
@@ -69,46 +45,16 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Set up Node
-        # actions/setup-node v6.4.0
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
-        with:
-          node-version: '24'
-
-      - name: Build UI (embedded into the binary)
-        # The Go binary embeds internal/ui/dist via //go:embed; build it before
-        # goreleaser compiles. `npm run build` emits into internal/ui/dist.
-        run: |
-          cd ui
-          # --ignore-scripts: no dependency lifecycle script runs during a
-          # release install. Verified the vite build needs none.
-          npm ci --ignore-scripts
-          npm run build
-          test -f ../internal/ui/dist/index.html
-          # vite's emptyOutDir wipes internal/ui/dist on rebuild, deleting the
-          # committed .gitkeep placeholder that script-cut release tags carry.
-          # Restore it so the working tree matches the tag and GoReleaser's
-          # dirty-state check passes (no-op for tags that don't track .gitkeep).
-          git -C "$GITHUB_WORKSPACE" checkout -- internal/ui/dist/.gitkeep 2>/dev/null || true
-
       - name: Install cosign
-        # sigstore/cosign-installer v3.9.2 — provides `cosign` for the keyless
-        # signing step in .goreleaser.yaml (signs: cmd: cosign).
+        # sigstore/cosign-installer v3.9.2
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
         with:
-          # Pin the cosign BINARY, not just the installer action: without this
-          # the action installs the latest cosign, and cosign v3 flipped
-          # --new-bundle-format on by default, ignoring the --output-signature/
-          # --output-certificate flags .goreleaser.yaml relies on and failing
-          # the sign step (v0.4.0-beta.2 tag-push run). v2 keeps the .sig+.pem
-          # output contract Scorecard Signed-Releases is checked against.
+          # Cosign v2 preserves the detached signature and certificate output
+          # contract used by the GoReleaser configuration.
           cosign-release: 'v2.6.5'
 
       - name: Install syft
-        # anchore/sbom-action v0.24.0 (download-syft sub-action) — puts `syft`
-        # on PATH for the goreleaser `sboms:` step, which shells out to syft per
-        # archive. Without this goreleaser fails: `exec: "syft": not found`.
-        # Pin reused from security.yml.
+        # anchore/sbom-action v0.24.0
         uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610
 
       - name: Run GoReleaser
@@ -118,9 +64,6 @@ jobs:
           version: '~> v2'
           args: release --clean
         env:
-          # Pure-Go SQLite driver → cgo off (matches .goreleaser.yaml builds.env).
           CGO_ENABLED: '0'
-          # Default token: goreleaser uses it to create/append the release.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # cosign keyless reads the OIDC token from these (set by id-token: write).
           COSIGN_EXPERIMENTAL: '1'

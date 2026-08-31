@@ -42,7 +42,7 @@ In scope:
 
 - The otelcontext binary (single Go process serving OTLP gRPC `:4317`, HTTP API + OTLP HTTP + UI + MCP `:8080`).
 - All packages under `internal/` (ingestion, storage, GraphRAG, MCP, API, telemetry).
-- The embedded React frontend under `ui/`.
+- The embedded browser UI under `internal/ui/static/`.
 - The OTLP/MCP wire protocol surface as exposed by this binary.
 - The DLQ (Dead Letter Queue) on-disk format.
 
@@ -57,7 +57,7 @@ Out of scope (please report upstream):
 - [`CLAUDE.md`](CLAUDE.md) — architecture, multi-tenancy model, configuration surface.
 - [`.bestpractices.json`](.bestpractices.json) — OpenSSF Best Practices self-assessment evidence map.
 - [`.github/workflows/scorecard.yml`](.github/workflows/scorecard.yml) — OpenSSF Scorecard supply-chain analysis (push + weekly).
-- [`.github/workflows/security.yml`](.github/workflows/security.yml) — OSS-CLI security stack (OSV-Scanner, Trivy, Semgrep, Gitleaks, jscpd, SBOM).
+- [`.github/workflows/security.yml`](.github/workflows/security.yml) — OSS-CLI security stack (OSV-Scanner, Trivy, Semgrep, Gitleaks, SBOM).
 - [`.github/dependabot.yml`](.github/dependabot.yml) — dependency update + security update channels.
 - [`scripts/setup-git-signed.sh`](scripts/setup-git-signed.sh) — repo-local config for signed commits on `main`.
 

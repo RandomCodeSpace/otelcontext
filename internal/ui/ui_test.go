@@ -1,300 +1,275 @@
 package ui
 
 import (
-	"io"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"testing/fstest"
 )
 
-// builtDistFS returns a fake Vite build output: index.html with both
-// precompressed siblings, a hashed JS asset with both siblings, a hashed
-// CSS asset with no siblings, and a root-level static file.
-func builtDistFS() fstest.MapFS {
+func testAssets() fstest.MapFS {
 	return fstest.MapFS{
-		"index.html":              {Data: []byte("<html>index</html>")},
-		"index.html.br":           {Data: []byte("br-index")},
-		"index.html.gz":           {Data: []byte("gz-index")},
-		"assets/app-abc123.js":    {Data: []byte("console.log('app')")},
-		"assets/app-abc123.js.br": {Data: []byte("br-js")},
-		"assets/app-abc123.js.gz": {Data: []byte("gz-js")},
-		"assets/app-abc123.css":   {Data: []byte("body{}")},
-		"vite.svg":                {Data: []byte("<svg/>")},
+		"static/index.html":  {Data: []byte("<html>shell</html>")},
+		"static/app.js":      {Data: []byte("console.log('app')")},
+		"static/app.css":     {Data: []byte("body{}")},
+		"static/favicon.svg": {Data: []byte("<svg/>")},
 	}
 }
 
-func get(t *testing.T, h http.Handler, path string, hdr map[string]string) *httptest.ResponseRecorder {
+func request(t *testing.T, handler http.Handler, method, target string, headers map[string]string) *httptest.ResponseRecorder {
 	t.Helper()
-	req := httptest.NewRequest(http.MethodGet, path, nil)
-	for k, v := range hdr {
-		req.Header.Set(k, v)
+	req := httptest.NewRequest(method, target, nil)
+	for key, value := range headers {
+		req.Header.Set(key, value)
 	}
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
+	handler.ServeHTTP(rec, req)
 	return rec
 }
 
-func TestServeAsset_BrotliNegotiation(t *testing.T) {
-	h := newSPAHandler(builtDistFS())
-	rec := get(t, h, "/assets/app-abc123.js", map[string]string{"Accept-Encoding": "gzip, br"})
+func newTestHandler(t *testing.T) http.Handler {
+	t.Helper()
+	handler, err := newEmbeddedHandler(testAssets())
+	if err != nil {
+		t.Fatalf("newEmbeddedHandler: %v", err)
+	}
+	return handler
+}
+
+func TestIndexServesEmbeddedShellWithETag(t *testing.T) {
+	handler := newTestHandler(t)
+	rec := request(t, handler, http.MethodGet, "/", nil)
 
 	if rec.Code != http.StatusOK {
-		t.Fatalf("want 200, got %d", rec.Code)
+		t.Fatalf("status = %d, want 200", rec.Code)
 	}
-	if got := rec.Header().Get("Content-Encoding"); got != "br" {
-		t.Errorf("Content-Encoding = %q, want br", got)
-	}
-	if got := rec.Header().Get("Cache-Control"); got != "public, max-age=31536000, immutable" {
-		t.Errorf("Cache-Control = %q", got)
-	}
-	if got := rec.Header().Get("Vary"); got != "Accept-Encoding" {
-		t.Errorf("Vary = %q", got)
-	}
-	// Content-Type must come from the ORIGINAL .js extension, not .br.
-	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "javascript") {
-		t.Errorf("Content-Type = %q, want javascript", ct)
-	}
-	if rec.Body.String() != "br-js" {
-		t.Errorf("body = %q, want br sibling bytes", rec.Body.String())
-	}
-}
-
-func TestServeAsset_GzipFallback(t *testing.T) {
-	h := newSPAHandler(builtDistFS())
-	rec := get(t, h, "/assets/app-abc123.js", map[string]string{"Accept-Encoding": "gzip"})
-
-	if got := rec.Header().Get("Content-Encoding"); got != "gzip" {
-		t.Errorf("Content-Encoding = %q, want gzip", got)
-	}
-	if rec.Body.String() != "gz-js" {
-		t.Errorf("body = %q, want gz sibling bytes", rec.Body.String())
-	}
-}
-
-func TestServeAsset_BrotliQZeroFallsBackToGzip(t *testing.T) {
-	h := newSPAHandler(builtDistFS())
-	rec := get(t, h, "/assets/app-abc123.js", map[string]string{"Accept-Encoding": "br;q=0, gzip"})
-
-	if got := rec.Header().Get("Content-Encoding"); got != "gzip" {
-		t.Errorf("Content-Encoding = %q, want gzip", got)
-	}
-}
-
-func TestServeAsset_IdentityWhenNoAcceptEncoding(t *testing.T) {
-	h := newSPAHandler(builtDistFS())
-	rec := get(t, h, "/assets/app-abc123.js", nil)
-
-	if got := rec.Header().Get("Content-Encoding"); got != "" {
-		t.Errorf("Content-Encoding = %q, want empty", got)
-	}
-	if rec.Body.String() != "console.log('app')" {
-		t.Errorf("body = %q, want original bytes", rec.Body.String())
-	}
-	if got := rec.Header().Get("Cache-Control"); !strings.Contains(got, "immutable") {
-		t.Errorf("Cache-Control = %q, want immutable", got)
-	}
-}
-
-func TestServeAsset_NoSiblingServesIdentity(t *testing.T) {
-	h := newSPAHandler(builtDistFS())
-	rec := get(t, h, "/assets/app-abc123.css", map[string]string{"Accept-Encoding": "gzip, br"})
-
-	if got := rec.Header().Get("Content-Encoding"); got != "" {
-		t.Errorf("Content-Encoding = %q, want empty (no siblings exist)", got)
-	}
-	if rec.Body.String() != "body{}" {
-		t.Errorf("body = %q", rec.Body.String())
-	}
-	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "text/css") {
-		t.Errorf("Content-Type = %q, want text/css", ct)
-	}
-}
-
-func TestServeAsset_Missing404(t *testing.T) {
-	h := newSPAHandler(builtDistFS())
-	rec := get(t, h, "/assets/nope-zzz.js", nil)
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("want 404, got %d", rec.Code)
-	}
-}
-
-func TestIndex_ETagAnd304(t *testing.T) {
-	h := newSPAHandler(builtDistFS())
-
-	rec := get(t, h, "/", nil)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("want 200, got %d", rec.Code)
+	if rec.Body.String() != "<html>shell</html>" {
+		t.Fatalf("body = %q", rec.Body.String())
 	}
 	if got := rec.Header().Get("Cache-Control"); got != "no-cache" {
 		t.Errorf("Cache-Control = %q, want no-cache", got)
 	}
 	etag := rec.Header().Get("ETag")
-	if etag == "" || !strings.HasPrefix(etag, `"`) {
-		t.Fatalf("ETag = %q, want quoted non-empty", etag)
+	if etag == "" {
+		t.Fatal("ETag is empty")
 	}
-	if rec.Body.String() != "<html>index</html>" {
+
+	notModified := request(t, handler, http.MethodGet, "/", map[string]string{"If-None-Match": etag})
+	if notModified.Code != http.StatusNotModified {
+		t.Fatalf("conditional status = %d, want 304", notModified.Code)
+	}
+	if notModified.Body.Len() != 0 {
+		t.Errorf("304 body = %q, want empty", notModified.Body.String())
+	}
+}
+
+func TestStaticAssetCachingAndContentType(t *testing.T) {
+	handler := newTestHandler(t)
+	rec := request(t, handler, http.MethodGet, "/static/app.js", nil)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if rec.Body.String() != "console.log('app')" {
 		t.Errorf("body = %q", rec.Body.String())
 	}
-
-	rec2 := get(t, h, "/", map[string]string{"If-None-Match": etag})
-	if rec2.Code != http.StatusNotModified {
-		t.Fatalf("want 304, got %d", rec2.Code)
+	if got := rec.Header().Get("Cache-Control"); got != "no-cache" {
+		t.Errorf("Cache-Control = %q, want no-cache", got)
 	}
-	if rec2.Body.Len() != 0 {
-		t.Errorf("304 body should be empty, got %q", rec2.Body.String())
-	}
-	if got := rec2.Header().Get("ETag"); got != etag {
-		t.Errorf("304 ETag = %q, want %q", got, etag)
-	}
-}
-
-func TestIndex_PrecompressedVariant(t *testing.T) {
-	h := newSPAHandler(builtDistFS())
-	rec := get(t, h, "/", map[string]string{"Accept-Encoding": "br"})
-
-	if got := rec.Header().Get("Content-Encoding"); got != "br" {
-		t.Errorf("Content-Encoding = %q, want br", got)
-	}
-	if rec.Body.String() != "br-index" {
-		t.Errorf("body = %q, want br variant", rec.Body.String())
-	}
-	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "text/html") {
-		t.Errorf("Content-Type = %q, want text/html", ct)
-	}
-	// ETag must be identical across encodings — it identifies the document,
-	// and Vary: Accept-Encoding disambiguates the representation.
-	identity := get(t, h, "/", nil)
-	if rec.Header().Get("ETag") != identity.Header().Get("ETag") {
-		t.Errorf("ETag differs between encodings")
-	}
-	if got := rec.Header().Get("Vary"); got != "Accept-Encoding" {
-		t.Errorf("Vary = %q", got)
-	}
-}
-
-func TestSPAFallback_ServesIndexForClientRoutes(t *testing.T) {
-	h := newSPAHandler(builtDistFS())
-	for _, path := range []string{"/traces", "/logs", "/traces/deep/route"} {
-		rec := get(t, h, path, nil)
-		if rec.Code != http.StatusOK {
-			t.Errorf("%s: want 200, got %d", path, rec.Code)
-			continue
-		}
-		if rec.Body.String() != "<html>index</html>" {
-			t.Errorf("%s: body = %q, want index", path, rec.Body.String())
-		}
-		// Fallback responses are the mutable SPA shell — same caching rules
-		// as "/" so a deploy is picked up on the next poll.
-		if got := rec.Header().Get("Cache-Control"); got != "no-cache" {
-			t.Errorf("%s: Cache-Control = %q, want no-cache", path, got)
-		}
-	}
-}
-
-func TestSPAFallback_DoesNotClaimReservedOrAssetPaths(t *testing.T) {
-	h := newSPAHandler(builtDistFS())
-	for _, path := range []string{
-		"/api/x",            // unknown API route must 404, not get HTML
-		"/v1/unknown",       // OTLP namespace
-		"/ws/nope",          // WebSocket namespace
-		"/mcp/extra",        // MCP namespace
-		"/metrics/unknown",  // Prometheus namespace
-		"/missing.png",      // asset-shaped: extension means real 404
-		"/release/v1.2/doc", // dot anywhere in the path: preserved legacy spaFS behavior
-	} {
-		rec := get(t, h, path, nil)
-		if rec.Code != http.StatusNotFound {
-			t.Errorf("%s: want 404, got %d (body %q)", path, rec.Code, rec.Body.String())
-		}
-	}
-}
-
-func TestRealFile_DelegatesToFileServer(t *testing.T) {
-	h := newSPAHandler(builtDistFS())
-	rec := get(t, h, "/vite.svg", nil)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("want 200, got %d", rec.Code)
-	}
-	if rec.Body.String() != "<svg/>" {
-		t.Errorf("body = %q", rec.Body.String())
-	}
-}
-
-func TestHeadRequest_NoBody(t *testing.T) {
-	h := newSPAHandler(builtDistFS())
-	req := httptest.NewRequest(http.MethodHead, "/", nil)
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("want 200, got %d", rec.Code)
-	}
-	if rec.Body.Len() != 0 {
-		t.Errorf("HEAD body should be empty, got %q", rec.Body.String())
+	if got := rec.Header().Get("Content-Type"); !strings.Contains(got, "javascript") {
+		t.Errorf("Content-Type = %q, want javascript", got)
 	}
 	if rec.Header().Get("ETag") == "" {
-		t.Errorf("HEAD response missing ETag")
+		t.Error("ETag is empty")
 	}
 }
 
-// TestStubDist covers the source-only checkout where dist holds just the
-// .gitkeep placeholder: the handler must degrade to a plain 404 instead of
-// panicking or serving a directory listing.
-func TestStubDist_Graceful404(t *testing.T) {
-	h := newSPAHandler(fstest.MapFS{".gitkeep": {Data: nil}})
-	for _, path := range []string{"/", "/traces"} {
-		rec := get(t, h, path, nil)
+func TestClientRouteFallbackAndMachineNamespace404(t *testing.T) {
+	handler := newTestHandler(t)
+
+	for _, target := range []string{"/map", "/services/checkout"} {
+		rec := request(t, handler, http.MethodGet, target, nil)
+		if rec.Code != http.StatusOK || rec.Body.String() != "<html>shell</html>" {
+			t.Errorf("%s: got %d %q, want shell", target, rec.Code, rec.Body.String())
+		}
+	}
+
+	for _, target := range []string{
+		"/api/missing",
+		"/api",
+		"/v1/missing",
+		"/ws/missing",
+		"/mcp/missing",
+		"/metrics/missing",
+		"/missing.png",
+		"/static/missing.js",
+	} {
+		rec := request(t, handler, http.MethodGet, target, nil)
 		if rec.Code != http.StatusNotFound {
-			t.Errorf("%s: want 404 in stub mode, got %d", path, rec.Code)
-		}
-		body, _ := io.ReadAll(rec.Body)
-		if !strings.Contains(string(body), "UI not built") {
-			t.Errorf("%s: stub body should explain the missing build, got %q", path, body)
+			t.Errorf("%s: status = %d, want 404", target, rec.Code)
 		}
 	}
 }
 
-// TestRegisterRoutes_RealEmbed exercises the production wiring against the
-// actual embedded FS (a stub dist in a source-only checkout).
-func TestRegisterRoutes_RealEmbed(t *testing.T) {
-	s := NewServer(nil, nil, nil)
-	s.SetMCPConfig(true, "/mcp")
+func TestHeadHasHeadersAndNoBody(t *testing.T) {
+	handler := newTestHandler(t)
+	rec := request(t, handler, http.MethodHead, "/static/app.css", nil)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if rec.Body.Len() != 0 {
+		t.Errorf("body = %q, want empty", rec.Body.String())
+	}
+	if rec.Header().Get("Content-Length") == "" {
+		t.Error("Content-Length is empty")
+	}
+}
+
+func TestRootedPathCleaningDoesNotEscapeAssets(t *testing.T) {
+	handler := newTestHandler(t)
+
+	rec := request(t, handler, http.MethodGet, "/../../etc/secret.txt", nil)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("traversal status = %d, want 404", rec.Code)
+	}
+
+	rec = request(t, handler, http.MethodGet, "/static/../index.html", nil)
+	if rec.Code != http.StatusOK || rec.Body.String() != "<html>shell</html>" {
+		t.Fatalf("cleaned path = %d %q, want index", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Cache-Control"); got != "no-cache" {
+		t.Errorf("cleaned index Cache-Control = %q, want no-cache", got)
+	}
+}
+
+func TestMissingIndexFailsRegistration(t *testing.T) {
+	_, err := newEmbeddedHandler(fstest.MapFS{
+		"static/app.js": {Data: []byte("app")},
+	})
+	if err == nil || !strings.Contains(err.Error(), "index.html") {
+		t.Fatalf("error = %v, want missing index error", err)
+	}
+}
+
+func TestRegisterRoutesUsesCommittedAssets(t *testing.T) {
 	mux := http.NewServeMux()
-	if err := s.RegisterRoutes(mux); err != nil {
+	if err := RegisterRoutes(mux); err != nil {
 		t.Fatalf("RegisterRoutes: %v", err)
 	}
-	// /static/style.css is committed and embedded — must always serve.
-	rec := get(t, mux, "/static/style.css", nil)
-	if rec.Code != http.StatusOK {
-		t.Errorf("/static/style.css: want 200, got %d", rec.Code)
+
+	index := request(t, mux, http.MethodGet, "/", nil)
+	if index.Code != http.StatusOK || !strings.Contains(index.Body.String(), "Service constellation") {
+		t.Fatalf("index = %d, contains screen heading = %v", index.Code, strings.Contains(index.Body.String(), "Service constellation"))
+	}
+	for _, marker := range []string{
+		"type=\"module\" src=\"/static/app.js\"",
+		"id=\"service-map\"",
+		"id=\"inspector\" aria-labelledby=\"inspector-title\" aria-hidden=\"true\" inert",
+		"id=\"command-dialog\"",
+		"id=\"shortcut-dialog\"",
+	} {
+		if !strings.Contains(index.Body.String(), marker) {
+			t.Errorf("index is missing %q", marker)
+		}
+	}
+	for _, target := range []string{"/static/app.css", "/static/app.js", "/static/favicon.svg"} {
+		rec := request(t, mux, http.MethodGet, target, nil)
+		if rec.Code != http.StatusOK || rec.Body.Len() == 0 {
+			t.Errorf("%s: status = %d, bytes = %d", target, rec.Code, rec.Body.Len())
+		}
 	}
 }
 
-// Regression for semgrep filepath-clean-misuse: request paths are
-// rooted-cleaned before any lookup, so traversal shapes can never escape
-// the dist tree (fs.ValidPath is the second layer of the same defense).
-func TestServeHTTP_PathTraversalRootedClean(t *testing.T) {
-	h := newSPAHandler(builtDistFS())
+func TestCommittedUIHasNoFrontendBuildContract(t *testing.T) {
+	entries, err := fs.ReadDir(content, "static")
+	if err != nil {
+		t.Fatalf("read embedded UI: %v", err)
+	}
+	wantAssets := map[string]bool{
+		"app.css":     true,
+		"app.js":      true,
+		"favicon.svg": true,
+		"index.html":  true,
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !wantAssets[entry.Name()] {
+			t.Errorf("embedded UI contains unexpected generated or nested asset %q", entry.Name())
+		}
+		delete(wantAssets, entry.Name())
+	}
+	for name := range wantAssets {
+		t.Errorf("embedded UI is missing source asset %q", name)
+	}
 
-	// Climbing above the root collapses to a rooted path: asset-shaped
-	// targets 404, extensionless ones get the SPA shell — never a file read.
-	rec := get(t, h, "/../../etc/secret.txt", nil)
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("traversal path: got %d, want 404", rec.Code)
-	}
-	rec = get(t, h, "/../../etc/passwd", nil)
-	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "index") {
-		t.Fatalf("traversal fallback: got %d %q, want SPA shell", rec.Code, rec.Body.String())
+	for _, name := range []string{"index.html", "app.css", "app.js"} {
+		body, readErr := fs.ReadFile(content, "static/"+name)
+		if readErr != nil {
+			t.Fatalf("read %s: %v", name, readErr)
+		}
+		text := strings.ReplaceAll(strings.ToLower(string(body)), "http://www.w3.org/2000/svg", "")
+		for _, forbidden := range []string{"http://", "https://", "@import", "node_modules", "sourceMappingURL"} {
+			if strings.Contains(text, strings.ToLower(forbidden)) {
+				t.Errorf("%s contains external or generated asset marker %q", name, forbidden)
+			}
+		}
 	}
 
-	// ".." inside /assets collapses to the real target, which is served by
-	// its own handler (index: no-cache), never via the immutable asset path.
-	rec = get(t, h, "/assets/../index.html", nil)
-	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "index") {
-		t.Fatalf("collapsed path: got %d %q, want index", rec.Code, rec.Body.String())
+	forbiddenFiles := map[string]bool{
+		"package.json":      true,
+		"package-lock.json": true,
+		"pnpm-lock.yaml":    true,
+		"yarn.lock":         true,
+		"bun.lock":          true,
+		"bun.lockb":         true,
+		"vite.config.js":    true,
+		"vite.config.ts":    true,
+		"webpack.config.js": true,
 	}
-	if cc := rec.Header().Get("Cache-Control"); cc != "no-cache" {
-		t.Fatalf("collapsed path served with asset caching: Cache-Control=%q", cc)
+	err = filepath.WalkDir(filepath.Join("..", ".."), func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			if entry.Name() == "node_modules" {
+				return filepath.SkipDir
+			}
+			if strings.HasPrefix(entry.Name(), ".") && path != filepath.Join("..", "..") {
+				return filepath.SkipDir
+			}
+		}
+		if forbiddenFiles[entry.Name()] {
+			t.Errorf("frontend build dependency is not allowed: %s", path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("scan repository frontend contract: %v", err)
+	}
+}
+
+func TestReadmeCoversTheUserJourney(t *testing.T) {
+	body, err := os.ReadFile(filepath.Join("..", "..", "README.md"))
+	if err != nil {
+		t.Fatalf("read README: %v", err)
+	}
+	readme := string(body)
+	for _, marker := range []string{
+		"style=for-the-badge",
+		"docs/assets/otelcontext-overview.webp",
+		"## What you get",
+		"## Quick start",
+		"## Investigate with MCP",
+		"## Common configuration",
+		"docs/OPERATIONS.md",
+		"There is no Node.js install or frontend build step.",
+	} {
+		if !strings.Contains(readme, marker) {
+			t.Errorf("README is missing user-journey marker %q", marker)
+		}
 	}
 }

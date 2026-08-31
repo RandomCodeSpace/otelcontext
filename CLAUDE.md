@@ -2,15 +2,15 @@
 
 ## Project Overview
 
-OtelContext is a self-hosted OTLP observability platform. Single Go binary with embedded React frontend.
+OtelContext is a self-hosted OTLP observability platform. Single Go binary with an embedded browser-native frontend.
 - **Backend:** Go 1.25, native `net/http` (no frameworks), GORM ORM, gRPC + HTTP for OTLP ingestion
-- **Frontend:** React 19 + TypeScript + TanStack Query/Virtual + wouter + Radix primitives + cmdk palette + hand-rolled token CSS (`ui/src/styles/tokens.css`) with CSS Modules. The **service map renders via React Flow (`@xyflow/react`, MIT)** over a deterministic phyllotaxis ("sunflower") layout (`ui/src/lib/radialLayout.ts` — most-critical service near the disc centre, golden-angle spiral) computed synchronously. Unlike a layered DAG, the sunflower fills a disc evenly and never collapses sparse/disconnected graphs into a single column, so the map stays navigable from 7 to 120+ services. React Flow owns pan/zoom/fit/minimap/grid/a11y; nodes are token-themed React components — draggable, and they collapse to status **dots** below a zoom threshold (level-of-detail) so they stop occluding edges at scale. Edges are straight chords pinned to node borders (centre-to-centre at dot zoom) carrying a direction **arrowhead** (`markerEnd`) so flow is legible statically — at any zoom and under `prefers-reduced-motion`; selecting a node accents the active path (both nodes **and** edges) and dims the rest. No UI framework: `@ossrandom/design-system`, cytoscape, uplot, **and `@dagrejs/dagre`** remain removed (cytoscape's physics hairball → React Flow; the prior hand-rolled-SVG map was replaced by React Flow on 2026-06-18; the dagre layered layout it briefly used was itself replaced by the sunflower layout on 2026-06-18 because a layered DAG stacked sparse 120-service graphs into an unreadable single column)
+- **Frontend:** committed semantic HTML, token CSS, and native browser JavaScript under `internal/ui/static/`. The browser fetches REST and MCP data, listens on WebSocket, and renders the service map as accessible SVG using a deterministic golden-angle phyllotaxis layout. Go embeds these source assets directly; there is no Node.js toolchain or generated bundle.
 - **Ports:** gRPC `:4317` (OTLP), HTTP `:8080` (API + HTTP OTLP + WebSocket + UI)
 
 ## Strict Rules
 
 - NO Express.js/Gin/Echo — use native Go `net/http`
-- NO Tailwind CSS, NO Mantine, NO general-purpose component frameworks — UI styling is the hand-rolled token sheet (`ui/src/styles/tokens.css`) + per-component CSS Modules. Sanctioned third-party UI: Radix primitives (unstyled) for the a11y-hard parts (dialog/tabs/tooltip/dropdown), and **React Flow (`@xyflow/react`) for the service map only** — themed to the token sheet, nodes/edges are our own components. Token values only — no raw hex outside tokens.css.
+- Keep the frontend dependency-free. Use semantic HTML, token-based CSS in `internal/ui/static/app.css`, and native browser APIs in `internal/ui/static/app.js`. Go tests own asset-serving contracts; rendered interaction checks own browser behavior.
 - Single-service architecture (no microservices split)
 - All internal DBs must be **embedded** (no external processes)
 - Relational DB (SQLite/MySQL/PostgreSQL/MSSQL) is the **single source of truth**
@@ -442,8 +442,7 @@ internal/
   storage/      # GORM repository, models, migrations, Close() method, SQLite PRAGMA stanza
   telemetry/    # Prometheus metrics + health (19 metrics)
   tsdb/         # Time series aggregator + ring buffer (lock-free Windows()) — legacy/shadow only
-  ui/           # Embedded React frontend
-ui/             # React frontend (Vite + token CSS Modules, no UI framework)
+  ui/           # Embedded browser UI server, assets, and Go contract tests
 test/           # Microservice simulation (7 services)
   aggprefill/   # Deterministic 7-day store-level prefill (build tag `prefill`)
   loadsim/      # OTLP load generator (build tag `loadtest`); --direct measures ACK latency, --ack-ledger persists the per-window contribution ledger
@@ -707,17 +706,16 @@ Thresholds (`0` disables that probe):
 
 ## Security & Supply Chain
 
-OtelContext targets the OpenSSF Best Practices `passing` badge (project [12646](https://www.bestpractices.dev/en/projects/12646)) and ships a six-job OSS-CLI security stack, supplemented by **SonarCloud SAST as a required gate** (board reversal 2026-04-28). No CodeQL, no NVD-direct tooling. Cost: $0 for the OSS-CLI tier; SonarCloud is free for public repos.
+OtelContext targets the OpenSSF Best Practices `passing` badge (project [12646](https://www.bestpractices.dev/en/projects/12646)) and ships a five-job OSS-CLI security stack, supplemented by **SonarCloud SAST as a required gate** (board reversal 2026-04-28). No CodeQL, no NVD-direct tooling. Cost: $0 for the OSS-CLI tier; SonarCloud is free for public repos.
 
 ### OSS-CLI security stack (`.github/workflows/security.yml`)
 
 | Concern | Tool | Gate |
 |---|---|---|
-| SCA (Go modules + npm) | OSV-Scanner against `go.mod` + `ui/package-lock.json` (OSV.dev / GHSA / ecosystem feeds; **not NVD**) | Block merge on High/Critical |
+| SCA (Go modules) | OSV-Scanner against `go.mod` (OSV.dev / GHSA / ecosystem feeds; **not NVD**) | Block merge on High/Critical |
 | SCA (filesystem + OS) + container scan | Trivy filesystem scan; Dependabot surfaces advisories on the Security tab | Block merge on `severity: HIGH,CRITICAL`, `exit-code: 1`, `ignore-unfixed: true` |
 | SAST | Semgrep (`p/security-audit` + `p/owasp-top-ten` + `p/golang`) | Block merge on `--severity ERROR` |
 | Secret scan | Gitleaks (full git history) | Block merge on any finding |
-| Duplication | jscpd, threshold 3%, `--min-tokens 100`, scoped to `internal/` + `ui/src/`, excludes tests, vendor, build artifacts, and the legacy `internal/graph/` package | Block merge above threshold |
 | SBOM | `anchore/sbom-action` (SPDX + CycloneDX) | Surface as 90-day artifact; do **not** gate merge |
 | Lint (Go) | `golangci-lint` (existing `.golangci.yml`) | Wired into `ci.yml`, not security.yml |
 
