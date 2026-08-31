@@ -123,7 +123,7 @@ func startNativeFixture(t *testing.T, adapter string) *nativeFixture {
 		request.Image = "mysql:8.4"
 		request.Env = map[string]string{"MYSQL_ROOT_PASSWORD": "OtelContext-248"}
 		request.ExposedPorts = []string{"3306/tcp"}
-		request.WaitingFor = wait.ForLog("ready for connections").WithStartupTimeout(3 * time.Minute)
+		request.WaitingFor = wait.ForLog("ready for connections").WithOccurrence(2).WithStartupTimeout(3 * time.Minute)
 	case "mssql":
 		request.Image = "mcr.microsoft.com/mssql/server:2022-latest"
 		request.Env = map[string]string{

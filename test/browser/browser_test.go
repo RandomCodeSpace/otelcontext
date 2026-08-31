@@ -128,6 +128,8 @@ func (a *appProcess) environment() []string {
 		"AUTH_TRUST_EXTERNAL":             "false",
 		"DB_DRIVER":                       "sqlite",
 		"DB_DSN":                          filepath.Join(a.dir, "otelcontext.db"),
+		"DATA_DISK_BUDGET_MB":             "1000000",
+		"DATA_DISK_PATH":                  a.dir,
 		"DLQ_PATH":                        filepath.Join(a.dir, "dlq"),
 		"GRPC_PORT":                       strconv.Itoa(a.grpcPort),
 		"HTTP_PORT":                       strconv.Itoa(a.httpPort),
