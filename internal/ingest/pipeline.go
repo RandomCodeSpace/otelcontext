@@ -3,6 +3,7 @@ package ingest
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"runtime/debug"
 	"sync"
@@ -300,6 +301,11 @@ type Pipeline struct {
 	stopCh chan struct{}
 	once   sync.Once
 	wg     sync.WaitGroup
+
+	startOnce   sync.Once
+	lifecycleMu sync.Mutex
+	started     bool
+	workersDone chan struct{}
 }
 
 // NewPipeline constructs a Pipeline with the given config, falling back
@@ -361,6 +367,7 @@ func NewPipeline(writer pipelineWriter, metrics *telemetry.Metrics, cfg Pipeline
 		queue:          make(chan *Batch, capacity),
 		tenantInFlight: make(map[string]int),
 		stopCh:         make(chan struct{}),
+		workersDone:    make(chan struct{}),
 	}
 }
 
@@ -421,22 +428,32 @@ func (p *Pipeline) TenantDropped() int64 { return p.tenantDropped.Load() }
 // Start spawns the worker pool. Safe to call once. Subsequent calls are
 // no-ops; tests rely on this for reset semantics.
 func (p *Pipeline) Start(ctx context.Context) {
-	for range p.cfg.Workers {
-		p.wg.Go(func() {
-			defer func() {
-				if r := recover(); r != nil {
-					slog.Error("ingest pipeline worker panic",
-						"panic", r,
-						"stack", string(debug.Stack()),
-					)
-					if p.metrics != nil && p.metrics.PanicsRecoveredTotal != nil {
-						p.metrics.PanicsRecoveredTotal.WithLabelValues("ingest_pipeline").Inc()
+	p.startOnce.Do(func() {
+		p.lifecycleMu.Lock()
+		p.started = true
+		p.lifecycleMu.Unlock()
+		for range p.cfg.Workers {
+			p.wg.Go(func() {
+				defer func() {
+					if r := recover(); r != nil {
+						slog.Error("ingest pipeline worker panic",
+							"panic", r,
+							"stack", string(debug.Stack()),
+						)
+						p.processFailures.Add(1)
+						if p.metrics != nil && p.metrics.PanicsRecoveredTotal != nil {
+							p.metrics.PanicsRecoveredTotal.WithLabelValues("ingest_pipeline").Inc()
+						}
 					}
-				}
-			}()
-			p.worker(ctx)
-		})
-	}
+				}()
+				p.worker(ctx)
+			})
+		}
+		go func() {
+			p.wg.Wait()
+			close(p.workersDone)
+		}()
+	})
 }
 
 // Submit enqueues a batch for asynchronous persistence. It returns a
@@ -544,13 +561,42 @@ func (p *Pipeline) releaseTenantSlot(tenant string) {
 	p.tenantMu.Unlock()
 }
 
-// Stop signals workers to exit and blocks until in-flight batches have
-// been drained from the channel. Idempotent.
-func (p *Pipeline) Stop() {
+// Shutdown signals workers to exit, drains accepted batches, and reports any
+// state that did not reach the database or durable DLQ before the deadline.
+func (p *Pipeline) Shutdown(ctx context.Context) error {
 	p.once.Do(func() {
 		close(p.stopCh)
 	})
-	p.wg.Wait()
+	p.lifecycleMu.Lock()
+	started := p.started
+	p.lifecycleMu.Unlock()
+	if !started {
+		return nil
+	}
+	select {
+	case <-p.workersDone:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	stats := p.Stats()
+	if stats.QueueDepth != 0 || stats.QueueBytes != 0 {
+		return fmt.Errorf("ingest pipeline not drained: queue_depth=%d queue_bytes=%d", stats.QueueDepth, stats.QueueBytes)
+	}
+	if stats.DLQFailed > 0 {
+		return fmt.Errorf("ingest pipeline lost %d batches after DLQ refusal", stats.DLQFailed)
+	}
+	if unprotected := stats.ProcessFailures - stats.DLQEnqueued; unprotected > 0 {
+		return fmt.Errorf("ingest pipeline has %d failed batches without durable DLQ envelopes", unprotected)
+	}
+	return nil
+}
+
+// Stop preserves the prior internal lifecycle surface. Production shutdown
+// uses Shutdown so deadline and durability failures reach the process result.
+func (p *Pipeline) Stop() {
+	if err := p.Shutdown(context.Background()); err != nil {
+		slog.Error("ingest pipeline shutdown failed", "error", err)
+	}
 }
 
 // Stats returns snapshot counters for tests and for telemetry that

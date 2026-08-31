@@ -82,8 +82,9 @@ func (h *DBHealth) Start(ctx context.Context) {
 	go h.loop(ctx)
 }
 
-// Stop signals the poller to exit and waits briefly for it to finish.
-func (h *DBHealth) Stop() {
+// Shutdown signals the poller to exit and joins it within the application
+// shutdown deadline.
+func (h *DBHealth) Shutdown(ctx context.Context) error {
 	select {
 	case <-h.stopCh:
 		// already stopped
@@ -92,8 +93,17 @@ func (h *DBHealth) Stop() {
 	}
 	select {
 	case <-h.doneCh:
-	case <-time.After(2 * time.Second):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
+}
+
+// Stop preserves the previous two-second bounded lifecycle surface.
+func (h *DBHealth) Stop() {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = h.Shutdown(ctx)
 }
 
 // Healthy reports the most recent ping result.

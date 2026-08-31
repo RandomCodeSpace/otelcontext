@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -444,12 +445,17 @@ func main() {
 		return out, nil
 	}, 5*time.Minute, 30*time.Second)
 	ctxGraph, cancelGraph := context.WithCancel(context.Background())
+	var graphDone chan struct{}
 	// The legacy graph is a raw-span scanner. In aggregate mode the topology
 	// comes from the aggregate engine's snapshot and this scan is retired
 	// outright (#174) — the object stays wired so the nil-tolerant handlers
 	// keep their shape, but nothing refreshes it.
 	if cfg.AggregateMode != aggregate.ModeAggregate {
-		go svcGraph.Start(ctxGraph)
+		graphDone = make(chan struct{})
+		go func() {
+			defer close(graphDone)
+			svcGraph.Start(ctxGraph)
+		}()
 		slog.Info("🕸️  In-memory service graph started (5m window, 30s refresh)")
 	} else {
 		slog.Info("🕸️  Legacy in-memory service graph disabled (AGGREGATE_MODE=aggregate)")
@@ -709,7 +715,7 @@ func main() {
 		}
 		topologyProvider = provider
 	}
-	go graphRAG.Start(ctxGraphRAG)
+	graphRAG.Start(ctxGraphRAG)
 	slog.Info("GraphRAG started (layered graph with anomaly detection)",
 		"workers", cfg.GraphRAGWorkerCount,
 		"event_queue_size", cfg.GraphRAGEventQueueSize,
@@ -767,7 +773,11 @@ func main() {
 	go hub.Run()
 	slog.Info("🔌 WebSocket hub started", "topology_source", topologyProvider.Source())
 
-	go eventHub.Start(ctxEvents, 5*time.Second, 500*time.Millisecond)
+	eventHubDone := make(chan struct{})
+	go func() {
+		defer close(eventHubDone)
+		eventHub.Start(ctxEvents, 5*time.Second, 500*time.Millisecond)
+	}()
 	slog.Info("⚡ Event notification hub started (5s snapshots, 500ms batches)")
 
 	retention.Start(ctxRetention)
@@ -1187,9 +1197,11 @@ func main() {
 		slog.Info("🔒 gRPC reflection disabled (APP_ENV=production) — set GRPC_REFLECTION=true to re-enable")
 	}
 
+	grpcServeDone := make(chan struct{})
 	go func() {
+		defer close(grpcServeDone)
 		slog.Info("📡 gRPC OTLP receiver started", "port", cfg.GRPCPort)
-		if err := grpcServer.Serve(lis); err != nil {
+		if err := grpcServer.Serve(lis); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
 			fatal("Failed to serve gRPC", err)
 		}
 	}()
@@ -1404,7 +1416,9 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
+	httpServeDone := make(chan struct{})
 	go func() {
+		defer close(httpServeDone)
 		if tlsMode != "" {
 			slog.Info("🔒 HTTPS server started", "port", cfg.HTTPPort, "mode", tlsMode)
 			if err := srv.ListenAndServeTLS(tlsCertPath, tlsKeyPath); err != nil && err != http.ErrServerClosed {
@@ -1422,104 +1436,163 @@ func main() {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	<-stop
+	signal.Stop(stop)
 
+	apiServer.BeginShutdown()
 	slog.Info("Shutting down OtelContext V5.4...")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), gracefulShutdownTimeout)
 	defer cancel()
 
-	// Ordered shutdown: ingestion → HTTP → hubs/events → processing → DLQ → DB
-	// 1. Stop ingestion paths first (no new data)
-	grpcServer.GracefulStop()
-	if err := srv.Shutdown(ctx); err != nil {
-		slog.Error("HTTP server forced shutdown", "error", err)
-	}
-	if pprofSrv != nil {
-		_ = pprofSrv.Close()
+	report, shutdownErr := executeShutdown(ctx, []shutdownStep{
+		{name: "otlp_admission", run: func(stepCtx context.Context) error {
+			if err := gracefulStopAdmission(stepCtx, grpcServer.GracefulStop, grpcServer.Stop); err != nil {
+				return err
+			}
+			select {
+			case <-grpcServeDone:
+				return nil
+			case <-stepCtx.Done():
+				return stepCtx.Err()
+			}
+		}},
+		{name: "http", run: func(stepCtx context.Context) error {
+			if err := srv.Shutdown(stepCtx); err != nil {
+				return err
+			}
+			select {
+			case <-httpServeDone:
+				return nil
+			case <-stepCtx.Done():
+				return stepCtx.Err()
+			}
+		}},
+		{name: "pprof", run: func(context.Context) error {
+			if pprofSrv == nil {
+				return nil
+			}
+			if err := pprofSrv.Close(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				return err
+			}
+			return nil
+		}},
+		{name: "realtime", run: func(stepCtx context.Context) error {
+			cancelEvents()
+			eventHub.Stop()
+			hub.Stop()
+			select {
+			case <-eventHubDone:
+				return nil
+			case <-stepCtx.Done():
+				return stepCtx.Err()
+			}
+		}},
+		{name: "ai", run: func(context.Context) error {
+			// Cancel in-flight calls before joining the workers.
+			aiCancel()
+			aiService.Stop()
+			return nil
+		}},
+		{name: "ingest_pipeline", run: func(stepCtx context.Context) error {
+			if ingestPipeline == nil {
+				return nil
+			}
+			return ingestPipeline.Shutdown(stepCtx)
+		}},
+		{name: "aggregate_writer", run: func(stepCtx context.Context) error {
+			if aggWriter == nil {
+				return nil
+			}
+			return aggWriter.Shutdown(stepCtx)
+		}},
+		{name: "tsdb", run: func(stepCtx context.Context) error {
+			defer cancelTSDB()
+			if tsdbAgg == nil {
+				return nil
+			}
+			return tsdbAgg.Shutdown(stepCtx)
+		}},
+		{name: "graphrag", run: func(stepCtx context.Context) error {
+			defer cancelGraphRAG()
+			return graphRAG.Shutdown(stepCtx)
+		}},
+		{name: "service_graph", run: func(stepCtx context.Context) error {
+			cancelGraph()
+			if graphDone == nil {
+				return nil
+			}
+			select {
+			case <-graphDone:
+				return nil
+			case <-stepCtx.Done():
+				return stepCtx.Err()
+			}
+		}},
+		{name: "dlq", run: func(stepCtx context.Context) error {
+			if dlq == nil {
+				return nil
+			}
+			return dlq.Shutdown(stepCtx)
+		}},
+		{name: "disk_watchdog", run: func(context.Context) error {
+			cancelDisk()
+			diskWatchdog.Stop()
+			return nil
+		}},
+		{name: "retention", run: func(context.Context) error {
+			cancelRetention()
+			retention.Stop()
+			return nil
+		}},
+		{name: "partitions", run: func(context.Context) error {
+			cancelPartitions()
+			if partitionScheduler != nil {
+				partitionScheduler.Stop()
+			}
+			return nil
+		}},
+		{name: "tracer", run: func(stepCtx context.Context) error {
+			if shutdownTracer == nil {
+				return nil
+			}
+			return shutdownTracer(stepCtx)
+		}},
+		{name: "database_health", run: func(stepCtx context.Context) error {
+			if dbHealth == nil {
+				return nil
+			}
+			return dbHealth.Shutdown(stepCtx)
+		}},
+		{name: "boot_workers", run: func(context.Context) error {
+			appCancel()
+			bootWG.Wait()
+			return nil
+		}},
+		{name: "aggregate_store", run: func(context.Context) error {
+			if aggStore == nil {
+				return nil
+			}
+			return aggStore.Close()
+		}},
+		{name: "main_database", run: func(context.Context) error {
+			return repo.Close()
+		}},
+	})
+	proof, _ := json.Marshal(report)
+	if shutdownErr != nil {
+		fatal("shutdown_failed", shutdownErr,
+			"status", "failed",
+			"version", Version,
+			"proof", string(proof),
+		)
 	}
 
-	// 2. Stop real-time hubs and event processing
-	hub.Stop()
-	cancelEvents()
-	// Cancel in-flight LLM calls BEFORE Stop so workers don't burn the
-	// 30s LLM deadline waiting on a half-dead upstream during shutdown.
-	aiCancel()
-	aiService.Stop()
-
-	// 3. Stop processing engines (TSDB flush, graph, GraphRAG)
-	if tsdbAgg != nil {
-		tsdbAgg.Stop()
-	}
-	cancelTSDB()
-	cancelGraph()
-	graphRAG.Stop()
-	cancelGraphRAG()
-
-	// 3a. Drain async ingest pipeline. gRPC GracefulStop above guarantees
-	// no new Submits land; this blocks until workers finish in-flight
-	// batches so a graceful shutdown doesn't lose buffered ingest.
-	if ingestPipeline != nil {
-		ingestPipeline.Stop()
-	}
-
-	// 3b. Drain the aggregate group-commit writer. gRPC GracefulStop above
-	// guarantees no new Exports, so this commits whatever was still queued
-	// rather than dropping deltas an Export is still waiting on.
-	if aggWriter != nil {
-		aggWriter.Stop()
-	}
-
-	// 4. Stop DLQ (may still be replaying)
-	dlq.Stop()
-
-	// 4a. Stop retention + partition schedulers before closing DB (both issue queries).
-	cancelDisk()
-	diskWatchdog.Stop()
-	cancelRetention()
-	retention.Stop()
-	cancelPartitions()
-	if partitionScheduler != nil {
-		partitionScheduler.Stop()
-	}
-
-	// 4b. Shutdown the OTel tracer provider (flushes pending spans).
-	if shutdownTracer != nil {
-		if err := shutdownTracer(ctx); err != nil {
-			slog.Error("Failed to shutdown tracer provider", "error", err)
-		}
-	}
-
-	// 4b2. Stop DB health poller before cancelling appCtx so final state is
-	// written to the gauge before the pool closes.
-	if dbHealth != nil {
-		dbHealth.Stop()
-	}
-
-	// 4c. Cancel boot-time goroutines (hydrator, DB health poller) and wait
-	// with a bounded timeout before closing the DB — otherwise a mid-query
-	// hydrator would race with the pool closing underneath it.
-	appCancel()
-	waitDone := make(chan struct{})
-	go func() { bootWG.Wait(); close(waitDone) }()
-	select {
-	case <-waitDone:
-	case <-time.After(10 * time.Second):
-		slog.Warn("hydrator did not finish before shutdown; cancelling")
-	}
-
-	// 5. Close the databases last (everything above may still write). The
-	// aggregate store closes before the main DB: its writer has already
-	// drained, and retention — which touches both — has already stopped.
-	if aggStore != nil {
-		if err := aggStore.Close(); err != nil {
-			slog.Error("Failed to close aggregate store", "error", err)
-		}
-	}
-	if err := repo.Close(); err != nil {
-		slog.Error("Failed to close database", "error", err)
-	}
-
-	slog.Info("✅ OtelContext V5.4 shutdown complete")
+	slog.Info("shutdown_complete",
+		"status", "success",
+		"version", Version,
+		"duration_ms", report.CompletedAt.Sub(report.StartedAt).Milliseconds(),
+		"proof", string(proof),
+	)
 }
 
 // recoveryUnaryInterceptor catches panics inside any unary gRPC handler,

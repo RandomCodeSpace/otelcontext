@@ -140,7 +140,7 @@ func TestSchemaGatePrecedesEveryWorkerAndListenerInMain(t *testing.T) {
 		"startPprofServer(cfg.PprofAddr, logger)",
 		"partitionScheduler.Start(ctxPart)",
 		"go hub.Run()",
-		"go graphRAG.Start(ctxGraphRAG)",
+		"graphRAG.Start(ctxGraphRAG)",
 	} {
 		position := strings.Index(text, marker)
 		if position < 0 || position < gate {

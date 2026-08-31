@@ -1,6 +1,8 @@
 package aggregate
 
 import (
+	"context"
+	"fmt"
 	"log/slog"
 	"math"
 	"sync"
@@ -233,11 +235,15 @@ type Writer struct {
 	// (#200 Q2). Running it here is what makes "no group commit interleaves
 	// with an identity delete" structural: there is one commit goroutine and
 	// the barrier IS that goroutine.
-	barriers chan *barrierRequest
-	stop     chan struct{}
-	stopOnce sync.Once
-	wg       sync.WaitGroup
-	closed   atomic.Bool
+	barriers    chan *barrierRequest
+	stop        chan struct{}
+	stopOnce    sync.Once
+	startOnce   sync.Once
+	wg          sync.WaitGroup
+	closed      atomic.Bool
+	lifecycleMu sync.Mutex
+	started     bool
+	workersDone chan struct{}
 
 	// admission counters, guarded by mu.
 	mu            sync.Mutex
@@ -289,6 +295,7 @@ func NewWriter(cfg WriterConfig) (*Writer, error) {
 		submissions: make(chan *submission, cfg.MaxWaiters),
 		barriers:    make(chan *barrierRequest),
 		stop:        make(chan struct{}),
+		workersDone: make(chan struct{}),
 	}, nil
 }
 
@@ -340,45 +347,78 @@ func (w *Writer) CollectIdentities() (GCStats, error) {
 // SaveTemplateStats writes the miner's dirty non-identity counters. Identity
 // mutations do NOT come through here — they ride the group commit — so a lost
 // batch costs a count that the next line restores.
-func (w *Writer) SaveTemplateStats() {
+func (w *Writer) SaveTemplateStats() error {
 	if w.miner == nil {
-		return
+		return nil
 	}
 	gcs, ok := w.store.(GCStore)
 	if !ok {
-		return
+		return nil
 	}
 	rows := w.miner.DrainDirtyStats()
 	if len(rows) == 0 {
-		return
+		return nil
 	}
 	if err := gcs.SaveTemplateStats(rows); err != nil {
 		slog.Warn("aggregate: template statistics write failed", "error", err, "rows", len(rows))
+		return err
 	}
+	return nil
 }
 
 // Start launches the commit loop and, unless disabled, the finalize loop.
 func (w *Writer) Start() {
-	w.wg.Add(1)
-	go w.commitLoop()
-	if w.cfg.FinalizeInterval > 0 {
+	w.startOnce.Do(func() {
+		w.lifecycleMu.Lock()
+		w.started = true
+		w.lifecycleMu.Unlock()
 		w.wg.Add(1)
-		go w.finalizeLoop()
-	}
+		go w.commitLoop()
+		if w.cfg.FinalizeInterval > 0 {
+			w.wg.Add(1)
+			go w.finalizeLoop()
+		}
+		go func() {
+			w.wg.Wait()
+			close(w.workersDone)
+		}()
+	})
 }
 
-// Stop drains the in-flight submissions, commits them, and returns once the
-// loops have exited. It is idempotent.
-func (w *Writer) Stop() {
+// Shutdown drains in-flight submissions and joins both writer loops within the
+// shared application deadline. The final template-statistics write is part of
+// the durability result rather than a best-effort log line.
+func (w *Writer) Shutdown(ctx context.Context) error {
 	w.stopOnce.Do(func() {
 		w.closed.Store(true)
 		close(w.stop)
 	})
-	w.wg.Wait()
-	// Final best-effort statistics save, after the loops are gone so nothing
-	// races the writer lock. Identity is already durable — it rode the group
-	// commits — so this only saves counters.
-	w.SaveTemplateStats()
+	w.lifecycleMu.Lock()
+	started := w.started
+	w.lifecycleMu.Unlock()
+	if started {
+		select {
+		case <-w.workersDone:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	stats := w.Stats()
+	if stats.PendingBytes != 0 || stats.PendingDeltas != 0 || stats.Waiters != 0 {
+		return fmt.Errorf("aggregate writer not drained: pending_bytes=%d pending_deltas=%d waiters=%d", stats.PendingBytes, stats.PendingDeltas, stats.Waiters)
+	}
+	if err := w.SaveTemplateStats(); err != nil {
+		return fmt.Errorf("save aggregate template statistics: %w", err)
+	}
+	return nil
+}
+
+// Stop preserves the prior internal lifecycle surface. Production shutdown
+// uses Shutdown so deadline and persistence failures reach the process result.
+func (w *Writer) Stop() {
+	if err := w.Shutdown(context.Background()); err != nil {
+		slog.Error("aggregate writer shutdown failed", "error", err)
+	}
 }
 
 // Stats returns a snapshot of the writer counters.

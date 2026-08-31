@@ -1,12 +1,28 @@
 package queue
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 )
+
+func TestDLQShutdownIsIdempotent(t *testing.T) {
+	q, err := NewDLQ(t.TempDir(), time.Hour, func([]byte) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := q.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Shutdown(ctx); err != nil {
+		t.Fatalf("second shutdown: %v", err)
+	}
+}
 
 // TestDLQ_ConcurrentEnqueue_NoFilenameCollision exercises 1000 parallel
 // Enqueue() calls and verifies each one produced its own file. This guards

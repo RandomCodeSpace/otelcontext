@@ -1,6 +1,7 @@
 package aggregate
 
 import (
+	"context"
 	"errors"
 	"sync"
 	"sync/atomic"
@@ -383,6 +384,24 @@ func TestWriterRefusesAfterStop(t *testing.T) {
 	w.Stop()
 	if _, err := eng.ApplyDeltasErr(deltaFor(clock.Now(), 1, 1)); !errors.Is(err, ErrStoreClosed) {
 		t.Fatalf("apply after Stop = %v, want ErrStoreClosed", err)
+	}
+}
+
+func TestWriterShutdownDrainsAndIsIdempotent(t *testing.T) {
+	clock := newClock(time.Unix(3_000_000, 0).UTC())
+	base := newTestStore(t)
+	eng := newTestEngine(t, clock, nil)
+	w := newTestWriter(t, base, eng, clock, WriterConfig{})
+	if _, err := eng.ApplyDeltasErr(deltaFor(clock.Now(), 1, 1)); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := w.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Shutdown(ctx); err != nil {
+		t.Fatalf("second shutdown: %v", err)
 	}
 }
 

@@ -282,11 +282,7 @@ func (g *GraphRAG) OnTemplateFact(fact aggregate.TemplateFact) {
 	if fact.Timestamp.IsZero() {
 		fact.Timestamp = time.Now()
 	}
-	select {
-	case g.eventCh <- event{tmpl: &fact}:
-	default:
-		g.recordEventDrop("log")
-	}
+	g.enqueueEvent(event{tmpl: &fact}, "log")
 }
 
 // processTemplateFact folds one template fact into its tenant's log clusters.

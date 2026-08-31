@@ -2,6 +2,8 @@ package graphrag
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"runtime/debug"
 	"sync"
@@ -25,8 +27,10 @@ func SetPanicMetrics(m *telemetry.Metrics) { panicMetrics = m }
 
 // guardWorker is a tiny helper that recovers from panics in a worker
 // goroutine, logs the stack, and increments the metric.
-func guardWorker(name string) {
+func (g *GraphRAG) guardWorker(name string) {
 	if r := recover(); r != nil {
+		err := fmt.Errorf("graphrag worker %s panic: %v", name, r)
+		g.recordShutdownError(err)
 		slog.Error("graphrag worker panic",
 			"worker", name,
 			"panic", r,
@@ -114,6 +118,18 @@ type GraphRAG struct {
 
 	eventCh chan event
 	stopCh  chan struct{}
+
+	startOnce   sync.Once
+	stopOnce    sync.Once
+	saveOnce    sync.Once
+	lifecycleMu sync.Mutex
+	started     bool
+	workerWG    sync.WaitGroup
+	workersDone chan struct{}
+	admissionMu sync.RWMutex
+	closed      bool
+	shutdownMu  sync.Mutex
+	shutdownErr error
 
 	// Configuration
 	traceTTL          time.Duration
@@ -316,6 +332,7 @@ func New(repo *storage.Repository, tsdbAgg *tsdb.Aggregator, ringBuf *tsdb.RingB
 		drain:             NewDrain(),
 		eventCh:           make(chan event, cfg.ChannelSize),
 		stopCh:            make(chan struct{}),
+		workersDone:       make(chan struct{}),
 		traceTTL:          cfg.TraceTTL,
 		refreshEvery:      cfg.RefreshEvery,
 		snapshotEvery:     cfg.SnapshotEvery,
@@ -363,52 +380,98 @@ func New(repo *storage.Repository, tsdbAgg *tsdb.Aggregator, ringBuf *tsdb.RingB
 // Each goroutine is wrapped in a panic recovery so one misbehaving event
 // can't take down the whole subsystem.
 func (g *GraphRAG) Start(ctx context.Context) {
-	// Start event workers. Honor the configured worker count so operators
-	// can scale up under sustained high ingest; fall back to the package
-	// default when the constructor wasn't handed an override.
-	workers := g.workerCount
-	if workers <= 0 {
-		workers = defaultWorkerCount
-	}
-	for i := 0; i < workers; i++ {
+	g.startOnce.Do(func() {
+		g.lifecycleMu.Lock()
+		g.started = true
+		g.lifecycleMu.Unlock()
+
+		// Start event workers. Honor the configured worker count so operators
+		// can scale up under sustained high ingest; fall back to the package
+		// default when the constructor wasn't handed an override.
+		workers := g.workerCount
+		if workers <= 0 {
+			workers = defaultWorkerCount
+		}
+		for i := 0; i < workers; i++ {
+			g.workerWG.Add(1)
+			go func() {
+				defer g.workerWG.Done()
+				defer g.guardWorker("eventWorker")
+				g.eventWorker(ctx)
+			}()
+		}
+
+		for name, loop := range map[string]func(context.Context){
+			"refreshLoop":  g.refreshLoop,
+			"snapshotLoop": g.snapshotLoop,
+			"anomalyLoop":  g.anomalyLoop,
+		} {
+			g.workerWG.Add(1)
+			go func() {
+				defer g.workerWG.Done()
+				defer g.guardWorker(name)
+				loop(ctx)
+			}()
+		}
 		go func() {
-			defer guardWorker("eventWorker")
-			g.eventWorker(ctx)
+			g.workerWG.Wait()
+			close(g.workersDone)
 		}()
-	}
 
-	// Start background tasks
-	go func() {
-		defer guardWorker("refreshLoop")
-		g.refreshLoop(ctx)
-	}()
-	go func() {
-		defer guardWorker("snapshotLoop")
-		g.snapshotLoop(ctx)
-	}()
-	go func() {
-		defer guardWorker("anomalyLoop")
-		g.anomalyLoop(ctx)
-	}()
-
-	slog.Info("GraphRAG started",
-		"workers", workers,
-		"trace_ttl", g.traceTTL,
-		"refresh_every", g.refreshEvery,
-	)
+		slog.Info("GraphRAG started",
+			"workers", workers,
+			"trace_ttl", g.traceTTL,
+			"refresh_every", g.refreshEvery,
+		)
+	})
 }
 
-// Stop signals all goroutines to exit.
-func (g *GraphRAG) Stop() {
-	// Best-effort final Drain template persistence — losing the most recent
-	// updates on an unclean shutdown would force rebuilding from scratch.
-	if g.repo != nil && g.repo.DB() != nil && g.drain != nil {
-		if err := SaveDrainTemplates(g.repo.DB(), storage.DefaultTenantID, g.drain.Templates()); err != nil {
-			slog.Warn("GraphRAG: final drain template save failed", "error", err)
-		}
+// Shutdown closes event admission, drains accepted events, joins every worker,
+// and only then persists the final Drain template state.
+func (g *GraphRAG) Shutdown(ctx context.Context) error {
+	if g == nil {
+		return nil
 	}
-	close(g.stopCh)
-	slog.Info("GraphRAG stopped")
+	g.admissionMu.Lock()
+	g.closed = true
+	g.stopOnce.Do(func() { close(g.stopCh) })
+	g.admissionMu.Unlock()
+
+	g.lifecycleMu.Lock()
+	started := g.started
+	g.lifecycleMu.Unlock()
+	if !started {
+		return nil
+	}
+
+	select {
+	case <-g.workersDone:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	g.saveOnce.Do(func() {
+		if g.repo != nil && g.repo.DB() != nil && g.drain != nil {
+			if err := SaveDrainTemplates(g.repo.DB(), storage.DefaultTenantID, g.drain.Templates()); err != nil {
+				g.recordShutdownError(fmt.Errorf("persist final Drain templates: %w", err))
+			}
+		}
+	})
+	g.shutdownMu.Lock()
+	err := g.shutdownErr
+	g.shutdownMu.Unlock()
+	if err == nil {
+		slog.Info("GraphRAG stopped")
+	}
+	return err
+}
+
+// Stop preserves the prior internal lifecycle surface. Production shutdown
+// uses Shutdown so deadline and persistence failures reach the process result.
+func (g *GraphRAG) Stop() {
+	if err := g.Shutdown(context.Background()); err != nil {
+		slog.Error("GraphRAG shutdown failed", "error", err)
+	}
 }
 
 // EventBufferDepth returns the current number of events queued in the
@@ -447,17 +510,12 @@ func (g *GraphRAG) OnSpanIngested(span storage.Span) {
 	if tenant == "" {
 		tenant = storage.DefaultTenantID
 	}
-	select {
-	case g.eventCh <- event{span: &spanEvent{
+	g.enqueueEvent(event{span: &spanEvent{
 		Span:    span,
 		TraceID: span.TraceID,
 		Status:  status,
 		Tenant:  tenant,
-	}}:
-	default:
-		// Channel full — graph is best-effort; DB is source of truth.
-		g.recordEventDrop("span")
-	}
+	}}, "span")
 }
 
 // OnLogIngested is the callback wired into the log ingestion pipeline.
@@ -466,12 +524,7 @@ func (g *GraphRAG) OnLogIngested(log storage.Log) {
 	if tenant == "" {
 		tenant = storage.DefaultTenantID
 	}
-	select {
-	case g.eventCh <- event{log: &logEvent{Log: log, Tenant: tenant}}:
-	default:
-		// Channel full — graph is best-effort; DB is source of truth.
-		g.recordEventDrop("log")
-	}
+	g.enqueueEvent(event{log: &logEvent{Log: log, Tenant: tenant}}, "log")
 }
 
 // OnMetricIngested is the callback wired into the metric ingestion pipeline.
@@ -483,37 +536,70 @@ func (g *GraphRAG) OnMetricIngested(metric tsdb.RawMetric) {
 	if tenant == "" {
 		tenant = storage.DefaultTenantID
 	}
-	select {
-	case g.eventCh <- event{metric: &metricEvent{Metric: metric, Tenant: tenant}}:
-	default:
-		// Channel full — graph is best-effort; DB is source of truth.
-		g.recordEventDrop("metric")
-	}
+	g.enqueueEvent(event{metric: &metricEvent{Metric: metric, Tenant: tenant}}, "metric")
 }
 
 // eventWorker processes events from the channel.
 func (g *GraphRAG) eventWorker(ctx context.Context) {
 	for {
 		select {
-		case <-ctx.Done():
-			return
 		case <-g.stopCh:
+			for {
+				select {
+				case ev := <-g.eventCh:
+					g.processEvent(ev)
+				default:
+					return
+				}
+			}
+		case <-ctx.Done():
+			g.recordShutdownError(fmt.Errorf("event worker stopped before shutdown barrier: %w", ctx.Err()))
 			return
 		case ev := <-g.eventCh:
-			if ev.span != nil {
-				g.processSpan(ev.span)
-			}
-			if ev.log != nil {
-				g.processLog(ev.log)
-			}
-			if ev.metric != nil {
-				g.processMetric(ev.metric)
-			}
-			if ev.tmpl != nil {
-				g.processTemplateFact(ev.tmpl)
-			}
+			g.processEvent(ev)
 		}
 	}
+}
+
+func (g *GraphRAG) enqueueEvent(ev event, signal string) {
+	if g == nil {
+		return
+	}
+	g.admissionMu.RLock()
+	defer g.admissionMu.RUnlock()
+	if g.closed {
+		return
+	}
+	select {
+	case g.eventCh <- ev:
+	default:
+		// Channel full — graph is best-effort; DB is source of truth.
+		g.recordEventDrop(signal)
+	}
+}
+
+func (g *GraphRAG) processEvent(ev event) {
+	if ev.span != nil {
+		g.processSpan(ev.span)
+	}
+	if ev.log != nil {
+		g.processLog(ev.log)
+	}
+	if ev.metric != nil {
+		g.processMetric(ev.metric)
+	}
+	if ev.tmpl != nil {
+		g.processTemplateFact(ev.tmpl)
+	}
+}
+
+func (g *GraphRAG) recordShutdownError(err error) {
+	if err == nil {
+		return
+	}
+	g.shutdownMu.Lock()
+	g.shutdownErr = errors.Join(g.shutdownErr, err)
+	g.shutdownMu.Unlock()
 }
 
 func (g *GraphRAG) processSpan(ev *spanEvent) {
