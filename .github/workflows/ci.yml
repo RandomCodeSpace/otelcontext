@@ -381,7 +381,7 @@ jobs:
           cosign-release: 'v2.6.5'
 
       - name: install syft
-        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610
+        uses: anchore/sbom-action/download-syft@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26
 
       - name: build and sign release-shaped source archive
         run: |
