@@ -362,16 +362,19 @@ systemctl show "$service_name" \
   -p StateDirectory -p StateDirectoryMode -p UMask -p Restart -p RestartUSec \
   -p KillSignal -p KillMode -p TimeoutStopUSec -p StandardOutput -p StandardError \
   -p SyslogIdentifier -p StartLimitIntervalUSec -p StartLimitBurst -p Wants -p After \
-  -p ExecStartPre -p ExecStop -p ExecReload -p PIDFile \
+  -p PIDFile \
   >"$proof_dir/systemd-properties.txt"
 for required in \
   'Type=exec' 'User=otelcontext' 'Group=otelcontext' 'WorkingDirectory=/var/lib/otelcontext' \
   'StateDirectory=otelcontext' 'StateDirectoryMode=0750' 'UMask=0027' 'Restart=on-failure' \
   'RestartUSec=5s' 'KillSignal=15' 'KillMode=control-group' 'TimeoutStopUSec=45s' \
   'StandardOutput=journal' 'StandardError=journal' 'SyslogIdentifier=otelcontext' \
-  'StartLimitIntervalUSec=1min' 'StartLimitBurst=3' 'ExecStartPre=' 'ExecStop=' 'ExecReload=' 'PIDFile='; do
+  'StartLimitIntervalUSec=1min' 'StartLimitBurst=3' 'PIDFile='; do
   grep -Fxq "$required" "$proof_dir/systemd-properties.txt" || die "systemd property mismatch: $required"
 done
+if grep -Eq '^[[:space:]]*(ExecStartPre|ExecStop|ExecReload|PIDFile)=' "$unit_path"; then
+  die "unit contains a forbidden lifecycle wrapper or PID file"
+fi
 grep -Fq "$env_path" "$proof_dir/systemd-properties.txt" || die "unit does not own the expected environment file"
 grep -Fq "$opt_root/current/otelcontext" "$proof_dir/systemd-properties.txt" || die "unit does not execute the active selector"
 grep -Eq '^Wants=.*network-online\.target( |$)' "$proof_dir/systemd-properties.txt" || die "unit does not want network-online.target"
