@@ -190,20 +190,29 @@ func startNativeFixture(t *testing.T, adapter string) *nativeFixture {
 
 func createDatabases(t *testing.T, adapter, dsn string, names []string) {
 	t.Helper()
-	db, err := storage.NewDatabase(adapter, dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer closeGORM(db)
-	for _, name := range names {
-		statement := "CREATE DATABASE " + name
-		if adapter == "mysql" {
-			statement += " CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+	var lastErr error
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		db, err := storage.NewDatabase(adapter, dsn)
+		if err != nil {
+			closeGORM(db)
+			lastErr = err
+			time.Sleep(250 * time.Millisecond)
+			continue
 		}
-		if err := db.Exec(statement).Error; err != nil { //nolint:gosec // fixed test database identifiers.
-			t.Fatalf("create %s database %s: %v", adapter, name, err)
+		defer closeGORM(db)
+		for _, name := range names {
+			statement := "CREATE DATABASE " + name
+			if adapter == "mysql" {
+				statement += " CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+			}
+			if err := db.Exec(statement).Error; err != nil { //nolint:gosec // fixed test database identifiers.
+				t.Fatalf("create %s database %s: %v", adapter, name, err)
+			}
 		}
+		return
 	}
+	t.Fatalf("wait for %s database authentication: %v", adapter, lastErr)
 }
 
 func prepareNativeSource(t *testing.T, fixture *nativeFixture) {
