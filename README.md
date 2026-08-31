@@ -160,6 +160,8 @@ If the database came from an older release that predates migration tracking, ide
 
 The baseline command validates the database first; it does not repair or guess. Create a complete OtelContext backup before upgrading, and keep the previous signed binary until `migrate status` reports `result=ready`. Versioned production checks are available for SQLite and unpartitioned PostgreSQL 16. MySQL, SQL Server, and PostgreSQL daily partitioning keep their existing preview AutoMigrate path.
 
+For a one-host Linux deployment, use the shipped [systemd unit and environment example](deploy/systemd/) and follow the [install, upgrade, and rollback runbook](docs/OPERATIONS.md#supported-systemd-deployment). Direct execution remains supported for local use.
+
 ## Back up and restore
 
 After stopping OtelContext cleanly, use the same binary and environment as the service:
