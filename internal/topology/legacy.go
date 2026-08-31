@@ -70,17 +70,18 @@ func (p *LegacyProvider) liveSnapshot(ctx context.Context, services []string) (S
 				}
 				svc := entry.Service
 				snap.Nodes = append(snap.Nodes, Node{
-					Name:           svc.Name,
-					TotalTraces:    svc.CallCount,
-					ErrorCount:     svc.ErrorCount,
-					AvgLatencyMs:   svc.AvgLatency,
-					RequestRateRPS: float64(svc.CallCount) / 300,
-					ErrorRate:      svc.ErrorRate,
-					P99LatencyMs:   svc.AvgLatency * 2.5,
-					SpanCount:      svc.CallCount,
-					HealthScore:    svc.HealthScore,
-					Status:         healthStatus(svc.HealthScore),
-					Alerts:         alerts(svc.ErrorRate, svc.AvgLatency),
+					Name:              svc.Name,
+					TotalTraces:       svc.CallCount,
+					ErrorCount:        svc.ErrorCount,
+					AvgLatencyMs:      svc.AvgLatency,
+					RequestRateRPS:    float64(svc.CallCount) / 300,
+					ErrorRate:         svc.ErrorRate,
+					P99LatencyMs:      svc.P99Latency,
+					LatencyProvenance: svc.LatencyProvenance,
+					SpanCount:         svc.CallCount,
+					HealthScore:       svc.HealthScore,
+					Status:            healthStatus(svc.HealthScore),
+					Alerts:            alerts(svc.ErrorRate, svc.AvgLatency),
 				})
 			}
 			for _, edge := range p.graphRAG.AllServiceEdges(ctx) {
@@ -114,16 +115,17 @@ func (p *LegacyProvider) liveSnapshot(ctx context.Context, services []string) (S
 					continue
 				}
 				snap.Nodes = append(snap.Nodes, Node{
-					Name:           node.Name,
-					TotalTraces:    node.SpanCount,
-					AvgLatencyMs:   node.AvgLatencyMs,
-					RequestRateRPS: node.RequestRateRPS,
-					ErrorRate:      node.ErrorRate,
-					P99LatencyMs:   node.P99LatencyMs,
-					SpanCount:      node.SpanCount,
-					HealthScore:    node.HealthScore,
-					Status:         node.Status,
-					Alerts:         append([]string(nil), node.Alerts...),
+					Name:              node.Name,
+					TotalTraces:       node.SpanCount,
+					AvgLatencyMs:      node.AvgLatencyMs,
+					RequestRateRPS:    node.RequestRateRPS,
+					ErrorRate:         node.ErrorRate,
+					P99LatencyMs:      node.P99LatencyMs,
+					LatencyProvenance: node.LatencyProvenance,
+					SpanCount:         node.SpanCount,
+					HealthScore:       node.HealthScore,
+					Status:            node.Status,
+					Alerts:            append([]string(nil), node.Alerts...),
 				})
 			}
 			for _, edge := range current.Edges {
@@ -157,17 +159,18 @@ func fromStorage(metrics *storage.ServiceMapMetrics) Snapshot {
 		}
 		health := legacyHealth(errorRate, node.AvgLatencyMs)
 		snap.Nodes = append(snap.Nodes, Node{
-			Name:           node.Name,
-			TotalTraces:    node.TotalTraces,
-			ErrorCount:     node.ErrorCount,
-			AvgLatencyMs:   node.AvgLatencyMs,
-			RequestRateRPS: float64(node.TotalTraces) / 3600,
-			ErrorRate:      errorRate,
-			P99LatencyMs:   node.AvgLatencyMs * 2.5,
-			SpanCount:      node.TotalTraces,
-			HealthScore:    health,
-			Status:         healthStatus(health),
-			Alerts:         alerts(errorRate, node.AvgLatencyMs),
+			Name:              node.Name,
+			TotalTraces:       node.TotalTraces,
+			ErrorCount:        node.ErrorCount,
+			AvgLatencyMs:      node.AvgLatencyMs,
+			RequestRateRPS:    float64(node.TotalTraces) / 3600,
+			ErrorRate:         errorRate,
+			P99LatencyMs:      node.P99LatencyMs,
+			LatencyProvenance: node.LatencyProvenance,
+			SpanCount:         node.TotalTraces,
+			HealthScore:       health,
+			Status:            healthStatus(health),
+			Alerts:            alerts(errorRate, node.AvgLatencyMs),
 		})
 	}
 	snap.Edges = make([]Edge, 0, len(metrics.Edges))

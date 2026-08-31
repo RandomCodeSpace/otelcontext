@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/RandomCodeSpace/otelcontext/internal/latency"
 	"github.com/RandomCodeSpace/otelcontext/internal/migrate"
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 	"github.com/testcontainers/testcontainers-go"
@@ -230,13 +231,44 @@ func prepareNativeSource(t *testing.T, fixture *nativeFixture) {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC().Truncate(time.Microsecond)
-	trace := storage.Trace{
+	traces := make([]storage.Trace, 1000)
+	traces[0] = storage.Trace{
 		TenantID: "default", TraceID: "native-backup-fixture", ServiceName: "checkout",
-		Duration: 42, Status: storage.StatusCodeError, Timestamp: now,
+		Duration: 10_000, Status: storage.StatusCodeError, Timestamp: now,
 	}
-	if err := db.Create(&trace).Error; err != nil {
+	for index := 1; index < len(traces); index++ {
+		duration := int64(10_000)
+		if index >= 989 {
+			duration = 1_000_000
+		}
+		traces[index] = storage.Trace{
+			TenantID: "default", TraceID: fmt.Sprintf("native-latency-%04d", index), ServiceName: "checkout",
+			Duration: duration, Status: "OK", Timestamp: now,
+		}
+	}
+	if err := db.CreateInBatches(traces, 100).Error; err != nil {
 		t.Fatal(err)
 	}
+}
+
+type nativeLatencyProof struct {
+	P99Micros  int64               `json:"p99_micros"`
+	Provenance *latency.Provenance `json:"latency_provenance"`
+}
+
+func inspectNativeLatency(t *testing.T, adapter, dsn string) nativeLatencyProof {
+	t.Helper()
+	db, err := storage.NewDatabase(adapter, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := storage.NewRepositoryFromDB(db, adapter)
+	defer func() { _ = repo.Close() }()
+	stats, err := repo.GetDashboardStats(context.Background(), time.Now().Add(-24*time.Hour), time.Now().Add(24*time.Hour), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return nativeLatencyProof{P99Micros: stats.P99Latency, Provenance: stats.LatencyProvenance}
 }
 
 func nativeConfig(root, adapter, dsn, suffix string) Config {
@@ -277,16 +309,18 @@ func writeNativeShutdownProof(t *testing.T, cfg Config, candidate Candidate) {
 }
 
 type nativeProof struct {
-	SchemaVersion     string        `json:"schema_version"`
-	Adapter           string        `json:"adapter"`
-	CandidateSHA      string        `json:"candidate_sha,omitempty"`
-	EngineVersion     string        `json:"engine_version"`
-	MigrationState    string        `json:"migration_state"`
-	SourceLifecycle   string        `json:"source_lifecycle_fingerprint"`
-	RestoredLifecycle string        `json:"restored_lifecycle_fingerprint"`
-	Create            CreateReport  `json:"create"`
-	Restore           RestoreReport `json:"restore"`
-	ManifestSHA256    string        `json:"manifest_sha256"`
+	SchemaVersion     string             `json:"schema_version"`
+	Adapter           string             `json:"adapter"`
+	CandidateSHA      string             `json:"candidate_sha,omitempty"`
+	EngineVersion     string             `json:"engine_version"`
+	MigrationState    string             `json:"migration_state"`
+	SourceLifecycle   string             `json:"source_lifecycle_fingerprint"`
+	RestoredLifecycle string             `json:"restored_lifecycle_fingerprint"`
+	Create            CreateReport       `json:"create"`
+	Restore           RestoreReport      `json:"restore"`
+	ManifestSHA256    string             `json:"manifest_sha256"`
+	SourceLatency     nativeLatencyProof `json:"source_latency"`
+	RestoredLatency   nativeLatencyProof `json:"restored_latency"`
 	Assertions        []struct {
 		Name   string `json:"name"`
 		Passed bool   `json:"passed"`
@@ -300,6 +334,7 @@ func TestNativeBackupRestoreLifecycle(t *testing.T) {
 	}
 	fixture := startNativeFixture(t, adapter)
 	prepareNativeSource(t, fixture)
+	sourceLatency := inspectNativeLatency(t, adapter, fixture.sourceDSN)
 	candidate, err := CurrentCandidate("integration-test")
 	if err != nil {
 		t.Fatal(err)
@@ -339,6 +374,7 @@ func TestNativeBackupRestoreLifecycle(t *testing.T) {
 	if err := compareMain(manifest.Main, restored); err != nil {
 		t.Fatal(err)
 	}
+	restoredLatency := inspectNativeLatency(t, adapter, fixture.targetDSN)
 	targetDB, err := storage.NewDatabase(adapter, fixture.targetDSN)
 	if err != nil {
 		t.Fatal(err)
@@ -350,6 +386,10 @@ func TestNativeBackupRestoreLifecycle(t *testing.T) {
 	}
 	closeGORM(targetDB)
 	prefix := map[string]string{"postgres": "16.", "mysql": "8.4.", "mssql": "16."}[adapter]
+	latencyMethod := latency.MethodOrderedRank
+	if adapter == "postgres" {
+		latencyMethod = latency.MethodPercentileDisc
+	}
 	checks := []struct {
 		Name   string `json:"name"`
 		Passed bool   `json:"passed"`
@@ -364,6 +404,8 @@ func TestNativeBackupRestoreLifecycle(t *testing.T) {
 		{"lifecycle_fingerprint_equal", manifest.Main.LifecycleFingerprint == restored.LifecycleFingerprint},
 		{"fixture_row_restored", restoredFixtureRows == 1},
 		{"bundle_lifecycle_equal", manifest.LifecycleFingerprint == restore.LifecycleFingerprint},
+		{"source_p99_nearest_rank", sourceLatency.P99Micros == 1_000_000 && sourceLatency.Provenance != nil && sourceLatency.Provenance.P99.SampleCount == 1000 && sourceLatency.Provenance.P99.Method == latencyMethod},
+		{"restored_p99_equal", restoredLatency.P99Micros == sourceLatency.P99Micros && restoredLatency.Provenance.P99.Status == latency.StatusMeasured},
 	}
 	for _, check := range checks {
 		if !check.Passed {
@@ -382,6 +424,8 @@ func TestNativeBackupRestoreLifecycle(t *testing.T) {
 		Create:            create,
 		Restore:           restore,
 		ManifestSHA256:    digest,
+		SourceLatency:     sourceLatency,
+		RestoredLatency:   restoredLatency,
 		Assertions:        checks,
 	}
 	proofDir := os.Getenv("OTELCONTEXT_NATIVE_BACKUP_PROOF_DIR")

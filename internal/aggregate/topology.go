@@ -4,6 +4,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/RandomCodeSpace/otelcontext/internal/latency"
 )
 
 // Bounded per-tenant topology projection (#163, #174).
@@ -98,8 +100,9 @@ type TopologyWindow struct {
 	// zero when the entity carries no sketch (operations, edges and metrics
 	// deliberately do not, so a 2 KiB sketch is not multiplied by every
 	// operation of every service of every window).
-	P95Micros float64 `json:"p95_micros,omitempty"`
-	P99Micros float64 `json:"p99_micros,omitempty"`
+	P95Micros         float64             `json:"p95_micros,omitempty"`
+	P99Micros         float64             `json:"p99_micros,omitempty"`
+	LatencyProvenance *latency.Provenance `json:"latency_provenance,omitempty"`
 
 	// Value* carry metric samples: gauge samples plus counter deltas, which
 	// is what a rolling mean/variance baseline is computed over.
@@ -778,6 +781,9 @@ func renderWindows(e *topoEntry, now time.Time) []TopologyWindow {
 		if w.sketch != nil && w.sketch.Count() > 0 {
 			tw.P95Micros = w.sketch.Quantile(0.95)
 			tw.P99Micros = w.sketch.Quantile(0.99)
+			p95 := *percentileProvenanceFromSketch(w.sketch)
+			p99 := p95
+			tw.LatencyProvenance = &latency.Provenance{P95: &p95, P99: &p99}
 		}
 		out = append(out, tw)
 	}

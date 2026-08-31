@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/RandomCodeSpace/otelcontext/internal/aggregate"
+	"github.com/RandomCodeSpace/otelcontext/internal/latency"
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 )
 
@@ -140,16 +141,17 @@ func applyTopologySnapshot(stores *tenantStores, snap aggregate.TopologySnapshot
 // windowTotals sums a snapshot entity's retained windows into the absolute
 // counters a graph node carries.
 type windowTotals struct {
-	count      uint64
-	errors     uint64
-	durCount   uint64
-	durSumMs   float64
-	p95Ms      float64
-	p99Ms      float64
-	valueCount uint64
-	valueSum   float64
-	valueMin   float64
-	valueMax   float64
+	count             uint64
+	errors            uint64
+	durCount          uint64
+	durSumMs          float64
+	p95Ms             float64
+	p99Ms             float64
+	latencyProvenance *latency.Provenance
+	valueCount        uint64
+	valueSum          float64
+	valueMin          float64
+	valueMax          float64
 }
 
 func totalsOf(windows []aggregate.TopologyWindow) windowTotals {
@@ -170,11 +172,13 @@ func totalsOf(windows []aggregate.TopologyWindow) windowTotals {
 		// Percentiles do not sum. The most recent window that carries a
 		// sketch is the current picture; older windows are baseline material
 		// for the anomaly detector, not for the node's displayed latency.
-		if w.P95Micros > 0 {
+		if w.LatencyProvenance != nil && w.LatencyProvenance.P95 != nil {
 			t.p95Ms = w.P95Micros / 1000.0
 		}
-		if w.P99Micros > 0 {
+		if w.LatencyProvenance != nil && w.LatencyProvenance.P99 != nil {
 			t.p99Ms = w.P99Micros / 1000.0
+			provenance := *w.LatencyProvenance
+			t.latencyProvenance = &provenance
 		}
 	}
 	return t
@@ -207,6 +211,16 @@ func serviceNodeFrom(svc aggregate.TopologyService) *ServiceNode {
 	}
 	node.ErrorRate = t.errorRate()
 	node.AvgLatency = t.avgLatencyMs()
+	node.P95Latency = t.p95Ms
+	node.P99Latency = t.p99Ms
+	node.LatencyProvenance = t.latencyProvenance
+	if node.LatencyProvenance == nil {
+		node.LatencyProvenance = &latency.Provenance{P99: &latency.Percentile{
+			Status: latency.StatusUnavailable,
+			Method: latency.MethodDDSketch,
+			Reason: latency.ReasonNoObservations,
+		}}
+	}
 	node.HealthScore = computeHealth(node.ErrorRate, node.AvgLatency)
 	return node
 }
@@ -225,6 +239,7 @@ func operationNodeFrom(op aggregate.TopologyOperation) *OperationNode {
 	}
 	node.ErrorRate = t.errorRate()
 	node.AvgLatency = t.avgLatencyMs()
+	node.LatencyProvenance = unavailableOperationLatency()
 	node.HealthScore = computeHealth(node.ErrorRate, node.AvgLatency)
 	return node
 }

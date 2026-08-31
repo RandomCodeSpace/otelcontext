@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/RandomCodeSpace/otelcontext/internal/graphrag"
+	"github.com/RandomCodeSpace/otelcontext/internal/latency"
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 )
 
@@ -149,6 +150,42 @@ func TestToolDescriptionsStateTheirCoverageLimits(t *testing.T) {
 		if !strings.Contains(byName[name], want) {
 			t.Errorf("%s description does not state %q: %s", name, want, byName[name])
 		}
+	}
+}
+
+func TestTopologyToolsPreserveLatencyProvenance(t *testing.T) {
+	srv, g, _ := honestyServer(t)
+	g.OnSpanIngested(storage.Span{
+		TenantID: storage.DefaultTenantID, TraceID: "latency-trace", SpanID: "latency-span",
+		ServiceName: "checkout", OperationName: "/pay", StartTime: time.Now(), Duration: 20_000,
+	})
+	ctx := storage.WithTenantContext(context.Background(), storage.DefaultTenantID)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(g.ServiceMap(ctx, 0)) == 1 {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	mapResult := srv.toolHandler(context.Background(), "get_service_map", nil)
+	if mapResult.IsError || len(mapResult.Content) == 0 {
+		t.Fatalf("get_service_map = %+v", mapResult)
+	}
+	var entries []graphrag.ServiceMapEntry
+	if err := json.Unmarshal([]byte(mapResult.Content[0].Text), &entries); err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Service.LatencyProvenance == nil || entries[0].Service.LatencyProvenance.P99.Status != latency.StatusEstimated || entries[0].Service.P99Latency != 50 {
+		t.Fatalf("service map latency = %+v", entries)
+	}
+	if len(entries[0].Operations) != 1 || entries[0].Operations[0].LatencyProvenance.P99.Status != latency.StatusUnavailable {
+		t.Fatalf("operation latency = %+v", entries[0].Operations)
+	}
+
+	health := srv.toolHandler(context.Background(), "get_service_health", map[string]any{"service_name": "checkout"})
+	if health.IsError || len(health.Content) == 0 || !strings.Contains(health.Content[0].Text, `"latency_provenance"`) {
+		t.Fatalf("get_service_health = %+v", health)
 	}
 }
 

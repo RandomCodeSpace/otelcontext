@@ -9,15 +9,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/RandomCodeSpace/otelcontext/internal/latency"
 	"gorm.io/gorm"
 )
-
-// sqliteP99RowCap is the maximum number of duration rows fetched for the
-// in-memory p99 sort on SQLite. Queries returning more rows than this are
-// capped with a warning; accuracy degrades gracefully at the tail.
-// Declared as var (not const) so tests can temporarily shrink it to exercise
-// the cap path without seeding 200k rows under -race.
-var sqliteP99RowCap = 200_000
 
 // TrafficPoint represents a data point for the traffic chart.
 //
@@ -60,14 +54,15 @@ type ServiceError struct {
 // they should always have been. The six additive fields below are populated
 // only in aggregate mode and name their basis explicitly (#197 Q3).
 type DashboardStats struct {
-	TotalTraces        int64          `json:"total_traces"`
-	TotalLogs          int64          `json:"total_logs"`
-	TotalErrors        int64          `json:"total_errors"`
-	AvgLatencyMs       float64        `json:"avg_latency_ms"`
-	ErrorRate          float64        `json:"error_rate"`
-	ActiveServices     int64          `json:"active_services"`
-	P99Latency         int64          `json:"p99_latency"`
-	TopFailingServices []ServiceError `json:"top_failing_services"`
+	TotalTraces        int64               `json:"total_traces"`
+	TotalLogs          int64               `json:"total_logs"`
+	TotalErrors        int64               `json:"total_errors"`
+	AvgLatencyMs       float64             `json:"avg_latency_ms"`
+	ErrorRate          float64             `json:"error_rate"`
+	ActiveServices     int64               `json:"active_services"`
+	P99Latency         int64               `json:"p99_latency"`
+	LatencyProvenance  *latency.Provenance `json:"latency_provenance,omitempty"`
+	TopFailingServices []ServiceError      `json:"top_failing_services"`
 
 	Requests         int64   `json:"requests,omitempty"`
 	RequestErrors    int64   `json:"request_errors,omitempty"`
@@ -125,8 +120,7 @@ func (r *Repository) GetMetricNames(ctx context.Context, serviceName string) ([]
 // matching rows of session. It dispatches on r.driver:
 //
 //   - postgres / postgresql: native percentile_disc aggregate (single query).
-//   - mysql: two-query COUNT + ORDER BY … OFFSET approach.
-//   - default (sqlite + unknown): in-memory sort capped at sqliteP99RowCap rows.
+//   - every other retained adapter: COUNT + ORDER BY … OFFSET.
 //
 // The caller must pass a fresh Session so nothing leaks across subsequent calls.
 // ctx is threaded into every sub-session so client cancellation (disconnect/timeout)
@@ -152,7 +146,7 @@ func (r *Repository) p99DurationForQuery(ctx context.Context, session *gorm.DB) 
 		}
 		return p, nil
 
-	case "mysql":
+	default:
 		var n int64
 		if err := session.Session(&gorm.Session{Context: ctx}).Model(&Trace{}).Count(&n).Error; err != nil {
 			return 0, err
@@ -171,33 +165,6 @@ func (r *Repository) p99DurationForQuery(ctx context.Context, session *gorm.DB) 
 			return 0, err
 		}
 		return p, nil
-
-	default: // sqlite and any unknown driver
-		var durations []int64
-		q := session.Session(&gorm.Session{Context: ctx}).Select("duration").Order("duration ASC").Limit(sqliteP99RowCap + 1)
-		if err := q.Find(&durations).Error; err != nil {
-			return 0, err
-		}
-		if len(durations) == 0 {
-			return 0, nil
-		}
-		if len(durations) > sqliteP99RowCap {
-			// Truncate to cap — accuracy degrades gracefully. Operators alert on
-			// the counter (dataset is too large for in-memory p99 — migrate to
-			// Postgres). Keep a low-volume debug log for dev observability.
-			if r.metrics != nil {
-				r.metrics.DashboardP99RowCapHitsTotal.Inc()
-			}
-			slog.Debug("p99 SQLite fallback capped rows", "cap", sqliteP99RowCap)
-			durations = durations[:sqliteP99RowCap]
-		}
-		idx := int(math.Ceil(float64(len(durations))*0.99)) - 1
-		if idx < 0 {
-			idx = 0
-		} else if idx >= len(durations) {
-			idx = len(durations) - 1
-		}
-		return durations[idx], nil
 	}
 }
 
@@ -264,6 +231,23 @@ func (r *Repository) GetDashboardStats(ctx context.Context, start, end time.Time
 		return nil, fmt.Errorf("failed to compute p99 latency: %w", err)
 	}
 	stats.P99Latency = p99
+	method := latency.MethodOrderedRank
+	if driver := strings.ToLower(r.driver); driver == "postgres" || driver == "postgresql" {
+		method = latency.MethodPercentileDisc
+	}
+	percentile := &latency.Percentile{
+		Status:          latency.StatusUnavailable,
+		Method:          method,
+		PopulationCount: uint64(stats.TotalTraces), // #nosec G115 -- database counts cannot be negative.
+		Reason:          latency.ReasonNoObservations,
+	}
+	if stats.TotalTraces > 0 {
+		percentile.Status = latency.StatusMeasured
+		percentile.SampleCount = uint64(stats.TotalTraces) // #nosec G115 -- database counts cannot be negative.
+		percentile.LowSample = percentile.SampleCount < latency.LowSampleThreshold
+		percentile.Reason = ""
+	}
+	stats.LatencyProvenance = &latency.Provenance{P99: percentile}
 
 	// 7. Top Failing Services
 	type svcCount struct {

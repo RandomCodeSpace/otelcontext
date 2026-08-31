@@ -5,6 +5,8 @@ import (
 	"sort"
 	"testing"
 	"time"
+
+	"github.com/RandomCodeSpace/otelcontext/internal/latency"
 )
 
 // stubStore is a Store that serves a fixed set of store-owned rows. It exists
@@ -346,6 +348,10 @@ func TestQueryDashboardPercentileWithinReportedBound(t *testing.T) {
 	}
 	if res.Accuracy.RelativeErrorBound <= 0 {
 		t.Fatalf("RelativeErrorBound = %v, want > 0", res.Accuracy.RelativeErrorBound)
+	}
+	p99 := res.LatencyProvenance.P99
+	if p99 == nil || p99.Status != latency.StatusApproximate || p99.Method != latency.MethodDDSketch || p99.SampleCount != 1000 || p99.SketchScale != SketchDefaultScale || p99.Degraded {
+		t.Fatalf("latency provenance = %+v", p99)
 	}
 	want := 99000.0 // the 990th of 1000 values, in microseconds
 	rel := math.Abs(res.P99LatencyMicros-want) / want

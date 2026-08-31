@@ -5,6 +5,8 @@ import (
 	"context"
 	"strconv"
 	"time"
+
+	"github.com/RandomCodeSpace/otelcontext/internal/latency"
 )
 
 // Source identifies the producer that owns a snapshot.
@@ -66,13 +68,14 @@ type Node struct {
 	ErrorCount   int64   `json:"error_count"`
 	AvgLatencyMs float64 `json:"avg_latency_ms"`
 
-	RequestRateRPS float64  `json:"request_rate_rps,omitempty"`
-	ErrorRate      float64  `json:"error_rate,omitempty"`
-	P99LatencyMs   float64  `json:"p99_latency_ms,omitempty"`
-	SpanCount      int64    `json:"span_count,omitempty"`
-	HealthScore    float64  `json:"health_score,omitempty"`
-	Status         string   `json:"status,omitempty"`
-	Alerts         []string `json:"alerts,omitempty"`
+	RequestRateRPS    float64             `json:"request_rate_rps,omitempty"`
+	ErrorRate         float64             `json:"error_rate,omitempty"`
+	P99LatencyMs      float64             `json:"p99_latency_ms,omitempty"`
+	LatencyProvenance *latency.Provenance `json:"latency_provenance,omitempty"`
+	SpanCount         int64               `json:"span_count,omitempty"`
+	HealthScore       float64             `json:"health_score,omitempty"`
+	Status            string              `json:"status,omitempty"`
+	Alerts            []string            `json:"alerts,omitempty"`
 }
 
 // Edge is one directed service dependency.

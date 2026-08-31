@@ -73,6 +73,14 @@ jobs:
           BROWSER_SMOKE_ARTIFACTS: ${{ runner.temp }}/browser-smoke/artifacts
         run: go test -tags=browser -count=1 -timeout 150s -run '^TestProtectedBrowserWorkflow$' ./test/browser
 
+      - name: verify latency wording in the embedded client
+        env:
+          OTELCONTEXT_BINARY: ${{ runner.temp }}/browser-smoke/otelcontext
+          OTELCONTEXT_BROWSER_CASE: latency
+          CHROME_BIN: google-chrome
+          BROWSER_SMOKE_ARTIFACTS: ${{ runner.temp }}/browser-smoke/artifacts
+        run: go test -tags=browser -count=1 -timeout 150s -run '^TestLatencyLabels$' ./test/browser
+
       - name: upload browser diagnostics
         if: ${{ always() }}
         uses: actions/upload-artifact@v7
@@ -123,6 +131,53 @@ jobs:
         with:
           name: topology-proof-${{ matrix.mode }}-${{ github.sha }}
           path: ${{ runner.temp }}/topology-proof
+          if-no-files-found: error
+          retention-days: 14
+
+  latency-proof:
+    name: latency proof · ${{ matrix.mode }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [legacy, aggregate-shadow, aggregate]
+    env:
+      CGO_ENABLED: "1"
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: run contradictory-distribution latency proof
+        env:
+          OTELCONTEXT_LATENCY_PROOF_MODE: ${{ matrix.mode }}
+          OTELCONTEXT_LATENCY_PROOF_DIR: ${{ runner.temp }}/latency-proof
+        run: |
+          set -o pipefail
+          mkdir -p "${OTELCONTEXT_LATENCY_PROOF_DIR}"
+          go test -race -count=1 -v -run '^TestLatencyModeProof$' ./test/topologyproof 2>&1 \
+            | tee "${OTELCONTEXT_LATENCY_PROOF_DIR}/${OTELCONTEXT_LATENCY_PROOF_MODE}.log"
+          jq -e --arg mode "${OTELCONTEXT_LATENCY_PROOF_MODE}" '
+            .schema_version == "otelcontext.latency-contract.v1" and
+            .mode == $mode and
+            .sentinel.population == 1000 and
+            .sentinel.nearest_rank_p99_ms == 1000 and
+            .websocket_dashboard.unit == "microseconds" and
+            (.ui_labels | length) == 7 and
+            (.assertions | length) >= 11 and
+            all(.assertions[]; .passed == true)
+          ' "${OTELCONTEXT_LATENCY_PROOF_DIR}/${OTELCONTEXT_LATENCY_PROOF_MODE}.json"
+
+      - name: upload mode latency proof
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: latency-contract-${{ matrix.mode }}-${{ github.sha }}
+          path: ${{ runner.temp }}/latency-proof
           if-no-files-found: error
           retention-days: 14
 

@@ -5,6 +5,8 @@ import (
 	"math"
 	"sort"
 	"time"
+
+	"github.com/RandomCodeSpace/otelcontext/internal/latency"
 )
 
 // The engine's query facade (#164, #175).
@@ -146,6 +148,39 @@ func AccuracyFromSketch(s *Sketch) AccuracyMetadata {
 	}
 }
 
+func percentileProvenanceFromSketch(s *Sketch) *latency.Percentile {
+	if s == nil || s.Count() == 0 {
+		return &latency.Percentile{
+			Status: latency.StatusUnavailable,
+			Method: latency.MethodDDSketch,
+			Reason: latency.ReasonNoObservations,
+		}
+	}
+	collapsed := s.Collapsed()
+	saturations := s.Saturations()
+	reason := ""
+	switch {
+	case collapsed && saturations > 0:
+		reason = latency.ReasonSketchCollapsedSaturated
+	case collapsed:
+		reason = latency.ReasonSketchCollapsed
+	case saturations > 0:
+		reason = latency.ReasonSketchSaturated
+	}
+	return &latency.Percentile{
+		Status:             latency.StatusApproximate,
+		Method:             latency.MethodDDSketch,
+		SampleCount:        s.Count(),
+		LowSample:          s.Count() < latency.LowSampleThreshold,
+		SketchScale:        s.Scale(),
+		RelativeErrorBound: s.RelativeError(),
+		Degraded:           collapsed || saturations > 0,
+		Collapsed:          collapsed,
+		Saturations:        saturations,
+		Reason:             reason,
+	}
+}
+
 // Query bounds one read. Tenant, Start and End are mandatory; the rest narrow
 // the scan.
 type Query struct {
@@ -194,6 +229,8 @@ type ServiceStat struct {
 	ErrorCount        int64
 	ErrorRate         float64
 	AvgLatencyMs      float64
+	P99LatencyMicros  float64
+	LatencyProvenance latency.Provenance
 	RequestCount      int64
 	ErrorRequestCount int64
 }
@@ -217,15 +254,16 @@ type DashboardResult struct {
 	SpanErrorCount int64
 	SpanErrorRate  float64
 
-	TotalLogs        int64
-	AvgLatencyMs     float64
-	ActiveServices   int64
-	P99LatencyMicros float64
-	TopFailing       []ServiceStat
-	Accuracy         AccuracyMetadata
-	Coverage         Coverage
-	Epoch            string
-	Revision         uint64
+	TotalLogs         int64
+	AvgLatencyMs      float64
+	ActiveServices    int64
+	P99LatencyMicros  float64
+	LatencyProvenance latency.Provenance
+	TopFailing        []ServiceStat
+	Accuracy          AccuracyMetadata
+	Coverage          Coverage
+	Epoch             string
+	Revision          uint64
 }
 
 // TopologyEdge is one caller/callee edge of the topology.
@@ -372,7 +410,7 @@ func (e *Engine) sumStore(sel Selector, by GroupBy) ([]SumRow, error) {
 // identities just to apply a service filter. A sketch merge is commutative
 // and associative, so VisitSketches streams the rows once in table order,
 // and the filter memoizes ONE dictionary lookup per distinct service ID.
-func (e *Engine) mergeStoreSketches(sel Selector, filter map[string]struct{}, merge func(*Sketch)) error {
+func (e *Engine) visitStoreSketches(sel Selector, filter map[string]struct{}, visit func(uint32, *Sketch)) error {
 	st := e.Store()
 	if st == nil {
 		return nil
@@ -394,9 +432,13 @@ func (e *Engine) mergeStoreSketches(sel Selector, filter map[string]struct{}, me
 				return nil
 			}
 		}
-		merge(sk)
+		visit(serviceID, sk)
 		return nil
 	})
+}
+
+func (e *Engine) mergeStoreSketches(sel Selector, filter map[string]struct{}, merge func(*Sketch)) error {
+	return e.visitStoreSketches(sel, filter, func(_ uint32, sk *Sketch) { merge(sk) })
 }
 
 // serviceName resolves a series' service through the dictionary. An
@@ -544,6 +586,17 @@ type dashAccum struct {
 	errRequests uint64
 	durCount    uint64
 	durSum      float64
+	sketch      *Sketch
+}
+
+func (a *dashAccum) mergeSketch(s *Sketch) {
+	if s == nil {
+		return
+	}
+	if a.sketch == nil {
+		a.sketch = NewSketchAtScaleUnchecked(s.Scale())
+	}
+	a.sketch.Merge(s)
 }
 
 // addDelta folds one in-memory delta into the accumulator.
@@ -554,6 +607,7 @@ func (a *dashAccum) addDelta(d *AggregateDelta) {
 	a.errRequests += d.ErrorRequestCount
 	a.durCount += d.DurationCount
 	a.durSum += d.DurationSum
+	a.mergeSketch(d.Sketch)
 }
 
 // addSum folds one SQL aggregation row into the accumulator.
@@ -667,6 +721,7 @@ func (e *Engine) QueryDashboard(q Query) (*DashboardResult, error) {
 		TotalLogs:         asInt64(logs),
 		ActiveServices:    int64(len(services)),
 		Accuracy:          AccuracyFromSketch(merged),
+		LatencyProvenance: latency.Provenance{P99: percentileProvenanceFromSketch(merged)},
 		Coverage:          CoverageFull,
 		Epoch:             own.Epoch,
 		Revision:          own.Revision,
@@ -799,6 +854,14 @@ func (e *Engine) QueryTopology(q Query) (*TopologyResult, error) {
 			}
 			at(name).addSum(r)
 		}
+		if err := e.visitStoreSketches(sel, filter, func(serviceID uint32, sk *Sketch) {
+			name := e.serviceNameByID(serviceID)
+			if keep(name) {
+				at(name).mergeSketch(sk)
+			}
+		}); err != nil {
+			return nil, err
+		}
 
 		// One row per (caller, callee): the callee is the series NAME, so the
 		// edge grouping is GroupByService|GroupByName under a single-signal
@@ -832,6 +895,10 @@ func (e *Engine) QueryTopology(q Query) (*TopologyResult, error) {
 		}
 		if acc.durCount > 0 {
 			stat.AvgLatencyMs = acc.durSum / float64(acc.durCount) / 1000.0
+		}
+		stat.LatencyProvenance = latency.Provenance{P99: percentileProvenanceFromSketch(acc.sketch)}
+		if acc.sketch != nil {
+			stat.P99LatencyMicros = acc.sketch.Quantile(0.99)
 		}
 		out = append(out, stat)
 	}

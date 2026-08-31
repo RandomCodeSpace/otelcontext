@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/RandomCodeSpace/otelcontext/internal/latency"
 	"gorm.io/gorm"
 )
 
@@ -12,10 +13,9 @@ import (
 // Step 1: dialect-dispatch tests (DryRun + real SQLite)
 // ---------------------------------------------------------------------------
 
-// TestP99_SQLite_DispatchLimit verifies that the SQLite path issues a query
-// with Limit(sqliteP99RowCap+1). We use a real in-memory SQLite DB with a
-// DryRun session to capture the generated SQL.
-func TestP99_SQLite_DispatchLimit(t *testing.T) {
+// TestP99_SQLite_DispatchOrderedRank verifies the SQLite path is callable on
+// an empty filtered population without inventing a percentile.
+func TestP99_SQLite_DispatchOrderedRank(t *testing.T) {
 	repo := newTestRepo(t)
 
 	// Build a session identical to how GetDashboardStats passes it:
@@ -131,49 +131,70 @@ func TestP99_SQLite_SingleRow(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Step 3b: Large-data / cap test
+// Step 3b: contradictory distribution and retained-adapter parity
 // ---------------------------------------------------------------------------
 
-// TestP99_SQLite_CapTriggers temporarily shrinks sqliteP99RowCap and inserts
-// just over that amount, verifying the cap path is exercised:
-//  1. GetDashboardStats returns without error.
-//  2. P99Latency is non-zero.
-//  3. The call completes quickly (small dataset).
-//
-// The cap is a var specifically so this test can run under -race without
-// seeding 200k rows. Default cap remains 200_000 in production.
-func TestP99_SQLite_CapTriggers(t *testing.T) {
-	orig := sqliteP99RowCap
-	sqliteP99RowCap = 200
-	t.Cleanup(func() { sqliteP99RowCap = orig })
-
-	repo := newTestRepo(t)
-	now := time.Now().UTC()
-
-	insertCount := sqliteP99RowCap + 50 // just over the (shrunk) cap
-
-	batch := make([]Trace, 0, insertCount)
-	for i := 0; i < insertCount; i++ {
-		batch = append(batch, Trace{
-			TraceID:     "t" + p99Itoa(i),
-			ServiceName: "svc",
-			Duration:    int64(i + 1),
-			Status:      "OK",
-			Timestamp:   now,
-			TenantID:    "default",
+func TestP99OrderedRankAdaptersContradictAverage(t *testing.T) {
+	for _, driver := range []string{"sqlite", "mysql", "sqlserver", "mssql"} {
+		t.Run(driver, func(t *testing.T) {
+			repo := newTestRepo(t)
+			repo.driver = driver
+			now := time.Now().UTC()
+			batch := make([]Trace, 1000)
+			for i := range batch {
+				duration := int64(10_000)
+				if i >= 989 {
+					duration = 1_000_000
+				}
+				batch[i] = Trace{
+					TraceID: "sentinel-" + p99Itoa(i), ServiceName: "svc",
+					Duration: duration, Status: "OK", Timestamp: now, TenantID: "default",
+				}
+			}
+			if err := repo.db.CreateInBatches(batch, 100).Error; err != nil {
+				t.Fatal(err)
+			}
+			stats, err := repo.GetDashboardStats(context.Background(), now.Add(-time.Hour), now.Add(time.Hour), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if stats.P99Latency != 1_000_000 {
+				t.Fatalf("p99 = %d µs, want 1000000", stats.P99Latency)
+			}
+			p99 := stats.LatencyProvenance.P99
+			if p99.Status != latency.StatusMeasured || p99.Method != latency.MethodOrderedRank || p99.SampleCount != 1000 || p99.LowSample {
+				t.Fatalf("provenance = %+v", p99)
+			}
 		})
 	}
-	if err := repo.db.CreateInBatches(batch, 100).Error; err != nil {
-		t.Fatalf("seed batch: %v", err)
-	}
+}
 
-	ctx := context.Background()
-	stats, err := repo.GetDashboardStats(ctx, now.Add(-time.Hour), now.Add(time.Hour), nil)
-	if err != nil {
-		t.Fatalf("GetDashboardStats: %v", err)
-	}
-	if stats.P99Latency <= 0 {
-		t.Fatalf("P99Latency should be positive, got %d", stats.P99Latency)
+func TestP99ObservationBoundaries(t *testing.T) {
+	for _, count := range []int{0, 1, 99, 100} {
+		t.Run(p99Itoa(count), func(t *testing.T) {
+			repo := newTestRepo(t)
+			now := time.Now().UTC()
+			if count > 0 {
+				rows := makeTraces(t, count, now)
+				if err := repo.db.Create(&rows).Error; err != nil {
+					t.Fatal(err)
+				}
+			}
+			stats, err := repo.GetDashboardStats(context.Background(), now.Add(-time.Hour), now.Add(time.Hour), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			p99 := stats.LatencyProvenance.P99
+			if count == 0 {
+				if stats.P99Latency != 0 || p99.Status != latency.StatusUnavailable || p99.Reason != latency.ReasonNoObservations {
+					t.Fatalf("empty stats = %+v provenance=%+v", stats, p99)
+				}
+				return
+			}
+			if p99.Status != latency.StatusMeasured || p99.SampleCount != uint64(count) || p99.LowSample != (count < 100) {
+				t.Fatalf("count %d provenance = %+v", count, p99)
+			}
+		})
 	}
 }
 

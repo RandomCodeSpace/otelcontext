@@ -9,6 +9,7 @@ const dom = {
   connectionLabel: byId("connection-label"),
   pulseHealth: byId("pulse-health"),
   pulseErrors: byId("pulse-errors"),
+  pulseLatencyLabel: byId("pulse-latency-label"),
   pulseP99: byId("pulse-p99"),
   pulseServices: byId("pulse-services"),
   pulseUptime: byId("pulse-uptime"),
@@ -130,6 +131,64 @@ function formatMs(value) {
   if (ms < 1000) return trimFixed(ms, 0) + "ms";
   if (ms < 60000) return trimFixed(ms / 1000, 1) + "s";
   return trimFixed(ms / 60000, 1) + "m";
+}
+
+function formatP99(value, provenance) {
+  const p99 = provenance && typeof provenance === "object" && provenance.p99 && typeof provenance.p99 === "object"
+    ? provenance.p99
+    : null;
+  if (!p99) {
+    return {
+      label: "Reported p99",
+      value: formatMs(value),
+      explanation: "Server did not report percentile provenance",
+    };
+  }
+
+  const samples = Math.max(0, finite(p99.sample_count, 0));
+  const lowSample = p99.low_sample
+    ? (samples ? formatCount(samples) + " samples; low sample" : "Low sample")
+    : "";
+  const explain = (text) => lowSample ? text + "; " + lowSample : text;
+  switch (String(p99.status || "")) {
+  case "measured":
+    return {
+      label: "P99",
+      value: formatMs(value),
+      explanation: explain("Measured from " + formatCount(samples) + " spans"),
+    };
+  case "approximate": {
+    const bound = Number(p99.relative_error_bound);
+    const accuracy = p99.degraded
+      ? "DDSketch; degraded accuracy"
+      : Number.isFinite(bound) && bound > 0
+        ? "DDSketch, ±" + trimFixed(bound * 100, 1) + "%"
+        : "DDSketch approximation";
+    return { label: "Approx. p99", value: formatMs(value), explanation: explain(accuracy) };
+  }
+  case "estimated":
+    return {
+      label: "Estimated tail",
+      value: Number.isFinite(Number(value)) ? "~" + formatMs(value) : "—",
+      explanation: explain("Derived from average latency; not a measured percentile"),
+    };
+  case "bounded": {
+    const population = Math.max(0, finite(p99.population_count, 0));
+    return {
+      label: "Sample p99",
+      value: formatMs(value),
+      explanation: explain(formatCount(samples) + " retained spans out of " + formatCount(population)),
+    };
+  }
+  case "unavailable":
+    return { label: "P99 unavailable", value: "—", explanation: "No percentile data" };
+  default:
+    return {
+      label: "Reported p99",
+      value: formatMs(value),
+      explanation: "Server reported unknown percentile provenance",
+    };
+  }
 }
 
 function formatCount(value) {
@@ -483,6 +542,16 @@ function normalizeGraph(graph) {
   return value;
 }
 
+function formatPulseLatency(summary, dashboard) {
+  if (Object.prototype.hasOwnProperty.call(dashboard, "p99_latency_ms") || dashboard.latency_provenance) {
+    return formatP99(dashboard.p99_latency_ms, dashboard.latency_provenance);
+  }
+  if (Number.isFinite(Number(summary.avg_latency_ms))) {
+    return { label: "Average", value: formatMs(summary.avg_latency_ms), explanation: "Arithmetic mean latency" };
+  }
+  return { label: "P99 unavailable", value: "—", explanation: "No percentile data" };
+}
+
 function renderStates() {
   const nodeCount = state.graph && state.graph.nodes ? state.graph.nodes.length : 0;
   dom.loading.hidden = !state.loading;
@@ -505,9 +574,11 @@ function renderPulse() {
   dom.pulseErrors.textContent = Number.isFinite(Number(dashboard.error_rate))
     ? formatPercent(dashboard.error_rate, 1)
     : formatRatio(summary.total_error_rate, 1);
-  dom.pulseP99.textContent = Number.isFinite(Number(dashboard.p99_latency_ms))
-    ? formatMs(dashboard.p99_latency_ms)
-    : formatMs(summary.avg_latency_ms);
+  const tail = formatPulseLatency(summary, dashboard);
+  dom.pulseLatencyLabel.textContent = tail.label;
+  dom.pulseP99.textContent = tail.value;
+  dom.pulseP99.title = tail.explanation;
+  dom.pulseP99.setAttribute("aria-label", tail.label + ": " + tail.value + ". " + tail.explanation);
   dom.pulseServices.textContent = formatCount(summary.total_services);
   const uptime = Number(summary.uptime_seconds);
   if (Number.isFinite(uptime) && uptime !== state.uptimeAuthoritative) {
@@ -580,9 +651,11 @@ function serviceButton(node) {
   main.className = "service-row-main";
   main.appendChild(textElement("span", "service-name", node.id));
   const metrics = node.metrics || {};
-  let detail = formatMs(metrics.p99_latency_ms) + " p99 · " + formatRatio(metrics.error_rate, 1) + " error";
+  const tail = formatP99(metrics.p99_latency_ms, metrics.latency_provenance);
+  let detail = tail.value + " " + tail.label.toLowerCase() + " · " + formatRatio(metrics.error_rate, 1) + " error";
   if (state.anomalies.has(node.id)) detail += " · anomaly";
   main.appendChild(textElement("span", "service-meta", detail));
+  main.title = tail.explanation;
   const health = textElement("span", "service-health", formatRatio(node.health_score, 0));
   health.style.color = statusColor(status);
   button.append(dot, main, health);
@@ -799,7 +872,8 @@ function renderGraph() {
       group.appendChild(label);
     }
     const title = svgElement("title");
-    title.textContent = node.id + " — " + status + ", p99 " + formatMs(node.metrics.p99_latency_ms);
+    const tail = formatP99(node.metrics.p99_latency_ms, node.metrics.latency_provenance);
+    title.textContent = node.id + " — " + status + ", " + tail.label + " " + tail.value + ". " + tail.explanation;
     group.appendChild(title);
     group.addEventListener("click", (event) => {
       event.stopPropagation();
@@ -864,9 +938,10 @@ function setMobileMode(mode) {
   renderStates();
 }
 
-function statCard(label, value, critical) {
+function statCard(label, value, critical, explanation) {
   const card = document.createElement("div");
   card.className = "stat-card" + (critical ? " is-critical" : "");
+  if (explanation) card.title = explanation;
   card.append(textElement("span", "stat-label", label), textElement("strong", "", value));
   return card;
 }
@@ -876,11 +951,12 @@ function renderOverview(node) {
   const metrics = node.metrics || {};
   const stats = document.createElement("div");
   stats.className = "stat-grid";
+  const tail = formatP99(metrics.p99_latency_ms, metrics.latency_provenance);
   stats.append(
     statCard("RPS", formatCount(metrics.request_rate_rps) + "/s"),
     statCard("Error", formatRatio(metrics.error_rate, 1), finite(metrics.error_rate, 0) > 0),
     statCard("Average", formatMs(metrics.avg_latency_ms)),
-    statCard("P99", formatMs(metrics.p99_latency_ms))
+    statCard(tail.label, tail.value, false, tail.explanation)
   );
   wrapper.appendChild(stats);
 
@@ -1590,3 +1666,5 @@ refresh({ silent: false });
 refreshAnomalies();
 connectWebSocket();
 startPolling();
+
+export { formatP99, formatPulseLatency };

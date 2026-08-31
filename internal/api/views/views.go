@@ -16,6 +16,7 @@ import (
 
 	"github.com/RandomCodeSpace/otelcontext/internal/aggregate"
 	"github.com/RandomCodeSpace/otelcontext/internal/graphrag"
+	"github.com/RandomCodeSpace/otelcontext/internal/latency"
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 	"github.com/RandomCodeSpace/otelcontext/internal/topology"
 )
@@ -108,14 +109,15 @@ type ServiceError struct {
 // and spans/span_errors/span_error_rate carry the span basis the old aggregate
 // payload was mislabelling as traces. Both rates are percents, like error_rate.
 type DashboardStats struct {
-	TotalTraces        int64          `json:"total_traces"`
-	TotalLogs          int64          `json:"total_logs"`
-	TotalErrors        int64          `json:"total_errors"`
-	AvgLatencyMs       float64        `json:"avg_latency_ms"`
-	ErrorRate          float64        `json:"error_rate"`
-	ActiveServices     int64          `json:"active_services"`
-	P99LatencyMs       float64        `json:"p99_latency_ms"`
-	TopFailingServices []ServiceError `json:"top_failing_services"`
+	TotalTraces        int64               `json:"total_traces"`
+	TotalLogs          int64               `json:"total_logs"`
+	TotalErrors        int64               `json:"total_errors"`
+	AvgLatencyMs       float64             `json:"avg_latency_ms"`
+	ErrorRate          float64             `json:"error_rate"`
+	ActiveServices     int64               `json:"active_services"`
+	P99LatencyMs       float64             `json:"p99_latency_ms"`
+	LatencyProvenance  *latency.Provenance `json:"latency_provenance,omitempty"`
+	TopFailingServices []ServiceError      `json:"top_failing_services"`
 
 	Requests         int64   `json:"requests,omitempty"`
 	RequestErrors    int64   `json:"request_errors,omitempty"`
@@ -133,10 +135,12 @@ type DashboardStats struct {
 
 // ServiceMapNode is a node on the service topology view.
 type ServiceMapNode struct {
-	Name         string  `json:"name"`
-	TotalTraces  int64   `json:"total_traces"`
-	ErrorCount   int64   `json:"error_count"`
-	AvgLatencyMs float64 `json:"avg_latency_ms"`
+	Name              string              `json:"name"`
+	TotalTraces       int64               `json:"total_traces"`
+	ErrorCount        int64               `json:"error_count"`
+	AvgLatencyMs      float64             `json:"avg_latency_ms"`
+	P99LatencyMs      float64             `json:"p99_latency_ms,omitempty"`
+	LatencyProvenance *latency.Provenance `json:"latency_provenance,omitempty"`
 }
 
 // ServiceMapEdge is an edge on the service topology view.
@@ -372,7 +376,8 @@ func DashboardStatsFromModel(s *storage.DashboardStats) DashboardStats {
 		ActiveServices: s.ActiveServices,
 		// storage.P99Latency is microseconds (storage tests assert µs); convert
 		// to milliseconds here so the API matches AvgLatencyMs and the field name.
-		P99LatencyMs: float64(s.P99Latency) / 1000.0,
+		P99LatencyMs:      float64(s.P99Latency) / 1000.0,
+		LatencyProvenance: s.LatencyProvenance,
 	}
 	if len(s.TopFailingServices) > 0 {
 		out.TopFailingServices = make([]ServiceError, len(s.TopFailingServices))
@@ -397,6 +402,7 @@ func DashboardStatsFromAggregate(r *aggregate.DashboardResult) DashboardStats {
 		return DashboardStats{}
 	}
 	acc := r.Accuracy
+	provenance := r.LatencyProvenance
 	out := DashboardStats{
 		// The headline trio is the REQUEST basis: that is what a dashboard
 		// labelled "traces" and "error rate" has always meant to a reader.
@@ -414,12 +420,13 @@ func DashboardStatsFromAggregate(r *aggregate.DashboardResult) DashboardStats {
 		ActiveServices:   r.ActiveServices,
 		// The engine reports microseconds, matching storage.P99Latency; the
 		// view is milliseconds in both modes.
-		P99LatencyMs: r.P99LatencyMicros / 1000.0,
-		Coverage:     string(r.Coverage),
-		CoverageNote: r.Coverage.Note(),
-		Accuracy:     &acc,
-		Epoch:        r.Epoch,
-		Revision:     r.Revision,
+		P99LatencyMs:      r.P99LatencyMicros / 1000.0,
+		LatencyProvenance: &provenance,
+		Coverage:          string(r.Coverage),
+		CoverageNote:      r.Coverage.Note(),
+		Accuracy:          &acc,
+		Epoch:             r.Epoch,
+		Revision:          r.Revision,
 	}
 	if len(r.TopFailing) > 0 {
 		out.TopFailingServices = make([]ServiceError, len(r.TopFailing))
@@ -449,10 +456,12 @@ func ServiceMapMetricsFromAggregate(r *aggregate.TopologyResult) ServiceMapMetri
 	nodes := make([]ServiceMapNode, len(r.Nodes))
 	for i, n := range r.Nodes {
 		nodes[i] = ServiceMapNode{
-			Name:         n.Service,
-			TotalTraces:  n.Count,
-			ErrorCount:   n.ErrorCount,
-			AvgLatencyMs: n.AvgLatencyMs,
+			Name:              n.Service,
+			TotalTraces:       n.Count,
+			ErrorCount:        n.ErrorCount,
+			AvgLatencyMs:      n.AvgLatencyMs,
+			P99LatencyMs:      n.P99LatencyMicros / 1000.0,
+			LatencyProvenance: &n.LatencyProvenance,
 		}
 	}
 	edges := make([]ServiceMapEdge, len(r.Edges))
@@ -481,10 +490,12 @@ func ServiceMapMetricsFromTopology(snapshot topology.Snapshot) ServiceMapMetrics
 	nodes := make([]ServiceMapNode, len(snapshot.Nodes))
 	for i, node := range snapshot.Nodes {
 		nodes[i] = ServiceMapNode{
-			Name:         node.Name,
-			TotalTraces:  node.TotalTraces,
-			ErrorCount:   node.ErrorCount,
-			AvgLatencyMs: node.AvgLatencyMs,
+			Name:              node.Name,
+			TotalTraces:       node.TotalTraces,
+			ErrorCount:        node.ErrorCount,
+			AvgLatencyMs:      node.AvgLatencyMs,
+			P99LatencyMs:      node.P99LatencyMs,
+			LatencyProvenance: node.LatencyProvenance,
 		}
 	}
 	edges := make([]ServiceMapEdge, len(snapshot.Edges))
@@ -521,10 +532,12 @@ func ServiceMapMetricsFromModel(m *storage.ServiceMapMetrics) ServiceMapMetrics 
 	nodes := make([]ServiceMapNode, len(m.Nodes))
 	for i, n := range m.Nodes {
 		nodes[i] = ServiceMapNode{
-			Name:         n.Name,
-			TotalTraces:  n.TotalTraces,
-			ErrorCount:   n.ErrorCount,
-			AvgLatencyMs: n.AvgLatencyMs,
+			Name:              n.Name,
+			TotalTraces:       n.TotalTraces,
+			ErrorCount:        n.ErrorCount,
+			AvgLatencyMs:      n.AvgLatencyMs,
+			P99LatencyMs:      n.P99LatencyMs,
+			LatencyProvenance: n.LatencyProvenance,
 		}
 	}
 	edges := make([]ServiceMapEdge, len(m.Edges))

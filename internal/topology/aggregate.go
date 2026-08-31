@@ -6,6 +6,7 @@ import (
 	"math"
 
 	"github.com/RandomCodeSpace/otelcontext/internal/aggregate"
+	"github.com/RandomCodeSpace/otelcontext/internal/latency"
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 )
 
@@ -73,15 +74,17 @@ func (p *AggregateProvider) Snapshot(ctx context.Context, q Query) (Snapshot, er
 		errorRate := node.ErrorRate
 		health := aggregateHealth(errorRate, node.AvgLatencyMs)
 		snap.Nodes = append(snap.Nodes, Node{
-			Name:         node.Service,
-			TotalTraces:  node.Count,
-			ErrorCount:   node.ErrorCount,
-			AvgLatencyMs: node.AvgLatencyMs,
-			ErrorRate:    errorRate,
-			SpanCount:    node.Count,
-			HealthScore:  health,
-			Status:       healthStatus(health),
-			Alerts:       alerts(errorRate, node.AvgLatencyMs),
+			Name:              node.Service,
+			TotalTraces:       node.Count,
+			ErrorCount:        node.ErrorCount,
+			AvgLatencyMs:      node.AvgLatencyMs,
+			P99LatencyMs:      node.P99LatencyMicros / 1000.0,
+			LatencyProvenance: &node.LatencyProvenance,
+			ErrorRate:         errorRate,
+			SpanCount:         node.Count,
+			HealthScore:       health,
+			Status:            healthStatus(health),
+			Alerts:            alerts(errorRate, node.AvgLatencyMs),
 		})
 	}
 	for _, edge := range result.Edges {
@@ -129,18 +132,27 @@ func fromAggregateProjection(projection aggregate.TopologySnapshot) Snapshot {
 		errorRate := totals.errorRate()
 		avg := totals.avgLatencyMs()
 		health := aggregateHealth(errorRate, avg)
+		provenance := totals.latencyProvenance
+		if provenance == nil {
+			provenance = &latency.Provenance{P99: &latency.Percentile{
+				Status: latency.StatusUnavailable,
+				Method: latency.MethodDDSketch,
+				Reason: latency.ReasonNoObservations,
+			}}
+		}
 		snap.Nodes = append(snap.Nodes, Node{
-			Name:           service.Name,
-			TotalTraces:    saturatingInt64(totals.count),
-			ErrorCount:     saturatingInt64(totals.errors),
-			AvgLatencyMs:   avg,
-			RequestRateRPS: float64(totals.count) / 300,
-			ErrorRate:      errorRate,
-			P99LatencyMs:   totals.p99Ms,
-			SpanCount:      saturatingInt64(totals.count),
-			HealthScore:    health,
-			Status:         healthStatus(health),
-			Alerts:         alerts(errorRate, avg),
+			Name:              service.Name,
+			TotalTraces:       saturatingInt64(totals.count),
+			ErrorCount:        saturatingInt64(totals.errors),
+			AvgLatencyMs:      avg,
+			RequestRateRPS:    float64(totals.count) / 300,
+			ErrorRate:         errorRate,
+			P99LatencyMs:      totals.p99Ms,
+			LatencyProvenance: provenance,
+			SpanCount:         saturatingInt64(totals.count),
+			HealthScore:       health,
+			Status:            healthStatus(health),
+			Alerts:            alerts(errorRate, avg),
 		})
 	}
 	for _, edge := range projection.Edges {
@@ -162,6 +174,7 @@ func fromAggregateProjection(projection aggregate.TopologySnapshot) Snapshot {
 type windowTotals struct {
 	count, errors, durationCount uint64
 	durationSumMicros, p99Ms     float64
+	latencyProvenance            *latency.Provenance
 }
 
 func sumWindows(windows []aggregate.TopologyWindow) windowTotals {
@@ -171,8 +184,10 @@ func sumWindows(windows []aggregate.TopologyWindow) windowTotals {
 		totals.errors += window.ErrorCount
 		totals.durationCount += window.DurationCount
 		totals.durationSumMicros += window.DurationSumMicros
-		if window.P99Micros > 0 {
+		if window.LatencyProvenance != nil && window.LatencyProvenance.P99 != nil {
 			totals.p99Ms = window.P99Micros / 1000
+			provenance := *window.LatencyProvenance
+			totals.latencyProvenance = &provenance
 		}
 	}
 	return totals

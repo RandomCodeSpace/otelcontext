@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/RandomCodeSpace/otelcontext/internal/latency"
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 	"github.com/RandomCodeSpace/otelcontext/internal/topology"
 )
@@ -35,11 +36,12 @@ type GraphNode struct {
 
 // NodeMetrics holds per-service observability metrics.
 type NodeMetrics struct {
-	RequestRateRPS float64 `json:"request_rate_rps"`
-	ErrorRate      float64 `json:"error_rate"`
-	AvgLatencyMs   float64 `json:"avg_latency_ms"`
-	P99LatencyMs   float64 `json:"p99_latency_ms"`
-	SpanCount1H    int64   `json:"span_count_1h"`
+	RequestRateRPS    float64             `json:"request_rate_rps"`
+	ErrorRate         float64             `json:"error_rate"`
+	AvgLatencyMs      float64             `json:"avg_latency_ms"`
+	P99LatencyMs      float64             `json:"p99_latency_ms"`
+	LatencyProvenance *latency.Provenance `json:"latency_provenance,omitempty"`
+	SpanCount1H       int64               `json:"span_count_1h"`
 }
 
 // GraphEdge represents a call relationship between two services.
@@ -142,11 +144,12 @@ func buildGraphFromTopology(snapshot topology.Snapshot) *SystemGraphResponse {
 			HealthScore: math.Round(health*100) / 100,
 			Status:      status,
 			Metrics: NodeMetrics{
-				RequestRateRPS: math.Round(node.RequestRateRPS*100) / 100,
-				ErrorRate:      math.Round(node.ErrorRate*1000000) / 1000000,
-				AvgLatencyMs:   math.Round(node.AvgLatencyMs*100) / 100,
-				P99LatencyMs:   math.Round(node.P99LatencyMs*100) / 100,
-				SpanCount1H:    node.SpanCount,
+				RequestRateRPS:    math.Round(node.RequestRateRPS*100) / 100,
+				ErrorRate:         math.Round(node.ErrorRate*1000000) / 1000000,
+				AvgLatencyMs:      math.Round(node.AvgLatencyMs*100) / 100,
+				P99LatencyMs:      math.Round(node.P99LatencyMs*100) / 100,
+				LatencyProvenance: node.LatencyProvenance,
+				SpanCount1H:       node.SpanCount,
 			},
 			Alerts: alerts,
 		})
@@ -213,11 +216,12 @@ func (s *Server) buildGraphFromMemory(ctx context.Context) *SystemGraphResponse 
 			HealthScore: math.Round(n.HealthScore*100) / 100,
 			Status:      n.Status,
 			Metrics: NodeMetrics{
-				RequestRateRPS: math.Round(n.RequestRateRPS*100) / 100,
-				ErrorRate:      math.Round(n.ErrorRate*1000000) / 1000000,
-				AvgLatencyMs:   math.Round(n.AvgLatencyMs*100) / 100,
-				P99LatencyMs:   math.Round(n.P99LatencyMs*100) / 100,
-				SpanCount1H:    n.SpanCount,
+				RequestRateRPS:    math.Round(n.RequestRateRPS*100) / 100,
+				ErrorRate:         math.Round(n.ErrorRate*1000000) / 1000000,
+				AvgLatencyMs:      math.Round(n.AvgLatencyMs*100) / 100,
+				P99LatencyMs:      math.Round(n.P99LatencyMs*100) / 100,
+				LatencyProvenance: n.LatencyProvenance,
+				SpanCount1H:       n.SpanCount,
 			},
 			Alerts: alerts,
 		})
@@ -260,11 +264,12 @@ func (s *Server) buildGraphFromGraphRAG(ctx context.Context) *SystemGraphRespons
 			HealthScore: math.Round(svc.HealthScore*100) / 100,
 			Status:      healthStatus(svc.HealthScore),
 			Metrics: NodeMetrics{
-				RequestRateRPS: math.Round(float64(svc.CallCount)/300*100) / 100, // approx 5min window
-				ErrorRate:      math.Round(svc.ErrorRate*1000000) / 1000000,
-				AvgLatencyMs:   math.Round(svc.AvgLatency*100) / 100,
-				P99LatencyMs:   math.Round(svc.AvgLatency*2.5*100) / 100, // estimate
-				SpanCount1H:    svc.CallCount,
+				RequestRateRPS:    math.Round(float64(svc.CallCount)/300*100) / 100, // approx 5min window
+				ErrorRate:         math.Round(svc.ErrorRate*1000000) / 1000000,
+				AvgLatencyMs:      math.Round(svc.AvgLatency*100) / 100,
+				P99LatencyMs:      math.Round(svc.P99Latency*100) / 100,
+				LatencyProvenance: svc.LatencyProvenance,
+				SpanCount1H:       svc.CallCount,
 			},
 			Alerts: alerts,
 		})
@@ -339,11 +344,12 @@ func (s *Server) buildGraphFromDB(ctx context.Context) *SystemGraphResponse {
 			HealthScore: healthScore,
 			Status:      healthStatus(healthScore),
 			Metrics: NodeMetrics{
-				RequestRateRPS: math.Round(float64(n.TotalTraces)/3600*100) / 100,
-				ErrorRate:      math.Round(errorRate*1000000) / 1000000,
-				AvgLatencyMs:   n.AvgLatencyMs,
-				P99LatencyMs:   n.AvgLatencyMs * 2.5,
-				SpanCount1H:    n.TotalTraces,
+				RequestRateRPS:    math.Round(float64(n.TotalTraces)/3600*100) / 100,
+				ErrorRate:         math.Round(errorRate*1000000) / 1000000,
+				AvgLatencyMs:      n.AvgLatencyMs,
+				P99LatencyMs:      n.P99LatencyMs,
+				LatencyProvenance: n.LatencyProvenance,
+				SpanCount1H:       n.TotalTraces,
 			},
 			Alerts: alerts,
 		})

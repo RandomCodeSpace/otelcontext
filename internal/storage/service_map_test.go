@@ -4,10 +4,12 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"reflect"
 	"sort"
 	"testing"
 	"time"
 
+	"github.com/RandomCodeSpace/otelcontext/internal/latency"
 	"gorm.io/gorm"
 )
 
@@ -241,10 +243,16 @@ func TestGetServiceMapMetrics_FixtureValues(t *testing.T) {
 	}
 	sortServiceMap(got)
 
+	estimated := func(count uint64) *latency.Provenance {
+		return &latency.Provenance{P99: &latency.Percentile{
+			Status: latency.StatusEstimated, Method: latency.MethodAverageMultiplier,
+			SampleCount: count, LowSample: true, EstimateFactor: 2.5,
+		}}
+	}
 	wantNodes := []ServiceMapNode{
-		{Name: "svc-a", TotalTraces: 2, ErrorCount: 0, AvgLatencyMs: 55},
-		{Name: "svc-b", TotalTraces: 4, ErrorCount: 1, AvgLatencyMs: 25},
-		{Name: "svc-c", TotalTraces: 2, ErrorCount: 1, AvgLatencyMs: 30},
+		{Name: "svc-a", TotalTraces: 2, ErrorCount: 0, AvgLatencyMs: 55, P99LatencyMs: 137.5, LatencyProvenance: estimated(2)},
+		{Name: "svc-b", TotalTraces: 4, ErrorCount: 1, AvgLatencyMs: 25, P99LatencyMs: 62.5, LatencyProvenance: estimated(4)},
+		{Name: "svc-c", TotalTraces: 2, ErrorCount: 1, AvgLatencyMs: 30, P99LatencyMs: 75, LatencyProvenance: estimated(2)},
 	}
 	wantEdges := []ServiceMapEdge{
 		{Source: "svc-a", Target: "svc-b", CallCount: 2, AvgLatencyMs: 40},
@@ -255,7 +263,7 @@ func TestGetServiceMapMetrics_FixtureValues(t *testing.T) {
 		t.Fatalf("nodes: got %+v want %+v", got.Nodes, wantNodes)
 	}
 	for i := range wantNodes {
-		if got.Nodes[i] != wantNodes[i] {
+		if !reflect.DeepEqual(got.Nodes[i], wantNodes[i]) {
 			t.Errorf("node %d: got %+v want %+v", i, got.Nodes[i], wantNodes[i])
 		}
 	}
