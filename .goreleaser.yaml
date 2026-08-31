@@ -34,6 +34,10 @@ archives:
     files:
       - LICENSE.md
       - README.md
+      - src: deploy/systemd/otelcontext.service
+        dst: deploy/systemd
+      - src: deploy/systemd/otelcontext.env.example
+        dst: deploy/systemd
 
 checksum:
   name_template: "checksums.txt"

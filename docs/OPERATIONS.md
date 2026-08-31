@@ -82,6 +82,48 @@ DB_DSN="host=my-server.postgres.database.azure.com user=my-mi@tenant.onmicrosoft
 
 ---
 
+## Supported systemd deployment
+
+The supported limited-production shape is one signed Linux binary on one host running systemd 249 or newer. It uses `AGGREGATE_MODE=legacy` with PostgreSQL 16, or the bounded SQLite profile above. Direct binary execution remains supported for local use; containers and deployment frameworks are not part of this contract.
+
+The release archive includes [`otelcontext.service`](../deploy/systemd/otelcontext.service) and [`otelcontext.env.example`](../deploy/systemd/otelcontext.env.example). Install them with these paths and owners:
+
+| Purpose | Path | Owner and mode |
+|---|---|---|
+| Versioned binary | `/opt/otelcontext/releases/<version>/otelcontext` | `root:root 0755` |
+| Active selector | `/opt/otelcontext/current` | Root-owned symlink to one release directory |
+| Environment | `/etc/otelcontext/otelcontext.env` | `root:otelcontext 0640` |
+| Unit | `/etc/systemd/system/otelcontext.service` | `root:root 0644` |
+| Writable state | `/var/lib/otelcontext` | `otelcontext:otelcontext 0750` via `StateDirectory` |
+| Quiesced bundles | `/var/backups/otelcontext/<backup-id>` | `root:root 0750` |
+| Runtime log | system journal | `journalctl -u otelcontext.service` |
+
+Keep `/var/lib/otelcontext/.env` absent. The systemd environment file is the only service configuration owner, and every writable path in it must be absolute. Use a dedicated local volume for SQLite: the disk watchdog measures the filesystem containing `DATA_DISK_PATH`, not just the application directory.
+
+### First install
+
+1. Verify the release checksum and Sigstore certificate before extraction. Stage the binary under a new versioned release directory; never overwrite the previous binary.
+2. Create the static `otelcontext` service account with home `/var/lib/otelcontext` and no interactive shell. Install the environment file and unit with the owners and modes above.
+3. Run `migrate status`, `migrate up`, then `migrate status` as transient systemd services using `User=otelcontext`, `WorkingDirectory=/var/lib/otelcontext`, and `EnvironmentFile=/etc/otelcontext/otelcontext.env`. Require the final status to be exact.
+4. Atomically point `/opt/otelcontext/current` at the staged release, then run `systemd-analyze verify /etc/systemd/system/otelcontext.service` so its absolute `ExecStart` resolves.
+5. Run `systemctl daemon-reload`, enable and start the unit, then require `/live` and `/ready` within 30 seconds.
+
+`systemctl is-active` proves only that the process exists. Route traffic on `/ready`; use `/live` for liveness. A readiness failure removes the process from traffic but must not trigger a restart loop. systemd restarts process failures, with at most three failed starts per minute.
+
+### Upgrade and rollback
+
+Remove the instance from traffic, then stop it with `systemctl stop otelcontext.service`. Require an inactive unit, a zero exit, unavailable probes, and a `shutdown_complete` journal record before creating a bundle. Run the staged candidate migration explicitly, require exact status, atomically repoint `current`, start, and verify readiness plus the telemetry fingerprint. Keep the previous release, configuration, and quiesced bundle for the rollback window.
+
+Before any migration or candidate write, rollback is a selector change. After migration or candidate startup, do not run a down migration: restore the bundle into fresh database and state targets, restore the previous configuration, repoint the previous signed binary, and require migration status, readiness, and the original fingerprint.
+
+The disposable verifier used by the release gate is [`scripts/prove-systemd-release.sh`](../scripts/prove-systemd-release.sh). It refuses a host where any production path, account, unit, or listener already exists, and it removes every object it creates. Run it only on an isolated host.
+
+### Whole-origin proxy
+
+A proxy is optional. When one already fronts the browser, give OtelContext a dedicated origin and forward the whole origin to the HTTP listener: `/`, `/static/*`, `/api/*`, `/mcp`, `/ws*`, `/live`, `/ready`, and any OTLP HTTP `/v1/*` paths you choose to expose. Preserve WebSocket upgrades and streaming responses. Do not mount the client under a path prefix; it uses root-relative URLs. OTLP gRPC on port 4317 stays direct or uses the operator's existing HTTP/2 route. This is routing guidance only and does not change authentication.
+
+---
+
 ## Production Checklist
 
 ### Must set
