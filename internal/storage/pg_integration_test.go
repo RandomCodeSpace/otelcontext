@@ -240,13 +240,17 @@ func TestPG_PgTrgm_SubstringQueryUsesGIN(t *testing.T) {
 	repo, teardown := setupPGContainer(t)
 	defer teardown()
 
-	// Seed enough rows that the planner prefers the index over a seq scan.
+	// Keep the substring selective so the planner has a reason to use the index.
 	now := time.Now().UTC()
 	batch := make([]Log, 0, 2000)
 	for i := 0; i < 2000; i++ {
+		body := fmt.Sprintf("request %d: upstream healthy", i)
+		if i%1000 == 0 {
+			body = fmt.Sprintf("request %d: connection-refused-dbcontract", i)
+		}
 		batch = append(batch, Log{
 			Severity:    "INFO",
-			Body:        fmt.Sprintf("request %d: connection refused by upstream-%d", i, i%37),
+			Body:        body,
 			ServiceName: fmt.Sprintf("svc-%d", i%11),
 			Timestamp:   now,
 		})
@@ -261,7 +265,7 @@ func TestPG_PgTrgm_SubstringQueryUsesGIN(t *testing.T) {
 
 	rows, err := repo.db.Raw(
 		"EXPLAIN SELECT id FROM logs WHERE body ILIKE ?",
-		"%connection%",
+		"%connection-refused-dbcontract%",
 	).Rows()
 	if err != nil {
 		t.Fatalf("EXPLAIN: %v", err)
