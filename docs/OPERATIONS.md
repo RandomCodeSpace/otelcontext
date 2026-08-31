@@ -25,14 +25,14 @@ What happens:
 ### Postgres
 
 ```bash
-DB_DRIVER=postgres \
-DB_DSN="host=localhost user=otel password=otel dbname=otelcontext port=5432 sslmode=disable TimeZone=UTC" \
-DB_AUTOMIGRATE=false \
-API_KEY="$(openssl rand -hex 32)" \
-./otelcontext
+export DB_DRIVER=postgres
+export DB_DSN="host=localhost user=otel password=otel dbname=otelcontext port=5432 sslmode=disable TimeZone=UTC"
+
+./otelcontext migrate up
+DB_AUTOMIGRATE=false API_KEY="$(openssl rand -hex 32)" ./otelcontext
 ```
 
-Set `DB_AUTOMIGRATE=false` in production. AutoMigrate locks tables and has no rollback; run schema changes out-of-band (Flyway, goose, sqlc migrate, etc.).
+Set `DB_AUTOMIGRATE=false` in production after `otelcontext migrate status` reports `result=ready`. The binary owns the ordered SQLite and unpartitioned PostgreSQL 16 migrations; no separate migration tool is required. Daily PostgreSQL partitioning remains on the preview AutoMigrate path.
 
 ### TLS
 
@@ -84,7 +84,7 @@ DB_DSN="host=my-server.postgres.database.azure.com user=my-mi@tenant.onmicrosoft
 - `DB_MAX_OPEN_CONNS` — size to match your Postgres pool and expected ingest concurrency.
 - `DEFAULT_TENANT` — a non-`default` value if the deployment serves a specific tenant.
 - `OTEL_EXPORTER_OTLP_ENDPOINT` — enables self-instrumentation. Set to `localhost:4317` to dogfood into the same instance.
-- `DB_AUTOMIGRATE=false` for Postgres in production.
+- `DB_AUTOMIGRATE=false` for SQLite or unpartitioned Postgres production after the versioned migration command reports ready.
 
 ### Trust the defaults (don't tune unless you have a reason)
 - `METRIC_MAX_CARDINALITY=10000`, `METRIC_MAX_CARDINALITY_PER_TENANT=0` (unlimited per-tenant by default). For multi-tenant deployments, set the per-tenant cap to enforce fairness — a noisy tenant gets bounded before exhausting the global pool. Watch `otelcontext_tsdb_cardinality_overflow_by_tenant_total{tenant_id}` to identify offenders.
@@ -443,12 +443,14 @@ If the edge Collector applies tail-sampling, set `SAMPLING_RATE=1.0` on OtelCont
 
 ## Upgrade Path
 
-1. **Back up the DB** (see Backup & Restore above).
+1. **Stop OtelContext and back up the DB** (see Backup & Restore above). Keep the previous signed binary.
 2. **Read the CHANGELOG** for breaking changes between your current and target versions.
-3. **SQLite:** `DB_AUTOMIGRATE=true` (default) handles schema upgrades in place.
-4. **Postgres in production:** keep `DB_AUTOMIGRATE=false` and apply migrations out-of-band before starting the new binary.
-5. Roll the new binary. Watch `/ready`, `OtelContext_db_up`, and `retention_*` metrics for the first hour.
+3. Run `otelcontext migrate status` with the same `DB_*`, `AGGREGATE_MODE`, and `AGGREGATE_DB_PATH` settings as the service.
+4. If this is the first versioned upgrade, run `otelcontext migrate baseline --from v0.3.1` or `--from v0.4.0-beta.2`. The command refuses a database that does not match the named release.
+5. Run `otelcontext migrate up`, then rerun `otelcontext migrate status` and require `result=ready`.
+6. Start the new binary with `DB_AUTOMIGRATE=false`. Watch `/ready`, `OtelContext_db_up`, and `retention_*` metrics for the first hour.
+
+For automation, `migrate status` exits `0` for exact, `10` for empty, `11` for unmanaged, `12` for behind, `13` for ahead, `14` for dirty, `15` for incompatible, and `16` for an unverified preview driver. Command-usage errors exit `2`.
 
 If the new version fails to start:
-- For SQLite, restore the pre-upgrade backup with `VACUUM INTO`.
-- For Postgres, restore via `pg_restore --clean --if-exists`.
+- Stop the candidate, restore both main and aggregate stores from the pre-migration backup, and start the previous signed binary. There are no down migrations.

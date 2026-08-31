@@ -209,7 +209,7 @@ func TestAutoMigrateEnabled_EnvParsing(t *testing.T) {
 			} else {
 				t.Setenv("DB_AUTOMIGRATE", c.env)
 			}
-			got := autoMigrateEnabled()
+			got := AutoMigrateEnabled()
 			if got != c.want {
 				t.Fatalf("DB_AUTOMIGRATE=%q → %v, want %v", c.env, got, c.want)
 			}

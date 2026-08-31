@@ -117,6 +117,10 @@ func fatal(msg string, err error, kv ...any) {
 }
 
 func main() {
+	if handled, code := maybeRunMigrationCommand(os.Args[1:], os.Stdout, os.Stderr); handled {
+		os.Exit(code)
+	}
+
 	versionFlag := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 
@@ -191,6 +195,22 @@ func main() {
 
 	slog.Info("🚀 Starting OtelContext", "version", Version, "env", cfg.Env, "log_level", level)
 
+	// 1. Initialize Internal Telemetry (first — everything registers metrics against this)
+	metrics := telemetry.New()
+	slog.Info("📊 Internal telemetry initialized")
+
+	// 2. Initialize Storage
+	repo, err := storage.NewRepository(metrics)
+	if err != nil {
+		fatal("Failed to initialize repository", err)
+	}
+	if err := prepareDatabaseSchemas(appCtx, cfg, repo); err != nil {
+		_ = repo.Close()
+		fatal("Database schema compatibility gate failed", err)
+	}
+	slog.Info("💾 Storage initialized", "driver", cfg.DBDriver)
+
+	// No listener or background worker may start before the schema gate above.
 	// Pace the GC against a soft memory ceiling so RSS stays bounded under
 	// sustained ingest (honors an explicit GOMEMLIMIT; otherwise 75% of the
 	// detected cgroup/host budget). See applyMemoryLimit in memlimit.go.
@@ -202,11 +222,7 @@ func main() {
 		slog.Warn("pprof server disabled", "error", err, "addr", cfg.PprofAddr)
 	}
 
-	// 1. Initialize Internal Telemetry (first — everything registers metrics against this)
-	metrics := telemetry.New()
-	slog.Info("📊 Internal telemetry initialized")
-
-	// 1b. Initialize OTel self-instrumentation (optional)
+	// 2b. Initialize OTel self-instrumentation (optional).
 	var shutdownTracer func(context.Context) error
 	if cfg.OTelExporterEndpoint != "" {
 		tp, err := initTracerProvider(cfg.OTelExporterEndpoint)
@@ -219,14 +235,7 @@ func main() {
 		}
 	}
 
-	// 2. Initialize Storage
-	repo, err := storage.NewRepository(metrics)
-	if err != nil {
-		fatal("Failed to initialize repository", err)
-	}
-	slog.Info("💾 Storage initialized", "driver", cfg.DBDriver)
-
-	// 2a. Retention scheduler: hourly batched purge + daily maintenance
+	// 2c. Retention scheduler: hourly batched purge + daily maintenance
 	// (VACUUM ANALYZE / OPTIMIZE / PRAGMA optimize + incremental_vacuum).
 	ctxRetention, cancelRetention := context.WithCancel(context.Background())
 	retention := storage.NewRetentionScheduler(
@@ -239,7 +248,7 @@ func main() {
 	// Start() is deferred until after the aggregate store is wired in below —
 	// SetAggregateRetention must be called before the loop reads the fields.
 
-	// 2b. Partition scheduler: only when DB_POSTGRES_PARTITIONING=daily.
+	// 2d. Partition scheduler: only when DB_POSTGRES_PARTITIONING=daily.
 	// Maintains lookahead daily partitions and drops expired ones — DROP
 	// PARTITION is orders of magnitude faster than DELETE for retention.
 	var partitionScheduler *storage.PartitionScheduler
@@ -477,11 +486,6 @@ func main() {
 		"tenant_idle_ttl", graphRAGCfg.TenantIdleTTL,
 		"mode", graphRAGCfg.Mode,
 	)
-
-	// Auto-migrate GraphRAG models (Investigation, DrainTemplateRow)
-	if err := graphrag.AutoMigrateGraphRAG(repo.DB()); err != nil {
-		slog.Error("Failed to migrate GraphRAG models", "error", err)
-	}
 
 	// 5. Initialize AI Service.
 	// Workers inherit aiCtx so an in-flight LLM call (30s timeout) is

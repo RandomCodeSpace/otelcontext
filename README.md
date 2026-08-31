@@ -141,6 +141,25 @@ Connect an MCP client to `http://localhost:8080/mcp` to investigate the same tel
 
 Trace-based answers say whether the supporting exemplar is complete, partial, or no longer retained. OtelContext does not present a partial trace as the whole story.
 
+## Upgrade without guessing
+
+The same binary can check and upgrade its database before it starts any receiver or background work:
+
+```bash
+./otelcontext migrate status
+./otelcontext migrate up
+```
+
+If the database came from an older release that predates migration tracking, identify it once before upgrading:
+
+```bash
+./otelcontext migrate baseline --from v0.3.1
+# or: --from v0.4.0-beta.2
+./otelcontext migrate up
+```
+
+The baseline command validates the database first; it does not repair or guess. Back up the main database and aggregate database file, and keep the previous signed binary until `migrate status` reports `result=ready`. Versioned production checks are available for SQLite and unpartitioned PostgreSQL 16. MySQL, SQL Server, and PostgreSQL daily partitioning keep their existing preview AutoMigrate path.
+
 ## Secure a deployment
 
 Set at least one authentication method before exposing OtelContext:

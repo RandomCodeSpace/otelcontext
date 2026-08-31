@@ -78,9 +78,9 @@ func likeOpFor(driver string) string {
 // likeOp returns the case-insensitive LIKE operator for this Repository's dialect.
 func (r *Repository) likeOp() string { return likeOpFor(r.driver) }
 
-// autoMigrateEnabled reports whether GORM AutoMigrate should run on startup.
+// AutoMigrateEnabled reports whether GORM AutoMigrate should run on startup.
 // Defaults to true; set DB_AUTOMIGRATE=false to run versioned migrations externally.
-func autoMigrateEnabled() bool {
+func AutoMigrateEnabled() bool {
 	v, ok := os.LookupEnv("DB_AUTOMIGRATE")
 	if !ok {
 		return true
@@ -90,6 +90,16 @@ func autoMigrateEnabled() bool {
 		return false
 	default:
 		return true
+	}
+}
+
+// MigrateOptionsFromEnv returns the existing development AutoMigrate tuning.
+// The versioned migration owner calls this before any worker or listener starts.
+func MigrateOptionsFromEnv() MigrateOptions {
+	return MigrateOptions{
+		PostgresPartitioning:   strings.ToLower(strings.TrimSpace(os.Getenv("DB_POSTGRES_PARTITIONING"))),
+		PartitionLookaheadDays: partitionLookaheadFromEnv(),
+		Timeout:                migrateTimeoutFromEnv(),
 	}
 }
 
@@ -121,7 +131,9 @@ func (r *Repository) LogsPartitioned() bool { return r.logsPartitioned.Load() }
 // setup path (factory.go) once the partitioned schema is in place.
 func (r *Repository) MarkLogsPartitioned() { r.logsPartitioned.Store(true) }
 
-// NewRepository initializes the database connection using environment variables and migrates the schema.
+// NewRepository initializes the database connection using environment variables.
+// Schema ownership lives in internal/migrate so main storage and GraphRAG cannot
+// migrate under different startup policies.
 func NewRepository(metrics *telemetry.Metrics) (*Repository, error) {
 	driver := os.Getenv("DB_DRIVER")
 	dsn := os.Getenv("DB_DSN")
@@ -134,21 +146,6 @@ func NewRepository(metrics *telemetry.Metrics) (*Repository, error) {
 	// Resolve effective driver name
 	if driver == "" {
 		driver = "sqlite"
-	}
-
-	// Auto-migration is enabled by default. Disable via DB_AUTOMIGRATE=false when
-	// using versioned migrations in production (Postgres table locks, no rollback).
-	if autoMigrateEnabled() {
-		opts := MigrateOptions{
-			PostgresPartitioning:   strings.ToLower(strings.TrimSpace(os.Getenv("DB_POSTGRES_PARTITIONING"))),
-			PartitionLookaheadDays: partitionLookaheadFromEnv(),
-			Timeout:                migrateTimeoutFromEnv(),
-		}
-		if err := AutoMigrateModelsWithOptions(db, driver, opts); err != nil {
-			return nil, err
-		}
-	} else {
-		slog.Info("AutoMigrate skipped (DB_AUTOMIGRATE=false)")
 	}
 
 	// Register GORM Callback for DB Latency Metrics
