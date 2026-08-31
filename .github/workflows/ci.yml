@@ -429,6 +429,40 @@ jobs:
             --pattern checksums.txt.pem
           echo "PREVIOUS_ARCHIVE=${previous_dir}/${previous_name}" >> "${GITHUB_ENV}"
 
+      - name: start isolated Ubuntu systemd host
+        run: |
+          set -euo pipefail
+          go_root="$(go env GOROOT)"
+          cosign_path="$(command -v cosign)"
+          docker run --detach --name otelcontext-systemd-proof \
+            --privileged --cgroupns=private \
+            --tmpfs /run --tmpfs /run/lock \
+            --volume "${GITHUB_WORKSPACE}:/workspace:ro" \
+            --volume "${RUNNER_TEMP}/systemd-source:/proof-input" \
+            --volume "${go_root}:/usr/local/go:ro" \
+            --volume "${cosign_path}:/usr/local/bin/cosign:ro" \
+            ubuntu:24.04@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517 \
+            /bin/bash -c 'export DEBIAN_FRONTEND=noninteractive; apt-get update; apt-get install -y --no-install-recommends systemd systemd-sysv ca-certificates coreutils curl findutils gawk grep gzip iproute2 jq openssl passwd sed tar util-linux; exec /sbin/init'
+          ready=0
+          for ((attempt = 0; attempt < 60; attempt++)); do
+            state="$(docker inspect --format '{{.State.Status}}' otelcontext-systemd-proof)"
+            if [[ "${state}" != "running" ]]; then
+              docker logs otelcontext-systemd-proof
+              exit 1
+            fi
+            system_state="$(docker exec otelcontext-systemd-proof systemctl is-system-running 2>/dev/null || true)"
+            if [[ "${system_state}" == "running" || "${system_state}" == "degraded" ]]; then
+              ready=1
+              break
+            fi
+            sleep 2
+          done
+          if [[ "${ready}" -ne 1 ]]; then
+            docker logs otelcontext-systemd-proof
+            exit 1
+          fi
+          docker exec otelcontext-systemd-proof systemd-analyze --version
+
       - name: run disposable production-shaped proof
         env:
           OTELCONTEXT_PROOF_SOURCE: "1"
@@ -436,16 +470,22 @@ jobs:
           OTELCONTEXT_PREVIOUS_TAG: v0.4.0-beta.2
         run: |
           set -euo pipefail
-          OTELCONTEXT_PREVIOUS_ARCHIVE="${PREVIOUS_ARCHIVE}"
-          OTELCONTEXT_COSIGN="$(command -v cosign)"
-          export OTELCONTEXT_PREVIOUS_ARCHIVE OTELCONTEXT_COSIGN
           proof_dir="${RUNNER_TEMP}/systemd-source/proof"
-          sudo --preserve-env=OTELCONTEXT_PROOF_SOURCE,OTELCONTEXT_PROOF_CERTIFICATE_IDENTITY,OTELCONTEXT_PREVIOUS_ARCHIVE,OTELCONTEXT_PREVIOUS_TAG,OTELCONTEXT_COSIGN \
-            scripts/prove-systemd-release.sh \
-              --archive "${SOURCE_ARCHIVE}" \
+          docker exec \
+            --env "PATH=/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+            --env "SUDO_UID=$(id -u)" \
+            --env "SUDO_GID=$(id -g)" \
+            --env "OTELCONTEXT_PROOF_SOURCE=${OTELCONTEXT_PROOF_SOURCE}" \
+            --env "OTELCONTEXT_PROOF_CERTIFICATE_IDENTITY=${OTELCONTEXT_PROOF_CERTIFICATE_IDENTITY}" \
+            --env "OTELCONTEXT_PREVIOUS_ARCHIVE=/proof-input/previous/otelcontext_0.4.0-beta.2_linux_amd64.tar.gz" \
+            --env "OTELCONTEXT_PREVIOUS_TAG=${OTELCONTEXT_PREVIOUS_TAG}" \
+            --env "OTELCONTEXT_COSIGN=/usr/local/bin/cosign" \
+            otelcontext-systemd-proof \
+            /workspace/scripts/prove-systemd-release.sh \
+              --archive "/proof-input/assets/$(basename "${SOURCE_ARCHIVE}")" \
               --tag "${SOURCE_VERSION}" \
               --sha "${GITHUB_SHA}" \
-              --proof-dir "${proof_dir}"
+              --proof-dir "/proof-input/proof"
           jq -e --arg sha "${GITHUB_SHA}" '
             .schema_version == "otelcontext.systemd-proof.v1" and
             .sha == $sha and
@@ -455,6 +495,13 @@ jobs:
             (.fingerprints | [.initial,.restart,.crash_recovery,.rollback,.upgrade] | unique | length) == 1 and
             all(.assertions[]; .passed == true)
           ' "${proof_dir}/systemd-proof-v1.json"
+
+      - name: remove isolated systemd host
+        if: ${{ always() }}
+        run: |
+          if docker inspect otelcontext-systemd-proof >/dev/null 2>&1; then
+            docker rm --force otelcontext-systemd-proof
+          fi
 
       - name: upload systemd diagnostics
         if: ${{ always() }}
