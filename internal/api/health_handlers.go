@@ -36,6 +36,16 @@ func (s *Server) handleLive(w http.ResponseWriter, r *http.Request) {
 // the GraphRAG coordinator is running. Returns 503 with a per-check breakdown
 // on failure.
 func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
+	if s.shuttingDown.Load() {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ready":  false,
+			"checks": map[string]string{"shutdown": "in_progress"},
+		})
+		return
+	}
+
 	checks := map[string]string{
 		"database": "ok",
 		"graphrag": "ok",

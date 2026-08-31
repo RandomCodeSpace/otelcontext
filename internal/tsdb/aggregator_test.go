@@ -163,7 +163,7 @@ func TestAggregator_FlushResetsPerTenantCounts(t *testing.T) {
 		t.Fatalf("pre-flush BucketCount=%d, want 2", got)
 	}
 
-	a.flush()
+	_ = a.flush(false)
 
 	// Post-flush, the live map is empty and per-tenant count is reset.
 	if got := a.BucketCount(); got != 0 {

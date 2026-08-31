@@ -130,6 +130,55 @@ func waitFor(t *testing.T, timeout time.Duration, pred func() bool) bool {
 	return pred()
 }
 
+func TestPipelineShutdownDrainsAcceptedBatchAndIsIdempotent(t *testing.T) {
+	w := &fakeWriter{spanDelay: 25 * time.Millisecond}
+	p := NewPipeline(w, nil, PipelineConfig{Capacity: 4, Workers: 1})
+	p.Start(context.Background())
+	if _, err := p.Submit(healthyBatch()); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := p.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Shutdown(ctx); err != nil {
+		t.Fatalf("second shutdown: %v", err)
+	}
+	stats := p.Stats()
+	if stats.Processed != 1 || stats.QueueDepth != 0 || stats.QueueBytes != 0 {
+		t.Fatalf("pipeline did not quiesce: %#v", stats)
+	}
+}
+
+func TestPipelineShutdownBeforeStartIsSafe(t *testing.T) {
+	p := NewPipeline(&fakeWriter{}, nil, PipelineConfig{Capacity: 4, Workers: 1})
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := p.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+	p.Start(context.Background())
+	if err := p.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPipelineShutdownReturnsUndurableFailure(t *testing.T) {
+	w := &fakeWriter{traceErr: errors.New("database unavailable")}
+	p := NewPipeline(w, nil, PipelineConfig{Capacity: 4, Workers: 1})
+	p.Start(context.Background())
+	if _, err := p.Submit(healthyBatch()); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := p.Shutdown(ctx); err == nil {
+		t.Fatal("shutdown reported success for a failed batch without a DLQ")
+	}
+}
+
 // ===== Submission semantics =====
 
 func TestPipeline_NilBatch_NoOp(t *testing.T) {

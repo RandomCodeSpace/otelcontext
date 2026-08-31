@@ -64,6 +64,15 @@ type Aggregator struct {
 	// Metric callbacks
 	onIngest  func() // TSDBIngestTotal.Inc()
 	onDropped func() // TSDBBatchesDropped.Inc()
+
+	startOnce   sync.Once
+	stopOnce    sync.Once
+	lifecycleMu sync.Mutex
+	started     atomic.Bool
+	runDone     chan struct{}
+	workerWG    sync.WaitGroup
+	errMu       sync.Mutex
+	shutdownErr error
 }
 
 const persistenceWorkers = 3
@@ -83,6 +92,7 @@ func NewAggregator(repo *storage.Repository, windowSize time.Duration) *Aggregat
 		seriesPerTenant: make(map[string]int),
 		stopChan:        make(chan struct{}),
 		flushChan:       make(chan []storage.MetricBucket, 500),
+		runDone:         make(chan struct{}),
 		overflowKey:     "__cardinality_overflow__",
 	}
 	a.pool.New = func() any {
@@ -126,31 +136,74 @@ func (a *Aggregator) SetMetrics(onIngest, onDropped func()) {
 
 // Start begins the aggregation background processes.
 func (a *Aggregator) Start(ctx context.Context) {
-	ticker := time.NewTicker(a.windowSize)
-	defer ticker.Stop()
+	a.startOnce.Do(func() {
+		a.lifecycleMu.Lock()
+		a.started.Store(true)
+		a.lifecycleMu.Unlock()
+		defer close(a.runDone)
 
-	slog.Info("📈 TSDB Aggregator started", "window_size", a.windowSize, "workers", persistenceWorkers)
+		ticker := time.NewTicker(a.windowSize)
+		defer ticker.Stop()
+		slog.Info("📈 TSDB Aggregator started", "window_size", a.windowSize, "workers", persistenceWorkers)
 
-	for i := 0; i < persistenceWorkers; i++ {
-		go a.persistenceWorker(ctx)
-	}
-
-	for {
-		select {
-		case <-ticker.C:
-			a.flush()
-		case <-a.stopChan:
-			a.flush() // Final flush
-			return
-		case <-ctx.Done():
-			return
+		for i := 0; i < persistenceWorkers; i++ {
+			a.workerWG.Add(1)
+			go a.persistenceWorker()
 		}
+
+	loop:
+		for {
+			select {
+			case <-ticker.C:
+				if err := a.flush(false); err != nil {
+					a.recordShutdownError(err)
+				}
+			case <-a.stopChan:
+				if err := a.flush(true); err != nil {
+					a.recordShutdownError(err)
+				}
+				break loop
+			case <-ctx.Done():
+				a.recordShutdownError(fmt.Errorf("TSDB stopped before shutdown barrier: %w", ctx.Err()))
+				if err := a.flush(true); err != nil {
+					a.recordShutdownError(err)
+				}
+				break loop
+			}
+		}
+
+		close(a.flushChan)
+		a.workerWG.Wait()
+	})
+}
+
+// Shutdown flushes the final metric window and joins every persistence worker.
+// The caller's context is the bounded quiescence deadline.
+func (a *Aggregator) Shutdown(ctx context.Context) error {
+	a.stopOnce.Do(func() { close(a.stopChan) })
+	a.lifecycleMu.Lock()
+	started := a.started.Load()
+	a.lifecycleMu.Unlock()
+	if !started {
+		return nil
+	}
+	select {
+	case <-a.runDone:
+		a.errMu.Lock()
+		err := a.shutdownErr
+		a.errMu.Unlock()
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
-// Stop stops the aggregator.
+// Stop preserves the previous internal lifecycle surface. Production shutdown
+// uses Shutdown so deadline and persistence failures reach the process result.
 func (a *Aggregator) Stop() {
-	close(a.stopChan)
+	if err := a.Shutdown(context.Background()); err != nil {
+		slog.Error("TSDB shutdown failed", "error", err)
+	}
 }
 
 // Ingest adds a raw metric point to the current aggregator window.
@@ -280,11 +333,11 @@ func (a *Aggregator) DroppedBatches() int64 {
 }
 
 // flush moves the current buckets to the flush channel and resets the in-memory map.
-func (a *Aggregator) flush() {
+func (a *Aggregator) flush(final bool) error {
 	a.mu.Lock()
 	if len(a.buckets) == 0 {
 		a.mu.Unlock()
-		return
+		return nil
 	}
 
 	batch := a.pool.Get().([]storage.MetricBucket)
@@ -297,9 +350,15 @@ func (a *Aggregator) flush() {
 	a.seriesPerTenant = make(map[string]int)
 	a.mu.Unlock()
 
+	if final {
+		a.flushChan <- batch
+		return nil
+	}
 	select {
 	case a.flushChan <- batch:
+		return nil
 	default:
+		count := len(batch)
 		dropped := a.droppedBatches.Add(1)
 		if a.onDropped != nil {
 			a.onDropped()
@@ -307,28 +366,37 @@ func (a *Aggregator) flush() {
 		slog.Warn("⚠️ TSDB flush channel full, dropping metric batch", "count", len(batch), "total_dropped", dropped)
 		batch = batch[:0]
 		a.pool.Put(batch) //nolint:staticcheck // SA6002: []T in sync.Pool is intentional; proper refactor would change channel semantics
+		return fmt.Errorf("TSDB flush channel full: dropped %d metric buckets", count)
 	}
 }
 
 // persistenceWorker drains the flush channel and writes batches to the database.
-func (a *Aggregator) persistenceWorker(ctx context.Context) {
-	for {
-		select {
-		case batch := <-a.flushChan:
-			if len(batch) == 0 {
-				a.pool.Put(batch[:0]) //nolint:staticcheck // SA6002: see flush() for rationale
-				continue
-			}
-			err := a.repo.BatchCreateMetrics(batch)
-			if err != nil {
-				slog.Error("❌ Failed to persist metric batch", "error", err, "count", len(batch))
-			} else {
-				slog.Debug("💾 TSDB persisted metric batch", "count", len(batch))
-			}
-			batch = batch[:0]
-			a.pool.Put(batch) //nolint:staticcheck // SA6002: see flush() for rationale
-		case <-ctx.Done():
-			return
+func (a *Aggregator) persistenceWorker() {
+	defer a.workerWG.Done()
+	for batch := range a.flushChan {
+		if len(batch) == 0 {
+			a.pool.Put(batch[:0]) //nolint:staticcheck // SA6002: see flush() for rationale
+			continue
 		}
+		err := a.repo.BatchCreateMetrics(batch)
+		if err != nil {
+			slog.Error("❌ Failed to persist metric batch", "error", err, "count", len(batch))
+			a.recordShutdownError(fmt.Errorf("persist metric batch: %w", err))
+		} else {
+			slog.Debug("💾 TSDB persisted metric batch", "count", len(batch))
+		}
+		batch = batch[:0]
+		a.pool.Put(batch) //nolint:staticcheck // SA6002: see flush() for rationale
 	}
+}
+
+func (a *Aggregator) recordShutdownError(err error) {
+	if err == nil {
+		return
+	}
+	a.errMu.Lock()
+	if a.shutdownErr == nil {
+		a.shutdownErr = err
+	}
+	a.errMu.Unlock()
 }

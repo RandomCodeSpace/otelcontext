@@ -1,6 +1,7 @@
 package queue
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -25,6 +26,8 @@ type DeadLetterQueue struct {
 	stopCh   chan struct{}
 	wg       sync.WaitGroup
 	mu       sync.Mutex
+	stopOnce sync.Once
+	done     chan struct{}
 
 	// Bounds
 	maxFiles   int   // 0 = unlimited
@@ -71,6 +74,7 @@ func NewDLQWithLimits(dir string, interval time.Duration, replayFn func(data []b
 		interval:   interval,
 		replayFn:   replayFn,
 		stopCh:     make(chan struct{}),
+		done:       make(chan struct{}),
 		maxFiles:   maxFiles,
 		maxDiskMB:  maxDiskMB,
 		maxRetries: maxRetries,
@@ -292,16 +296,31 @@ func (d *DeadLetterQueue) Size() int {
 	return count
 }
 
-// Stop gracefully shuts down the replay worker.
+// Shutdown stops replay admission and joins the current replay pass within the
+// shared application deadline. Pending envelopes remain durable on disk.
+func (d *DeadLetterQueue) Shutdown(ctx context.Context) error {
+	d.stopOnce.Do(func() { close(d.stopCh) })
+	select {
+	case <-d.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// Stop preserves the prior lifecycle surface for callers without a deadline.
 func (d *DeadLetterQueue) Stop() {
-	close(d.stopCh)
-	d.wg.Wait()
+	if err := d.Shutdown(context.Background()); err != nil {
+		slog.Error("DLQ shutdown failed", "error", err)
+		return
+	}
 	slog.Info("🛑 DLQ replay worker stopped")
 }
 
 // replayWorker periodically scans the DLQ directory and attempts to re-insert failed batches.
 func (d *DeadLetterQueue) replayWorker() {
 	defer d.wg.Done()
+	defer close(d.done)
 
 	ticker := time.NewTicker(d.interval)
 	defer ticker.Stop()

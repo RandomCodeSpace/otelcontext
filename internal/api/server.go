@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/RandomCodeSpace/otelcontext/internal/aggregate"
@@ -72,6 +73,11 @@ type Server struct {
 	// DefaultReadinessThresholds; an explicitly-set zero struct disables
 	// every runtime probe, which is what a 0 in each env knob means.
 	readyThresholds *ReadinessThresholds
+
+	// shuttingDown flips before listener admission stops. Readiness must fail
+	// immediately so a load balancer cannot route fresh work into a process
+	// that has started its quiescence barrier.
+	shuttingDown atomic.Bool
 }
 
 // AggregateRuntime is the aggregate runtime health snapshot /ready consults.
@@ -226,6 +232,12 @@ func (s *Server) SetAggregateDBProbe(fn func(context.Context) error) {
 // any field disables that probe.
 func (s *Server) SetReadinessThresholds(t ReadinessThresholds) {
 	s.readyThresholds = &t
+}
+
+// BeginShutdown removes this instance from readiness before admission stops.
+// It is idempotent and leaves /live unchanged while the process drains.
+func (s *Server) BeginShutdown() {
+	s.shuttingDown.Store(true)
 }
 
 // RegisterRoutes registers API endpoints on the provided mux.
