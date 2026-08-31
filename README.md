@@ -1,152 +1,222 @@
-# OtelContext
+<div align="center">
+  <img src="ui/public/favicon.svg" width="88" height="88" alt="OtelContext">
 
-[![CI](https://github.com/RandomCodeSpace/otelcontext/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/RandomCodeSpace/otelcontext/actions/workflows/ci.yml)
-[![Security (OSS-CLI)](https://github.com/RandomCodeSpace/otelcontext/actions/workflows/security.yml/badge.svg?branch=main)](https://github.com/RandomCodeSpace/otelcontext/actions/workflows/security.yml)
-[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/RandomCodeSpace/otelcontext/badge)](https://scorecard.dev/viewer/?uri=github.com/RandomCodeSpace/otelcontext)
-[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/12646/badge)](https://www.bestpractices.dev/projects/12646)
-[![Release](https://img.shields.io/github/v/release/RandomCodeSpace/otelcontext)](https://github.com/RandomCodeSpace/otelcontext/releases)
-[![Beta](https://img.shields.io/github/v/release/RandomCodeSpace/otelcontext?include_prereleases&label=beta)](https://github.com/RandomCodeSpace/otelcontext/releases)
-![Go Version](https://img.shields.io/github/go-mod/go-version/RandomCodeSpace/otelcontext)
-[![Frontend Version](https://img.shields.io/badge/frontend-none-lightgrey)](https://github.com/RandomCodeSpace/otelcontext)
+  <h1>OtelContext</h1>
 
-A self-hosted OTLP observability platform in a single Go binary — OTLP gRPC + HTTP ingest, GraphRAG-powered root-cause analysis, multi-tenant storage, and a built-in MCP server for AI agents.
+  <p><strong>Turn traces, logs, and metrics into one clear view of your services.</strong></p>
+  <p>Self-hosted OpenTelemetry collection, incident triage, and service mapping in one Go binary.</p>
 
-For teams who want traces, logs, and metrics in one place without standing up a Collector + Prometheus + Loki + Tempo stack.
+  <p>
+    <a href="https://github.com/RandomCodeSpace/otelcontext/releases"><img alt="Latest release" src="https://img.shields.io/github/v/release/RandomCodeSpace/otelcontext?style=for-the-badge&logo=github&label=Release"></a>
+    <a href="https://github.com/RandomCodeSpace/otelcontext/actions/workflows/ci.yml"><img alt="CI status" src="https://img.shields.io/github/actions/workflow/status/RandomCodeSpace/otelcontext/ci.yml?branch=main&style=for-the-badge&logo=githubactions&logoColor=white&label=CI"></a>
+    <a href="https://github.com/RandomCodeSpace/otelcontext/actions/workflows/security.yml"><img alt="Security status" src="https://img.shields.io/github/actions/workflow/status/RandomCodeSpace/otelcontext/security.yml?branch=main&style=for-the-badge&logo=securityscorecard&logoColor=white&label=Security"></a>
+    <a href="LICENSE.md"><img alt="MIT license" src="https://img.shields.io/github/license/RandomCodeSpace/otelcontext?style=for-the-badge&color=818cf8"></a>
+  </p>
+</div>
 
-## Documentation
+![Traces, logs, and metrics flowing through OtelContext into a connected service map](docs/assets/otelcontext-overview.webp)
 
-- **Operators:** [`docs/OPERATIONS.md`](docs/OPERATIONS.md) — first run, production checklist, backup, incident response, upgrades.
-- **AI agents / contributors:** [`CLAUDE.md`](CLAUDE.md) — architecture, GraphRAG, MCP tools, conventions.
-- **Env reference:** [`.env.example`](.env.example) — every supported environment variable with defaults.
+OtelContext helps you answer the question that starts most incidents: **what is broken, and what does it affect?** Send it standard OpenTelemetry data and it connects service relationships, errors, latency, logs, and traces in a map built for investigation.
+
+It starts with SQLite and no external services. When you need more, the main telemetry database can use PostgreSQL, MySQL, or SQL Server.
+
+> [!IMPORTANT]
+> OtelContext is pre-1.0. Use a published release for a working embedded UI, and read the [changelog](CHANGELOG.md) before upgrading.
+
+## What you get
+
+- **A live service map** that shows dependencies, health, latency, and active anomalies.
+- **Incident context in one place** with related traces, logs, metrics, and impact analysis.
+- **Seven MCP tools** for investigating your system from an AI client or coding agent.
+- **Standard OTLP input** over gRPC and HTTP, so existing SDKs and Collectors can send data directly.
+- **A simple first run** with one binary and a local SQLite database.
+- **Self-hosted data** with retention controls, health probes, and Prometheus metrics.
 
 ## Quick start
 
+### 1. Install a release
+
+Download the archive for your platform from [GitHub Releases](https://github.com/RandomCodeSpace/otelcontext/releases), or install the latest release with Go:
+
 ```bash
-# 1. Build (Go binary + embedded React UI)
-make build                 # builds the UI, then `go build` with it embedded
-
-# ...or install a released, UI-complete binary directly:
-#   go install github.com/RandomCodeSpace/otelcontext@latest
-
-# 2. Run with an API key (dev-friendly — SQLite, plaintext HTTP)
-export API_KEY="$(openssl rand -hex 32)"
-./otelcontext
+go install github.com/RandomCodeSpace/otelcontext@latest
 ```
 
-> The built UI is **not** committed — the repo is source-only. A plain
-> `go build .` produces a working API/binary but serves no web UI at `/`.
-> Use `make build` (or a release tag, which embeds the built UI) for the
-> full experience. Maintainers cut releases with `make release VERSION=vX.Y.Z`
-> — see [`scripts/release.sh`](scripts/release.sh).
-
-The server listens on:
-- OTLP gRPC: `:4317`
-- HTTP API + OTLP HTTP + UI + MCP: `:8080`
-- Prometheus: `:8080/metrics/prometheus`
-- Probes: `:8080/live`, `:8080/ready`
-
-Send an OTLP log via HTTP:
+### 2. Start OtelContext
 
 ```bash
-curl -sS -X POST http://localhost:8080/v1/logs \
-  -H "Authorization: Bearer $API_KEY" \
+otelcontext
+```
+
+That is enough for a local trial. OtelContext creates `OtelContext.db`, listens for OTLP gRPC on `4317`, and serves the UI and HTTP endpoints on `8080`.
+
+Open **[http://localhost:8080](http://localhost:8080)**.
+
+Authentication is off by default so the browser UI works immediately. Keep this first run on your machine. Before exposing it to a network, follow [Secure a deployment](#secure-a-deployment).
+
+### 3. Send telemetry
+
+Point an OpenTelemetry SDK or Collector at either endpoint:
+
+| Protocol | Endpoint |
+|---|---|
+| OTLP gRPC | `localhost:4317` |
+| OTLP HTTP | `http://localhost:8080/v1/traces`, `/v1/logs`, or `/v1/metrics` |
+
+To confirm the connection without setting up an application, send one sample error log:
+
+```bash
+curl -fsS http://localhost:8080/v1/logs \
   -H "Content-Type: application/json" \
-  -d '{
-    "resourceLogs": [{
-      "resource": {"attributes": [{"key": "service.name", "value": {"stringValue": "demo"}}]},
-      "scopeLogs": [{"logRecords": [{
-        "timeUnixNano": "'$(date +%s)000000000'",
-        "severityText": "INFO",
-        "body": {"stringValue": "hello otelcontext"}
+  -d "{
+    \"resourceLogs\": [{
+      \"resource\": {\"attributes\": [{
+        \"key\": \"service.name\",
+        \"value\": {\"stringValue\": \"readme-demo\"}
+      }]},
+      \"scopeLogs\": [{\"logRecords\": [{
+        \"timeUnixNano\": \"$(date +%s)000000000\",
+        \"severityNumber\": 17,
+        \"severityText\": \"ERROR\",
+        \"body\": {\"stringValue\": \"OtelContext is receiving data\"}
       }]}]
     }]
-  }'
+  }"
 ```
 
-Then query it back:
+ERROR is used because the default storage threshold keeps WARN and ERROR logs.
 
-```bash
-curl -sS -H "Authorization: Bearer $API_KEY" \
-  "http://localhost:8080/api/logs?limit=5" | jq .
-```
+<details>
+<summary><strong>OpenTelemetry Collector example</strong></summary>
 
-## Switching databases
-
-Default is SQLite (`otelcontext.db` in the working dir). Override via env vars:
-
-```bash
-# PostgreSQL
-DB_DRIVER=postgres \
-DB_DSN="host=localhost user=otel password=otel dbname=otelcontext port=5432 sslmode=disable" \
-./otelcontext
-
-# MySQL
-DB_DRIVER=mysql \
-DB_DSN="root:password@tcp(localhost:3306)/otelcontext?charset=utf8mb4&parseTime=True&loc=Local" \
-./otelcontext
-```
-
-See [`.env.example`](.env.example) for SQL Server and Azure Entra (passwordless Postgres) configurations.
-
-## Production sizing
-
-OtelContext auto-tunes itself by driver. The numbers below assume the
-auto-flipped SQLite defaults (5% sampling baseline, `STORE_MIN_SEVERITY=WARN`,
-3k metric cardinality cap, FTS5 enabled, 1 SQLite writer with WAL + 256 MB
-page cache + 1 GB mmap). Postgres keeps the looser defaults.
-
-| Workload | DB | Steady RSS | Notes |
-|---|---|---|---|
-| Dev / <10 services | SQLite | <500 MB | Default config; no tuning needed. |
-| 50–120 services, 7-day retention | **SQLite (auto-tuned)** or Postgres | ~1.8 GB | SQLite survives this band on the auto-flipped defaults. |
-| >120 services, or >7-day retention, or sustained 50+ writes/sec | **Postgres** | depends on host | SQLite's single-writer serialization becomes the bottleneck. |
-
-`OTELCONTEXT_ALLOW_SQLITE_PROD=false` is the guardrail — `APP_ENV=production` with `DB_DRIVER=sqlite` refuses to start unless the operator opts in.
-
-See [`CLAUDE.md`](CLAUDE.md) "SQLite per-driver defaults" for the full
-table of which env vars get auto-overridden on SQLite, and the rationale
-per entry.
-
-## OTLP Integration
-
-OtelContext accepts OTLP gRPC on `:4317` and OTLP HTTP on `:8080/v1/{traces,logs,metrics}`. Point any OpenTelemetry Collector (or SDK) at it:
+Save this as part of your Collector configuration. Replace `otelcontext` with the host or service name running OtelContext.
 
 ```yaml
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch: {}
+
 exporters:
   otlp/otelcontext:
-    endpoint: "localhost:4317"
+    endpoint: otelcontext:4317
     tls:
       insecure: true
 
 service:
   pipelines:
     traces:
+      receivers: [otlp]
+      processors: [batch]
       exporters: [otlp/otelcontext]
     logs:
+      receivers: [otlp]
+      processors: [batch]
       exporters: [otlp/otelcontext]
     metrics:
+      receivers: [otlp]
+      processors: [batch]
       exporters: [otlp/otelcontext]
 ```
 
-See `docs/otel-collector-example.yaml` for a complete example.
+For an authenticated deployment, add an `authorization` bearer header and, if needed, `x-tenant-id` under the exporter.
 
-## Features
+</details>
 
-- **OTLP gRPC + HTTP ingest** — traces, logs, metrics; gzip and protobuf/JSON supported. Hybrid backpressure (90% soft-drop, 100% reject) prevents queue OOMs.
-- **GraphRAG** — layered in-memory graph with `error_chain`, `impact_analysis`, `root_cause_analysis`, and anomaly-correlation queries.
-- **Drain log clustering** — deterministic template mining, persisted across restarts.
-- **MCP server** — 7-tool triage surface for AI agents over JSON-RPC 2.0 + SSE: `get_anomaly_timeline`, `get_service_map`, `get_service_health`, `root_cause_analysis`, `impact_analysis`, `trace_graph`, `search_logs`. Per-call deadlines, concurrency semaphore, 5 s TTL cache for cheap in-memory tools, SSE keep-alives every 25 s.
-- **Log search** — SQLite FTS5 (BM25-ranked) on by default; `pg_trgm` GIN on Postgres; LIKE fallback. `search_logs` is 24-hour-capped to bound the worst-case scan.
-- **Multi-tenancy** — per-row `tenant_id`, `X-Tenant-ID` header / `x-tenant-id` gRPC metadata, per-tenant cardinality caps.
-- **Adaptive sampling** — always-on for errors and slow spans, probabilistic otherwise (defaults to 5 % on SQLite, 100 % on Postgres).
-- **Auto-tuned SQLite path** — fail-closed PRAGMA stanza (WAL, NORMAL sync, 256 MB cache, 1 GB mmap, 64 MB WAL cap) + 9 per-driver config defaults so single-binary deploys survive 120 services on a 4 GB host.
-- **DLQ** — durable typed envelopes with disk-bounded replay.
-- **Self-instrumentation** — export OtelContext's own spans via `OTEL_EXPORTER_OTLP_ENDPOINT`. Loopback guard prevents recursive feedback.
+## Investigate with MCP
 
-## Security
+Connect an MCP client to `http://localhost:8080/mcp` to investigate the same telemetry from an agent. The tools can:
 
-See [`SECURITY.md`](SECURITY.md) for the vulnerability reporting process. The security posture (OSV-Scanner, Trivy, Semgrep, Gitleaks, jscpd, SBOM, Scorecard) is described in [`CLAUDE.md`](CLAUDE.md) under "Security & Supply Chain".
+- Build an anomaly timeline.
+- Show the service map and service health.
+- Analyze likely root causes and downstream impact.
+- Reconstruct a trace graph.
+- Search logs with bounded results.
+
+Trace-based answers say whether the supporting exemplar is complete, partial, or no longer retained. OtelContext does not present a partial trace as the whole story.
+
+## Secure a deployment
+
+Set at least one authentication method before exposing OtelContext:
+
+- `API_KEY` for a shared operator credential.
+- `AUTH_TRUST_EXTERNAL=true` when a trusted reverse proxy owns authentication and tenant identity.
+
+Example:
+
+```bash
+export API_KEY="$(openssl rand -hex 32)"
+./otelcontext
+```
+
+Clients then send `Authorization: Bearer <key>`. Production mode also requires protected, authenticated gRPC unless you set an explicit waiver.
+
+The browser UI does not currently store an API key. For an authenticated browser deployment, put OtelContext behind a same-origin proxy that authenticates the user and injects the credential for REST, MCP, and WebSocket traffic.
+
+See the [operations guide](docs/OPERATIONS.md) for database, TLS, retention, proxy, and health-check setup.
+
+## Common configuration
+
+OtelContext reads environment variables and an optional `.env` file in its working directory.
+
+| Setting | Default | Use it for |
+|---|---|---|
+| `HTTP_PORT` | `8080` | UI, REST, OTLP HTTP, MCP, WebSockets, and probes |
+| `GRPC_PORT` | `4317` | OTLP gRPC |
+| `DB_DRIVER` | `sqlite` | `sqlite`, `postgres`, `mysql`, or `sqlserver` |
+| `DB_DSN` | `OtelContext.db` | Database connection string |
+| `API_KEY` | empty | Shared bearer authentication |
+| `DEFAULT_TENANT` | `default` | Scope used when no trusted tenant is supplied |
+| `HOT_RETENTION_DAYS` | `7` | Main retention horizon |
+| `STORE_MIN_SEVERITY` | `WARN` | Lowest log severity stored in the main database |
+| `AGGREGATE_MODE` | `legacy` | `legacy`, `aggregate-shadow`, or `aggregate` |
+
+Start with [`.env.example`](.env.example). The default `legacy` mode is the right choice for a first run. Aggregate modes are for measured high-volume deployments; review the [aggregate gate report](docs/gates/2026-08-23-aggregate-7day-gate.md) before enabling them.
+
+<details>
+<summary><strong>Build from source</strong></summary>
+
+Use the Go version in `go.mod` and Node 24:
+
+```bash
+git clone https://github.com/RandomCodeSpace/otelcontext.git
+cd otelcontext
+
+npm ci --prefix ui --ignore-scripts
+npm run --prefix ui build
+CGO_ENABLED=0 go build -o otelcontext .
+```
+
+The UI build must run first because the Go binary embeds its output. A plain build from `main` serves the API but not the browser UI.
+
+Run the core checks with:
+
+```bash
+go build ./...
+go vet ./...
+go test -race -timeout 180s ./...
+
+npm test --prefix ui
+```
+
+</details>
+
+## Project links
+
+- [Releases](https://github.com/RandomCodeSpace/otelcontext/releases)
+- [Changelog](CHANGELOG.md)
+- [Operations guide](docs/OPERATIONS.md)
+- [Contributing](CONTRIBUTING.md)
+- [Security policy](SECURITY.md)
+- [Aggregate design glossary](CONTEXT.md)
+- [Release gate protocol](docs/gates/README.md)
 
 ## License
 
-See [LICENSE.md](LICENSE.md).
+OtelContext is available under the [MIT License](LICENSE.md).
