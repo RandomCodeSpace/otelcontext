@@ -1411,7 +1411,10 @@ function scheduleWebSocketReconnect() {
   const delay = Math.min(100 * Math.pow(2, wsRetry), 10000);
   wsRetry += 1;
   setConnection("reconnecting", "Reconnecting");
-  wsReconnectTimer = window.setTimeout(connectWebSocket, delay + Math.random() * delay * 0.2);
+  const entropy = new Uint32Array(1);
+  window.crypto.getRandomValues(entropy);
+  const jitter = entropy[0] / 0x100000000 * delay * 0.2;
+  wsReconnectTimer = window.setTimeout(connectWebSocket, delay + jitter);
 }
 
 async function refreshAnomalies() {
