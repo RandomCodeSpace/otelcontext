@@ -442,7 +442,7 @@ jobs:
             --volume "${go_root}:/usr/local/go:ro" \
             --volume "${cosign_path}:/usr/local/bin/cosign:ro" \
             ubuntu:24.04@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517 \
-            /bin/bash -c 'export DEBIAN_FRONTEND=noninteractive; apt-get update; apt-get install -y --no-install-recommends systemd systemd-sysv ca-certificates coreutils curl findutils gawk grep gzip iproute2 jq openssl passwd sed tar util-linux; exec /sbin/init'
+            /bin/bash -c 'export DEBIAN_FRONTEND=noninteractive; apt-get update; apt-get install -y --no-install-recommends systemd systemd-sysv ca-certificates coreutils curl dbus findutils gawk grep gzip iproute2 jq openssl passwd sed tar util-linux; exec /sbin/init'
           ready=0
           for ((attempt = 0; attempt < 60; attempt++)); do
             state="$(docker inspect --format '{{.State.Status}}' otelcontext-systemd-proof)"
