@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="OtelContext">
+  <rect width="64" height="64" rx="15" fill="#10141c"/>
+  <path d="M17 40 31 18l16 27" fill="none" stroke="#8b95ff" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="17" cy="40" r="5" fill="#39d59b"/>
+  <circle cx="31" cy="18" r="5" fill="#f7bd45"/>
+  <circle cx="47" cy="45" r="5" fill="#ff7078"/>
+  <circle cx="33" cy="35" r="4" fill="#f1f3f7"/>
+</svg>

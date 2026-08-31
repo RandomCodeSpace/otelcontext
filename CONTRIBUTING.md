@@ -1,6 +1,6 @@
 # Contributing to otelcontext
 
-Thanks for considering a contribution. otelcontext is a single-binary OTLP observability platform written in Go (with an embedded React UI). Contributions are welcome via GitHub pull requests.
+Thanks for considering a contribution. otelcontext is a single-binary OTLP observability platform written in Go, with a browser-native UI embedded in the binary. Contributions are welcome via GitHub pull requests.
 
 ## Reporting bugs
 
@@ -25,11 +25,10 @@ CI gates every PR on the following — please run them locally before requesting
 | Vet | `go vet ./...` | `.github/workflows/ci.yml` |
 | Tests (race-enabled) | `go test -race -timeout 180s ./...` | `.github/workflows/ci.yml` |
 | Lint | `golangci-lint run` (config in [`.golangci.yml`](.golangci.yml)) | `.github/workflows/ci.yml` |
-| SCA — Go modules + npm | `osv-scanner --lockfile=go.mod --lockfile=ui/package-lock.json` | `.github/workflows/security.yml` |
+| SCA — Go modules | `osv-scanner --lockfile=go.mod` | `.github/workflows/security.yml` |
 | SCA + OS — filesystem | `trivy fs . --severity HIGH,CRITICAL --exit-code 1 --ignore-unfixed` | `.github/workflows/security.yml` |
 | SAST | `semgrep scan --error --config p/security-audit --config p/owasp-top-ten --config p/golang` | `.github/workflows/security.yml` |
 | Secret scan | `gitleaks detect --source . --redact --no-banner --exit-code 1` | `.github/workflows/security.yml` |
-| Duplication | `jscpd --threshold 3 --min-tokens 100` (`internal/`, `ui/src/`) | `.github/workflows/security.yml` |
 
 Merge is blocked on **any** High/Critical finding from OSV-Scanner, Trivy, Semgrep `ERROR`, or Gitleaks. See [`SECURITY.md`](SECURITY.md) and [`CLAUDE.md`](CLAUDE.md) "Security & Supply Chain" for the full policy.
 
@@ -46,7 +45,7 @@ See [`CLAUDE.md`](CLAUDE.md) for the architecture overview, key directory map, i
 Hard rules from `CLAUDE.md` worth repeating here:
 
 - Use native Go `net/http` (no Express/Gin/Echo).
-- Use Mantine UI v8 for the React frontend (no Tailwind).
+- Keep the UI dependency-free: semantic HTML, token-based CSS, and native browser JavaScript under `internal/ui/static/`.
 - Single-service architecture; embedded internal DBs only.
 - Relational DB (SQLite/Postgres/MySQL/MSSQL) is the source of truth.
 - New graph work goes in `internal/graphrag/`, not the legacy `internal/graph/`.

@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="ui/public/favicon.svg" width="88" height="88" alt="OtelContext">
+  <img src="internal/ui/static/favicon.svg" width="88" height="88" alt="OtelContext">
 
   <h1>OtelContext</h1>
 
@@ -21,7 +21,7 @@ OtelContext helps you answer the question that starts most incidents: **what is 
 It starts with SQLite and no external services. When you need more, the main telemetry database can use PostgreSQL, MySQL, or SQL Server.
 
 > [!IMPORTANT]
-> OtelContext is pre-1.0. Use a published release for a working embedded UI, and read the [changelog](CHANGELOG.md) before upgrading.
+> OtelContext is pre-1.0. Read the [changelog](CHANGELOG.md) before upgrading.
 
 ## What you get
 
@@ -182,18 +182,16 @@ Start with [`.env.example`](.env.example). The default `legacy` mode is the righ
 <details>
 <summary><strong>Build from source</strong></summary>
 
-Use the Go version in `go.mod` and Node 24:
+Use the Go version in `go.mod`:
 
 ```bash
 git clone https://github.com/RandomCodeSpace/otelcontext.git
 cd otelcontext
 
-npm ci --prefix ui --ignore-scripts
-npm run --prefix ui build
 CGO_ENABLED=0 go build -o otelcontext .
 ```
 
-The UI build must run first because the Go binary embeds its output. A plain build from `main` serves the API but not the browser UI.
+The client-rendered UI is committed as plain HTML, CSS, and JavaScript and is embedded automatically. There is no Node.js install or frontend build step.
 
 Run the core checks with:
 
@@ -201,8 +199,6 @@ Run the core checks with:
 go build ./...
 go vet ./...
 go test -race -timeout 180s ./...
-
-npm test --prefix ui
 ```
 
 </details>

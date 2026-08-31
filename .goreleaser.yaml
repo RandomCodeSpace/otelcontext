@@ -1,21 +1,12 @@
 # GoReleaser config — release ARTIFACTS + signing for OtelContext.
-# Triggered by the `release.yml` workflow on a `v*` tag push (the tag is cut by
-# scripts/release.sh, which also builds + embeds the React UI into the tagged
-# commit). See CLAUDE.md "Security & Supply Chain" for the split of duties.
+# Triggered by the release workflow on a version tag push. The committed
+# browser-native UI is embedded by Go in every build.
 #
 # OSS-only (cost $0): GoReleaser OSS v2, cosign (keyless OIDC), syft for SBOMs.
 # No Pro-only keys are used. Validate locally with `goreleaser check`.
 version: 2
 
 project_name: otelcontext
-
-# The UI must already be built into internal/ui/dist before this runs — the
-# binary embeds it via `//go:embed all:dist`. release.yml runs `npm ci &&
-# npm run build` in ui/ before invoking goreleaser; this hook just fails loudly
-# if that step was skipped (e.g. a local `goreleaser release` without the UI).
-before:
-  hooks:
-    - sh -c 'test -f internal/ui/dist/index.html || { echo "internal/ui/dist not built — run (cd ui && npm ci && npm run build) first" >&2; exit 1; }'
 
 builds:
   - id: otelcontext

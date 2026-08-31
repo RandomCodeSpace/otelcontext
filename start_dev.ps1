@@ -1,5 +1,5 @@
 # OtelContext V5.4 Development Startup Script
-# Starts: Backend (Air) + Frontend (Vite)
+# Starts the Go server. The browser UI is embedded in the binary.
 # Chaos test services are started separately via test/run_simulation.ps1
 
 $ErrorActionPreference = "Stop"
@@ -38,7 +38,7 @@ Start-Sleep -Seconds 1
 # ── Start services ──
 $pids = @()
 
-# 1. OtelContext Backend (UI is embedded Go templates — no separate frontend process needed)
+# OtelContext server (the browser-native UI needs no separate process)
 Write-Host "[1/1] Starting OtelContext Backend..." -ForegroundColor Green
 $p = Start-Process pwsh -ArgumentList "-NoExit", "-Command", "Set-Location '$PSScriptRoot'; air" -PassThru
 $pids += $p.Id
@@ -60,4 +60,3 @@ Write-Host ""
 Write-Host "  To run chaos tests: .\test\run_simulation.ps1" -ForegroundColor DarkGray
 Write-Host "  Re-run this script to restart cleanly." -ForegroundColor DarkGray
 Write-Host ""
-

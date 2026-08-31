@@ -1201,9 +1201,7 @@ func main() {
 	}
 
 	// Embedded UI Server
-	uiServer := ui.NewServer(repo, metrics, svcGraph)
-	uiServer.SetMCPConfig(cfg.MCPEnabled, cfg.MCPPath)
-	if err := uiServer.RegisterRoutes(mux); err != nil {
+	if err := ui.RegisterRoutes(mux); err != nil {
 		fatal("Failed to register UI routes", err)
 	}
 
