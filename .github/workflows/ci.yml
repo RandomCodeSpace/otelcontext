@@ -184,6 +184,67 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  backup-proof:
+    name: backup proof · ${{ matrix.mode }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [legacy, aggregate-shadow, aggregate]
+    env:
+      CGO_ENABLED: "1"
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: build exact backup-proof binary
+        run: |
+          mkdir -p "${RUNNER_TEMP}/backup-proof"
+          go build -trimpath -o "${RUNNER_TEMP}/backup-proof/otelcontext" .
+
+      - name: run manifest-bound fresh-target restore proof
+        env:
+          OTELCONTEXT_SHUTDOWN_BINARY: ${{ runner.temp }}/backup-proof/otelcontext
+          OTELCONTEXT_BACKUP_PROOF_MODE: ${{ matrix.mode }}
+          OTELCONTEXT_BACKUP_PROOF_DIR: ${{ runner.temp }}/backup-proof/artifacts
+        run: |
+          set -o pipefail
+          mkdir -p "${RUNNER_TEMP}/backup-proof/artifacts"
+          go test -tags=shutdownproof -count=1 -v -timeout=150s \
+            -run '^TestBackupRestoreModeProof$' ./test/shutdownproof 2>&1 \
+            | tee "${RUNNER_TEMP}/backup-proof/artifacts/${OTELCONTEXT_BACKUP_PROOF_MODE}-test.log"
+          jq -e --arg mode "${OTELCONTEXT_BACKUP_PROOF_MODE}" '
+            .schema_version == "otelcontext.backup-proof.v1" and
+            .mode == $mode and
+            .create.schema_version == "otelcontext.backup/v1" and
+            .create.status == "created" and
+            .restore.schema_version == "otelcontext.backup/v1" and
+            .restore.status == "restored" and
+            .restore.ready_seconds > 0 and
+            .source_fingerprint == .target_fingerprint and
+            .source_surfaces == .target_surfaces and
+            .dlq_before == .dlq_after and
+            (.source_surfaces.mcp_tools | length) == 7 and
+            (.source_surfaces.mcp_calls | length) == 7 and
+            (.assertions | length) >= 14 and
+            all(.assertions[]; .passed == true)
+          ' "${RUNNER_TEMP}/backup-proof/artifacts/${OTELCONTEXT_BACKUP_PROOF_MODE}.json"
+          test -s "${RUNNER_TEMP}/backup-proof/artifacts/${OTELCONTEXT_BACKUP_PROOF_MODE}-manifest.json"
+
+      - name: upload mode backup proof
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: backup-proof-${{ matrix.mode }}-${{ github.sha }}
+          path: ${{ runner.temp }}/backup-proof/artifacts
+          if-no-files-found: error
+          retention-days: 14
+
   database-sqlite:
     name: database proof · sqlite
     runs-on: ubuntu-24.04
@@ -240,5 +301,61 @@ jobs:
         with:
           name: database-proof-postgres-16-${{ github.sha }}
           path: ${{ runner.temp }}/database-proof/postgres-16.log
+          if-no-files-found: error
+          retention-days: 14
+
+  database-backup-proof:
+    name: database backup proof · ${{ matrix.profile }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - profile: postgres-16
+            adapter: postgres
+          - profile: mysql-8.4
+            adapter: mysql
+          - profile: sqlserver-2022
+            adapter: mssql
+    env:
+      CGO_ENABLED: "1"
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: run native capture and fresh-target restore lifecycle
+        env:
+          OTELCONTEXT_BACKUP_ADAPTER: ${{ matrix.adapter }}
+          OTELCONTEXT_NATIVE_BACKUP_PROOF_DIR: ${{ runner.temp }}/native-backup-proof
+        run: |
+          set -o pipefail
+          mkdir -p "${OTELCONTEXT_NATIVE_BACKUP_PROOF_DIR}"
+          go test -tags=integration -count=1 -v -timeout=22m \
+            -run '^TestNativeBackupRestoreLifecycle$' ./internal/backup 2>&1 \
+            | tee "${OTELCONTEXT_NATIVE_BACKUP_PROOF_DIR}/${OTELCONTEXT_BACKUP_ADAPTER}-test.log"
+          jq -e --arg adapter "${OTELCONTEXT_BACKUP_ADAPTER}" '
+            .schema_version == "otelcontext.native-backup-proof/v1" and
+            .adapter == $adapter and
+            .create.schema_version == "otelcontext.backup/v1" and
+            .create.status == "created" and
+            .restore.schema_version == "otelcontext.backup/v1" and
+            .restore.status == "restored" and
+            .source_lifecycle_fingerprint == .restored_lifecycle_fingerprint and
+            (.assertions | length) >= 8 and
+            all(.assertions[]; .passed == true)
+          ' "${OTELCONTEXT_NATIVE_BACKUP_PROOF_DIR}/${OTELCONTEXT_BACKUP_ADAPTER}.json"
+          test -s "${OTELCONTEXT_NATIVE_BACKUP_PROOF_DIR}/${OTELCONTEXT_BACKUP_ADAPTER}-manifest.json"
+
+      - name: upload native database backup proof
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-backup-proof-${{ matrix.profile }}-${{ github.sha }}
+          path: ${{ runner.temp }}/native-backup-proof
           if-no-files-found: error
           retention-days: 14
