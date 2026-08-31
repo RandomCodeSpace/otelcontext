@@ -466,7 +466,9 @@ for signal in traces logs metrics; do
 done
 
 fingerprint_api() {
-  local label="$1" deadline=$((SECONDS + 30)) traces_json logs_json metrics_json trace_count log_count metric_count digest
+  # Legacy metrics become queryable only after the 30-second TSDB window is
+  # persisted. Leave a full scheduling margin beyond that boundary.
+  local label="$1" deadline=$((SECONDS + 45)) traces_json logs_json metrics_json trace_count log_count metric_count digest
   while ((SECONDS < deadline)); do
     traces_json="$(curl --fail --silent --show-error --max-time 3 "$http_base/api/traces?limit=50" || true)"
     logs_json="$(curl --fail --silent --show-error --max-time 3 "$http_base/api/logs?limit=50" || true)"
@@ -483,7 +485,12 @@ fingerprint_api() {
     fi
     sleep 1
   done
-  die "fixture API fingerprint did not stabilize"
+  printf '%s\n' "$traces_json" >"$proof_dir/$label-last-traces.json"
+  printf '%s\n' "$logs_json" >"$proof_dir/$label-last-logs.json"
+  printf '%s\n' "$metrics_json" >"$proof_dir/$label-last-metrics.json"
+  jq -n --argjson traces "$trace_count" --argjson logs "$log_count" --argjson metrics "$metric_count" \
+    '{traces:$traces,logs:$logs,metrics:$metrics}' >"$proof_dir/$label-last-counts.json"
+  die "fixture API fingerprint did not stabilize (traces=$trace_count logs=$log_count metrics=$metric_count)"
 }
 
 initial_fingerprint="$(fingerprint_api fingerprint-initial)"
