@@ -295,12 +295,12 @@ jobs:
       mysql:
         image: mysql:8.4.11@sha256:b3b90af2a6552ae30c266fdb7d5dd55f3afb72404bb78d37fe8a23eb857fd3fb
         env:
-          MYSQL_ROOT_PASSWORD: OtelContext-250
+          MYSQL_ROOT_PASSWORD: proof-${{ github.run_id }}
           MYSQL_DATABASE: otelcontext
         ports:
           - 3306:3306
         options: >-
-          --health-cmd "mysqladmin ping --host=127.0.0.1 --user=root --password=OtelContext-250"
+          --health-cmd "mysqladmin ping --host=127.0.0.1 --user=root --password=proof-${{ github.run_id }}"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 24
@@ -336,7 +336,7 @@ jobs:
         env:
           OTELCONTEXT_TEST_BINARY: ${{ runner.temp }}/otelcontext
           OTELCONTEXT_TEST_DRIVER: mysql
-          OTELCONTEXT_TEST_DSN: root:OtelContext-250@tcp(127.0.0.1:3306)/otelcontext?charset=utf8mb4&parseTime=True&loc=UTC
+          OTELCONTEXT_TEST_DSN: root:proof-${{ github.run_id }}@tcp(127.0.0.1:3306)/otelcontext?charset=utf8mb4&parseTime=True&loc=UTC
           OTELCONTEXT_TEST_REQUIRE_DB: '1'
           OTELCONTEXT_PROOF_DIR: ${{ runner.temp }}/database-proof
           OTELCONTEXT_TEST_NATIVE_RESTORE_PROOF: ${{ runner.temp }}/database-proof/native/mysql.json
@@ -379,13 +379,13 @@ jobs:
         image: mcr.microsoft.com/mssql/server:2022-CU26-ubuntu-22.04@sha256:ba4c8329f48fb8f02e1416be6a930ebfd71268caee78aa985f3af4315e457c89
         env:
           ACCEPT_EULA: Y
-          MSSQL_SA_PASSWORD: OtelContext!250Proof
+          MSSQL_SA_PASSWORD: Otc-${{ github.run_id }}-Proof!
           MSSQL_PID: Developer
           MSSQL_MEMORY_LIMIT_MB: '2048'
         ports:
           - 1433:1433
         options: >-
-          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -S 127.0.0.1 -U sa -P 'OtelContext!250Proof' -C -Q 'SELECT 1'"
+          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -S 127.0.0.1 -U sa -P 'Otc-${{ github.run_id }}-Proof!' -C -Q 'SELECT 1'"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 30
@@ -407,8 +407,8 @@ jobs:
         env:
           SQLSERVER_ID: ${{ job.services.sqlserver.id }}
         run: |
-          docker exec "${SQLSERVER_ID}" /opt/mssql-tools18/bin/sqlcmd -S 127.0.0.1 -U sa -P 'OtelContext!250Proof' -C -b -Q "SELECT CONVERT(varchar(128), SERVERPROPERTY('ProductVersion'))" | grep '16.0.4265.3'
-          docker exec "${SQLSERVER_ID}" /opt/mssql-tools18/bin/sqlcmd -S 127.0.0.1 -U sa -P 'OtelContext!250Proof' -C -b -Q "CREATE DATABASE [otelcontext]"
+          docker exec "${SQLSERVER_ID}" /opt/mssql-tools18/bin/sqlcmd -S 127.0.0.1 -U sa -P 'Otc-${{ github.run_id }}-Proof!' -C -b -Q "SELECT CONVERT(varchar(128), SERVERPROPERTY('ProductVersion'))" | grep '16.0.4265.3'
+          docker exec "${SQLSERVER_ID}" /opt/mssql-tools18/bin/sqlcmd -S 127.0.0.1 -U sa -P 'Otc-${{ github.run_id }}-Proof!' -C -b -Q "CREATE DATABASE [otelcontext]"
 
       - name: Build candidate once
         run: |
@@ -428,7 +428,7 @@ jobs:
         env:
           OTELCONTEXT_TEST_BINARY: ${{ runner.temp }}/otelcontext
           OTELCONTEXT_TEST_DRIVER: mssql
-          OTELCONTEXT_TEST_DSN: sqlserver://sa:OtelContext%21250Proof@127.0.0.1:1433?database=otelcontext&encrypt=disable&TrustServerCertificate=true
+          OTELCONTEXT_TEST_DSN: sqlserver://sa:Otc-${{ github.run_id }}-Proof%21@127.0.0.1:1433?database=otelcontext&encrypt=disable&TrustServerCertificate=true
           OTELCONTEXT_TEST_REQUIRE_DB: '1'
           OTELCONTEXT_PROOF_DIR: ${{ runner.temp }}/database-proof
           OTELCONTEXT_TEST_NATIVE_RESTORE_PROOF: ${{ runner.temp }}/database-proof/native/mssql.json

@@ -208,20 +208,26 @@ func (a *appProcess) start() error {
 	if a.cmd != nil {
 		return errors.New("application already running")
 	}
-	command := exec.Command(a.binary)
-	command.Dir = a.dir
-	command.Env = a.environment()
-	command.Stdout = a.log
-	command.Stderr = a.log
-	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	command := a.command()
 	if err := command.Start(); err != nil {
 		return err
 	}
 	done := make(chan error, 1)
-	go func() { done <- command.Wait() }()
+	go func() {
+		done <- command.Wait()
+		close(done)
+	}()
 	a.cmd = command
 	a.done = done
 	return nil
+}
+
+func (a *appProcess) command(arguments ...string) *exec.Cmd {
+	command := exec.Command(a.binary, arguments...)
+	command.Dir, command.Env = a.dir, a.environment()
+	command.Stdout, command.Stderr = a.log, a.log
+	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	return command
 }
 
 func (a *appProcess) stop() (int, error) {
@@ -233,6 +239,12 @@ func (a *appProcess) stop() (int, error) {
 	if err := syscall.Kill(-command.Process.Pid, syscall.SIGTERM); err != nil {
 		return -1, err
 	}
+	return waitForExit(command, done)
+}
+
+func waitForExit(command *exec.Cmd, done <-chan error) (int, error) {
+	timer := time.NewTimer(35 * time.Second)
+	defer timer.Stop()
 	select {
 	case err := <-done:
 		if err == nil {
@@ -243,7 +255,7 @@ func (a *appProcess) stop() (int, error) {
 			return exitErr.ExitCode(), err
 		}
 		return -1, err
-	case <-time.After(35 * time.Second):
+	case <-timer.C:
 		_ = syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
 		<-done
 		return -1, errors.New("shutdown exceeded 35 seconds")
@@ -730,28 +742,16 @@ func getBody(endpoint string) ([]byte, error) {
 }
 
 func listMCPTools(endpoint string) ([]string, error) {
-	body, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
-	response, err := http.Post(endpoint, "application/json", bytes.NewReader(body)) //nolint:gosec // exact loopback proof endpoint.
-	if err != nil {
+	var result struct {
+		Tools []struct {
+			Name string `json:"name"`
+		} `json:"tools"`
+	}
+	if err := postJSONRPC(endpoint, "tools/list", nil, &result); err != nil {
 		return nil, err
 	}
-	defer response.Body.Close()
-	var envelope struct {
-		Result struct {
-			Tools []struct {
-				Name string `json:"name"`
-			} `json:"tools"`
-		} `json:"result"`
-		Error any `json:"error"`
-	}
-	if err := json.NewDecoder(response.Body).Decode(&envelope); err != nil {
-		return nil, err
-	}
-	if envelope.Error != nil {
-		return nil, fmt.Errorf("tools/list error: %v", envelope.Error)
-	}
-	names := make([]string, 0, len(envelope.Result.Tools))
-	for _, tool := range envelope.Result.Tools {
+	names := make([]string, 0, len(result.Tools))
+	for _, tool := range result.Tools {
 		names = append(names, tool.Name)
 	}
 	sort.Strings(names)
@@ -762,41 +762,67 @@ func callMCPTool(endpoint, name string, arguments map[string]any) (string, bool,
 	if arguments == nil {
 		arguments = map[string]any{}
 	}
-	body, _ := json.Marshal(map[string]any{
-		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-		"params": map[string]any{"name": name, "arguments": arguments},
-	})
-	response, err := http.Post(endpoint, "application/json", bytes.NewReader(body)) //nolint:gosec // exact loopback proof endpoint.
-	if err != nil {
+	var result struct {
+		IsError bool `json:"isError"`
+		Content []struct {
+			Text     string `json:"text"`
+			Resource *struct {
+				Text string `json:"text"`
+			} `json:"resource,omitempty"`
+		} `json:"content"`
+	}
+	params := map[string]any{"name": name, "arguments": arguments}
+	if err := postJSONRPC(endpoint, "tools/call", params, &result); err != nil {
 		return "", false, err
-	}
-	defer response.Body.Close()
-	var envelope struct {
-		Result struct {
-			IsError bool `json:"isError"`
-			Content []struct {
-				Text     string `json:"text"`
-				Resource *struct {
-					Text string `json:"text"`
-				} `json:"resource,omitempty"`
-			} `json:"content"`
-		} `json:"result"`
-		Error any `json:"error"`
-	}
-	if err := json.NewDecoder(response.Body).Decode(&envelope); err != nil {
-		return "", false, err
-	}
-	if envelope.Error != nil {
-		return fmt.Sprint(envelope.Error), false, nil
 	}
 	var text strings.Builder
-	for _, content := range envelope.Result.Content {
+	for _, content := range result.Content {
 		text.WriteString(content.Text)
 		if content.Resource != nil {
 			text.WriteString(content.Resource.Text)
 		}
 	}
-	return text.String(), !envelope.Result.IsError && text.Len() > 0, nil
+	return text.String(), !result.IsError && text.Len() > 0, nil
+}
+
+func postJSONRPC(endpoint, method string, params any, result any) error {
+	payload := map[string]any{"jsonrpc": "2.0", "id": 1, "method": method}
+	if params != nil {
+		payload["params"] = params
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := (&http.Client{Transport: &http.Transport{Proxy: nil}}).Do(request) //nolint:gosec // exact loopback proof endpoint.
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("%s status=%d", method, response.StatusCode)
+	}
+	var envelope struct {
+		Result json.RawMessage `json:"result"`
+		Error  json.RawMessage `json:"error"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&envelope); err != nil {
+		return err
+	}
+	if len(envelope.Error) > 0 && string(envelope.Error) != "null" {
+		return fmt.Errorf("%s error: %s", method, envelope.Error)
+	}
+	if len(envelope.Result) == 0 {
+		return fmt.Errorf("%s returned no result", method)
+	}
+	return json.Unmarshal(envelope.Result, result)
 }
 
 func readWebSocket(httpURL string) ([]byte, error) {
