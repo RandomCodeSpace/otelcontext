@@ -94,21 +94,20 @@ type staleFixture struct {
 }
 
 type lockedBuffer struct {
-	mu   sync.Mutex
-	data []byte
+	sync.Mutex
+	bytes.Buffer
 }
 
 func (b *lockedBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	b.data = append(b.data, p...)
-	b.mu.Unlock()
-	return len(p), nil
+	b.Lock()
+	defer b.Unlock()
+	return b.Buffer.Write(p)
 }
 
 func (b *lockedBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return string(append([]byte(nil), b.data...))
+	b.Lock()
+	defer b.Unlock()
+	return b.Buffer.String()
 }
 
 type appProcess struct {

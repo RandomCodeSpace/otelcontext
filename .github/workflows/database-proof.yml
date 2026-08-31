@@ -300,7 +300,7 @@ jobs:
         ports:
           - 3306:3306
         options: >-
-          --health-cmd "mysqladmin ping --host=127.0.0.1 --user=root --password=proof-${{ github.run_id }}"
+          --health-cmd "MYSQL_PWD=$MYSQL_ROOT_PASSWORD mysqladmin ping --host=127.0.0.1 --user=root"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 24
