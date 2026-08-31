@@ -270,7 +270,6 @@ candidate_identity="${OTELCONTEXT_PROOF_CERTIFICATE_IDENTITY:-https://github.com
 candidate_version="$tag"
 if [[ "$source_proof" -eq 1 ]]; then
   [[ -n "${OTELCONTEXT_PROOF_CERTIFICATE_IDENTITY:-}" ]] || die "source proof requires OTELCONTEXT_PROOF_CERTIFICATE_IDENTITY"
-  candidate_version="local"
 fi
 
 previous_archive="${OTELCONTEXT_PREVIOUS_ARCHIVE:-}"

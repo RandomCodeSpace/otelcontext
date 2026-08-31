@@ -391,6 +391,10 @@ jobs:
           archive="${asset_dir}/otelcontext_source_linux_amd64.tar.gz"
           install -d -m 0755 "${asset_dir}" "${payload_dir}/deploy/systemd"
           go build -trimpath -o "${payload_dir}/otelcontext" .
+          version_output="$("${payload_dir}/otelcontext" --version)"
+          source_version="${version_output#OtelContext version }"
+          test "${version_output}" = "OtelContext version ${source_version}"
+          [[ "${source_version}" =~ ^[0-9A-Za-z._+-]+$ ]]
           install -m 0644 README.md LICENSE.md "${payload_dir}/"
           install -m 0644 deploy/systemd/otelcontext.service deploy/systemd/otelcontext.env.example \
             "${payload_dir}/deploy/systemd/"
@@ -406,6 +410,7 @@ jobs:
             --output-certificate "${asset_dir}/checksums.txt.pem" \
             "${asset_dir}/checksums.txt"
           echo "SOURCE_ARCHIVE=${archive}" >> "${GITHUB_ENV}"
+          echo "SOURCE_VERSION=${source_version}" >> "${GITHUB_ENV}"
 
       - name: download signed previous release
         env:
@@ -438,7 +443,7 @@ jobs:
           sudo --preserve-env=OTELCONTEXT_PROOF_SOURCE,OTELCONTEXT_PROOF_CERTIFICATE_IDENTITY,OTELCONTEXT_PREVIOUS_ARCHIVE,OTELCONTEXT_PREVIOUS_TAG,OTELCONTEXT_COSIGN \
             scripts/prove-systemd-release.sh \
               --archive "${SOURCE_ARCHIVE}" \
-              --tag "source-${GITHUB_SHA}" \
+              --tag "${SOURCE_VERSION}" \
               --sha "${GITHUB_SHA}" \
               --proof-dir "${proof_dir}"
           jq -e --arg sha "${GITHUB_SHA}" '
