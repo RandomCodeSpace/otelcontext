@@ -450,6 +450,9 @@ initial_pid="$(systemctl show "$service_name" -p MainPID --value)"
 
 fixture_time="$(date +%s%N)"
 fixture_end=$((fixture_time + 1000000))
+fixture_epoch=$((fixture_time / 1000000000))
+fixture_query_start="$(date --utc --date="@$((fixture_epoch - 60))" +%Y-%m-%dT%H:%M:%SZ)"
+fixture_query_end="$(date --utc --date="@$((fixture_epoch + 60))" +%Y-%m-%dT%H:%M:%SZ)"
 cat >"$work_dir/traces.json" <<EOF
 {"resourceSpans":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"systemd-proof"}}]},"scopeSpans":[{"spans":[{"traceId":"qqqqqqqqqqqqqqqqqqqqqg==","spanId":"u7u7u7u7u7s=","name":"systemd-proof-request","kind":2,"startTimeUnixNano":"$fixture_time","endTimeUnixNano":"$fixture_end"}]}]}]}
 EOF
@@ -472,7 +475,7 @@ fingerprint_api() {
   while ((SECONDS < deadline)); do
     traces_json="$(curl --fail --silent --show-error --max-time 3 "$http_base/api/traces?limit=50" || true)"
     logs_json="$(curl --fail --silent --show-error --max-time 3 "$http_base/api/logs?limit=50" || true)"
-    metrics_json="$(curl --fail --silent --show-error --max-time 3 "$http_base/api/metrics?name=systemd_proof_requests&service_name=systemd-proof" || true)"
+    metrics_json="$(curl --fail --silent --show-error --max-time 3 "$http_base/api/metrics?name=systemd_proof_requests&service_name=systemd-proof&start=$fixture_query_start&end=$fixture_query_end" || true)"
     trace_count="$(jq -r '[.traces[]? | select(.service_name == "systemd-proof")] | length' <<<"$traces_json" 2>/dev/null || echo 0)"
     log_count="$(jq -r '[.data[]? | select(.body == "systemd-proof fixture")] | length' <<<"$logs_json" 2>/dev/null || echo 0)"
     metric_count="$(jq -r '[.[]? | select(.name == "systemd_proof_requests" and .service_name == "systemd-proof")] | length' <<<"$metrics_json" 2>/dev/null || echo 0)"
