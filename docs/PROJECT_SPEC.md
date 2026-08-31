@@ -451,10 +451,10 @@ type Log struct {
 ### Database Support
 
 **Supported Drivers:**
-- SQLite (default) - Embedded, zero-config
-- MySQL - Production-ready, high performance
-- PostgreSQL - Advanced features, JSON support
-- SQL Server - Enterprise environments
+- PostgreSQL 16 - Primary production database
+- SQLite (default) - Bounded opt-in for one process, at most five services, and a low write rate
+- MySQL 8.4 - Preview
+- SQL Server 2022 - Experimental
 
 **Configuration:**
 ```bash

@@ -5,6 +5,7 @@ package migrate
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,8 +19,22 @@ import (
 
 func startMigrationPostgres16(t *testing.T) (string, *gorm.DB) {
 	t.Helper()
+	if os.Getenv("OTELCONTEXT_TEST_DRIVER") == "postgres" && os.Getenv("OTELCONTEXT_TEST_DSN") != "" {
+		dsn := os.Getenv("OTELCONTEXT_TEST_DSN")
+		admin, err := storage.NewDatabase("postgres", dsn)
+		if err != nil {
+			t.Fatalf("connect required PostgreSQL workflow service: %v", err)
+		}
+		if sqlDB, dbErr := admin.DB(); dbErr == nil {
+			t.Cleanup(func() { _ = sqlDB.Close() })
+		}
+		return dsn, admin
+	}
+	if os.Getenv("OTELCONTEXT_TEST_REQUIRE_DB") == "1" {
+		t.Fatal("required PostgreSQL proof is missing OTELCONTEXT_TEST_DSN")
+	}
 	ctx := context.Background()
-	container, err := postgres.Run(ctx, "postgres:16-alpine",
+	container, err := postgres.Run(ctx, "postgres:16.15-alpine3.24@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685",
 		postgres.WithDatabase("otel_migrate"),
 		postgres.WithUsername("otel"),
 		postgres.WithPassword("otel"),
