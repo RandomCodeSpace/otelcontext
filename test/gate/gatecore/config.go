@@ -20,17 +20,18 @@ type Config struct {
 	DataDir   string `json:"data_dir"`
 	ReportDir string `json:"report_dir"`
 
-	Binaries    Binaries          `json:"binaries"`
-	HTTPAddr    string            `json:"http_addr"`
-	GRPCAddr    string            `json:"grpc_addr"`
-	MCPPath     string            `json:"mcp_path"`
-	APIKey      string            `json:"api_key"`
-	Confinement ConfinementConfig `json:"confinement"`
-	Prefill     PrefillConfig     `json:"prefill"`
-	Load        LoadConfig        `json:"load"`
-	Sampling    SamplingConfig    `json:"sampling"`
-	Queries     QueryConfig       `json:"queries"`
-	Thresholds  Thresholds        `json:"thresholds"`
+	Binaries      Binaries            `json:"binaries"`
+	Certification CertificationConfig `json:"certification"`
+	HTTPAddr      string              `json:"http_addr"`
+	GRPCAddr      string              `json:"grpc_addr"`
+	MCPPath       string              `json:"mcp_path"`
+	APIKey        string              `json:"api_key"`
+	Confinement   ConfinementConfig   `json:"confinement"`
+	Prefill       PrefillConfig       `json:"prefill"`
+	Load          LoadConfig          `json:"load"`
+	Sampling      SamplingConfig      `json:"sampling"`
+	Queries       QueryConfig         `json:"queries"`
+	Thresholds    Thresholds          `json:"thresholds"`
 
 	// ServerEnv is the environment the server under test is started with. It
 	// is recorded in full; AGGREGATE_SYNCHRONOUS in particular is a durability
@@ -47,6 +48,14 @@ type Binaries struct {
 	Server  string `json:"server"`
 	Loadsim string `json:"loadsim"`
 	Prefill string `json:"prefill"`
+}
+
+// CertificationConfig switches the historical diagnostic protocol into the
+// strict release-candidate contract. Candidate paths and expected digests are
+// supplied by the workflow flags because they do not exist until the signed
+// draft release has been downloaded and verified.
+type CertificationConfig struct {
+	Required bool `json:"required"`
 }
 
 // ConfinementConfig configures Q2.
@@ -229,8 +238,10 @@ func DefaultRequiredMetrics() []string {
 		"otelcontext_aggregate_input_points_total",
 		"otelcontext_aggregate_late_points_total",
 		"otelcontext_aggregate_admission_rejected_total",
+		"otelcontext_aggregate_identity_overflow_total",
 		"otelcontext_aggregate_delta_log_rows",
 		"otelcontext_disk_component_bytes",
+		"otelcontext_ingest_pipeline_dropped_total",
 	}
 }
 

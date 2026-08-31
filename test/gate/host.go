@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -88,14 +89,23 @@ func mountFor(path string) (device, mount, fsType string) {
 }
 
 // collectProvenance records exactly what was measured.
-func collectProvenance(repoRoot string, binaries gatecore.Binaries) gatecore.Provenance {
+func collectProvenance(repoRoot string, binaries gatecore.Binaries, candidate candidateSpec) gatecore.Provenance {
 	p := gatecore.Provenance{
-		GoVersion:       runtime.Version(),
-		BinarySHA256:    map[string]string{},
-		BuiltAt:         time.Now().UTC(),
-		OrchestratorPID: os.Getpid(),
+		ExpectedCommitSHA:     candidate.expectedCommitSHA,
+		CandidateTag:          candidate.tag,
+		ExpectedServerSHA256:  candidate.expectedServerSHA256,
+		ArchivePath:           candidate.archivePath,
+		ExpectedArchiveSHA256: candidate.expectedArchiveSHA256,
+		ConfigPath:            candidate.configPath,
+		GoVersion:             runtime.Version(),
+		BinarySHA256:          map[string]string{},
+		BuiltAt:               time.Now().UTC(),
+		OrchestratorPID:       os.Getpid(),
 	}
 	p.CommitSHA = gitOutput(repoRoot, "rev-parse", "HEAD")
+	if candidate.tag != "" {
+		p.TagCommitSHA = gitOutput(repoRoot, "rev-parse", candidate.tag+"^{commit}")
+	}
 	p.Branch = gitOutput(repoRoot, "rev-parse", "--abbrev-ref", "HEAD")
 	status := gitOutput(repoRoot, "status", "--porcelain")
 	if status != "" {
@@ -112,13 +122,50 @@ func collectProvenance(repoRoot string, binaries gatecore.Binaries) gatecore.Pro
 		if path == "" {
 			continue
 		}
+		path = rootedPath(repoRoot, path)
 		if sum, err := sha256File(path); err == nil {
-			p.BinarySHA256[name+" ("+filepath.Base(path)+")"] = sum
+			p.BinarySHA256[name] = sum
 		} else {
-			p.BinarySHA256[name+" ("+filepath.Base(path)+")"] = "unreadable: " + err.Error()
+			p.BinarySHA256[name] = "unreadable: " + err.Error()
 		}
 	}
+	if exe, err := os.Executable(); err == nil {
+		if sum, err := sha256File(exe); err == nil {
+			p.BinarySHA256["gate"] = sum
+		} else {
+			p.BinarySHA256["gate"] = "unreadable: " + err.Error()
+		}
+	}
+	if candidate.archivePath != "" {
+		candidate.archivePath = rootedPath(repoRoot, candidate.archivePath)
+		p.ArchivePath = candidate.archivePath
+		if sum, err := sha256File(candidate.archivePath); err == nil {
+			p.ArchiveSHA256 = sum
+		} else {
+			p.ArchiveSHA256 = "unreadable: " + err.Error()
+		}
+	}
+	if candidate.configPath != "" {
+		candidate.configPath = rootedPath(repoRoot, candidate.configPath)
+		p.ConfigPath = candidate.configPath
+		if sum, err := sha256File(candidate.configPath); err == nil {
+			p.ConfigSHA256 = sum
+		} else {
+			p.ConfigSHA256 = "unreadable: " + err.Error()
+		}
+	}
+	serverPath := rootedPath(repoRoot, binaries.Server)
+	if out, err := exec.Command(serverPath, "--version").Output(); err == nil { // #nosec G204 -- operator-selected candidate path
+		p.ServerVersion = strings.TrimSpace(strings.TrimPrefix(string(out), "OtelContext version "))
+	}
 	return p
+}
+
+func rootedPath(root, path string) string {
+	if filepath.IsAbs(path) {
+		return path
+	}
+	return filepath.Join(root, path)
 }
 
 func gitOutput(dir string, args ...string) string {
@@ -148,6 +195,25 @@ func sha256File(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+func writeDigestManifest(path string, entries map[string]string) error {
+	names := make([]string, 0, len(entries))
+	for name, filePath := range entries {
+		if filePath != "" {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	var body strings.Builder
+	for _, name := range names {
+		digest, err := sha256File(entries[name])
+		if err != nil {
+			return fmt.Errorf("digest %s: %w", name, err)
+		}
+		fmt.Fprintf(&body, "%s  %s\n", digest, name)
+	}
+	return os.WriteFile(path, []byte(body.String()), 0o600)
+}
+
 // parsePrefillOutput pulls the deterministic seeded counts out of the prefill
 // binary's stdout. Those numbers are the only exact totals the prefill tier
 // publishes, so the gate reads them rather than assuming them.
@@ -157,6 +223,13 @@ type prefillFacts struct {
 	DeltaRows        int64
 	FirstWindow      int64
 	LastWindow       int64
+	Series           int
+	Services         int
+	Requests         int64
+	RequestErrors    int64
+	Spans            int64
+	SpanErrors       int64
+	Logs             int64
 }
 
 func parsePrefillOutput(out string) (prefillFacts, error) {
@@ -181,10 +254,38 @@ func parsePrefillOutput(out string) (prefillFacts, error) {
 			if _, err := fmt.Sscanf(line, "first_window: %d  last_window: %d", &f.FirstWindow, &f.LastWindow); err == nil {
 				seen++
 			}
+		case strings.HasPrefix(line, "series_total:"):
+			if _, err := fmt.Sscanf(line, "series_total: %d", &f.Series); err == nil {
+				seen++
+			}
+		case strings.HasPrefix(line, "services_total:"):
+			if _, err := fmt.Sscanf(line, "services_total: %d", &f.Services); err == nil {
+				seen++
+			}
+		case strings.HasPrefix(line, "dashboard_requests:"):
+			if _, err := fmt.Sscanf(line, "dashboard_requests: %d", &f.Requests); err == nil {
+				seen++
+			}
+		case strings.HasPrefix(line, "dashboard_request_errors:"):
+			if _, err := fmt.Sscanf(line, "dashboard_request_errors: %d", &f.RequestErrors); err == nil {
+				seen++
+			}
+		case strings.HasPrefix(line, "dashboard_spans:"):
+			if _, err := fmt.Sscanf(line, "dashboard_spans: %d", &f.Spans); err == nil {
+				seen++
+			}
+		case strings.HasPrefix(line, "dashboard_span_errors:"):
+			if _, err := fmt.Sscanf(line, "dashboard_span_errors: %d", &f.SpanErrors); err == nil {
+				seen++
+			}
+		case strings.HasPrefix(line, "dashboard_logs:"):
+			if _, err := fmt.Sscanf(line, "dashboard_logs: %d", &f.Logs); err == nil {
+				seen++
+			}
 		}
 	}
-	if seen < 4 {
-		return f, fmt.Errorf("prefill output did not carry the four seeded-count lines (found %d)", seen)
+	if seen < 11 {
+		return f, fmt.Errorf("prefill output did not carry the eleven seeded-count lines (found %d)", seen)
 	}
 	return f, nil
 }

@@ -123,7 +123,7 @@ type seedFixture struct {
 // SLOWER, for the same reason the production commit path gives (store_sqlite.go
 // mergeDeltas) — the cost is per-parameter binding, and a wide statement pays
 // extra to compile on top of it.
-func insertRows(t *testing.T, tx *sql.Tx, table string, ids []SeriesID, windows []int64, deltas []*AggregateDelta) {
+func insertRows(t testing.TB, tx *sql.Tx, table string, ids []SeriesID, windows []int64, deltas []*AggregateDelta) {
 	t.Helper()
 	stmt, err := tx.Prepare(`INSERT INTO ` + table + ` (window_start, series_id, ` + deltaColumnList + `)
 		VALUES (?,?,` + deltaValuePlaceholders + `)`)
@@ -151,7 +151,7 @@ func insertRows(t *testing.T, tx *sql.Tx, table string, ids []SeriesID, windows 
 
 // seedSeries writes the series identities the seeded rows join against,
 // through the store's own registration statement.
-func seedSeries(t *testing.T, tx *sql.Tx, rows []SeriesRow) {
+func seedSeries(t testing.TB, tx *sql.Tx, rows []SeriesRow) {
 	t.Helper()
 	if err := insertSeries(tx, rows); err != nil {
 		t.Fatalf("insert series: %v", err)

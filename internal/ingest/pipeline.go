@@ -360,6 +360,13 @@ func NewPipeline(writer pipelineWriter, metrics *telemetry.Metrics, cfg Pipeline
 	if cfg.SoftThreshold <= 0 || cfg.SoftThreshold >= 1.0 {
 		cfg.SoftThreshold = d.SoftThreshold
 	}
+	if metrics != nil && metrics.IngestPipelineDroppedTotal != nil {
+		for _, signal := range []SignalType{SignalTraces, SignalLogs} {
+			for _, reason := range []string{"soft_backpressure", "tenant_backpressure", "bytes_full", "queue_full"} {
+				metrics.IngestPipelineDroppedTotal.WithLabelValues(signalLabel(signal), reason)
+			}
+		}
+	}
 	return &Pipeline{
 		writer:         writer,
 		metrics:        metrics,

@@ -14,7 +14,7 @@ func newTestStore(t *testing.T) *SQLiteStore {
 	return newTestStoreAt(t, filepath.Join(t.TempDir(), "aggregate.db"), StoreConfig{})
 }
 
-func newTestStoreAt(t *testing.T, path string, cfg StoreConfig) *SQLiteStore {
+func newTestStoreAt(t testing.TB, path string, cfg StoreConfig) *SQLiteStore {
 	t.Helper()
 	cfg.Path = path
 	store, err := OpenSQLiteStore(cfg)

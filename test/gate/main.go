@@ -19,6 +19,7 @@
 package main
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -29,6 +30,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -48,8 +50,9 @@ const phaseGuard = 5 * time.Second
 const ctlTimeout = 5 * time.Second
 
 type gate struct {
-	cfg gatecore.Config
-	res *gatecore.Result
+	cfg       gatecore.Config
+	res       *gatecore.Result
+	candidate candidateSpec
 
 	// http is the query client: its long timeout exists for the seven-day
 	// completeness surfaces (the dashboard percentile path pages 12.1M
@@ -71,9 +74,27 @@ type gate struct {
 	mu sync.Mutex
 }
 
+type candidateSpec struct {
+	configPath            string
+	tag                   string
+	expectedCommitSHA     string
+	archivePath           string
+	expectedArchiveSHA256 string
+	expectedServerSHA256  string
+}
+
 func main() {
 	cfgPath := flag.String("config", "", "gate configuration JSON; unstated fields keep the frozen defaults")
 	outDir := flag.String("out", "", "report directory override (default: report_dir from the config)")
+	workDir := flag.String("work-dir", "", "work directory override; data is written below it")
+	server := flag.String("server", "", "server binary override (the extracted signed candidate for a certifying run)")
+	loadsim := flag.String("loadsim", "", "load generator binary override")
+	prefill := flag.String("prefill", "", "deterministic prefill binary override")
+	tag := flag.String("tag", "", "candidate version tag")
+	expectedCommit := flag.String("expected-commit-sha", "", "candidate tag's expected 40-character commit SHA")
+	archive := flag.String("archive", "", "verified release archive containing the candidate")
+	expectedArchiveSHA := flag.String("expected-archive-sha256", "", "expected SHA-256 of the verified release archive")
+	expectedServerSHA := flag.String("expected-server-sha256", "", "expected SHA-256 of the extracted candidate server")
 	runID := flag.String("run-id", "", "run identifier (default: UTC timestamp)")
 	printCfg := flag.Bool("print-config", false, "print the effective configuration and exit")
 	flag.Parse()
@@ -84,6 +105,19 @@ func main() {
 	}
 	if *outDir != "" {
 		cfg.ReportDir = *outDir
+	}
+	if *workDir != "" {
+		cfg.WorkDir = *workDir
+		cfg.DataDir = filepath.Join(*workDir, "data")
+	}
+	if *server != "" {
+		cfg.Binaries.Server = *server
+	}
+	if *loadsim != "" {
+		cfg.Binaries.Loadsim = *loadsim
+	}
+	if *prefill != "" {
+		cfg.Binaries.Prefill = *prefill
 	}
 	if cfg.RunID == "" {
 		cfg.RunID = *runID
@@ -96,6 +130,14 @@ func main() {
 			cfg.RepoRoot = wd
 		}
 	}
+	if root, err := filepath.Abs(cfg.RepoRoot); err == nil {
+		cfg.RepoRoot = root
+	}
+	candidate := candidateSpec{
+		configPath: *cfgPath, tag: *tag, expectedCommitSHA: strings.ToLower(*expectedCommit),
+		archivePath: *archive, expectedArchiveSHA256: strings.ToLower(*expectedArchiveSHA),
+		expectedServerSHA256: strings.ToLower(*expectedServerSHA),
+	}
 	if *printCfg {
 		fmt.Println(mustJSON(cfg))
 		return
@@ -103,8 +145,11 @@ func main() {
 	if err := cfg.Validate(); err != nil {
 		log.Fatalf("gate: %v", err)
 	}
+	if err := validateCandidateConfig(cfg, candidate); err != nil {
+		log.Fatalf("gate: %v", err)
+	}
 
-	g := newGate(cfg)
+	g := newGate(cfg, candidate)
 	runErr := g.run()
 
 	g.res.EndedAt = time.Now().UTC()
@@ -113,14 +158,36 @@ func main() {
 	jsonPath, mdPath, werr := gatecore.WriteReports(g.abs(cfg.ReportDir), g.res.StartedAt, g.res)
 	if werr != nil {
 		log.Printf("gate: writing the report failed: %v", werr)
+		runErr = errors.Join(runErr, fmt.Errorf("write gate reports: %w", werr))
 	} else {
 		log.Printf("gate: report written to %s and %s", jsonPath, mdPath)
+		digestPath := strings.TrimSuffix(jsonPath, ".json") + "-digests.txt"
+		manifestEntries := map[string]string{
+			"report.json":     jsonPath,
+			"report.md":       mdPath,
+			"config":          g.res.Provenance.ConfigPath,
+			"release-archive": g.res.Provenance.ArchivePath,
+			"server":          g.abs(g.cfg.Binaries.Server),
+			"loadsim":         g.abs(g.cfg.Binaries.Loadsim),
+			"prefill":         g.abs(g.cfg.Binaries.Prefill),
+		}
+		if gateExe, err := os.Executable(); err == nil {
+			manifestEntries["gate"] = gateExe
+		} else {
+			log.Printf("gate: resolving the gate executable for the digest manifest failed: %v", err)
+		}
+		if err := writeDigestManifest(digestPath, manifestEntries); err != nil {
+			log.Printf("gate: writing the digest manifest failed: %v", err)
+			runErr = errors.Join(runErr, fmt.Errorf("write digest manifest: %w", err))
+		} else {
+			log.Printf("gate: digest manifest written to %s", digestPath)
+		}
 	}
 
 	if runErr != nil {
 		log.Printf("gate: protocol error: %v", runErr)
 	}
-	if !g.res.Passed {
+	if runErr != nil || !g.res.Passed {
 		log.Printf("gate: FAILED with %d failing assertions", len(g.res.Failures))
 		for _, f := range g.res.Failures {
 			log.Printf("  - %s", f)
@@ -130,11 +197,12 @@ func main() {
 	log.Printf("gate: PASSED %d assertions", len(g.res.Assertions))
 }
 
-func newGate(cfg gatecore.Config) *gate {
+func newGate(cfg gatecore.Config, candidate candidateSpec) *gate {
 	g := &gate{
-		cfg:  cfg,
-		http: &http.Client{Timeout: time.Duration(cfg.Queries.Timeout * float64(time.Second))},
-		ctl:  &http.Client{Timeout: ctlTimeout},
+		cfg:       cfg,
+		candidate: candidate,
+		http:      &http.Client{Timeout: time.Duration(cfg.Queries.Timeout * float64(time.Second))},
+		ctl:       &http.Client{Timeout: ctlTimeout},
 		res: &gatecore.Result{
 			Schema:      gatecore.Schema,
 			GateVersion: gateVersion,
@@ -149,6 +217,63 @@ func newGate(cfg gatecore.Config) *gate {
 	}
 	g.sampler = newSampler(g)
 	return g
+}
+
+func validateCandidateConfig(cfg gatecore.Config, c candidateSpec) error {
+	if !cfg.Certification.Required {
+		return nil
+	}
+	var missing []string
+	for name, value := range map[string]string{
+		"-config": c.configPath, "-tag": c.tag, "-expected-commit-sha": c.expectedCommitSHA,
+		"-archive": c.archivePath, "-expected-archive-sha256": c.expectedArchiveSHA256,
+		"-expected-server-sha256": c.expectedServerSHA256,
+	} {
+		if strings.TrimSpace(value) == "" {
+			missing = append(missing, name)
+		}
+	}
+	if !validHex(c.expectedCommitSHA, 20) {
+		missing = append(missing, "-expected-commit-sha must be 40 hexadecimal characters")
+	}
+	for name, digest := range map[string]string{
+		"-expected-archive-sha256": c.expectedArchiveSHA256,
+		"-expected-server-sha256":  c.expectedServerSHA256,
+	} {
+		if !validHex(digest, 32) {
+			missing = append(missing, name+" must be 64 hexadecimal characters")
+		}
+	}
+	if cfg.Confinement.AllowFallback {
+		missing = append(missing, "confinement.allow_fallback must be false")
+	}
+	for name, path := range map[string]string{"work_dir": cfg.WorkDir, "report_dir": cfg.ReportDir} {
+		if pathWithin(cfg.RepoRoot, path) {
+			missing = append(missing, name+" must be outside repo_root")
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("certifying candidate configuration is incomplete: %s", strings.Join(missing, "; "))
+	}
+	return nil
+}
+
+func validHex(value string, bytes int) bool {
+	if len(value) != bytes*2 {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
+}
+
+func pathWithin(root, path string) bool {
+	rootAbs, rootErr := filepath.Abs(root)
+	pathAbs, pathErr := filepath.Abs(path)
+	if rootErr != nil || pathErr != nil {
+		return true
+	}
+	rel, err := filepath.Rel(rootAbs, pathAbs)
+	return err != nil || rel == "." || (!strings.HasPrefix(rel, ".."+string(filepath.Separator)) && rel != "..")
 }
 
 func (g *gate) abs(p string) string {
@@ -214,8 +339,11 @@ func (g *gate) run() error {
 	g.res.Config = g.cfg
 	g.res.ServerEnv = g.cfg.ServerEnv
 
-	g.res.Provenance = collectProvenance(g.cfg.RepoRoot, g.cfg.Binaries)
+	g.res.Provenance = collectProvenance(g.cfg.RepoRoot, g.cfg.Binaries, g.candidate)
 	g.res.Host = collectHost(g.cfg.DataDir)
+	if err := g.preflightCandidate(); err != nil {
+		return err
+	}
 	if err := g.preflightDisk(); err != nil {
 		return err
 	}
@@ -262,7 +390,41 @@ func (g *gate) run() error {
 	if err := g.runCrashPhase(); err != nil {
 		return err
 	}
+	if g.cfg.Certification.Required {
+		if err := g.runLatencySentinel(); err != nil {
+			return err
+		}
+	}
 	return g.measure(prefill)
+}
+
+func (g *gate) preflightCandidate() error {
+	if !g.cfg.Certification.Required {
+		return nil
+	}
+	p := g.res.Provenance
+	serverDigest := p.BinarySHA256["server"]
+	var failures []string
+	checks := []struct {
+		ok     bool
+		detail string
+	}{
+		{p.CommitSHA == p.ExpectedCommitSHA, "checkout commit does not match expected commit"},
+		{p.TagCommitSHA == p.ExpectedCommitSHA, "candidate tag does not resolve to expected commit"},
+		{!p.DirtyTree, "candidate checkout is dirty"},
+		{p.ArchiveSHA256 == p.ExpectedArchiveSHA256, "release archive digest mismatch"},
+		{serverDigest == p.ExpectedServerSHA256, "candidate server digest mismatch"},
+		{p.ServerVersion == p.CandidateTag, "candidate server version does not match tag"},
+	}
+	for _, check := range checks {
+		if !check.ok {
+			failures = append(failures, check.detail)
+		}
+	}
+	if len(failures) > 0 {
+		return fmt.Errorf("candidate preflight failed: %s", strings.Join(failures, "; "))
+	}
+	return nil
 }
 
 // pinServerPaths forces every file the server writes into the gate's own data
@@ -585,6 +747,48 @@ func (g *gate) runCrashPhase() error {
 	})
 }
 
+func (g *gate) runLatencySentinel() error {
+	return g.phase("latency_sentinel", func() error {
+		reportPath := filepath.Join(g.cfg.WorkDir, "latency-sentinel.json")
+		argv := []string{
+			g.abs(g.cfg.Binaries.Loadsim),
+			"--latency-sentinel",
+			"--endpoint", g.cfg.GRPCAddr,
+			"--call-timeout", dur(g.cfg.Load.CallTimeoutSec).String(),
+			"--report", reportPath,
+		}
+		if g.cfg.Load.TenantID != "" {
+			argv = append(argv, "--tenant-id", g.cfg.Load.TenantID)
+		}
+		if _, err := g.runCommand("latency_sentinel", argv, "latency-sentinel.log"); err != nil {
+			return err
+		}
+		body, err := os.ReadFile(reportPath) // #nosec G304 -- gate-owned work path
+		if err != nil {
+			return err
+		}
+		var fixture struct {
+			SchemaVersion string  `json:"schema_version"`
+			Service       string  `json:"service"`
+			LowCount      int     `json:"low_count"`
+			LowMS         float64 `json:"low_ms"`
+			TailCount     int     `json:"tail_count"`
+			TailMS        float64 `json:"tail_ms"`
+		}
+		if err := json.Unmarshal(body, &fixture); err != nil {
+			return fmt.Errorf("decode latency sentinel report: %w", err)
+		}
+		if fixture.SchemaVersion != "otelcontext.latency-sentinel.v1" {
+			return fmt.Errorf("latency sentinel schema is %q", fixture.SchemaVersion)
+		}
+		g.res.Queries.LatencySentinel = gatecore.LatencySentinelProof{
+			Service: fixture.Service, LowCount: fixture.LowCount, LowMS: fixture.LowMS,
+			TailCount: fixture.TailCount, TailMS: fixture.TailMS,
+		}
+		return g.waitLatencySentinel(fixture.Service, uint64(fixture.LowCount+fixture.TailCount), 30*time.Second)
+	})
+}
+
 // --- measurement ----------------------------------------------------------
 
 func (g *gate) measure(prefill prefillFacts) error {
@@ -719,8 +923,35 @@ func (g *gate) collectQueries(prefill prefillFacts) {
 	g.res.Queries.PrefillRangeStart = start
 	g.res.Queries.PrefillRangeEnd = end
 	g.res.Queries.PrefillWindows = len(expected)
+	g.res.Queries.PrefillSeries = prefill.Series
+	g.res.Queries.PrefillServices = prefill.Services
+	if g.cfg.Certification.Required {
+		g.res.Queries.LatencyChecks = g.runQueryLatencyChecks()
+	}
 	g.res.Queries.Checks = g.runAPIChecks(start, end, expected)
+	for i := range g.res.Queries.Checks {
+		switch g.res.Queries.Checks[i].Name {
+		case "dashboard_seven_day":
+			g.res.Queries.Checks[i].ExpectedScalars = map[string]float64{
+				"total_traces":    float64(prefill.Requests),
+				"total_errors":    float64(prefill.RequestErrors),
+				"requests":        float64(prefill.Requests),
+				"request_errors":  float64(prefill.RequestErrors),
+				"spans":           float64(prefill.Spans),
+				"span_errors":     float64(prefill.SpanErrors),
+				"total_logs":      float64(prefill.Logs),
+				"active_services": float64(prefill.Services),
+			}
+		case "service_map_seven_day":
+			g.res.Queries.Checks[i].ExpectedScalars = map[string]float64{
+				"services": float64(prefill.Services),
+			}
+		}
+	}
 	g.res.Queries.MCPTools = g.runMCPTools(start, end)
+	if g.cfg.Certification.Required {
+		g.res.Queries.LatencySentinel.Surfaces = g.collectLatencySentinel()
+	}
 }
 
 // collectCrashBounds compares the post-restart per-window span totals against

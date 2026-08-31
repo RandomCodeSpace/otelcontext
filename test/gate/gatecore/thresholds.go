@@ -14,13 +14,14 @@ type Thresholds struct {
 	// rate may sit before the phase is judged not to have run at the
 	// contracted load. A phase that quietly ran at 4k pts/s must not pass a
 	// 10k pts/s gate on the strength of its excellent latency.
-	SustainedRateTolerance    float64 `json:"sustained_rate_tolerance"`
-	AckP99MaxMs               float64 `json:"ack_p99_max_ms"`
-	AckRatioMin               float64 `json:"ack_ratio_min"`
-	MaxResourceExhausted      int64   `json:"max_resource_exhausted"`
-	MaxLatePointsDelta        float64 `json:"max_late_points_delta"`
-	MaxAdmissionRejectedDelta float64 `json:"max_admission_rejected_delta"`
-	MaxIdentityOverflowDelta  float64 `json:"max_identity_overflow_delta"`
+	SustainedRateTolerance     float64 `json:"sustained_rate_tolerance"`
+	AckP99MaxMs                float64 `json:"ack_p99_max_ms"`
+	AckRatioMin                float64 `json:"ack_ratio_min"`
+	MaxResourceExhausted       int64   `json:"max_resource_exhausted"`
+	MaxLatePointsDelta         float64 `json:"max_late_points_delta"`
+	MaxAdmissionRejectedDelta  float64 `json:"max_admission_rejected_delta"`
+	MaxIdentityOverflowDelta   float64 `json:"max_identity_overflow_delta"`
+	MaxIngestPipelineDropDelta float64 `json:"max_ingest_pipeline_drop_delta"`
 
 	// BacklogAllowanceFraction and BacklogAllowanceFloorRows define "no
 	// sustained backlog growth": the fitted growth across the phase and the
@@ -61,8 +62,14 @@ type Thresholds struct {
 	ProjectionHorizonWindows int     `json:"projection_horizon_windows"`
 
 	// --- Query completeness ---
-	PrefillWindows int `json:"prefill_windows"`
-	PrefillSeries  int `json:"prefill_series"`
+	PrefillWindows          int     `json:"prefill_windows"`
+	PrefillSeries           int     `json:"prefill_series"`
+	PrefillServices         int     `json:"prefill_services"`
+	ColdQueryMaxSeconds     float64 `json:"cold_query_max_seconds"`
+	WarmQueryP95MaxSeconds  float64 `json:"warm_query_p95_max_seconds"`
+	SevenDayQueryMaxSeconds float64 `json:"seven_day_query_max_seconds"`
+	MCPQueryMaxSeconds      float64 `json:"mcp_query_max_seconds"`
+	ProbeMaxSeconds         float64 `json:"probe_max_seconds"`
 	// RequiredCoverage is the marker a fully aggregate-derived surface must
 	// declare. Per-surface expectations live in QueryConfig.
 	RequiredCoverage string `json:"required_coverage"`
@@ -78,15 +85,16 @@ const (
 // DefaultThresholds returns the frozen contract.
 func DefaultThresholds() Thresholds {
 	return Thresholds{
-		SustainedHours:            3,
-		SustainedPointsPerSec:     10000,
-		SustainedRateTolerance:    0.05,
-		AckP99MaxMs:               500,
-		AckRatioMin:               0.999,
-		MaxResourceExhausted:      0,
-		MaxLatePointsDelta:        0,
-		MaxAdmissionRejectedDelta: 0,
-		MaxIdentityOverflowDelta:  0,
+		SustainedHours:             3,
+		SustainedPointsPerSec:      10000,
+		SustainedRateTolerance:     0.05,
+		AckP99MaxMs:                500,
+		AckRatioMin:                0.999,
+		MaxResourceExhausted:       0,
+		MaxLatePointsDelta:         0,
+		MaxAdmissionRejectedDelta:  0,
+		MaxIdentityOverflowDelta:   0,
+		MaxIngestPipelineDropDelta: 0,
 
 		BacklogAllowanceFraction:  0.10,
 		BacklogAllowanceFloorRows: 5000,
@@ -114,8 +122,14 @@ func DefaultThresholds() Thresholds {
 		ProjectionZ:              2,
 		ProjectionHorizonWindows: HorizonWindows,
 
-		PrefillWindows:   2016,
-		PrefillSeries:    6000,
-		RequiredCoverage: "full",
+		PrefillWindows:          2016,
+		PrefillSeries:           6000,
+		PrefillServices:         120,
+		ColdQueryMaxSeconds:     5,
+		WarmQueryP95MaxSeconds:  0.5,
+		SevenDayQueryMaxSeconds: 15,
+		MCPQueryMaxSeconds:      5,
+		ProbeMaxSeconds:         1,
+		RequiredCoverage:        "full",
 	}
 }

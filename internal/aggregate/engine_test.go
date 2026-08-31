@@ -9,7 +9,7 @@ import (
 
 // testEngine builds an engine with a fixed clock and generous caps, so a test
 // that is not about cardinality never trips a cap by accident.
-func testEngine(t *testing.T, now time.Time) *Engine {
+func testEngine(t testing.TB, now time.Time) *Engine {
 	t.Helper()
 	e, err := NewEngine(EngineConfig{
 		Mode: ModeShadow,
@@ -21,7 +21,7 @@ func testEngine(t *testing.T, now time.Time) *Engine {
 	return e
 }
 
-func mustTime(t *testing.T, s string) time.Time {
+func mustTime(t testing.TB, s string) time.Time {
 	t.Helper()
 	ts, err := time.Parse(time.RFC3339, s)
 	if err != nil {

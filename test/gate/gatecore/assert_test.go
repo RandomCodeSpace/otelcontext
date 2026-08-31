@@ -122,7 +122,7 @@ func passingResult() *Result {
 		Projection: FitProjection(synthSamples(24, 1*GiB, 4*MiB, 0), 576, 2, 6),
 	}
 
-	// Sustained-phase counter samples: the three silent-drop counters do not
+	// Sustained-phase counter samples: the silent-drop counters do not
 	// move, and the backlog oscillates without trending.
 	for i := 0; i < 20; i++ {
 		r.MetricSeries = append(r.MetricSeries, MetricSample{
@@ -131,6 +131,7 @@ func passingResult() *Result {
 				"otelcontext_aggregate_late_points_total":        0,
 				"otelcontext_aggregate_admission_rejected_total": 0,
 				"otelcontext_aggregate_identity_overflow_total":  0,
+				"otelcontext_ingest_pipeline_dropped_total":      0,
 				cfg.Sampling.BacklogMetric:                       10000,
 			},
 		})
@@ -162,6 +163,126 @@ func TestPassingResultPasses(t *testing.T) {
 	}
 	if len(r.Assertions) == 0 {
 		t.Fatal("no assertions produced")
+	}
+}
+
+func certifyingResult() *Result {
+	r := passingResult()
+	r.Config.Certification.Required = true
+	r.Config.Confinement.AllowFallback = false
+	digest := strings.Repeat("a", 64)
+	commit := strings.Repeat("b", 40)
+	r.Provenance = Provenance{
+		CommitSHA: commit, ExpectedCommitSHA: commit, CandidateTag: "v1.0.0", TagCommitSHA: commit,
+		BinarySHA256:         map[string]string{"server": digest, "gate": digest, "loadsim": digest, "prefill": digest},
+		ExpectedServerSHA256: digest, ArchivePath: "/proof/release.tar.gz", ArchiveSHA256: digest,
+		ExpectedArchiveSHA256: digest, ConfigPath: "/repo/test/gate/release.config.json", ConfigSHA256: digest,
+		ServerVersion: "v1.0.0",
+	}
+	r.Host = HostInfo{OS: "linux", Arch: "amd64", CgroupV2: true, DataDirFSType: "ext4", DataDir: "/proof/data"}
+	r.Phases = append(r.Phases, Phase{Name: "latency_sentinel", Completed: true})
+	for _, command := range []struct {
+		name string
+		exit int
+	}{
+		{"prefill", 0}, {"server-initial", -1}, {"main_load", 0}, {"post_burst", 0},
+		{"crash_run", 0}, {"server-restarted", -1}, {"latency_sentinel", 0},
+	} {
+		r.Commands = append(r.Commands, Command{Phase: command.name, Argv: []string{"tool"}, ExitCode: command.exit})
+	}
+	for i := range r.MetricSeries {
+		if r.MetricSeries[i].Phase != "sustained" {
+			continue
+		}
+		for _, metric := range r.Config.Sampling.RequiredMetrics {
+			if _, exists := r.MetricSeries[i].Values[metric]; !exists {
+				r.MetricSeries[i].Values[metric] = 0
+			}
+		}
+	}
+	r.Queries.PrefillSeries = 6000
+	r.Queries.PrefillServices = 120
+	r.Queries.Checks = append(r.Queries.Checks, QueryCheck{
+		Name: "service_map_seven_day", URL: "/api/metrics/service-map", Status: 200,
+		Coverage: "full", CoverageExpected: "full", DurationSec: 1,
+		Scalars: map[string]float64{"services": 120}, ExpectedScalars: map[string]float64{"services": 120},
+	})
+	for i := range r.Queries.Checks {
+		r.Queries.Checks[i].DurationSec = 1
+		if r.Queries.Checks[i].Name == "dashboard_seven_day" {
+			r.Queries.Checks[i].Scalars = map[string]float64{"requests": 42}
+			r.Queries.Checks[i].ExpectedScalars = map[string]float64{"requests": 42}
+		}
+	}
+	for i := range r.Queries.MCPTools {
+		r.Queries.MCPTools[i].DurationSec = 1
+	}
+	warm := make([]float64, 20)
+	for i := range warm {
+		warm[i] = 0.1
+	}
+	r.Queries.LatencyChecks = []QueryLatencyCheck{
+		{Name: "default_dashboard", URL: "/api/metrics/dashboard", Status: 200, ColdSeconds: 1, ColdCache: "MISS", WarmSeconds: warm, WarmCacheHits: 20, WarmP50: 0.1, WarmP95: 0.1, WarmMax: 0.1},
+		{Name: "system_graph", URL: "/api/system/graph", Status: 200, ColdSeconds: 1, ColdCache: "MISS", WarmSeconds: warm, WarmCacheHits: 20, WarmP50: 0.1, WarmP95: 0.1, WarmMax: 0.1},
+		{Name: "live", URL: "/live", Status: 200, ColdSeconds: 0.1},
+		{Name: "ready", URL: "/ready", Status: 200, ColdSeconds: 0.1},
+	}
+	r.Queries.LatencySentinel = LatencySentinelProof{
+		Service: "latency-sentinel", LowCount: 989, LowMS: 10, TailCount: 11, TailMS: 1000,
+	}
+	for _, name := range []string{"rest_dashboard", "rest_system_graph", "websocket_dashboard", "graphrag_service", "mcp_get_service_map", "mcp_get_service_health"} {
+		r.Queries.LatencySentinel.Surfaces = append(r.Queries.LatencySentinel.Surfaces, LatencySurface{
+			Name: name, ValueMS: 1000, Status: "approximate", Method: "ddsketch", SampleCount: 1000,
+			SketchScale: 4, RelativeErrorBound: sketchRelativeError(4),
+		})
+	}
+	return r
+}
+
+func TestCertifyingResultRequiresExactNonDegradedEvidence(t *testing.T) {
+	passing := certifyingResult()
+	passing.Finalize()
+	if !passing.Passed {
+		t.Fatalf("reference certifying result failed:\n  %s", strings.Join(passing.Failures, "\n  "))
+	}
+
+	cases := []struct {
+		name          string
+		id            string
+		breakEvidence func(*Result)
+	}{
+		{"candidate digest", "candidate.server_digest", func(r *Result) { r.Provenance.BinarySHA256["server"] = strings.Repeat("f", 64) }},
+		{"missing required metric", "candidate.metric.otelcontext_ingest_pipeline_dropped_total", func(r *Result) {
+			for i := range r.MetricSeries {
+				delete(r.MetricSeries[i].Values, "otelcontext_ingest_pipeline_dropped_total")
+			}
+		}},
+		{"metric missing from one scrape", "candidate.metric.otelcontext_aggregate_input_points_total", func(r *Result) {
+			delete(r.MetricSeries[0].Values, "otelcontext_aggregate_input_points_total")
+		}},
+		{"wrong scalar", "query.api.dashboard_seven_day.scalar.requests", func(r *Result) { r.Queries.Checks[1].Scalars["requests"] = 41 }},
+		{"wrong service map count", "query.api.service_map_seven_day.scalar.services", func(r *Result) { r.Queries.Checks[2].Scalars["services"] = 119 }},
+		{"slow warm query", "query.latency.default_dashboard.warm_p95", func(r *Result) { r.Queries.LatencyChecks[0].WarmP95 = 0.6 }},
+		{"collapsed latency proof", "latency_sentinel.rest_dashboard", func(r *Result) { r.Queries.LatencySentinel.Surfaces[0].Collapsed = true }},
+		{"inflated latency bound", "latency_sentinel.rest_dashboard", func(r *Result) { r.Queries.LatencySentinel.Surfaces[0].RelativeErrorBound = 0.5 }},
+		{"degraded confinement evidence", "certification.degraded_evidence", func(r *Result) {
+			r.Confinement = Confinement{
+				Mode: ConfinementTaskset, TasksetCPUs: "0,1", GOMAXPROCS: 2,
+				EffectiveCPUs: 2, Note: TasksetNote,
+			}
+			r.Memory.Basis = string(ConfinementTaskset)
+			r.Memory.PeakSource = "/proc/1/status VmHWM"
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := certifyingResult()
+			tc.breakEvidence(r)
+			r.Finalize()
+			if assertionByID(t, r, tc.id).Pass {
+				t.Fatalf("%s passed after its evidence was broken", tc.id)
+			}
+		})
 	}
 }
 

@@ -67,6 +67,19 @@ func NewPrometheusRecorder(m *telemetry.Metrics) MetricsRecorder {
 	if m == nil {
 		return noopRecorder{}
 	}
+	// Prometheus omits a CounterVec until at least one child exists. Materialize
+	// every bounded zero-drop label up front so a release gate can distinguish
+	// an explicit zero from a renamed or deleted metric family.
+	for signal := SignalTraceOp; signal <= signalMax; signal++ {
+		for _, reason := range []PointDisposition{PointLate, PointFuture} {
+			m.AggregateLatePointsTotal.WithLabelValues(signal.String(), reason.String())
+		}
+	}
+	for kind := KindTenant; kind <= kindMax; kind++ {
+		for _, bound := range []string{"length", "count"} {
+			m.AggregateIdentityOverflowTotal.WithLabelValues(kind.String(), bound)
+		}
+	}
 	return promRecorder{m: m}
 }
 
@@ -149,6 +162,9 @@ type promStoreRecorder struct{ m *telemetry.Metrics }
 func NewPrometheusStoreMetrics(m *telemetry.Metrics) StoreMetrics {
 	if m == nil {
 		return noopStoreMetrics{}
+	}
+	for _, bound := range []string{"bytes", "waiters", "deltas"} {
+		m.AggregateAdmissionRejectedTotal.WithLabelValues(bound)
 	}
 	return promStoreRecorder{m: m}
 }
