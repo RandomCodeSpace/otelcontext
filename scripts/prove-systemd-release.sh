@@ -219,13 +219,13 @@ verify_archive() {
   for file in "$checksums" "$signature" "$certificate" "$sbom"; do
     [[ -s "$file" ]] || die "$label release evidence is missing $file"
   done
-  [[ "$(grep -Fc "  $archive_name" "$checksums")" -eq 1 ]] || die "$label archive checksum entry is missing or duplicated"
-  [[ "$(grep -Fc "  $(basename "$sbom")" "$checksums")" -eq 1 ]] || die "$label SBOM checksum entry is missing or duplicated"
+  [[ "$(awk -v name="$archive_name" '$2 == name { count++ } END { print count + 0 }' "$checksums")" -eq 1 ]] || die "$label archive checksum entry is missing or duplicated"
+  [[ "$(awk -v name="$(basename "$sbom")" '$2 == name { count++ } END { print count + 0 }' "$checksums")" -eq 1 ]] || die "$label SBOM checksum entry is missing or duplicated"
   (
     cd "$asset_dir"
     {
-      grep -F "  $archive_name" checksums.txt
-      grep -F "  $(basename "$sbom")" checksums.txt
+      awk -v name="$archive_name" '$2 == name' checksums.txt
+      awk -v name="$(basename "$sbom")" '$2 == name' checksums.txt
     } | sha256sum --check -
   ) >"$proof_dir/$label-checksum.txt"
   decode_certificate "$certificate" "$decoded"
