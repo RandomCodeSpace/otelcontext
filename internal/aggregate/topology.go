@@ -559,15 +559,20 @@ func touchTimes(entry *topoEntry, d *AggregateDelta, window int64) {
 }
 
 // pruneTenantLocked drops windows behind the retention cutoff and forgets
-// entities that no longer hold any window.
-func (p *topologyProjection) pruneTenantLocked(tt *tenantTopology, cutoff int64) {
+// entities that no longer hold any window. It reports whether the visible
+// replacement changed.
+func (p *topologyProjection) pruneTenantLocked(tt *tenantTopology, cutoff int64) (changed bool) {
 	for name, e := range tt.services {
-		if pruneEntry(e, cutoff) {
+		empty, pruned := pruneEntry(e, cutoff)
+		changed = changed || pruned
+		if empty {
 			delete(tt.services, name)
 		}
 	}
 	for key, e := range tt.ops {
-		if pruneEntry(e, cutoff) {
+		empty, pruned := pruneEntry(e, cutoff)
+		changed = changed || pruned
+		if empty {
 			delete(tt.ops, key)
 			if n := tt.opsPerService[key.a]; n > 1 {
 				tt.opsPerService[key.a] = n - 1
@@ -577,38 +582,47 @@ func (p *topologyProjection) pruneTenantLocked(tt *tenantTopology, cutoff int64)
 		}
 	}
 	for key, e := range tt.edges {
-		if pruneEntry(e, cutoff) {
+		empty, pruned := pruneEntry(e, cutoff)
+		changed = changed || pruned
+		if empty {
 			delete(tt.edges, key)
 		}
 	}
 	for key, e := range tt.metrics {
-		if pruneEntry(e, cutoff) {
+		empty, pruned := pruneEntry(e, cutoff)
+		changed = changed || pruned
+		if empty {
 			delete(tt.metrics, key)
 		}
 	}
+	return changed
 }
 
 // pruneEntry drops expired windows and reports whether the entry is now empty.
-func pruneEntry(e *topoEntry, cutoff int64) bool {
+func pruneEntry(e *topoEntry, cutoff int64) (empty, changed bool) {
 	for start := range e.windows {
 		if start < cutoff {
 			delete(e.windows, start)
+			changed = true
 		}
 	}
-	return len(e.windows) == 0
+	return len(e.windows) == 0, changed
 }
 
 // Prune drops windows past the retention horizon for every tenant. The fold
 // path prunes the tenants it touches; this is what keeps a tenant that has gone
 // silent from holding its last windows forever.
-func (p *topologyProjection) Prune(now time.Time) {
+func (p *topologyProjection) Prune(now time.Time, nextRevision func() uint64) {
 	cutoff := p.retainCutoff(now)
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	for tenant, tt := range p.tenants {
-		p.pruneTenantLocked(tt, cutoff)
-		if len(tt.services) == 0 && len(tt.ops) == 0 && len(tt.edges) == 0 && len(tt.metrics) == 0 {
-			delete(p.tenants, tenant)
+	var revision uint64
+	for _, tt := range p.tenants {
+		if p.pruneTenantLocked(tt, cutoff) {
+			if revision == 0 {
+				revision = nextRevision()
+			}
+			tt.revision = revision
 		}
 	}
 }
@@ -642,10 +656,14 @@ func (p *topologyProjection) Revision(tenant string) uint64 {
 // the sketch here, so the consumer never touches engine state.
 func (p *topologyProjection) Snapshot(tenant string, now time.Time) TopologySnapshot {
 	snap := TopologySnapshot{
-		Tenant:  tenant,
-		Epoch:   p.epoch,
-		Now:     now,
-		Horizon: p.cfg.Horizon,
+		Tenant:     tenant,
+		Epoch:      p.epoch,
+		Now:        now,
+		Horizon:    p.cfg.Horizon,
+		Services:   []TopologyService{},
+		Operations: []TopologyOperation{},
+		Edges:      []SnapshotEdge{},
+		Metrics:    []TopologyMetric{},
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()

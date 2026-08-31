@@ -1,6 +1,7 @@
 package aggregate
 
 import (
+	"strconv"
 	"testing"
 	"time"
 )
@@ -155,6 +156,61 @@ func TestTopologyPartialWindowMetadata(t *testing.T) {
 	}
 	if w.Elapsed != WindowSize {
 		t.Fatalf("closed window elapsed = %v, want %v", w.Elapsed, WindowSize)
+	}
+}
+
+func TestTopologyExpiryPublishesEmptyTombstone(t *testing.T) {
+	start := mustTime(t, "2026-08-21T12:02:00Z")
+	clock := start
+	e, err := NewEngine(EngineConfig{
+		Mode:  ModeAggregate,
+		Epoch: 12345,
+		Now:   func() time.Time { return clock },
+		Topology: TopologyConfig{
+			Horizon: 5 * time.Minute,
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+
+	r := e.NewReducer(clock)
+	reduceSpanAt(r, "acme", "checkout", "/pay", 0, 1000, clock)
+	if _, err := e.ApplyReducerErr(r); err != nil {
+		t.Fatalf("ApplyReducerErr: %v", err)
+	}
+	before := e.Revision()
+	if e.TopologySnapshot("acme").Empty() {
+		t.Fatal("fixture topology is empty before expiry")
+	}
+
+	clock = start.Add(30 * time.Minute)
+	e.PruneTopology()
+	if got := e.Revision(); got <= before {
+		t.Fatalf("engine revision did not advance on visible expiry: %d -> %d", before, got)
+	}
+	snap := e.TopologySnapshot("acme")
+	if !snap.Empty() || snap.Revision != e.Revision() {
+		t.Fatalf("expiry snapshot = %+v, want an empty replacement at revision %d", snap, e.Revision())
+	}
+	if snap.Services == nil || snap.Edges == nil {
+		t.Fatalf("empty tombstone has nil replacement slices: services=%v edges=%v", snap.Services, snap.Edges)
+	}
+	found := false
+	for _, tenant := range e.TopologyTenants() {
+		found = found || tenant == "acme"
+	}
+	if !found {
+		t.Fatal("expired tenant tombstone was removed before consumers could clear state")
+	}
+
+	stable := e.Revision()
+	e.PruneTopology()
+	if got := e.Revision(); got != stable {
+		t.Fatalf("idempotent prune moved revision: %d -> %d", stable, got)
+	}
+	if got, want := e.Epoch(), strconv.FormatUint(e.TopologyEpoch(), 36); got != want {
+		t.Fatalf("query epoch %q and topology epoch %q identify different generations", got, want)
 	}
 }
 

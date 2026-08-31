@@ -82,6 +82,50 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+  topology-proof:
+    name: topology proof · ${{ matrix.mode }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [legacy, aggregate-shadow, aggregate]
+    env:
+      CGO_ENABLED: "1"
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: run cross-consumer topology proof
+        env:
+          OTELCONTEXT_TOPOLOGY_PROOF_MODE: ${{ matrix.mode }}
+          OTELCONTEXT_TOPOLOGY_PROOF_DIR: ${{ runner.temp }}/topology-proof
+        run: |
+          set -o pipefail
+          mkdir -p "${OTELCONTEXT_TOPOLOGY_PROOF_DIR}"
+          go test -race -count=1 -v -run '^TestTopologyModeProof$' ./test/topologyproof 2>&1 \
+            | tee "${OTELCONTEXT_TOPOLOGY_PROOF_DIR}/${OTELCONTEXT_TOPOLOGY_PROOF_MODE}.log"
+          jq -e --arg mode "${OTELCONTEXT_TOPOLOGY_PROOF_MODE}" '
+            .schema_version == "otelcontext.topology-proof.v1" and
+            .mode == $mode and
+            (.edge_set | length) == 1 and
+            (.assertions | length) >= 10 and
+            all(.assertions[]; .passed == true)
+          ' "${OTELCONTEXT_TOPOLOGY_PROOF_DIR}/${OTELCONTEXT_TOPOLOGY_PROOF_MODE}.json"
+
+      - name: upload mode topology proof
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: topology-proof-${{ matrix.mode }}-${{ github.sha }}
+          path: ${{ runner.temp }}/topology-proof
+          if-no-files-found: error
+          retention-days: 14
+
   database-sqlite:
     name: database proof · sqlite
     runs-on: ubuntu-24.04

@@ -28,6 +28,7 @@ import (
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 	"github.com/RandomCodeSpace/otelcontext/internal/telemetry"
 	tlsbootstrap "github.com/RandomCodeSpace/otelcontext/internal/tls"
+	"github.com/RandomCodeSpace/otelcontext/internal/topology"
 	"github.com/RandomCodeSpace/otelcontext/internal/tsdb"
 	"github.com/RandomCodeSpace/otelcontext/internal/ui"
 
@@ -358,9 +359,6 @@ func main() {
 		func(msgType string) { metrics.WSMessagesSent.WithLabelValues(msgType).Inc() },
 		func() { metrics.WSSlowClientsRemoved.Inc() },
 	)
-	go hub.Run()
-	slog.Info("🔌 WebSocket hub started")
-
 	// 4b. Initialize Event Notification Hub (for live mode — pushes data snapshots)
 	eventHub := realtime.NewEventHub(
 		repo,
@@ -477,15 +475,6 @@ func main() {
 	graphRAG := graphrag.New(repo, tsdbAgg, ringBuf, graphRAGCfg)
 	graphRAG.SetMetrics(metrics)
 	ctxGraphRAG, cancelGraphRAG := context.WithCancel(context.Background())
-	go graphRAG.Start(ctxGraphRAG)
-	slog.Info("GraphRAG started (layered graph with anomaly detection)",
-		"workers", cfg.GraphRAGWorkerCount,
-		"event_queue_size", cfg.GraphRAGEventQueueSize,
-		"trace_ttl", graphRAGCfg.TraceTTL,
-		"max_spans_per_tenant", graphRAGCfg.MaxSpansPerTenant,
-		"tenant_idle_ttl", graphRAGCfg.TenantIdleTTL,
-		"mode", graphRAGCfg.Mode,
-	)
 
 	// 5. Initialize AI Service.
 	// Workers inherit aiCtx so an in-flight LLM call (30s timeout) is
@@ -495,26 +484,6 @@ func main() {
 	aiCtx, aiCancel := context.WithCancel(appCtx)
 	aiService := ai.NewService(repo)
 	aiService.SetParentContext(aiCtx)
-
-	// 6. Initialize API Server
-	apiServer := api.NewServer(repo, hub, eventHub, metrics)
-	apiServer.SetGraph(svcGraph)
-	apiServer.SetGraphRAG(graphRAG)
-
-	// 6b. Initialize MCP Server (HTTP Streamable, JSON-RPC 2.0 + SSE)
-	mcpServer := mcp.New(cfg.DefaultTenant, repo, metrics, svcGraph)
-	mcpServer.SetGraphRAG(graphRAG)
-	mcpServer.SetCallLimit(cfg.MCPMaxConcurrent)
-	mcpServer.SetCallTimeout(time.Duration(cfg.MCPCallTimeoutMs) * time.Millisecond)
-	mcpServer.SetCacheTTL(time.Duration(cfg.MCPCacheTTLMs) * time.Millisecond)
-	slog.Info("🤖 MCP server initialized",
-		"path", cfg.MCPPath,
-		"enabled", cfg.MCPEnabled,
-		"default_tenant", cfg.DefaultTenant,
-		"max_concurrent", cfg.MCPMaxConcurrent,
-		"call_timeout_ms", cfg.MCPCallTimeoutMs,
-		"cache_ttl_ms", cfg.MCPCacheTTLMs,
-	)
 
 	// 7. Initialize OTLP Ingestion (gRPC)
 	traceServer := ingest.NewTraceServer(repo, metrics, cfg)
@@ -676,14 +645,6 @@ func main() {
 		// miner of its own in either mode, so the two never disagree about a
 		// template's identity (#163).
 		aggEngine.SetTemplateFactSink(graphRAG.OnTemplateFact)
-		// Aggregate mode: GraphRAG replaces its topology from the engine's
-		// per-revision snapshot instead of rescanning the spans table (#174).
-		if cfg.AggregateMode == aggregate.ModeAggregate {
-			graphRAG.SetAggregateSource(aggEngine)
-			slog.Info("🧭 GraphRAG consuming aggregate topology snapshots (raw-span rebuild retired)",
-				"epoch", aggEngine.TopologyEpoch(),
-			)
-		}
 		slog.Info("🧮 Aggregate engine enabled",
 			"mode", cfg.AggregateMode,
 			"max_series", cfg.AggregateMaxSeries,
@@ -726,6 +687,62 @@ func main() {
 		}
 	}
 
+	// Select the topology owner once, after every possible producer exists and
+	// before any HTTP or WebSocket listener starts. Aggregate mode is strict:
+	// a missing or mode-mismatched engine is a startup error, never a silent
+	// fallback to stale raw-span topology.
+	var topologyProvider topology.Provider
+	if cfg.AggregateMode == aggregate.ModeAggregate {
+		provider, err := topology.NewAggregateProvider(aggEngine)
+		if err != nil {
+			fatal("❌ Aggregate topology provider rejected", err)
+		}
+		topologyProvider = provider
+		graphRAG.SetAggregateSource(provider)
+		slog.Info("🧭 GraphRAG consuming aggregate topology snapshots (raw-span rebuild retired)",
+			"epoch", provider.Identity(context.Background()).Epoch,
+		)
+	} else {
+		provider, err := topology.NewLegacyProvider(repo, svcGraph, graphRAG)
+		if err != nil {
+			fatal("❌ Legacy topology provider rejected", err)
+		}
+		topologyProvider = provider
+	}
+	go graphRAG.Start(ctxGraphRAG)
+	slog.Info("GraphRAG started (layered graph with anomaly detection)",
+		"workers", cfg.GraphRAGWorkerCount,
+		"event_queue_size", cfg.GraphRAGEventQueueSize,
+		"trace_ttl", graphRAGCfg.TraceTTL,
+		"max_spans_per_tenant", graphRAGCfg.MaxSpansPerTenant,
+		"tenant_idle_ttl", graphRAGCfg.TenantIdleTTL,
+		"mode", graphRAGCfg.Mode,
+		"topology_source", topologyProvider.Source(),
+	)
+
+	// 6. Initialize API Server
+	apiServer := api.NewServer(repo, hub, eventHub, metrics)
+	apiServer.SetGraph(svcGraph)
+	apiServer.SetGraphRAG(graphRAG)
+	apiServer.SetTopologyProvider(topologyProvider)
+
+	// 6b. Initialize MCP Server (HTTP Streamable, JSON-RPC 2.0 + SSE)
+	mcpServer := mcp.New(cfg.DefaultTenant, repo, metrics, topologyProvider)
+	mcpServer.SetGraphRAG(graphRAG)
+	mcpServer.SetCallLimit(cfg.MCPMaxConcurrent)
+	mcpServer.SetCallTimeout(time.Duration(cfg.MCPCallTimeoutMs) * time.Millisecond)
+	mcpServer.SetCacheTTL(time.Duration(cfg.MCPCacheTTLMs) * time.Millisecond)
+	slog.Info("🤖 MCP server initialized",
+		"path", cfg.MCPPath,
+		"enabled", cfg.MCPEnabled,
+		"default_tenant", cfg.DefaultTenant,
+		"max_concurrent", cfg.MCPMaxConcurrent,
+		"call_timeout_ms", cfg.MCPCallTimeoutMs,
+		"cache_ttl_ms", cfg.MCPCacheTTLMs,
+	)
+
+	hub.SetTopologyProvider(topologyProvider, realtime.DefaultPublishFloor)
+
 	// Aggregate READ path (#175). Only AGGREGATE_MODE=aggregate switches the
 	// dashboard, the WebSocket publisher and the MCP coverage metadata over;
 	// shadow mode writes aggregates but keeps serving the legacy reads.
@@ -736,11 +753,9 @@ func main() {
 		// revision-driven snapshot.
 		hub.SetAggregateMode(true)
 		eventHub.SetAggregatePublisher(realtime.NewEnginePublisher(realtime.EnginePublisherConfig{
-			Engine: aggEngine,
-			Tenant: cfg.DefaultTenant,
-			Edges: func(ctx context.Context) []storage.ServiceMapEdge {
-				return graphRAGServiceEdges(ctx, graphRAG)
-			},
+			Engine:   aggEngine,
+			Topology: topologyProvider,
+			Tenant:   cfg.DefaultTenant,
 		}), realtime.DefaultPublishFloor)
 		slog.Info("📊 Aggregate read path enabled",
 			"epoch", aggEngine.Epoch(),
@@ -748,6 +763,9 @@ func main() {
 			"note", "dashboard, topology and WebSocket snapshots are served from the aggregate engine",
 		)
 	}
+
+	go hub.Run()
+	slog.Info("🔌 WebSocket hub started", "topology_source", topologyProvider.Source())
 
 	go eventHub.Start(ctxEvents, 5*time.Second, 500*time.Millisecond)
 	slog.Info("⚡ Event notification hub started (5s snapshots, 500ms batches)")
@@ -1598,31 +1616,6 @@ func printBanner() {
   version: %s
 `
 	fmt.Printf(banner, Version)
-}
-
-// graphRAGServiceEdges projects the GraphRAG service store's CALLS edges into
-// the storage topology shape. Caller/callee identity is not part of an
-// aggregate SeriesKey, so the aggregate read path sources edges here — which is
-// also why any response carrying them is marked "sampled" rather than "full".
-func graphRAGServiceEdges(ctx context.Context, g *graphrag.GraphRAG) []storage.ServiceMapEdge {
-	if g == nil {
-		return nil
-	}
-	all := g.AllServiceEdges(ctx)
-	edges := make([]storage.ServiceMapEdge, 0, len(all))
-	for _, e := range all {
-		if e.Type != "CALLS" {
-			continue
-		}
-		edges = append(edges, storage.ServiceMapEdge{
-			Source:       e.FromID,
-			Target:       e.ToID,
-			CallCount:    e.CallCount,
-			AvgLatencyMs: e.AvgMs,
-			ErrorRate:    e.ErrorRate,
-		})
-	}
-	return edges
 }
 
 // fileBytes returns the size of one file, or 0 when it cannot be stat'ed.

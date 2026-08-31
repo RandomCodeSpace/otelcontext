@@ -35,6 +35,13 @@ type LiveSnapshot struct {
 	Reset        bool   `json:"reset,omitempty"`
 	Coverage     string `json:"coverage,omitempty"`
 	CoverageNote string `json:"coverage_note,omitempty"`
+	Source       string `json:"source,omitempty"`
+	Truncated    bool   `json:"truncated,omitempty"`
+
+	DroppedServices   uint64 `json:"dropped_services,omitempty"`
+	DroppedOperations uint64 `json:"dropped_operations,omitempty"`
+	DroppedEdges      uint64 `json:"dropped_edges,omitempty"`
+	DroppedMetrics    uint64 `json:"dropped_metrics,omitempty"`
 }
 
 // AggregatePublisher supplies revision-driven snapshots in aggregate mode. It
@@ -149,9 +156,10 @@ type EventHub struct {
 	aggPub       AggregatePublisher
 	publishFloor time.Duration
 	// lastEpoch and lastRev are what was last published to every client.
-	lastEpoch string
-	lastRev   uint64
-	published bool
+	lastEpoch  string
+	lastRev    uint64
+	published  bool
+	retryReset bool
 }
 
 // NewEventHub creates a new event notification hub.
@@ -350,7 +358,13 @@ func (h *EventHub) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// Send immediate FULL snapshot so the client has data right away. In
 	// aggregate mode it carries {epoch, revision} and reset=true: a fresh
 	// client has nothing to merge into and must adopt the snapshot whole.
-	h.sendSnapshotTo(cf)
+	if !h.sendSnapshotTo(cf) && h.aggregatePublisher() != nil {
+		// A failed reconnect seed must remain retryable even when the revision
+		// was observed earlier while no clients were connected.
+		h.mu.Lock()
+		h.retryReset = true
+		h.mu.Unlock()
+	}
 
 	// Read loop: client can send {"service":"xxx"} to change filter. The
 	// tenant scope is not negotiable and is deliberately absent here.
@@ -545,20 +559,22 @@ func (h *EventHub) sendBatch(cf *clientFilter, batchType string, data any) {
 	h.deliver(cf, msg)
 }
 
-// sendSnapshotTo sends a snapshot to a single client.
-func (h *EventHub) sendSnapshotTo(cf *clientFilter) {
+// sendSnapshotTo sends a snapshot to a single client and reports whether a
+// full replacement was queued.
+func (h *EventHub) sendSnapshotTo(cf *clientFilter) bool {
 	snapshot := h.snapshotFor(scopeKey{tenant: cf.tenant, service: cf.service})
 	if snapshot == nil {
-		return
+		return false
 	}
 	if h.aggregatePublisher() != nil {
 		snapshot.Reset = true
 	}
 	msg, err := json.Marshal(snapshot)
 	if err != nil {
-		return
+		return false
 	}
 	h.deliver(cf, msg)
+	return true
 }
 
 // snapshotFor produces the payload for one scope from whichever source owns
@@ -616,34 +632,48 @@ func (h *EventHub) publishIfChanged() {
 	epoch, rev := pub.Epoch(), pub.Revision()
 
 	h.mu.Lock()
-	if h.published && h.lastEpoch == epoch && h.lastRev == rev {
+	if h.published && !h.retryReset && h.lastEpoch == epoch && h.lastRev == rev {
 		h.mu.Unlock()
 		return
 	}
-	// An epoch change means the revision counter restarted: clients cannot
-	// merge across it and are told to reset.
-	reset := h.published && h.lastEpoch != epoch
-	h.lastEpoch, h.lastRev, h.published = epoch, rev, true
+	if h.published && h.lastEpoch == epoch && rev < h.lastRev {
+		h.mu.Unlock()
+		return
+	}
+	reset := h.retryReset || (h.published && h.lastEpoch != epoch)
 	if len(h.clients) == 0 {
+		h.lastEpoch, h.lastRev, h.published = epoch, rev, true
+		h.retryReset = false
 		h.mu.Unlock()
 		return
 	}
 	groups := h.groupByScopeLocked()
 	h.mu.Unlock()
 
-	for scope, clients := range groups {
+	messages := make(map[scopeKey][]byte, len(groups))
+	for scope := range groups {
 		snap := h.snapshotFor(scope)
 		if snap == nil {
-			continue
+			// A provider error is not an empty topology. Keep the last good
+			// identity so the same revision is retried on the next tick.
+			return
 		}
 		snap.Reset = reset
 		msg, err := json.Marshal(snap)
 		if err != nil {
 			slog.Error("Event WS marshal failed", "error", err)
-			continue
+			return
 		}
+		messages[scope] = msg
+	}
+
+	h.mu.Lock()
+	h.lastEpoch, h.lastRev, h.published = epoch, rev, true
+	h.retryReset = false
+	h.mu.Unlock()
+	for scope, clients := range groups {
 		for _, cf := range clients {
-			h.deliver(cf, msg)
+			h.deliver(cf, messages[scope])
 		}
 	}
 }

@@ -55,18 +55,30 @@ func (g *GraphRAG) AggregateMode() bool { return g.mode == aggregate.ModeAggrega
 // aggregate modes so two template ID spaces never exist (#163).
 func (g *GraphRAG) externalTemplates() bool { return g.mode != aggregate.ModeLegacy }
 
-// SetAggregateSource wires the aggregate engine's topology projection. It is
-// only consulted in aggregate mode; wiring it in any other mode is a no-op by
-// construction, so main.go can call it unconditionally.
-func (g *GraphRAG) SetAggregateSource(src AggregateSource) { g.aggSource = src }
+// SetAggregateSource wires the aggregate engine's topology projection. Main
+// calls it before Start; the lock also keeps tests and alternate construction
+// paths from racing the refresh loop.
+func (g *GraphRAG) SetAggregateSource(src AggregateSource) {
+	g.topologyMu.Lock()
+	g.aggSource = src
+	g.topologyMu.Unlock()
+}
 
 // reconcileTopology replaces each tenant's service topology from the aggregate
 // snapshot whose revision it has not already applied. It is the aggregate-mode
 // stand-in for rebuildAllTenantsFromDB and issues no database query at all.
 func (g *GraphRAG) reconcileTopology() {
-	if !g.AggregateMode() || g.aggSource == nil {
+	if !g.AggregateMode() {
 		return
 	}
+	g.topologyMu.Lock()
+	defer g.topologyMu.Unlock()
+	if g.aggSource == nil {
+		return
+	}
+	// Expiry is itself a publishable replacement. Prune before reading the
+	// identity so this read can apply the empty tombstone immediately.
+	g.aggSource.PruneTopology()
 	epoch := g.aggSource.TopologyEpoch()
 	applied := 0
 	for _, tenant := range g.aggSource.TopologyTenants() {
@@ -87,9 +99,16 @@ func (g *GraphRAG) reconcileTopology() {
 		stores.lastTopology.Store(&snap)
 		applied++
 	}
-	g.aggSource.PruneTopology()
 	if applied > 0 {
 		slog.Debug("GraphRAG reconciled aggregate topology", "tenants", applied, "epoch", epoch)
+	}
+}
+
+// ensureTopologyCurrent makes the aggregate provider revision, rather than
+// the 60-second cleanup tick, the freshness bound for a topology read.
+func (g *GraphRAG) ensureTopologyCurrent() {
+	if g.AggregateMode() {
+		g.reconcileTopology()
 	}
 }
 

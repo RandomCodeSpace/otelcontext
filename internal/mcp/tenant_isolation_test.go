@@ -1,6 +1,6 @@
 // Package mcp tests the merge-gate invariant for RAN-19/RAN-39: every
-// GraphRAG-backed MCP tool (and the legacy svcGraph-backed tools rewired
-// onto GraphRAG) must scope its response to the tenant carried by the
+// GraphRAG-backed MCP tool, including the provider-backed topology tools,
+// must scope its response to the tenant carried by the
 // X-Tenant-ID header — overlapping data ingested for two tenants under
 // the same service_name, trace_id, span_id, log template, and snapshot
 // time must never leak across tenant boundaries.
