@@ -128,15 +128,22 @@ VALUES ('', 7, '["failed"]', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 'failed')`
 	}
 }
 
-func TestSQLiteBetaBaselineIsProductSchemaNoOp(t *testing.T) {
+func TestSQLiteBetaBaselineRecordsVersionTwoBehindCurrent(t *testing.T) {
 	db := newSQLiteMigrationDB(t)
-	applySQLiteFixture(t, db, CurrentVersion)
+	applySQLiteFixture(t, db, 2)
 	result, err := Baseline(context.Background(), db, "sqlite", "v0.4.0-beta.2")
 	if err != nil {
 		t.Fatalf("Baseline: %v", err)
 	}
-	if result.Status.State != StateExact || result.BeforeFingerprint != result.AfterFingerprint {
+	if result.Status.State != StateBehind || result.RecordedVersion != 2 || result.BeforeFingerprint != result.AfterFingerprint {
 		t.Fatalf("result = %#v", result)
+	}
+	status, err := Up(context.Background(), db, "sqlite")
+	if err != nil {
+		t.Fatalf("Up: %v", err)
+	}
+	if status.State != StateExact || !db.Migrator().HasTable("resource_registry") {
+		t.Fatalf("upgrade from beta baseline did not add resource_registry: %#v", status)
 	}
 }
 
@@ -177,7 +184,7 @@ func TestSQLiteStatusStatesAndExitCodes(t *testing.T) {
 			}
 			if err := db.Exec(`INSERT INTO otelcontext_schema_migrations
 (version,name,checksum,started_at,completed_at,dirty)
-VALUES (3,'future',?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,0)`, strings.Repeat("a", 64)).Error; err != nil {
+VALUES (?,'future',?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,0)`, CurrentVersion+1, strings.Repeat("a", 64)).Error; err != nil {
 				t.Fatal(err)
 			}
 		}, state: StateAhead, exitCode: ExitAhead, detail: "ahead"},
@@ -185,7 +192,7 @@ VALUES (3,'future',?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,0)`, strings.Repeat("a"
 			if _, err := Up(context.Background(), db, "sqlite"); err != nil {
 				t.Fatal(err)
 			}
-			if err := db.Exec(`UPDATE otelcontext_schema_migrations SET dirty=1, completed_at=NULL WHERE version=2`).Error; err != nil {
+			if err := db.Exec(`UPDATE otelcontext_schema_migrations SET dirty=1, completed_at=NULL WHERE version=?`, CurrentVersion).Error; err != nil {
 				t.Fatal(err)
 			}
 		}, state: StateDirty, exitCode: ExitDirty, detail: "incomplete"},

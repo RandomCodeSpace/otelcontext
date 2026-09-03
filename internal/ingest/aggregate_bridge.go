@@ -329,33 +329,64 @@ func aggregateEdgeInput(caller string, in aggregate.SpanInput) aggregate.EdgeInp
 // derive a metric producer's ProducerID (#166). Only the first-present value
 // per slot is taken: attributes that vary per export would fragment baselines.
 func aggregateResourceIdentity(attrs []*commonpb.KeyValue) aggregate.ResourceIdentity {
-	var id aggregate.ResourceIdentity
+	return scanResourceSlots(attrs).identity()
+}
+
+// resourceSlots is the stable identity slice of one OTLP resource, read once
+// per resource batch and shared by the aggregate producer identity and the
+// resource registry (#279). host is host.id else host.name; workload is
+// k8s.pod.uid else container.id else process.pid; workloadKind names the
+// slot that filled workload (pod|container|process) or "".
+type resourceSlots struct {
+	serviceInstanceID string
+	serviceNamespace  string
+	serviceName       string
+	host              string
+	workload          string
+	workloadKind      string
+}
+
+func (s resourceSlots) identity() aggregate.ResourceIdentity {
+	return aggregate.ResourceIdentity{
+		ServiceInstanceID: s.serviceInstanceID,
+		ServiceNamespace:  s.serviceNamespace,
+		ServiceName:       s.serviceName,
+		Host:              s.host,
+		Workload:          s.workload,
+	}
+}
+
+func scanResourceSlots(attrs []*commonpb.KeyValue) resourceSlots {
+	var id resourceSlots
 	for _, kv := range attrs {
 		if kv == nil || kv.Value == nil {
 			continue
 		}
 		switch kv.Key {
 		case "service.instance.id":
-			id.ServiceInstanceID = kv.Value.GetStringValue()
+			id.serviceInstanceID = kv.Value.GetStringValue()
 		case "service.namespace":
-			id.ServiceNamespace = kv.Value.GetStringValue()
+			id.serviceNamespace = kv.Value.GetStringValue()
 		case "service.name":
-			id.ServiceName = kv.Value.GetStringValue()
+			id.serviceName = kv.Value.GetStringValue()
 		case "host.id":
-			id.Host = kv.Value.GetStringValue()
+			id.host = kv.Value.GetStringValue()
 		case "host.name":
-			if id.Host == "" {
-				id.Host = kv.Value.GetStringValue()
+			if id.host == "" {
+				id.host = kv.Value.GetStringValue()
 			}
 		case "k8s.pod.uid":
-			id.Workload = kv.Value.GetStringValue()
+			id.workload = kv.Value.GetStringValue()
+			id.workloadKind = "pod"
 		case "container.id":
-			if id.Workload == "" {
-				id.Workload = kv.Value.GetStringValue()
+			if id.workload == "" {
+				id.workload = kv.Value.GetStringValue()
+				id.workloadKind = "container"
 			}
 		case "process.pid":
-			if id.Workload == "" {
-				id.Workload = kv.Value.String()
+			if id.workload == "" {
+				id.workload = kv.Value.String()
+				id.workloadKind = "process"
 			}
 		}
 	}

@@ -130,7 +130,7 @@ func schemaSpec(version int) map[string]tableSpec {
 	} else {
 		spanIndexes["idx_spans_status"] = indexSpec{columns: []string{"status"}}
 	}
-	return map[string]tableSpec{
+	spec := map[string]tableSpec{
 		"traces": {
 			columns: traceColumns,
 			primary: []string{"id"},
@@ -185,13 +185,25 @@ func schemaSpec(version int) map[string]tableSpec {
 			},
 		},
 	}
+	if version >= 3 {
+		spec["resource_registry"] = tableSpec{
+			columns: []string{"tenant_id", "id", "service_name", "host", "workload", "kind", "signals", "last_seen"},
+			primary: []string{"tenant_id", "id"},
+			indexes: map[string]indexSpec{
+				"idx_resource_registry_last_seen": {columns: []string{"last_seen"}},
+			},
+		}
+	}
+	return spec
 }
 
 // Inspect reads the ledger and required relational structure without mutating it.
 // A migration can commit between those two reads, so managed states are retried
 // unless the ledger still matches the snapshot used for structural validation.
 func Inspect(ctx context.Context, db *gorm.DB, driver string) (Status, error) {
-	for attempt := 0; attempt < 3; attempt++ {
+	// A migrating peer changes the ledger at most once per registry entry,
+	// plus the read before the ledger exists, plus one stable read.
+	for attempt := 0; attempt < CurrentVersion+2; attempt++ {
 		status, err := inspectOnce(ctx, db, driver)
 		if err != nil {
 			return status, err

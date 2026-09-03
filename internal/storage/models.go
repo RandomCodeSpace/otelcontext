@@ -187,3 +187,22 @@ type MetricBucket struct {
 	Count          int64          `json:"count"`
 	AttributesJSON CompressedText `json:"attributes_json"` // Grouped attributes
 }
+
+// ResourceRegistryEntry is one persisted row of the bounded resource registry
+// (#279): which service ran on which host/workload, per tenant, and which
+// signals it emitted. ID is the FNV-64a of (service_name, host, workload)
+// bit-reinterpreted as int64, so the composite primary key stays short on
+// every adapter. Signals is a bitmask (traces=1, logs=2, metrics=4).
+type ResourceRegistryEntry struct {
+	TenantID    string    `gorm:"primaryKey;size:64;default:'default';not null" json:"tenant_id"`
+	ID          int64     `gorm:"primaryKey;autoIncrement:false" json:"id"`
+	ServiceName string    `gorm:"size:255;not null" json:"service_name"`
+	Host        string    `gorm:"size:255;not null" json:"host"`
+	Workload    string    `gorm:"size:255;not null" json:"workload"`
+	Kind        string    `gorm:"size:16;not null" json:"kind"`
+	Signals     int64     `gorm:"not null" json:"signals"`
+	LastSeen    time.Time `gorm:"index:idx_resource_registry_last_seen" json:"last_seen"`
+}
+
+// TableName overrides GORM's default table name.
+func (ResourceRegistryEntry) TableName() string { return "resource_registry" }

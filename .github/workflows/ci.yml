@@ -222,8 +222,8 @@ jobs:
             .restart_exit_code == 0 and
             .pre_restart_fingerprint == .post_restart_fingerprint and
             .dlq_before == .dlq_after and
-            (.first_shutdown.steps | length) == 19 and
-            (.restart_shutdown.steps | length) == 19 and
+            (.first_shutdown.steps | length) == 20 and
+            (.restart_shutdown.steps | length) == 20 and
             all(.first_shutdown.steps[]; (.error // "") == "") and
             all(.restart_shutdown.steps[]; (.error // "") == "") and
             (.assertions | length) >= 10 and

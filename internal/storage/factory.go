@@ -361,7 +361,7 @@ func AutoMigrateModelsWithOptions(db *gorm.DB, driver string, opts MigrateOption
 		log.Printf("⚠️  span dedupe before unique index failed: %v", err)
 	}
 
-	migrateModels := []any{&Trace{}, &Span{}, &MetricBucket{}}
+	migrateModels := []any{&Trace{}, &Span{}, &MetricBucket{}, &ResourceRegistryEntry{}}
 	if !logsPartitioned {
 		migrateModels = append(migrateModels, &Log{})
 	}

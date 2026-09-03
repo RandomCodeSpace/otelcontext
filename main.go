@@ -510,6 +510,19 @@ func main() {
 	// build entirely (see exportNumberPoints).
 	metricsServer := ingest.NewMetricsServer(repo, metrics, tsdbAgg, cfg)
 
+	// Bounded resource registry (#279): one owner for every mode. Reloaded
+	// BEFORE any listener starts so a restart keeps last_seen; flushed on a
+	// dirty tick below and once more at shutdown ahead of the DB close.
+	resourceRegistry := topology.NewRegistry(metrics)
+	if restored, err := resourceRegistry.Load(appCtx, repo.DB()); err != nil {
+		fatal("❌ Resource registry could not be reloaded", err)
+	} else if restored > 0 {
+		slog.Info("🗺️ Resource registry reloaded", "entries", restored)
+	}
+	traceServer.SetResourceRegistry(resourceRegistry)
+	logsServer.SetResourceRegistry(resourceRegistry)
+	metricsServer.SetResourceRegistry(resourceRegistry)
+
 	// Aggregate engine + durable store (AGGREGATE_MODE != legacy). The reducer
 	// runs inside Export() ahead of the sampler; the group-commit writer makes
 	// the reduced deltas durable before the Export is acknowledged (#160), and
@@ -1388,6 +1401,13 @@ func main() {
 		}
 	}()
 
+	// Resource registry dirty tick: evict idle entries, publish gauges, flush.
+	bootWG.Add(1)
+	go func() {
+		defer bootWG.Done()
+		resourceRegistry.Run(appCtx, repo.DB(), topology.RegistryFlushInterval)
+	}()
+
 	// DB pool stats sampler (Task 7 — visibility for DB_MAX_OPEN_CONNS sizing).
 	// sql.DB.Stats() is cheap (atomic loads on the pool struct), so 5s is fine.
 	bootWG.Add(1)
@@ -1579,6 +1599,11 @@ func main() {
 			appCancel()
 			bootWG.Wait()
 			return nil
+		}},
+		{name: "resource_registry", run: func(stepCtx context.Context) error {
+			// After boot_workers: the tick loop has exited, so this is the
+			// only writer, and the main database is still open.
+			return resourceRegistry.Flush(stepCtx, repo.DB())
 		}},
 		{name: "aggregate_store", run: func(context.Context) error {
 			if aggStore == nil {

@@ -307,6 +307,13 @@ type Metrics struct {
 	// shared __other__, so this is a drop, not a degradation: alert on any
 	// sustained value.
 	AggregateTenantRejectedTotal *prometheus.CounterVec
+	// ResourceRegistryEntries — live resource registry entries per tenant.
+	// kind=pair counts service-host-workload entries, kind=host counts
+	// distinct non-empty hosts (#279).
+	ResourceRegistryEntries *prometheus.GaugeVec
+	// ResourceRegistryOverflowTotal — registrations DROPPED by a per-tenant
+	// registry bound (kind=host|pair). Never merged into a shared host.
+	ResourceRegistryOverflowTotal *prometheus.CounterVec
 	// --- Bounded exemplar retention (AGGREGATE_MODE=aggregate) ---
 	// ExemplarEligibleTotal — telemetry that qualified for raw retention,
 	// per signal and priority class. Eligible is not retained: the gap between
@@ -779,6 +786,14 @@ func New() *Metrics {
 		Name: "otelcontext_aggregate_tenant_rejected_total",
 		Help: "Points dropped because the tenant identity was refused (over-length, empty, or past the tenant cap). Tenants are never collapsed into __other__.",
 	}, []string{"signal"})
+	m.ResourceRegistryEntries = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "otelcontext_resource_registry_entries",
+		Help: "Live resource registry entries per tenant: kind=pair is service-host-workload entries, kind=host is distinct non-empty hosts.",
+	}, []string{"tenant", "kind"})
+	m.ResourceRegistryOverflowTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "otelcontext_resource_registry_overflow_total",
+		Help: "Resource registrations dropped by a per-tenant registry bound (kind=host|pair). Overflow is never merged into a shared host.",
+	}, []string{"tenant", "kind"})
 	m.ExemplarEligibleTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "otelcontext_exemplar_eligible_total",
 		Help: "Telemetry eligible for raw exemplar retention, by signal and priority class (error|slow|healthy|warn). Eligible is not retained.",
@@ -843,6 +858,24 @@ func (m *Metrics) RecordMetricUnsupported(pointType, reason string, n int) {
 		return
 	}
 	m.IngestMetricsUnsupportedTotal.WithLabelValues(pointType, reason).Add(float64(n))
+}
+
+// RecordResourceRegistryOverflow counts one registration refused by the
+// tenant's registry bound of kind (host|pair). Nil-safe.
+func (m *Metrics) RecordResourceRegistryOverflow(tenant, kind string) {
+	if m == nil {
+		return
+	}
+	m.ResourceRegistryOverflowTotal.WithLabelValues(tenant, kind).Inc()
+}
+
+// SetResourceRegistryEntries publishes the tenant's live registry count of
+// kind (host|pair). Nil-safe.
+func (m *Metrics) SetResourceRegistryEntries(tenant, kind string, n int) {
+	if m == nil {
+		return
+	}
+	m.ResourceRegistryEntries.WithLabelValues(tenant, kind).Set(float64(n))
 }
 
 // RecordMetricSketchDropped counts one histogram point kept for its scalars
