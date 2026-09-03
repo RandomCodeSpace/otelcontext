@@ -1,0 +1,500 @@
+{
+  "schema_version": "otelcontext.release-candidate.v1",
+  "tag": "v0.4.0-rc.1",
+  "sha": "4f3c0a9d1e7b2c6a8f5d3e1b9c7a4d2f6e8b0a1c",
+  "repository": "RandomCodeSpace/otelcontext",
+  "workflow": {
+    "file": "testdata/dry-run/release.yml",
+    "ref": "refs/tags/v0.4.0-rc.1",
+    "run_id": 17640023311,
+    "run_attempt": 1,
+    "run_url": "https://github.com/RandomCodeSpace/otelcontext/actions/runs/17640023311",
+    "started_at": "2026-09-03T10:02:00Z",
+    "finished_at": "2026-09-03T10:41:12Z"
+  },
+  "source": {
+    "schema_version": "otelcontext.source-identity.v1",
+    "tag": "v0.4.0-rc.1",
+    "sha": "4f3c0a9d1e7b2c6a8f5d3e1b9c7a4d2f6e8b0a1c",
+    "ref": "refs/tags/v0.4.0-rc.1",
+    "ref_type": "tag",
+    "protected_main": true,
+    "clean_tree": true,
+    "go_version": "go1.25.1",
+    "annotated_tag": true,
+    "required_checks": [
+      {
+        "name": "build · vet · test",
+        "conclusion": "success",
+        "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100000"
+      },
+      {
+        "name": "SonarCloud Code Analysis",
+        "conclusion": "success",
+        "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100001"
+      },
+      {
+        "name": "browser smoke",
+        "conclusion": "success",
+        "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100002"
+      },
+      {
+        "name": "database proof · sqlite",
+        "conclusion": "success",
+        "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100003"
+      },
+      {
+        "name": "database proof · postgres-16",
+        "conclusion": "success",
+        "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100004"
+      },
+      {
+        "name": "topology proof · legacy",
+        "conclusion": "success",
+        "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100005"
+      },
+      {
+        "name": "topology proof · aggregate-shadow",
+        "conclusion": "success",
+        "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100006"
+      },
+      {
+        "name": "topology proof · aggregate",
+        "conclusion": "success",
+        "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100007"
+      },
+      {
+        "name": "shutdown proof · legacy",
+        "conclusion": "success",
+        "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100008"
+      },
+      {
+        "name": "shutdown proof · aggregate-shadow",
+        "conclusion": "success",
+        "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100009"
+      },
+      {
+        "name": "shutdown proof · aggregate",
+        "conclusion": "success",
+        "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100010"
+      },
+      {
+        "name": "backup proof · legacy",
+        "conclusion": "success",
+        "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100011"
+      },
+      {
+        "name": "backup proof · aggregate-shadow",
+        "conclusion": "success",
+        "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100012"
+      },
+      {
+        "name": "backup proof · aggregate",
+        "conclusion": "success",
+        "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100013"
+      },
+      {
+        "name": "database backup proof · mysql-8.4",
+        "conclusion": "success",
+        "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100014"
+      },
+      {
+        "name": "database backup proof · postgres-16",
+        "conclusion": "success",
+        "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100015"
+      },
+      {
+        "name": "database backup proof · sqlserver-2022",
+        "conclusion": "success",
+        "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100016"
+      },
+      {
+        "name": "latency proof · legacy",
+        "conclusion": "success",
+        "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100017"
+      },
+      {
+        "name": "latency proof · aggregate-shadow",
+        "conclusion": "success",
+        "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100018"
+      },
+      {
+        "name": "latency proof · aggregate",
+        "conclusion": "success",
+        "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100019"
+      }
+    ],
+    "event": "push"
+  },
+  "actions": [
+    {
+      "uses": "step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c",
+      "version": "v2.13.0"
+    },
+    {
+      "uses": "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+      "version": "v4.2.2"
+    },
+    {
+      "uses": "actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e",
+      "version": "v5.5.0"
+    },
+    {
+      "uses": "sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6",
+      "version": "6f9f17788090df1f26f669e9d70d6ae9567deba6"
+    },
+    {
+      "uses": "./.github/workflows/database-proof.yml",
+      "version": ""
+    }
+  ],
+  "release_assets": {
+    "schema_version": "otelcontext.release-assets.v1",
+    "tag": "v0.4.0-rc.1",
+    "sha": "4f3c0a9d1e7b2c6a8f5d3e1b9c7a4d2f6e8b0a1c",
+    "certificate_identity": "https://github.com/RandomCodeSpace/otelcontext/.github/workflows/release.yml@refs/tags/v0.4.0-rc.1",
+    "certificate_wrapper": "base64",
+    "checksums_sha256": "092ed35ce184329ae3ccf786a43135951d8af11dc3a9bd313435f757626b3527",
+    "signature_verified": true,
+    "assets": [
+      {
+        "name": "checksums.txt",
+        "kind": "checksums",
+        "sha256": "092ed35ce184329ae3ccf786a43135951d8af11dc3a9bd313435f757626b3527",
+        "size_bytes": 936
+      },
+      {
+        "name": "checksums.txt.pem",
+        "kind": "certificate",
+        "sha256": "b0b0170a4da8429f86cb5a9b9f6202f37d63190fd57e1169795159803cebb109",
+        "size_bytes": 2124
+      },
+      {
+        "name": "checksums.txt.sig",
+        "kind": "signature",
+        "sha256": "457fd0caee4e13aa7bf7617100e699e09f0872d68881a5c4d37f84594e07b909",
+        "size_bytes": 96
+      },
+      {
+        "name": "otelcontext_0.4.0-rc.1_darwin_amd64.tar.gz",
+        "kind": "archive",
+        "sha256": "2b0b31b9afec4f560b39484b493c7c7e877cd7d42b13df53cebef48e87aa255a",
+        "size_bytes": 14242000
+      },
+      {
+        "name": "otelcontext_0.4.0-rc.1_darwin_amd64.tar.gz.sbom.json",
+        "kind": "sbom",
+        "sha256": "ad47ef2a6c066ef348d4b8d9f3e9bfde076aeb7d5cd761ad50b3cc8e4bcdae9c",
+        "size_bytes": 310042
+      },
+      {
+        "name": "otelcontext_0.4.0-rc.1_darwin_arm64.tar.gz",
+        "kind": "archive",
+        "sha256": "a6b1f3dc8a7514e4b86ffb9fe6519b48cf690ebb5cc2a97c78067281ae0dc779",
+        "size_bytes": 14242000
+      },
+      {
+        "name": "otelcontext_0.4.0-rc.1_darwin_arm64.tar.gz.sbom.json",
+        "kind": "sbom",
+        "sha256": "7feea810ea40dd20c50d495e59c725aa606da79ba3de61e4a41eca5e3909b13f",
+        "size_bytes": 310042
+      },
+      {
+        "name": "otelcontext_0.4.0-rc.1_linux_amd64.tar.gz",
+        "kind": "archive",
+        "sha256": "8a0479e9acb44bbb05ae4dfd5be840a2500b1b2c9301d8fc086b8a3e25614395",
+        "size_bytes": 14241000
+      },
+      {
+        "name": "otelcontext_0.4.0-rc.1_linux_amd64.tar.gz.sbom.json",
+        "kind": "sbom",
+        "sha256": "bfacc8062dbdba978c2036a52be95c36a32611cdadfc668b82a9539d738df8bf",
+        "size_bytes": 310041
+      },
+      {
+        "name": "otelcontext_0.4.0-rc.1_linux_arm64.tar.gz",
+        "kind": "archive",
+        "sha256": "4d20a4655cd672a016a03290ce3bd58246bed055b8d9c96426f61ea45c4e7990",
+        "size_bytes": 14241000
+      },
+      {
+        "name": "otelcontext_0.4.0-rc.1_linux_arm64.tar.gz.sbom.json",
+        "kind": "sbom",
+        "sha256": "ad4bfae0e120f360a90335c09164fc31abeb1e03aa8712e4211d72de2f1cd43f",
+        "size_bytes": 310041
+      }
+    ],
+    "archives": [
+      {
+        "name": "otelcontext_0.4.0-rc.1_darwin_amd64.tar.gz",
+        "goos": "darwin",
+        "goarch": "amd64",
+        "archive_sha256": "2b0b31b9afec4f560b39484b493c7c7e877cd7d42b13df53cebef48e87aa255a",
+        "binary_sha256": "0f3c175508fee5e758484e8b099b0b07ec28fc84f2d3471fa180486b451a6b48",
+        "sbom": "otelcontext_0.4.0-rc.1_darwin_amd64.tar.gz.sbom.json",
+        "sbom_sha256": "ad47ef2a6c066ef348d4b8d9f3e9bfde076aeb7d5cd761ad50b3cc8e4bcdae9c",
+        "version": "OtelContext version v0.4.0-rc.1",
+        "vcs_revision": "4f3c0a9d1e7b2c6a8f5d3e1b9c7a4d2f6e8b0a1c",
+        "embedded_ui": true,
+        "executed": false,
+        "files": [
+          "LICENSE.md",
+          "README.md",
+          "deploy/systemd/otelcontext.env.example",
+          "deploy/systemd/otelcontext.service",
+          "otelcontext"
+        ]
+      },
+      {
+        "name": "otelcontext_0.4.0-rc.1_darwin_arm64.tar.gz",
+        "goos": "darwin",
+        "goarch": "arm64",
+        "archive_sha256": "a6b1f3dc8a7514e4b86ffb9fe6519b48cf690ebb5cc2a97c78067281ae0dc779",
+        "binary_sha256": "7d6a956d1d27f660f1f2e42129844bbf679ef21f5abf78084a8c1366c12b59d9",
+        "sbom": "otelcontext_0.4.0-rc.1_darwin_arm64.tar.gz.sbom.json",
+        "sbom_sha256": "7feea810ea40dd20c50d495e59c725aa606da79ba3de61e4a41eca5e3909b13f",
+        "version": "OtelContext version v0.4.0-rc.1",
+        "vcs_revision": "4f3c0a9d1e7b2c6a8f5d3e1b9c7a4d2f6e8b0a1c",
+        "embedded_ui": true,
+        "executed": false,
+        "files": [
+          "LICENSE.md",
+          "README.md",
+          "deploy/systemd/otelcontext.env.example",
+          "deploy/systemd/otelcontext.service",
+          "otelcontext"
+        ]
+      },
+      {
+        "name": "otelcontext_0.4.0-rc.1_linux_amd64.tar.gz",
+        "goos": "linux",
+        "goarch": "amd64",
+        "archive_sha256": "8a0479e9acb44bbb05ae4dfd5be840a2500b1b2c9301d8fc086b8a3e25614395",
+        "binary_sha256": "8284d1c1bb4648cba0294f413a21c37896f8fbe0712045a9704c548f6668c1db",
+        "sbom": "otelcontext_0.4.0-rc.1_linux_amd64.tar.gz.sbom.json",
+        "sbom_sha256": "bfacc8062dbdba978c2036a52be95c36a32611cdadfc668b82a9539d738df8bf",
+        "version": "OtelContext version v0.4.0-rc.1",
+        "vcs_revision": "4f3c0a9d1e7b2c6a8f5d3e1b9c7a4d2f6e8b0a1c",
+        "embedded_ui": true,
+        "executed": true,
+        "files": [
+          "LICENSE.md",
+          "README.md",
+          "deploy/systemd/otelcontext.env.example",
+          "deploy/systemd/otelcontext.service",
+          "otelcontext"
+        ]
+      },
+      {
+        "name": "otelcontext_0.4.0-rc.1_linux_arm64.tar.gz",
+        "goos": "linux",
+        "goarch": "arm64",
+        "archive_sha256": "4d20a4655cd672a016a03290ce3bd58246bed055b8d9c96426f61ea45c4e7990",
+        "binary_sha256": "ba31dbe48762f1ca5329c1d4a2c2bc851702c442758cb5dab1688305c98f043e",
+        "sbom": "otelcontext_0.4.0-rc.1_linux_arm64.tar.gz.sbom.json",
+        "sbom_sha256": "ad4bfae0e120f360a90335c09164fc31abeb1e03aa8712e4211d72de2f1cd43f",
+        "version": "OtelContext version v0.4.0-rc.1",
+        "vcs_revision": "4f3c0a9d1e7b2c6a8f5d3e1b9c7a4d2f6e8b0a1c",
+        "embedded_ui": true,
+        "executed": false,
+        "files": [
+          "LICENSE.md",
+          "README.md",
+          "deploy/systemd/otelcontext.env.example",
+          "deploy/systemd/otelcontext.service",
+          "otelcontext"
+        ]
+      }
+    ],
+    "checks": [
+      {
+        "name": "assets",
+        "passed": true,
+        "detail": "ok"
+      },
+      {
+        "name": "checksums",
+        "passed": true,
+        "detail": "ok"
+      },
+      {
+        "name": "certificate",
+        "passed": true,
+        "detail": "ok"
+      },
+      {
+        "name": "signature",
+        "passed": true,
+        "detail": "ok"
+      },
+      {
+        "name": "archives",
+        "passed": true,
+        "detail": "ok"
+      },
+      {
+        "name": "embedded_ui",
+        "passed": true,
+        "detail": "ok"
+      },
+      {
+        "name": "version",
+        "passed": true,
+        "detail": "ok"
+      },
+      {
+        "name": "sboms",
+        "passed": true,
+        "detail": "ok"
+      }
+    ]
+  },
+  "jobs": [
+    {
+      "name": "browser smoke · release binary",
+      "id": 49518000107,
+      "conclusion": "success",
+      "url": "https://github.com/RandomCodeSpace/otelcontext/actions/runs/17640023311/job/49518000107",
+      "started_at": "2026-09-03T10:23:00Z",
+      "completed_at": "2026-09-03T10:25:30Z",
+      "required_for": "limited_production"
+    },
+    {
+      "name": "database lifecycle gate / database proof · mysql-8.4",
+      "id": 49518000105,
+      "conclusion": "success",
+      "url": "https://github.com/RandomCodeSpace/otelcontext/actions/runs/17640023311/job/49518000105",
+      "started_at": "2026-09-03T10:17:00Z",
+      "completed_at": "2026-09-03T10:19:30Z",
+      "required_for": "limited_production"
+    },
+    {
+      "name": "database lifecycle gate / database proof · postgres-16",
+      "id": 49518000104,
+      "conclusion": "success",
+      "url": "https://github.com/RandomCodeSpace/otelcontext/actions/runs/17640023311/job/49518000104",
+      "started_at": "2026-09-03T10:14:00Z",
+      "completed_at": "2026-09-03T10:16:30Z",
+      "required_for": "limited_production"
+    },
+    {
+      "name": "database lifecycle gate / database proof · sqlite",
+      "id": 49518000103,
+      "conclusion": "success",
+      "url": "https://github.com/RandomCodeSpace/otelcontext/actions/runs/17640023311/job/49518000103",
+      "started_at": "2026-09-03T10:11:00Z",
+      "completed_at": "2026-09-03T10:13:30Z",
+      "required_for": "limited_production"
+    },
+    {
+      "name": "database lifecycle gate / database proof · sqlserver-2022",
+      "id": 49518000106,
+      "conclusion": "success",
+      "url": "https://github.com/RandomCodeSpace/otelcontext/actions/runs/17640023311/job/49518000106",
+      "started_at": "2026-09-03T10:20:00Z",
+      "completed_at": "2026-09-03T10:22:30Z",
+      "required_for": "limited_production"
+    },
+    {
+      "name": "goreleaser",
+      "id": 49518000101,
+      "conclusion": "success",
+      "url": "https://github.com/RandomCodeSpace/otelcontext/actions/runs/17640023311/job/49518000101",
+      "started_at": "2026-09-03T10:05:00Z",
+      "completed_at": "2026-09-03T10:07:30Z",
+      "required_for": "informational"
+    },
+    {
+      "name": "linux arm64 smoke",
+      "id": 49518000109,
+      "conclusion": "success",
+      "url": "https://github.com/RandomCodeSpace/otelcontext/actions/runs/17640023311/job/49518000109",
+      "started_at": "2026-09-03T10:29:00Z",
+      "completed_at": "2026-09-03T10:31:30Z",
+      "required_for": "limited_production"
+    },
+    {
+      "name": "release candidate manifest",
+      "id": 49518000110,
+      "conclusion": "",
+      "url": "https://github.com/RandomCodeSpace/otelcontext/actions/runs/17640023311/job/49518000110",
+      "started_at": "2026-09-03T10:32:00Z",
+      "completed_at": "",
+      "required_for": "informational"
+    },
+    {
+      "name": "source identity",
+      "id": 49518000100,
+      "conclusion": "success",
+      "url": "https://github.com/RandomCodeSpace/otelcontext/actions/runs/17640023311/job/49518000100",
+      "started_at": "2026-09-03T10:02:00Z",
+      "completed_at": "2026-09-03T10:04:30Z",
+      "required_for": "limited_production"
+    },
+    {
+      "name": "systemd proof · release archive",
+      "id": 49518000108,
+      "conclusion": "success",
+      "url": "https://github.com/RandomCodeSpace/otelcontext/actions/runs/17640023311/job/49518000108",
+      "started_at": "2026-09-03T10:26:00Z",
+      "completed_at": "2026-09-03T10:28:30Z",
+      "required_for": "limited_production"
+    },
+    {
+      "name": "verify signed assets",
+      "id": 49518000102,
+      "conclusion": "success",
+      "url": "https://github.com/RandomCodeSpace/otelcontext/actions/runs/17640023311/job/49518000102",
+      "started_at": "2026-09-03T10:08:00Z",
+      "completed_at": "2026-09-03T10:10:30Z",
+      "required_for": "limited_production"
+    }
+  ],
+  "proof_artifacts": [
+    {
+      "name": "browser-smoke-release-v0.4.0-rc.1-4f3c0a9d1e7b2c6a8f5d3e1b9c7a4d2f6e8b0a1c",
+      "files": [
+        {
+          "path": "screenshots/topology.txt",
+          "sha256": "ecca1e9b5090912d964aaecb4cd658dab738c2c96283aea5e9054dcb5c8524d6",
+          "size_bytes": 29
+        },
+        {
+          "path": "summary.json",
+          "sha256": "5cfd17055c562879d890660cabe3d9a1d9d9012d12eea55bbc4d45594424df93",
+          "size_bytes": 147
+        }
+      ]
+    },
+    {
+      "name": "linux-arm64-smoke-v0.4.0-rc.1-4f3c0a9d1e7b2c6a8f5d3e1b9c7a4d2f6e8b0a1c",
+      "files": [
+        {
+          "path": "arm64-smoke-v1.json",
+          "sha256": "6a0aa1335d89724db885912bedd59070d14db772c11358ff10902940b3520ec9",
+          "size_bytes": 233
+        }
+      ]
+    }
+  ],
+  "conclusions": {
+    "limited_production": {
+      "approved": true,
+      "blocking_failures": [],
+      "profiles": {
+        "postgres-16-legacy": "approved",
+        "sqlite-legacy-bounded": "approved",
+        "mysql-8.4": "preview",
+        "sqlserver-2022": "experimental",
+        "aggregate": "available-unapproved",
+        "aggregate-shadow": "available-unapproved"
+      }
+    },
+    "aggregate_production": {
+      "approved": false,
+      "status": "not_run",
+      "workflow": ".github/workflows/aggregate-release-gate.yml",
+      "note": "Certified separately against the same signed Linux amd64 archive; a failure never changes limited_production."
+    }
+  }
+}

@@ -1,0 +1,201 @@
+{
+  "schema_version": "otelcontext.release-assets.v1",
+  "tag": "v0.4.0-rc.1",
+  "sha": "4f3c0a9d1e7b2c6a8f5d3e1b9c7a4d2f6e8b0a1c",
+  "certificate_identity": "https://github.com/RandomCodeSpace/otelcontext/.github/workflows/release.yml@refs/tags/v0.4.0-rc.1",
+  "certificate_wrapper": "base64",
+  "checksums_sha256": "092ed35ce184329ae3ccf786a43135951d8af11dc3a9bd313435f757626b3527",
+  "signature_verified": true,
+  "assets": [
+    {
+      "name": "checksums.txt",
+      "kind": "checksums",
+      "sha256": "092ed35ce184329ae3ccf786a43135951d8af11dc3a9bd313435f757626b3527",
+      "size_bytes": 936
+    },
+    {
+      "name": "checksums.txt.pem",
+      "kind": "certificate",
+      "sha256": "b0b0170a4da8429f86cb5a9b9f6202f37d63190fd57e1169795159803cebb109",
+      "size_bytes": 2124
+    },
+    {
+      "name": "checksums.txt.sig",
+      "kind": "signature",
+      "sha256": "457fd0caee4e13aa7bf7617100e699e09f0872d68881a5c4d37f84594e07b909",
+      "size_bytes": 96
+    },
+    {
+      "name": "otelcontext_0.4.0-rc.1_darwin_amd64.tar.gz",
+      "kind": "archive",
+      "sha256": "2b0b31b9afec4f560b39484b493c7c7e877cd7d42b13df53cebef48e87aa255a",
+      "size_bytes": 14242000
+    },
+    {
+      "name": "otelcontext_0.4.0-rc.1_darwin_amd64.tar.gz.sbom.json",
+      "kind": "sbom",
+      "sha256": "ad47ef2a6c066ef348d4b8d9f3e9bfde076aeb7d5cd761ad50b3cc8e4bcdae9c",
+      "size_bytes": 310042
+    },
+    {
+      "name": "otelcontext_0.4.0-rc.1_darwin_arm64.tar.gz",
+      "kind": "archive",
+      "sha256": "a6b1f3dc8a7514e4b86ffb9fe6519b48cf690ebb5cc2a97c78067281ae0dc779",
+      "size_bytes": 14242000
+    },
+    {
+      "name": "otelcontext_0.4.0-rc.1_darwin_arm64.tar.gz.sbom.json",
+      "kind": "sbom",
+      "sha256": "7feea810ea40dd20c50d495e59c725aa606da79ba3de61e4a41eca5e3909b13f",
+      "size_bytes": 310042
+    },
+    {
+      "name": "otelcontext_0.4.0-rc.1_linux_amd64.tar.gz",
+      "kind": "archive",
+      "sha256": "8a0479e9acb44bbb05ae4dfd5be840a2500b1b2c9301d8fc086b8a3e25614395",
+      "size_bytes": 14241000
+    },
+    {
+      "name": "otelcontext_0.4.0-rc.1_linux_amd64.tar.gz.sbom.json",
+      "kind": "sbom",
+      "sha256": "bfacc8062dbdba978c2036a52be95c36a32611cdadfc668b82a9539d738df8bf",
+      "size_bytes": 310041
+    },
+    {
+      "name": "otelcontext_0.4.0-rc.1_linux_arm64.tar.gz",
+      "kind": "archive",
+      "sha256": "4d20a4655cd672a016a03290ce3bd58246bed055b8d9c96426f61ea45c4e7990",
+      "size_bytes": 14241000
+    },
+    {
+      "name": "otelcontext_0.4.0-rc.1_linux_arm64.tar.gz.sbom.json",
+      "kind": "sbom",
+      "sha256": "ad4bfae0e120f360a90335c09164fc31abeb1e03aa8712e4211d72de2f1cd43f",
+      "size_bytes": 310041
+    }
+  ],
+  "archives": [
+    {
+      "name": "otelcontext_0.4.0-rc.1_darwin_amd64.tar.gz",
+      "goos": "darwin",
+      "goarch": "amd64",
+      "archive_sha256": "2b0b31b9afec4f560b39484b493c7c7e877cd7d42b13df53cebef48e87aa255a",
+      "binary_sha256": "0f3c175508fee5e758484e8b099b0b07ec28fc84f2d3471fa180486b451a6b48",
+      "sbom": "otelcontext_0.4.0-rc.1_darwin_amd64.tar.gz.sbom.json",
+      "sbom_sha256": "ad47ef2a6c066ef348d4b8d9f3e9bfde076aeb7d5cd761ad50b3cc8e4bcdae9c",
+      "version": "OtelContext version v0.4.0-rc.1",
+      "vcs_revision": "4f3c0a9d1e7b2c6a8f5d3e1b9c7a4d2f6e8b0a1c",
+      "embedded_ui": true,
+      "executed": false,
+      "files": [
+        "LICENSE.md",
+        "README.md",
+        "deploy/systemd/otelcontext.env.example",
+        "deploy/systemd/otelcontext.service",
+        "otelcontext"
+      ]
+    },
+    {
+      "name": "otelcontext_0.4.0-rc.1_darwin_arm64.tar.gz",
+      "goos": "darwin",
+      "goarch": "arm64",
+      "archive_sha256": "a6b1f3dc8a7514e4b86ffb9fe6519b48cf690ebb5cc2a97c78067281ae0dc779",
+      "binary_sha256": "7d6a956d1d27f660f1f2e42129844bbf679ef21f5abf78084a8c1366c12b59d9",
+      "sbom": "otelcontext_0.4.0-rc.1_darwin_arm64.tar.gz.sbom.json",
+      "sbom_sha256": "7feea810ea40dd20c50d495e59c725aa606da79ba3de61e4a41eca5e3909b13f",
+      "version": "OtelContext version v0.4.0-rc.1",
+      "vcs_revision": "4f3c0a9d1e7b2c6a8f5d3e1b9c7a4d2f6e8b0a1c",
+      "embedded_ui": true,
+      "executed": false,
+      "files": [
+        "LICENSE.md",
+        "README.md",
+        "deploy/systemd/otelcontext.env.example",
+        "deploy/systemd/otelcontext.service",
+        "otelcontext"
+      ]
+    },
+    {
+      "name": "otelcontext_0.4.0-rc.1_linux_amd64.tar.gz",
+      "goos": "linux",
+      "goarch": "amd64",
+      "archive_sha256": "8a0479e9acb44bbb05ae4dfd5be840a2500b1b2c9301d8fc086b8a3e25614395",
+      "binary_sha256": "8284d1c1bb4648cba0294f413a21c37896f8fbe0712045a9704c548f6668c1db",
+      "sbom": "otelcontext_0.4.0-rc.1_linux_amd64.tar.gz.sbom.json",
+      "sbom_sha256": "bfacc8062dbdba978c2036a52be95c36a32611cdadfc668b82a9539d738df8bf",
+      "version": "OtelContext version v0.4.0-rc.1",
+      "vcs_revision": "4f3c0a9d1e7b2c6a8f5d3e1b9c7a4d2f6e8b0a1c",
+      "embedded_ui": true,
+      "executed": true,
+      "files": [
+        "LICENSE.md",
+        "README.md",
+        "deploy/systemd/otelcontext.env.example",
+        "deploy/systemd/otelcontext.service",
+        "otelcontext"
+      ]
+    },
+    {
+      "name": "otelcontext_0.4.0-rc.1_linux_arm64.tar.gz",
+      "goos": "linux",
+      "goarch": "arm64",
+      "archive_sha256": "4d20a4655cd672a016a03290ce3bd58246bed055b8d9c96426f61ea45c4e7990",
+      "binary_sha256": "ba31dbe48762f1ca5329c1d4a2c2bc851702c442758cb5dab1688305c98f043e",
+      "sbom": "otelcontext_0.4.0-rc.1_linux_arm64.tar.gz.sbom.json",
+      "sbom_sha256": "ad4bfae0e120f360a90335c09164fc31abeb1e03aa8712e4211d72de2f1cd43f",
+      "version": "OtelContext version v0.4.0-rc.1",
+      "vcs_revision": "4f3c0a9d1e7b2c6a8f5d3e1b9c7a4d2f6e8b0a1c",
+      "embedded_ui": true,
+      "executed": false,
+      "files": [
+        "LICENSE.md",
+        "README.md",
+        "deploy/systemd/otelcontext.env.example",
+        "deploy/systemd/otelcontext.service",
+        "otelcontext"
+      ]
+    }
+  ],
+  "checks": [
+    {
+      "name": "assets",
+      "passed": true,
+      "detail": "ok"
+    },
+    {
+      "name": "checksums",
+      "passed": true,
+      "detail": "ok"
+    },
+    {
+      "name": "certificate",
+      "passed": true,
+      "detail": "ok"
+    },
+    {
+      "name": "signature",
+      "passed": true,
+      "detail": "ok"
+    },
+    {
+      "name": "archives",
+      "passed": true,
+      "detail": "ok"
+    },
+    {
+      "name": "embedded_ui",
+      "passed": true,
+      "detail": "ok"
+    },
+    {
+      "name": "version",
+      "passed": true,
+      "detail": "ok"
+    },
+    {
+      "name": "sboms",
+      "passed": true,
+      "detail": "ok"
+    }
+  ]
+}

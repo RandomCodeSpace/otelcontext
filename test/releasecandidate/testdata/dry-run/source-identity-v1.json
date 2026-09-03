@@ -1,0 +1,114 @@
+{
+  "schema_version": "otelcontext.source-identity.v1",
+  "tag": "v0.4.0-rc.1",
+  "sha": "4f3c0a9d1e7b2c6a8f5d3e1b9c7a4d2f6e8b0a1c",
+  "ref": "refs/tags/v0.4.0-rc.1",
+  "ref_type": "tag",
+  "protected_main": true,
+  "clean_tree": true,
+  "go_version": "go1.25.1",
+  "annotated_tag": true,
+  "required_checks": [
+    {
+      "name": "build · vet · test",
+      "conclusion": "success",
+      "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100000"
+    },
+    {
+      "name": "SonarCloud Code Analysis",
+      "conclusion": "success",
+      "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100001"
+    },
+    {
+      "name": "browser smoke",
+      "conclusion": "success",
+      "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100002"
+    },
+    {
+      "name": "database proof · sqlite",
+      "conclusion": "success",
+      "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100003"
+    },
+    {
+      "name": "database proof · postgres-16",
+      "conclusion": "success",
+      "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100004"
+    },
+    {
+      "name": "topology proof · legacy",
+      "conclusion": "success",
+      "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100005"
+    },
+    {
+      "name": "topology proof · aggregate-shadow",
+      "conclusion": "success",
+      "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100006"
+    },
+    {
+      "name": "topology proof · aggregate",
+      "conclusion": "success",
+      "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100007"
+    },
+    {
+      "name": "shutdown proof · legacy",
+      "conclusion": "success",
+      "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100008"
+    },
+    {
+      "name": "shutdown proof · aggregate-shadow",
+      "conclusion": "success",
+      "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100009"
+    },
+    {
+      "name": "shutdown proof · aggregate",
+      "conclusion": "success",
+      "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100010"
+    },
+    {
+      "name": "backup proof · legacy",
+      "conclusion": "success",
+      "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100011"
+    },
+    {
+      "name": "backup proof · aggregate-shadow",
+      "conclusion": "success",
+      "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100012"
+    },
+    {
+      "name": "backup proof · aggregate",
+      "conclusion": "success",
+      "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100013"
+    },
+    {
+      "name": "database backup proof · mysql-8.4",
+      "conclusion": "success",
+      "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100014"
+    },
+    {
+      "name": "database backup proof · postgres-16",
+      "conclusion": "success",
+      "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100015"
+    },
+    {
+      "name": "database backup proof · sqlserver-2022",
+      "conclusion": "success",
+      "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100016"
+    },
+    {
+      "name": "latency proof · legacy",
+      "conclusion": "success",
+      "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100017"
+    },
+    {
+      "name": "latency proof · aggregate-shadow",
+      "conclusion": "success",
+      "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100018"
+    },
+    {
+      "name": "latency proof · aggregate",
+      "conclusion": "success",
+      "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100019"
+    }
+  ],
+  "event": "push"
+}

@@ -1,0 +1,126 @@
+{
+  "total_count": 11,
+  "jobs": [
+    {
+      "id": 49518000100,
+      "run_id": 17640023311,
+      "run_attempt": 1,
+      "name": "source identity",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/RandomCodeSpace/otelcontext/actions/runs/17640023311/job/49518000100",
+      "started_at": "2026-09-03T10:02:00Z",
+      "completed_at": "2026-09-03T10:04:30Z"
+    },
+    {
+      "id": 49518000101,
+      "run_id": 17640023311,
+      "run_attempt": 1,
+      "name": "goreleaser",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/RandomCodeSpace/otelcontext/actions/runs/17640023311/job/49518000101",
+      "started_at": "2026-09-03T10:05:00Z",
+      "completed_at": "2026-09-03T10:07:30Z"
+    },
+    {
+      "id": 49518000102,
+      "run_id": 17640023311,
+      "run_attempt": 1,
+      "name": "verify signed assets",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/RandomCodeSpace/otelcontext/actions/runs/17640023311/job/49518000102",
+      "started_at": "2026-09-03T10:08:00Z",
+      "completed_at": "2026-09-03T10:10:30Z"
+    },
+    {
+      "id": 49518000103,
+      "run_id": 17640023311,
+      "run_attempt": 1,
+      "name": "database lifecycle gate / database proof · sqlite",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/RandomCodeSpace/otelcontext/actions/runs/17640023311/job/49518000103",
+      "started_at": "2026-09-03T10:11:00Z",
+      "completed_at": "2026-09-03T10:13:30Z"
+    },
+    {
+      "id": 49518000104,
+      "run_id": 17640023311,
+      "run_attempt": 1,
+      "name": "database lifecycle gate / database proof · postgres-16",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/RandomCodeSpace/otelcontext/actions/runs/17640023311/job/49518000104",
+      "started_at": "2026-09-03T10:14:00Z",
+      "completed_at": "2026-09-03T10:16:30Z"
+    },
+    {
+      "id": 49518000105,
+      "run_id": 17640023311,
+      "run_attempt": 1,
+      "name": "database lifecycle gate / database proof · mysql-8.4",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/RandomCodeSpace/otelcontext/actions/runs/17640023311/job/49518000105",
+      "started_at": "2026-09-03T10:17:00Z",
+      "completed_at": "2026-09-03T10:19:30Z"
+    },
+    {
+      "id": 49518000106,
+      "run_id": 17640023311,
+      "run_attempt": 1,
+      "name": "database lifecycle gate / database proof · sqlserver-2022",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/RandomCodeSpace/otelcontext/actions/runs/17640023311/job/49518000106",
+      "started_at": "2026-09-03T10:20:00Z",
+      "completed_at": "2026-09-03T10:22:30Z"
+    },
+    {
+      "id": 49518000107,
+      "run_id": 17640023311,
+      "run_attempt": 1,
+      "name": "browser smoke · release binary",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/RandomCodeSpace/otelcontext/actions/runs/17640023311/job/49518000107",
+      "started_at": "2026-09-03T10:23:00Z",
+      "completed_at": "2026-09-03T10:25:30Z"
+    },
+    {
+      "id": 49518000108,
+      "run_id": 17640023311,
+      "run_attempt": 1,
+      "name": "systemd proof · release archive",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/RandomCodeSpace/otelcontext/actions/runs/17640023311/job/49518000108",
+      "started_at": "2026-09-03T10:26:00Z",
+      "completed_at": "2026-09-03T10:28:30Z"
+    },
+    {
+      "id": 49518000109,
+      "run_id": 17640023311,
+      "run_attempt": 1,
+      "name": "linux arm64 smoke",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/RandomCodeSpace/otelcontext/actions/runs/17640023311/job/49518000109",
+      "started_at": "2026-09-03T10:29:00Z",
+      "completed_at": "2026-09-03T10:31:30Z"
+    },
+    {
+      "id": 49518000110,
+      "run_id": 17640023311,
+      "run_attempt": 1,
+      "name": "release candidate manifest",
+      "status": "in_progress",
+      "conclusion": null,
+      "html_url": "https://github.com/RandomCodeSpace/otelcontext/actions/runs/17640023311/job/49518000110",
+      "started_at": "2026-09-03T10:32:00Z",
+      "completed_at": null
+    }
+  ]
+}
