@@ -379,7 +379,7 @@ func (r *Repository) PurgeMetricBucketsBatched(ctx context.Context, olderThan ti
 			return total, err
 		}
 		result := r.db.WithContext(ctx).Exec(
-			"DELETE FROM metric_buckets WHERE id IN (SELECT id FROM metric_buckets WHERE time_bucket < ? ORDER BY id LIMIT ?)",
+			batchedDeleteSQL(driver, "metric_buckets", "time_bucket < ?"),
 			olderThan, batchSize,
 		)
 		if result.Error != nil {

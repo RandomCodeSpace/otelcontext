@@ -696,12 +696,15 @@ jobs:
           http_port="$(free_port)"
           grpc_port="$(free_port)"
           started_ms="$(date +%s%3N)"
+          # The hosted runner volume is far above the 8 GiB default data budget,
+          # which would put the disk watchdog into raw_off and fail /ready.
           env \
             AGGREGATE_MODE=legacy \
             APP_ENV=development \
             DB_DRIVER=sqlite \
             DB_DSN="${state}/otelcontext.db" \
             DATA_DISK_PATH="${state}" \
+            DATA_DISK_BUDGET_MB=1000000 \
             DLQ_PATH="${state}/dlq" \
             HTTP_PORT="${http_port}" \
             GRPC_PORT="${grpc_port}" \

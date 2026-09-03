@@ -34,7 +34,9 @@ func (CompressedText) GormDBDataType(db *gorm.DB, _ *schema.Field) string {
 
 func (ct CompressedText) Value() (driver.Value, error) {
 	if ct == "" {
-		return "", nil
+		// The column is binary on every dialect; a string parameter cannot be
+		// bound to varbinary on SQL Server (error 257), so bind empty bytes.
+		return []byte{}, nil
 	}
 	compressed := compress.Compress([]byte(ct))
 	// Prepend magic header to identify compressed data

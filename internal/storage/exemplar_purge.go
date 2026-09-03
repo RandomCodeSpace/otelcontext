@@ -68,7 +68,7 @@ func (r *Repository) PurgeExemplarsBatched(ctx context.Context, cutoff time.Time
 		var traces, spans int64
 		err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			res := tx.Exec(
-				"DELETE FROM traces WHERE id IN (SELECT id FROM traces WHERE timestamp < ? ORDER BY id LIMIT ?)",
+				batchedDeleteSQL(r.driver, "traces", "timestamp < ?"),
 				cutoff, batchSize,
 			)
 			if res.Error != nil {
@@ -81,7 +81,7 @@ func (r *Repository) PurgeExemplarsBatched(ctx context.Context, cutoff time.Time
 			// yet (Export writes traces and spans separately) is never a
 			// candidate.
 			res = tx.Exec(
-				"DELETE FROM spans WHERE id IN (SELECT id FROM spans WHERE start_time < ? AND trace_id NOT IN (SELECT trace_id FROM traces) ORDER BY id LIMIT ?)",
+				batchedDeleteSQL(r.driver, "spans", "start_time < ? AND trace_id NOT IN (SELECT trace_id FROM traces)"),
 				cutoff, batchSize,
 			)
 			if res.Error != nil {
@@ -111,7 +111,7 @@ func (r *Repository) PurgeExemplarsBatched(ctx context.Context, cutoff time.Time
 		var logs int64
 		err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			res := tx.Exec(
-				"DELETE FROM logs WHERE id IN (SELECT id FROM logs WHERE timestamp < ? ORDER BY id LIMIT ?)",
+				batchedDeleteSQL(r.driver, "logs", "timestamp < ?"),
 				cutoff, batchSize,
 			)
 			if res.Error != nil {
@@ -141,7 +141,7 @@ func (r *Repository) PurgeExemplarsBatched(ctx context.Context, cutoff time.Time
 			return stats, err
 		}
 		res := r.db.WithContext(ctx).Exec(
-			"DELETE FROM spans WHERE id IN (SELECT id FROM spans WHERE start_time < ? AND trace_id NOT IN (SELECT trace_id FROM traces) ORDER BY id LIMIT ?)",
+			batchedDeleteSQL(r.driver, "spans", "start_time < ? AND trace_id NOT IN (SELECT trace_id FROM traces)"),
 			cutoff, batchSize,
 		)
 		if res.Error != nil {
