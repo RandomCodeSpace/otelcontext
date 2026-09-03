@@ -106,6 +106,22 @@ candidate runs, and when a result is close to the threshold run the pair
 again before trusting it. The committed A/B file is one pair; its
 `notes` say how many pairs were run and what they showed.
 
+## Findings (2026-09-03, workstation pairs)
+
+| Finding | Owner | Baseline share | ACK p99 pair | Verdict | Record |
+|---|---|---:|---|---|---|
+| Batched delta-log pre-read in the group commit | `store_sqlite.go` `mergeDeltas` | 35.5 % (`prepareV2` re-parse 21.9 %) | 154.4 → 66.4 ms (0.43) | keep | `2026-09-03-delta-log-batched-read-ab.json`, `-bench-before.txt`, `-bench-after.txt` |
+| Skip the per-Export topology prune when the cutoff has not advanced | `topology.go` `fold` | 14.6 % | 154.4 → 260.4 ms (1.69); other pairs 0.73, 1.49, 1.00, 0.82 | revert (not consistent) | `2026-09-03-topology-prune-skip-ab.json` |
+| Multi-row `INSERT OR REPLACE` (8 rows per statement), stacked on the first | `store_sqlite.go` `mergeDeltas` | 13.5 % remaining re-parse | 66.4 → 67.2 ms (1.01), p50 worse | revert | `2026-09-03-delta-log-multirow-insert-ab.json` |
+
+What remains above 10 % after the kept change is kernel I/O under the
+commit and the network (`Syscall6`, ~17 %), the driver's statement
+re-parse spread over every remaining per-row `Exec` (~13 %), and the
+exemplar tier's GORM batch writes (`storage.BatchCreateAll`, ~12 %), which
+is outside the owners #293 names. The offered load fixes throughput at
+10,050 points/s in this harness, so only the p99 arm of the rule can be
+met here; a throughput claim needs the burst phase or a higher profile.
+
 ## Regenerating
 
 ```bash

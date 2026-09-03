@@ -1,0 +1,39 @@
+{
+  "schema_version": "otelcontext.ingest-ab.v1",
+  "rule": "identical acknowledged-point totals AND (ACK p99 <= 0.9x baseline at throughput within tolerance OR throughput >= 1.1x baseline at p99 within tolerance)",
+  "tolerance": 0.05,
+  "baseline": {
+    "git_sha": "32bb0363b9f87f5d7ee380871882001d054a5892",
+    "git_dirty": false,
+    "generated_at": "2026-09-03T22:36:00Z",
+    "points_sent": 1206015,
+    "points_acked": 1206015,
+    "points_acked_per_sec": 10050.038174286448,
+    "ack_p50_ms": 30.865455,
+    "ack_p99_ms": 66.356841,
+    "resource_exhausted": 0,
+    "cpu_model": "AMD EPYC 9354P 32-Core Processor",
+    "file": "ingest-baseline-v1.json"
+  },
+  "candidate": {
+    "git_sha": "002ac844a6f7a2bbb7f03418cc76bd5e2da2dccc",
+    "git_dirty": false,
+    "generated_at": "2026-09-03T22:56:01Z",
+    "points_sent": 1206000,
+    "points_acked": 1206000,
+    "points_acked_per_sec": 10049.995672304363,
+    "ack_p50_ms": 34.079821,
+    "ack_p99_ms": 67.211647,
+    "resource_exhausted": 0,
+    "cpu_model": "AMD EPYC 9354P 32-Core Processor",
+    "file": "ingest-baseline-v1.json"
+  },
+  "throughput_ratio": 0.99999577096312,
+  "ack_p99_ratio": 1.0128819574156642,
+  "acknowledged_identical": true,
+  "same_hardware": true,
+  "p99_improvement": false,
+  "throughput_improvement": false,
+  "verdict": "revert",
+  "notes": "Finding 3 of #293: carry eight delta rows per INSERT OR REPLACE (multi-row VALUES) so the driver parses one statement per chunk instead of one per row; stacked on finding 2 (baseline here is run f2a, the finding-2 candidate, binary 'f2' below is finding 2 alone, candidate 'f23' is finding 2 + 3). After finding 2 the remaining parser share was go-sqlite prepareV2 13.5 % of samples, 5.55 s of it under stmt.exec (the per-row INSERT). Result: ACK p99 66.4 -> 67.2 ms (1.01), p50 30.9 -> 34.1 ms (worse); BenchmarkCommitGroup5kSeries 147 ms/op (finding 2) -> 169 ms/op (median of 3). Confirms the note in mergeDeltas that a wider statement pays more in per-parameter binding than it saves in parsing. Reverted."
+}

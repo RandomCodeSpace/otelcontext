@@ -1,0 +1,39 @@
+{
+  "schema_version": "otelcontext.ingest-ab.v1",
+  "rule": "identical acknowledged-point totals AND (ACK p99 <= 0.9x baseline at throughput within tolerance OR throughput >= 1.1x baseline at p99 within tolerance)",
+  "tolerance": 0.05,
+  "baseline": {
+    "git_sha": "f49edcea2c3011b6da49fcfc46abaadeb60aafc3",
+    "git_dirty": false,
+    "generated_at": "2026-09-03T22:46:00Z",
+    "points_sent": 1206004,
+    "points_acked": 1206004,
+    "points_acked_per_sec": 10049.981897358482,
+    "ack_p50_ms": 50.274127,
+    "ack_p99_ms": 154.373946,
+    "resource_exhausted": 0,
+    "cpu_model": "AMD EPYC 9354P 32-Core Processor",
+    "file": "2026-09-03-aggregate-ingest-baseline.json"
+  },
+  "candidate": {
+    "git_sha": "32bb0363b9f87f5d7ee380871882001d054a5892",
+    "git_dirty": false,
+    "generated_at": "2026-09-03T22:26:00Z",
+    "points_sent": 1206012,
+    "points_acked": 1206012,
+    "points_acked_per_sec": 10050.032978340074,
+    "ack_p50_ms": 47.63374,
+    "ack_p99_ms": 260.353927,
+    "resource_exhausted": 0,
+    "cpu_model": "AMD EPYC 9354P 32-Core Processor",
+    "file": "ingest-baseline-v1.json"
+  },
+  "throughput_ratio": 1.0000050826938907,
+  "ack_p99_ratio": 1.6865146855804283,
+  "acknowledged_identical": true,
+  "same_hardware": true,
+  "p99_improvement": false,
+  "throughput_improvement": false,
+  "verdict": "revert",
+  "notes": "Finding 1 of #293: skip the per-Export topology prune when the retention cutoff has not advanced (internal/aggregate/topology.go). The profile put topologyProjection.pruneTenantLocked at 14.6 % of samples (10.85 s of 71 s) and the candidate profile removed it entirely (server CPU 118 % -> 95 % of one core), but ACK p99 did not move consistently: pairs base3/f1b 188.5 -> 137.6 ms (0.73), base4/f1c 174.2 -> 260.4 ms (1.49), base5/f1c 154.4 -> 260.4 ms (1.69); stacked on finding 2, f2a/f12a 66.4 -> 66.6 ms (1.00) and f2a/f12b 66.4 -> 54.4 ms (0.82). p50 moved 51.3/51.2/50.3 -> 47.8/47.6 ms. Not proven under the rule; reverted. Throughput is fixed by the offered load in this harness, so only the p99 arm of the rule can be met."
+}
