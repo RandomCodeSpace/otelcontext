@@ -3,6 +3,13 @@ const GOLDEN_ANGLE = 2.399963229728653;
 const POLL_INTERVAL_MS = 30000;
 const TOOL_CACHE_MS = 300000;
 const HOST_PREFIX = "host/";
+// HOST_NAME_PATTERN bounds what the page accepts as a host name from the URL
+// or a response before it builds a request URL from it.
+const HOST_NAME_PATTERN = /^[A-Za-z0-9._:-]{1,255}$/;
+
+function validHostName(value) {
+  return typeof value === "string" && HOST_NAME_PATTERN.test(value) ? value : null;
+}
 const HOST_METRICS_WINDOW_MS = 3600000;
 // Standard hostmetrics names. The first three always render; the usage pair
 // renders only when the host reports it.
@@ -363,7 +370,7 @@ function updateURL(changes) {
 
 function readURL() {
   const params = new URLSearchParams(window.location.search);
-  state.selectedHost = params.get("host");
+  state.selectedHost = validHostName(params.get("host"));
   state.selected = state.selectedHost ? null : params.get("service");
   state.groupBy = params.get("group") === "host" ? "host" : "service";
   const tab = params.get("tab");
@@ -1433,7 +1440,9 @@ async function fetchSeries(path) {
 
 // loadHostMetrics reads the host's hostmetrics series through the ordinary
 // metrics API. Previous samples stay on screen while a refresh is in flight.
-async function loadHostMetrics(host) {
+async function loadHostMetrics(candidate) {
+  const host = validHostName(candidate);
+  if (!host) return;
   const previous = state.hostMetrics.get(host);
   const entry = {
     series: previous ? previous.series : new Map(),
@@ -1794,7 +1803,9 @@ function openInspector(service) {
   window.setTimeout(() => dom.closeInspector.focus(), 0);
 }
 
-function openHost(host) {
+function openHost(candidate) {
+  const host = validHostName(candidate);
+  if (!host) return;
   state.selected = null;
   state.selectedHost = host;
   updateURL({ host: host, service: null, tab: null });
