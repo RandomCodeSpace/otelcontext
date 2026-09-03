@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/RandomCodeSpace/otelcontext/internal/authn"
 	"github.com/RandomCodeSpace/otelcontext/internal/graph"
 	"github.com/RandomCodeSpace/otelcontext/internal/graphrag"
 	"github.com/RandomCodeSpace/otelcontext/internal/httpconst"
@@ -290,12 +291,8 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request) {
 			rpcErr = &RPCError{Code: ErrInvalidParams, Message: "invalid tools/call params"}
 			break
 		}
-		// Resolve tenant from the MCP HTTP transport: header wins, else default.
 		// Downstream tool handlers pull the tenant off ctx via mcpCtx(r.Context()).
-		tenant := strings.TrimSpace(r.Header.Get(mcpTenantHeader))
-		if tenant == "" {
-			tenant = s.defaultTenant
-		}
+		tenant := s.requestTenant(r)
 		cacheTenant := s.topologyCacheScope(r.Context(), tenant, params.Name)
 
 		// Cache fast-path: cheap, idempotent GraphRAG tools are memoized
@@ -388,11 +385,7 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 
 	// Send initial endpoint event per MCP Streamable HTTP spec.
 	writeSSE(w, flusher, "endpoint", `{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}`)
-	tenant := strings.TrimSpace(r.Header.Get(mcpTenantHeader))
-	if tenant == "" {
-		tenant = s.defaultTenant
-	}
-	ctx := storage.WithTenantContext(r.Context(), tenant)
+	ctx := storage.WithTenantContext(r.Context(), s.requestTenant(r))
 	lastIdentity := topology.Identity{}
 	haveIdentity := false
 	if data, identity, ok := s.topologyNotification(ctx, lastIdentity, haveIdentity); ok {
@@ -542,6 +535,25 @@ func (s *Server) topologyNotification(ctx context.Context, last topology.Identit
 		return "", topology.Identity{}, false
 	}
 	return string(notificationJSON), identity, true
+}
+
+// requestTenant resolves the tenant an MCP request runs under. A bound
+// principal (tenant key or trusted external identity, stashed on the context
+// by the HTTP auth gate) pins the tenant: a contradicting X-Tenant-ID is
+// ignored and counted on the auth conflict counter. Operator and
+// unauthenticated requests keep the header-then-default precedence.
+func (s *Server) requestTenant(r *http.Request) string {
+	asserted := strings.TrimSpace(r.Header.Get(mcpTenantHeader))
+	if bound, ok := authn.BoundTenantFromContext(r.Context()); ok {
+		if asserted != "" && storage.SanitizeTenantID(asserted) != bound {
+			authn.RecordConflict("mcp", "header")
+		}
+		return bound
+	}
+	if asserted == "" {
+		return s.defaultTenant
+	}
+	return asserted
 }
 
 func (s *Server) topologyCacheScope(ctx context.Context, tenant, tool string) string {
