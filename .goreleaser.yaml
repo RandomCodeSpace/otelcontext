@@ -35,10 +35,12 @@ archives:
     files:
       - LICENSE.md
       - README.md
-      - src: deploy/systemd/otelcontext.service
-        dst: deploy/systemd
-      - src: deploy/systemd/otelcontext.env.example
-        dst: deploy/systemd
+      # Plain paths keep their directory inside the archive. A src/dst pair
+      # treats dst as the destination file name, which collapsed both files
+      # into one entry called deploy/systemd (caught by verify-assets on
+      # v0.4.0-rc.1).
+      - deploy/systemd/otelcontext.service
+      - deploy/systemd/otelcontext.env.example
 
 checksum:
   name_template: "checksums.txt"
