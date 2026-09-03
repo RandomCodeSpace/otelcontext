@@ -72,7 +72,11 @@ func TestReadLatencyAggregate(t *testing.T) {
 		workers = 8
 	}
 	prefillStarted := time.Now()
-	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Minute)
+	// The CI depth (144 windows) seeds in about two minutes; the full seven
+	// days writes 12M rows and needs the better part of an hour on two
+	// cores, so the budget scales with the requested depth.
+	prefillTimeout := max(12*time.Minute, time.Duration(windows)*5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), prefillTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, prefillBinary,
 		"-db", filepath.Join(dir, "aggregate.db"),
