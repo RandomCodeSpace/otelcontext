@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -25,14 +26,16 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/RandomCodeSpace/otelcontext/internal/aggregate"
 	"github.com/RandomCodeSpace/otelcontext/internal/api"
 )
 
 const (
-	binaryEnv   = "OTELCONTEXT_READPROOF_BINARY"
-	proofDirEnv = "OTELCONTEXT_PROOF_DIR"
+	binaryEnv    = "OTELCONTEXT_READPROOF_BINARY"
+	proofDirEnv  = "OTELCONTEXT_PROOF_DIR"
+	pprofAddrEnv = "OTELCONTEXT_READPROOF_PPROF_ADDR"
 
 	warmupRequests = 10
 	// endpointBudget bounds the timed phase of one endpoint so a slow surface
@@ -42,6 +45,26 @@ const (
 	callTimeout    = 30 * time.Second
 	rssInterval    = 5 * time.Second
 	mcpPath        = "/mcp"
+	metricsPath    = "/metrics/prometheus"
+	// graphRAGRefreshInterval is the GraphRAG refresh loop period: the tick
+	// that prunes TraceStore spans past their TTL. Seeded history is
+	// backdated, so every seeded span sits in memory until the first tick
+	// after seeding — the in-memory transient of seeding ends there, not
+	// when the rows are on disk.
+	graphRAGRefreshInterval = 60 * time.Second
+	// releaseGrace is how long a collection gets to be followed by the
+	// scavenger returning the freed heap before it counts as having had
+	// nothing to return; the observed delay ranges from a few seconds to
+	// over thirty.
+	releaseGrace = 90 * time.Second
+	// settleDeadline bounds the whole wait: the refresh tick, then the forced
+	// GC Go runs every two minutes when allocation alone does not trigger one
+	// (runtime forcegcperiod), then the release grace, plus a margin.
+	settleDeadline     = graphRAGRefreshInterval + 120*time.Second + releaseGrace + 30*time.Second
+	lastGCMetric       = "go_memstats_last_gc_time_seconds"
+	heapIdleMetric     = "go_memstats_heap_idle_bytes"
+	heapReleasedMetric = "go_memstats_heap_released_bytes"
+	heapInuseMetric    = "go_memstats_heap_inuse_bytes"
 )
 
 type lockedBuffer struct {
@@ -143,7 +166,10 @@ func newAppProcess(t *testing.T, binary, dir, mode string) *appProcess {
 		"INGEST_MIN_SEVERITY": "INFO",
 		"LOG_LEVEL":           "INFO",
 		"MCP_PATH":            mcpPath,
-		"PPROF_ADDR":          "",
+		// Off by default; OTELCONTEXT_READPROOF_PPROF_ADDR opens the server's
+		// pprof listener so an RSS exceedance can be attributed with a heap
+		// profile taken during the run (#292).
+		"PPROF_ADDR":          os.Getenv(pprofAddrEnv),
 		"SAMPLING_RATE":       "1.0",
 		"STORE_MIN_SEVERITY":  "INFO",
 		"TLS_AUTO_SELFSIGNED": "false",
@@ -260,7 +286,11 @@ func tail(s string, n int) string {
 	return s[len(s)-n:]
 }
 
-// rssSampler reads VmRSS of the server every rssInterval plus on demand.
+// rssSampler scrapes the server's own memory gauges from /metrics every
+// rssInterval plus on demand: otelcontext_process_resident_memory_bytes (the
+// #283 witness) and otelcontext_go_heap_inuse_bytes. The server is the
+// source, not /proc from outside, so the proof reads exactly what an
+// operator's scrape would.
 type rssSampler struct {
 	app  *appProcess
 	mu   sync.Mutex
@@ -269,8 +299,32 @@ type rssSampler struct {
 	wg   sync.WaitGroup
 }
 
+// scrapeMetrics fetches and parses the server's Prometheus exposition.
+func (a *appProcess) scrapeMetrics() ([]MetricSample, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.baseURL()+metricsPath, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("GET %s: HTTP %d", metricsPath, resp.StatusCode)
+	}
+	return ParseMetrics(string(body))
+}
+
 func startRSSSampler(app *appProcess) *rssSampler {
 	s := &rssSampler{app: app, stop: make(chan struct{})}
+	s.rss.Source = RSSMetric + " and " + HeapMetric + " scraped from GET " + metricsPath
 	s.sample()
 	s.wg.Add(1)
 	go func() {
@@ -294,19 +348,115 @@ func (s *rssSampler) sample() {
 	if cmd == nil || cmd.Process == nil {
 		return
 	}
-	raw, err := os.ReadFile("/proc/" + strconv.Itoa(cmd.Process.Pid) + "/status")
+	samples, err := s.app.scrapeMetrics()
+	at := round3(time.Since(s.app.started).Seconds())
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err != nil {
-		s.rss.Error = err.Error()
+		// The listener is not up yet during startup; that is not evidence
+		// of anything, so only a failure after the first sample is kept.
+		if len(s.rss.Samples) > 0 {
+			s.rss.Error = err.Error()
+		}
 		return
 	}
-	bytes, err := ParseVmRSS(string(raw))
+	rss, err := Gauge(samples, RSSMetric)
 	if err != nil {
 		s.rss.Error = err.Error()
 		return
 	}
-	s.rss.Samples = append(s.rss.Samples, RSSSample{Seconds: round3(time.Since(s.app.started).Seconds()), Bytes: bytes})
+	heap, _ := Gauge(samples, HeapMetric)
+	s.rss.Samples = append(s.rss.Samples, RSSSample{Seconds: at, Bytes: int64(rss), HeapBytes: int64(heap)})
+}
+
+// account reads the memory accounting once, at the end of the measurement
+// phase, so the report says where the memory sits at its steady state.
+func (a *appProcess) account() MemoryAccounting {
+	samples, err := a.scrapeMetrics()
+	at := round3(time.Since(a.started).Seconds())
+	if err != nil {
+		return MemoryAccounting{Seconds: at, Error: err.Error()}
+	}
+	acct := Account(samples, int64(unsafe.Sizeof(aggregate.Sketch{})))
+	acct.Seconds = at
+	return acct
+}
+
+// settle waits for the first GC cycle the server completes at least one
+// GraphRAG refresh interval after `since`, the moment seeding finished, and
+// then for the RSS gauge to stop moving. Seeding leaves the heap at its
+// high-water mark: the seeded spans stay live until the refresh tick prunes
+// them, garbage stays until the next cycle, and an idle process only gets
+// one from the two-minute forced GC — so the steady window (#283) starts at
+// the first collection that could actually free the seeding transient, never
+// inside it. The second wait is for the scavenger: the cycle is recorded
+// before the freed spans are returned to the OS, which begins several
+// seconds later, and a sample taken on that falling edge is the high-water
+// mark wearing a steady-state label. Timing cannot tell "not started" from
+// "finished", so the harness reads the runtime's own accounting: the
+// transient is returned once the idle heap it still retains
+// (heap_idle − heap_released) is below the heap in use. Then the RSS gauge
+// must hold across four readings 5 s apart. A collection after which the runtime
+// keeps retaining more than it uses for releaseGrace counts as settled with
+// the reason recorded, as does the deadline.
+func (s *rssSampler) settle(since time.Time) {
+	started := time.Now()
+	rule := "steady window starts at the first GC cycle completed at least one GraphRAG refresh interval (60s) after seeding finished, once the runtime's retained idle heap (go_memstats_heap_idle_bytes - go_memstats_heap_released_bytes) is below the heap in use and the RSS gauge has held within 2% across four readings 5s apart; a collection after which retained idle stays above in-use for 90s counts as settled"
+	deadline := started.Add(settleDeadline)
+	eligible := float64(since.Add(graphRAGRefreshInterval).UnixNano()) / 1e9
+	reason := ""
+	var collectedAt time.Time
+	released := false
+	prev, stable := 0.0, 0
+settling:
+	for {
+		samples, err := s.app.scrapeMetrics()
+		if err == nil {
+			switch {
+			case collectedAt.IsZero():
+				if last, err := Gauge(samples, lastGCMetric); err == nil && last > eligible {
+					collectedAt = time.Now()
+				}
+			case !released:
+				idle, _ := Gauge(samples, heapIdleMetric)
+				returned, _ := Gauge(samples, heapReleasedMetric)
+				inuse, _ := Gauge(samples, heapInuseMetric)
+				if inuse > 0 && idle-returned <= inuse {
+					released = true
+				} else if time.Since(collectedAt) >= releaseGrace {
+					reason = fmt.Sprintf("; retained idle heap stayed above in-use for %.0f s after the collection", releaseGrace.Seconds())
+					break settling
+				}
+			default:
+				// The release steps down over several seconds with pauses
+				// between steps, so stability is judged on the sampling
+				// cadence across four readings (15 s), not on a 2 s poll.
+				if cur, err := Gauge(samples, RSSMetric); err == nil {
+					if prev > 0 && math.Abs(cur-prev) <= 0.02*prev {
+						stable++
+					} else {
+						stable = 0
+					}
+					prev = cur
+					if stable >= 3 {
+						break settling
+					}
+				}
+				if time.Now().Before(deadline) {
+					time.Sleep(rssInterval - 2*time.Second)
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			reason = fmt.Sprintf("; not settled within %.0f s (gc cycle observed: %t, release observed: %t), window starts at the deadline", settleDeadline.Seconds(), !collectedAt.IsZero(), released)
+			break
+		}
+		time.Sleep(2 * time.Second)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rss.SettleSeconds = round3(time.Since(started).Seconds())
+	s.rss.SteadyRule = rule + reason
 }
 
 func (s *rssSampler) finish(steadyFrom float64) RSS {
@@ -578,9 +728,30 @@ func newProof(t *testing.T, shape, binary string, o Objectives) *Proof {
 			"rest_*: the default range (no query parameters), exactly as the embedded UI polls; rest_*_full_range: explicit start/end spanning the whole seeded horizon; server-side dashboard (10s) and service-map (30s) caches are in play as they are for any client",
 			"coverage is the OtelContext-Data-Coverage header; body_coverage is the `coverage` field of object-shaped bodies (dashboard, service-map); requested_start/effective_start appear only when the aggregate range clamp shortened the request",
 			"mcp_*: arguments a real client sends, so the 5s MCP result cache serves most warm calls; mcp_*_miss: an ignored `_nonce` argument defeats the cache key and is recorded, not asserted",
-			"rss is recorded for #292 and not asserted; steady_p95 covers samples taken from the start of the measurement phase",
+			"rss: the server's own otelcontext_process_resident_memory_bytes and otelcontext_go_heap_inuse_bytes scraped from " + metricsPath + " every 5 s; peak spans the whole run, steady_p95 is the exact ordered p95 over samples taken from the start of the measurement phase (steady_from_s) and is asserted against the #283 objective as rss.steady_p95_bytes",
+			"memory_accounting: one " + metricsPath + " read at the end of the measurement phase — resource registry entries, GraphRAG census (latency_sketches × sizeof(aggregate.Sketch) gives graphrag_latency_sketch_bytes) and read-cache entries next to the RSS and heap gauges at that instant",
 		},
 	}
+}
+
+// logMemory renders the RSS series summary and the accounting into the test
+// output, the proof's rendered report.
+func logMemory(t *testing.T, p *Proof) {
+	t.Helper()
+	mib := func(b int64) float64 { return float64(b) / MiB }
+	r := p.RSS
+	t.Logf("rss: %d samples, peak %.1f MiB, heap in use peak %.1f MiB, steady p95 %.1f MiB over %d samples from t=%.1fs (objective %.0f MiB)%s",
+		len(r.Samples), mib(r.PeakBytes), mib(r.HeapPeakBytes), mib(r.SteadyP95Bytes), r.SteadySamples, r.SteadyFromSeconds, mib(p.Objectives.RSSSteadyP95Bytes), errSuffix(r.Error))
+	a := p.Memory
+	t.Logf("memory accounting at t=%.1fs: rss %.1f MiB, heap in use %.1f MiB; registry pairs %d hosts %d; graphrag entities %v edges %v latency sketches %.2f MiB; read caches %v%s",
+		a.Seconds, mib(a.RSSBytes), mib(a.HeapInuseBytes), a.RegistryPairEntries, a.RegistryHostEntries, a.GraphRAGEntities, a.GraphRAGEdges, mib(a.LatencySketchBytes), a.ReadCacheEntries, errSuffix(a.Error))
+}
+
+func errSuffix(err string) string {
+	if err == "" {
+		return ""
+	}
+	return "; error: " + err
 }
 
 func writeProof(t *testing.T, p *Proof, started time.Time) {

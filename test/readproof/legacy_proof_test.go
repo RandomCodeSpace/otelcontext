@@ -46,7 +46,9 @@ var legacyServices = []string{"frontend", "checkout", "payment", "inventory", "s
 func TestReadLatencyLegacy(t *testing.T) {
 	binary := requireBinary(t)
 	started := time.Now()
-	objectives := Objectives{Requests: 200, WarmP99MS: 300, ColdMS: 1000}
+	// Latency from #281; RSS steady p95 from #283 (legacy, bounded SQLite,
+	// five services: 512 MiB).
+	objectives := Objectives{Requests: 200, WarmP99MS: 300, ColdMS: 1000, RSSSteadyP95Bytes: 512 * MiB}
 	proof := newProof(t, "legacy", binary, objectives)
 	proof.Prefill = Prefill{Services: len(legacyServices), Days: legacyDays, Traces: legacyTraces, Spans: legacyTraces * legacySpansPerTrace, Logs: legacyTraces}
 
@@ -98,12 +100,15 @@ func TestReadLatencyLegacy(t *testing.T) {
 	proof.Prefill.MainDBByte = fileSize(filepath.Join(dir, "otelcontext.db")) + fileSize(filepath.Join(dir, "otelcontext.db-wal"))
 	t.Logf("ingest: %d traces / %d spans / %d logs in %.1f s, main db %d bytes", legacyTraces, legacyTraces*legacySpansPerTrace, legacyTraces, proof.Prefill.Seconds, proof.Prefill.MainDBByte)
 
+	sampler.settle(time.Now())
 	measureFrom := time.Since(app.started).Seconds()
 	sampler.sample()
 	for _, ep := range plan {
 		measure(t, ep.m, ep.fn, objectives)
 	}
+	proof.Memory = app.account()
 	proof.RSS = sampler.finish(measureFrom)
+	logMemory(t, proof)
 }
 
 func legacyResource(service string) *resourcepb.Resource {

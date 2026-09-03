@@ -11,7 +11,6 @@ package readproof
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -27,12 +26,27 @@ const SchemaVersion = "otelcontext.read-latency.v1"
 // FileName is the artifact written into OTELCONTEXT_PROOF_DIR.
 const FileName = "read-latency-v1.json"
 
-// Objectives are the decision's numbers for one shape (#281).
+// Objectives are the decision's numbers for one shape: latency from #281,
+// RSS steady p95 from #283.
 type Objectives struct {
-	Requests  int     `json:"requests"`
-	WarmP99MS float64 `json:"warm_p99_ms"`
-	ColdMS    float64 `json:"cold_ms"`
+	Requests          int     `json:"requests"`
+	WarmP99MS         float64 `json:"warm_p99_ms"`
+	ColdMS            float64 `json:"cold_ms"`
+	RSSSteadyP95Bytes int64   `json:"rss_steady_p95_bytes"`
 }
+
+// MiB is the unit the memory objectives are written in.
+const MiB = 1 << 20
+
+// Metric names the proof reads from the server's Prometheus exposition.
+const (
+	RSSMetric              = "otelcontext_process_resident_memory_bytes"
+	HeapMetric             = "otelcontext_go_heap_inuse_bytes"
+	RegistryEntriesMetric  = "otelcontext_resource_registry_entries"
+	GraphRAGEntitiesMetric = "otelcontext_graphrag_store_entities"
+	GraphRAGEdgesMetric    = "otelcontext_graphrag_store_edges"
+	ReadCacheEntriesMetric = "otelcontext_read_cache_entries"
+)
 
 // Percentiles are exact ordered (nearest-rank) statistics in milliseconds.
 type Percentiles struct {
@@ -88,20 +102,220 @@ type Measurement struct {
 	Error          string `json:"error,omitempty"`
 }
 
-// RSSSample is one VmRSS reading, offset from server start.
+// RSSSample is one scrape of the server's own memory gauges, offset from
+// server start: otelcontext_process_resident_memory_bytes and
+// otelcontext_go_heap_inuse_bytes.
 type RSSSample struct {
-	Seconds float64 `json:"t_s"`
-	Bytes   int64   `json:"bytes"`
+	Seconds   float64 `json:"t_s"`
+	Bytes     int64   `json:"bytes"`
+	HeapBytes int64   `json:"heap_inuse_bytes"`
 }
 
-// RSS is the server's resident-set series across the run. Recorded, not
-// asserted (#292 owns the objective).
+// RSS is the server's resident-set series across the run, read from the
+// server's /metrics every 5 s. Peak spans the whole run; the steady p95 is
+// the exact ordered p95 over samples taken at or after SteadyFromSeconds —
+// the start of the measurement phase, once prefill and readiness are done —
+// and is what #283's objective is asserted against.
 type RSS struct {
-	Samples        []RSSSample `json:"samples"`
-	PeakBytes      int64       `json:"peak_bytes"`
-	SteadyP95Bytes int64       `json:"steady_p95_bytes"`
-	SteadySamples  int         `json:"steady_samples"`
-	Error          string      `json:"error,omitempty"`
+	Source            string      `json:"source"`
+	Samples           []RSSSample `json:"samples"`
+	PeakBytes         int64       `json:"peak_bytes"`
+	HeapPeakBytes     int64       `json:"heap_inuse_peak_bytes"`
+	SteadyFromSeconds float64     `json:"steady_from_s"`
+	// SettleSeconds is how long the harness waited after seeding for the
+	// runtime's first GC cycle; SteadyRule says how the window was chosen.
+	SettleSeconds  float64 `json:"settle_s"`
+	SteadyRule     string  `json:"steady_rule"`
+	SteadyP95Bytes int64   `json:"steady_p95_bytes"`
+	SteadySamples  int     `json:"steady_samples"`
+	Error          string  `json:"error,omitempty"`
+}
+
+// MemoryAccounting says where the memory sits at the end of the measurement
+// phase: one /metrics read of the counts the resource registry, the GraphRAG
+// stores (with the #291 latency sketches) and the read caches publish, next
+// to the RSS and heap gauges scraped at the same instant.
+type MemoryAccounting struct {
+	Seconds        float64 `json:"t_s"`
+	RSSBytes       int64   `json:"rss_bytes"`
+	HeapInuseBytes int64   `json:"heap_inuse_bytes"`
+	// Registry counts are summed over tenants: kind=pair entries and
+	// kind=host distinct hosts.
+	RegistryPairEntries int64 `json:"registry_pair_entries"`
+	RegistryHostEntries int64 `json:"registry_host_entries"`
+	// GraphRAG counts are the census gauges by entity kind and edge store.
+	GraphRAGEntities map[string]int64 `json:"graphrag_entities"`
+	GraphRAGEdges    map[string]int64 `json:"graphrag_edges"`
+	// LatencySketchBytes is latency_sketches × the fixed size of one
+	// aggregate.Sketch value.
+	LatencySketchBytes int64 `json:"graphrag_latency_sketch_bytes"`
+	// ReadCacheEntries is otelcontext_read_cache_entries by cache name.
+	ReadCacheEntries map[string]int64 `json:"read_cache_entries"`
+	Error            string           `json:"error,omitempty"`
+}
+
+// MetricSample is one line of Prometheus text exposition.
+type MetricSample struct {
+	Name   string
+	Labels map[string]string
+	Value  float64
+}
+
+// ParseMetrics reads Prometheus text exposition into samples. Comment and
+// blank lines are skipped; a malformed line is an error naming it.
+func ParseMetrics(text string) ([]MetricSample, error) {
+	var out []MetricSample
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		s, err := parseMetricLine(line)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	return out, nil
+}
+
+func parseMetricLine(line string) (MetricSample, error) {
+	s := MetricSample{Labels: map[string]string{}}
+	body := line
+	if i := strings.IndexByte(line, '{'); i >= 0 {
+		end := strings.LastIndexByte(line, '}')
+		if end < i {
+			return s, fmt.Errorf("metric line %q: unterminated labels", line)
+		}
+		s.Name = line[:i]
+		for _, pair := range splitLabels(line[i+1 : end]) {
+			key, value, ok := strings.Cut(pair, "=")
+			if !ok {
+				return s, fmt.Errorf("metric line %q: label %q", line, pair)
+			}
+			unquoted, err := strconv.Unquote(value)
+			if err != nil {
+				return s, fmt.Errorf("metric line %q: label %q: %w", line, pair, err)
+			}
+			s.Labels[key] = unquoted
+		}
+		body = strings.TrimSpace(line[end+1:])
+	} else {
+		name, rest, ok := strings.Cut(line, " ")
+		if !ok {
+			return s, fmt.Errorf("metric line %q: no value", line)
+		}
+		s.Name, body = name, strings.TrimSpace(rest)
+	}
+	// A trailing timestamp is legal; the value is the first field.
+	value := strings.Fields(body)
+	if len(value) == 0 {
+		return s, fmt.Errorf("metric line %q: no value", line)
+	}
+	v, err := strconv.ParseFloat(value[0], 64)
+	if err != nil {
+		return s, fmt.Errorf("metric line %q: value: %w", line, err)
+	}
+	s.Value = v
+	return s, nil
+}
+
+// splitLabels splits `a="x",b="y,z"` on commas outside quotes.
+func splitLabels(raw string) []string {
+	var out []string
+	start, quoted := 0, false
+	for i := 0; i < len(raw); i++ {
+		switch raw[i] {
+		case '\\':
+			if quoted {
+				i++
+			}
+		case '"':
+			quoted = !quoted
+		case ',':
+			if !quoted {
+				out = append(out, strings.TrimSpace(raw[start:i]))
+				start = i + 1
+			}
+		}
+	}
+	if rest := strings.TrimSpace(raw[start:]); rest != "" {
+		out = append(out, rest)
+	}
+	return out
+}
+
+// Gauge returns the single unlabelled sample of name.
+func Gauge(samples []MetricSample, name string) (float64, error) {
+	for _, s := range samples {
+		if s.Name == name && len(s.Labels) == 0 {
+			return s.Value, nil
+		}
+	}
+	return 0, fmt.Errorf("%s absent from /metrics", name)
+}
+
+// GaugeByLabel maps one label's values to the sample values for name.
+func GaugeByLabel(samples []MetricSample, name, label string) map[string]int64 {
+	out := map[string]int64{}
+	for _, s := range samples {
+		if s.Name == name {
+			out[s.Labels[label]] = int64(s.Value)
+		}
+	}
+	return out
+}
+
+// GaugeSum adds every sample of name whose labels include want.
+func GaugeSum(samples []MetricSample, name string, want map[string]string) int64 {
+	var total int64
+	for _, s := range samples {
+		if s.Name != name {
+			continue
+		}
+		match := true
+		for k, v := range want {
+			if s.Labels[k] != v {
+				match = false
+				break
+			}
+		}
+		if match {
+			total += int64(s.Value)
+		}
+	}
+	return total
+}
+
+// Account fills the accounting from one exposition read; sketchBytes is the
+// size of one aggregate.Sketch value.
+func Account(samples []MetricSample, sketchBytes int64) MemoryAccounting {
+	a := MemoryAccounting{
+		GraphRAGEntities: GaugeByLabel(samples, GraphRAGEntitiesMetric, "entity"),
+		GraphRAGEdges:    GaugeByLabel(samples, GraphRAGEdgesMetric, "store"),
+		ReadCacheEntries: GaugeByLabel(samples, ReadCacheEntriesMetric, "cache"),
+	}
+	a.RegistryPairEntries = GaugeSum(samples, RegistryEntriesMetric, map[string]string{"kind": "pair"})
+	a.RegistryHostEntries = GaugeSum(samples, RegistryEntriesMetric, map[string]string{"kind": "host"})
+	a.LatencySketchBytes = a.GraphRAGEntities["latency_sketches"] * sketchBytes
+	var errs []string
+	if v, err := Gauge(samples, RSSMetric); err == nil {
+		a.RSSBytes = int64(v)
+	} else {
+		errs = append(errs, err.Error())
+	}
+	if v, err := Gauge(samples, HeapMetric); err == nil {
+		a.HeapInuseBytes = int64(v)
+	} else {
+		errs = append(errs, err.Error())
+	}
+	for _, name := range []string{GraphRAGEntitiesMetric, GraphRAGEdgesMetric, ReadCacheEntriesMetric} {
+		if len(GaugeByLabel(samples, name, "")) == 0 {
+			errs = append(errs, name+" absent from /metrics")
+		}
+	}
+	a.Error = strings.Join(errs, "; ")
+	return a
 }
 
 // Prefill describes the seeded history. Fields are shape-specific.
@@ -147,6 +361,7 @@ type Proof struct {
 	Objectives    Objectives        `json:"objectives"`
 	Measurements  []*Measurement    `json:"measurements"`
 	RSS           RSS               `json:"rss"`
+	Memory        MemoryAccounting  `json:"memory_accounting"`
 	Assertions    []Assertion       `json:"assertions"`
 	Duration      float64           `json:"duration_seconds"`
 	Notes         []string          `json:"notes,omitempty"`
@@ -182,7 +397,8 @@ func Summarize(samples []float64) Percentiles {
 
 // Evaluate scores every asserted measurement against the objectives. Each
 // asserted endpoint yields exactly two assertions, whether or not it was
-// measured: a missing or failed measurement fails both with the reason.
+// measured: a missing or failed measurement fails both with the reason. An
+// RSS objective (#283) adds one more, `rss.steady_p95_bytes`.
 func Evaluate(p *Proof) []Assertion {
 	o := p.Objectives
 	var out []Assertion
@@ -192,7 +408,32 @@ func Evaluate(p *Proof) []Assertion {
 		}
 		out = append(out, coldAssertion(m, o), warmAssertion(m, o))
 	}
+	if o.RSSSteadyP95Bytes > 0 {
+		out = append(out, rssAssertion(&p.RSS, o))
+	}
 	return out
+}
+
+func rssAssertion(r *RSS, o Objectives) Assertion {
+	a := Assertion{Name: "rss.steady_p95_bytes", Measured: float64(r.SteadyP95Bytes), Objective: float64(o.RSSSteadyP95Bytes), Unit: "bytes"}
+	mib := func(b int64) float64 { return float64(b) / MiB }
+	switch {
+	case r.SteadySamples == 0 && r.Error != "":
+		a.Detail = "no steady-state RSS samples: " + r.Error
+	case r.SteadySamples == 0:
+		a.Detail = "no steady-state RSS samples: the measurement phase never started"
+	case r.SteadyP95Bytes > o.RSSSteadyP95Bytes:
+		a.Detail = fmt.Sprintf("rss steady p95 %.1f MiB > %.0f MiB objective over %d samples (peak %.1f MiB, heap in use peak %.1f MiB)",
+			mib(r.SteadyP95Bytes), mib(o.RSSSteadyP95Bytes), r.SteadySamples, mib(r.PeakBytes), mib(r.HeapPeakBytes))
+	default:
+		a.Passed = true
+		a.Detail = fmt.Sprintf("rss steady p95 %.1f MiB <= %.0f MiB objective over %d samples (peak %.1f MiB, heap in use peak %.1f MiB)",
+			mib(r.SteadyP95Bytes), mib(o.RSSSteadyP95Bytes), r.SteadySamples, mib(r.PeakBytes), mib(r.HeapPeakBytes))
+	}
+	if r.Error != "" && r.SteadySamples > 0 {
+		a.Detail += "; sampler error: " + r.Error
+	}
+	return a
 }
 
 func coldAssertion(m *Measurement, o Objectives) Assertion {
@@ -240,14 +481,18 @@ func Failed(assertions []Assertion) []Assertion {
 	return out
 }
 
-// SummarizeRSS fills peak and the p95 over samples taken at or after
-// steadyFrom seconds.
+// SummarizeRSS fills the peaks and the exact ordered p95 over samples taken
+// at or after steadyFrom seconds.
 func SummarizeRSS(r *RSS, steadyFrom float64) {
 	var steady []float64
-	r.PeakBytes = 0
+	r.PeakBytes, r.HeapPeakBytes = 0, 0
+	r.SteadyFromSeconds = steadyFrom
 	for _, s := range r.Samples {
 		if s.Bytes > r.PeakBytes {
 			r.PeakBytes = s.Bytes
+		}
+		if s.HeapBytes > r.HeapPeakBytes {
+			r.HeapPeakBytes = s.HeapBytes
 		}
 		if s.Seconds >= steadyFrom {
 			steady = append(steady, float64(s.Bytes))
@@ -255,26 +500,6 @@ func SummarizeRSS(r *RSS, steadyFrom float64) {
 	}
 	r.SteadySamples = len(steady)
 	r.SteadyP95Bytes = int64(NearestRank(steady, 0.95))
-}
-
-// ParseVmRSS extracts the resident-set size in bytes from a
-// /proc/<pid>/status payload.
-func ParseVmRSS(status string) (int64, error) {
-	for _, line := range strings.Split(status, "\n") {
-		if !strings.HasPrefix(line, "VmRSS:") {
-			continue
-		}
-		fields := strings.Fields(strings.TrimPrefix(line, "VmRSS:"))
-		if len(fields) < 2 || fields[1] != "kB" {
-			return 0, fmt.Errorf("unexpected VmRSS line %q", line)
-		}
-		kb, err := strconv.ParseInt(fields[0], 10, 64)
-		if err != nil {
-			return 0, fmt.Errorf("VmRSS %q: %w", fields[0], err)
-		}
-		return kb * 1024, nil
-	}
-	return 0, errors.New("VmRSS line absent")
 }
 
 // Write evaluates the proof and writes it to dir/FileName.

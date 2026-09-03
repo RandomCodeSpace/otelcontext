@@ -86,21 +86,85 @@ func TestEvaluateCarriesNumbersAndReasons(t *testing.T) {
 	}
 }
 
-func TestSummarizeRSSAndParseVmRSS(t *testing.T) {
-	bytes, err := ParseVmRSS("Name:\totelcontext\nVmPeak:\t 123 kB\nVmRSS:\t   2048 kB\nThreads:\t9\n")
-	if err != nil || bytes != 2048*1024 {
-		t.Fatalf("ParseVmRSS = %d, %v", bytes, err)
-	}
-	if _, err := ParseVmRSS("Name:\tx\n"); err == nil {
-		t.Error("absent VmRSS must error")
-	}
-	if _, err := ParseVmRSS("VmRSS:\t 12 MB\n"); err == nil {
-		t.Error("unexpected unit must error")
-	}
-	r := RSS{Samples: []RSSSample{{0, 10}, {5, 50}, {10, 30}, {15, 40}, {20, 35}}}
+func TestSummarizeRSSAndAssertion(t *testing.T) {
+	r := RSS{Samples: []RSSSample{{0, 10, 4}, {5, 50, 30}, {10, 30, 20}, {15, 40, 25}, {20, 35, 22}}}
 	SummarizeRSS(&r, 10)
-	if r.PeakBytes != 50 || r.SteadySamples != 3 || r.SteadyP95Bytes != 40 {
+	if r.PeakBytes != 50 || r.HeapPeakBytes != 30 || r.SteadySamples != 3 || r.SteadyP95Bytes != 40 || r.SteadyFromSeconds != 10 {
 		t.Errorf("SummarizeRSS = %+v", r)
+	}
+
+	o := Objectives{Requests: 200, WarmP99MS: 300, ColdMS: 1000, RSSSteadyP95Bytes: 512 * MiB}
+	pass := &Proof{Objectives: o, RSS: RSS{SteadySamples: 8, SteadyP95Bytes: 400 * MiB, PeakBytes: 700 * MiB, HeapPeakBytes: 300 * MiB}}
+	fail := &Proof{Objectives: o, RSS: RSS{SteadySamples: 8, SteadyP95Bytes: 925 * MiB, PeakBytes: 925 * MiB}}
+	none := &Proof{Objectives: o, RSS: RSS{Error: "connection refused"}}
+	unasserted := &Proof{Objectives: Objectives{Requests: 200, WarmP99MS: 300, ColdMS: 1000}, RSS: RSS{SteadySamples: 1, SteadyP95Bytes: 5 * MiB}}
+	check := func(p *Proof, passed bool, detail string) {
+		t.Helper()
+		got := Evaluate(p)
+		if len(got) != 1 {
+			t.Fatalf("assertions = %+v", got)
+		}
+		a := got[0]
+		if a.Name != "rss.steady_p95_bytes" || a.Unit != "bytes" || a.Passed != passed ||
+			a.Measured != float64(p.RSS.SteadyP95Bytes) || a.Objective != float64(512*MiB) || !strings.Contains(a.Detail, detail) {
+			t.Errorf("assertion = %+v", a)
+		}
+	}
+	check(pass, true, "400.0 MiB <= 512 MiB objective over 8 samples (peak 700.0 MiB, heap in use peak 300.0 MiB)")
+	check(fail, false, "925.0 MiB > 512 MiB objective")
+	check(none, false, "no steady-state RSS samples: connection refused")
+	if got := Evaluate(unasserted); len(got) != 0 {
+		t.Errorf("no RSS objective must add no assertion, got %+v", got)
+	}
+}
+
+func TestParseMetricsAndAccount(t *testing.T) {
+	exposition := `# HELP otelcontext_process_resident_memory_bytes Resident set size.
+# TYPE otelcontext_process_resident_memory_bytes gauge
+otelcontext_process_resident_memory_bytes 9.25519872e+08
+otelcontext_go_heap_inuse_bytes 3.1e+08
+otelcontext_resource_registry_entries{kind="host",tenant="default"} 5
+otelcontext_resource_registry_entries{kind="pair",tenant="default"} 7
+otelcontext_resource_registry_entries{kind="pair",tenant="acme, inc"} 2
+otelcontext_graphrag_store_entities{entity="latency_sketches"} 5
+otelcontext_graphrag_store_entities{entity="spans"} 184000
+otelcontext_graphrag_store_edges{store="trace"} 368000
+otelcontext_read_cache_entries{cache="api_ttl"} 3
+otelcontext_read_cache_entries{cache="mcp_result"} 4 1700000000000
+go_goroutines 42
+`
+	samples, err := ParseMetrics(exposition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(samples) != 11 {
+		t.Fatalf("samples = %d", len(samples))
+	}
+	if v, err := Gauge(samples, RSSMetric); err != nil || v != 925519872 {
+		t.Errorf("rss = %v, %v", v, err)
+	}
+	if _, err := Gauge(samples, "absent"); err == nil {
+		t.Error("absent gauge must error")
+	}
+	if _, err := ParseMetrics("broken{x=\"1\" 2\n"); err == nil {
+		t.Error("unterminated labels must error")
+	}
+	if _, err := ParseMetrics("novalue\n"); err == nil {
+		t.Error("missing value must error")
+	}
+
+	a := Account(samples, 2112)
+	if a.Error != "" || a.RSSBytes != 925519872 || a.HeapInuseBytes != 310000000 ||
+		a.RegistryPairEntries != 9 || a.RegistryHostEntries != 5 ||
+		a.GraphRAGEntities["spans"] != 184000 || a.GraphRAGEdges["trace"] != 368000 ||
+		a.LatencySketchBytes != 5*2112 || a.ReadCacheEntries["api_ttl"] != 3 || a.ReadCacheEntries["mcp_result"] != 4 {
+		t.Errorf("Account = %+v", a)
+	}
+	empty := Account(nil, 2112)
+	for _, want := range []string{RSSMetric, HeapMetric, GraphRAGEntitiesMetric, GraphRAGEdgesMetric, ReadCacheEntriesMetric} {
+		if !strings.Contains(empty.Error, want+" absent") {
+			t.Errorf("empty accounting must name %s: %q", want, empty.Error)
+		}
 	}
 }
 
