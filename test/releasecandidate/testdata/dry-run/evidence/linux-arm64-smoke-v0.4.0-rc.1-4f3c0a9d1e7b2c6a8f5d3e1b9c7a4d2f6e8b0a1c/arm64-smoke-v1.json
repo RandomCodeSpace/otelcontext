@@ -1,0 +1,9 @@
+{
+  "schema_version": "otelcontext.arm64-smoke.v1",
+  "tag": "v0.4.0-rc.1",
+  "sha": "4f3c0a9d1e7b2c6a8f5d3e1b9c7a4d2f6e8b0a1c",
+  "version": "OtelContext version v0.4.0-rc.1",
+  "live_ms": 412,
+  "ready_ms": 655,
+  "exit_code": 0
+}
