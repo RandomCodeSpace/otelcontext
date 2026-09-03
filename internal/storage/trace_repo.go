@@ -419,25 +419,52 @@ func (r *Repository) GetServiceMapMetrics(ctx context.Context, start, end time.T
 		return nil, fmt.Errorf("failed to aggregate service map nodes: %w", err)
 	}
 
+	// Exact per-service p99 (#291): one ordered-rank query over the range,
+	// only while the range fits the same row bound the edge pass scans.
+	// Above it every node keeps the average-multiplier estimate, labelled
+	// as such.
+	var rangeSpans int64
+	for _, nr := range nodeRows {
+		rangeSpans += nr.SpanCount
+	}
+	p99ByService := map[string]int64{}
+	if rangeSpans > 0 && rangeSpans <= int64(serviceMapSpanLimit) {
+		var err error
+		if p99ByService, err = r.serviceP99Durations(ctx, tenant, start, end); err != nil {
+			return nil, fmt.Errorf("failed to rank service map latencies: %w", err)
+		}
+	}
+
 	nodes := make([]ServiceMapNode, 0, len(nodeRows))
 	for _, nr := range nodeRows {
 		avgLatencyMs := math.Round(nr.AvgDuration/1000.0*100) / 100
 		sampleCount := uint64(nr.SpanCount) // #nosec G115 -- grouped database counts cannot be negative.
-		nodes = append(nodes, ServiceMapNode{
+		node := ServiceMapNode{
 			Name:        nr.ServiceName,
 			TotalTraces: nr.SpanCount,
 			ErrorCount:  nr.ErrorCount,
 			// AVG(duration) is microseconds; convert to ms and round to 2dp.
 			AvgLatencyMs: avgLatencyMs,
-			P99LatencyMs: avgLatencyMs * 2.5,
-			LatencyProvenance: &latency.Provenance{P99: &latency.Percentile{
+		}
+		if p99, ok := p99ByService[nr.ServiceName]; ok {
+			node.P99LatencyMs = math.Round(float64(p99)/1000.0*100) / 100
+			node.LatencyProvenance = &latency.Provenance{P99: &latency.Percentile{
+				Status:      latency.StatusMeasured,
+				Method:      latency.MethodOrderedRank,
+				SampleCount: sampleCount,
+				LowSample:   sampleCount < latency.LowSampleThreshold,
+			}}
+		} else {
+			node.P99LatencyMs = avgLatencyMs * 2.5
+			node.LatencyProvenance = &latency.Provenance{P99: &latency.Percentile{
 				Status:         latency.StatusEstimated,
 				Method:         latency.MethodAverageMultiplier,
 				SampleCount:    sampleCount,
 				LowSample:      sampleCount < latency.LowSampleThreshold,
 				EstimateFactor: 2.5,
-			}},
-		})
+			}}
+		}
+		nodes = append(nodes, node)
 	}
 
 	edgeQuery := r.db.WithContext(ctx).Model(&Span{}).
@@ -499,6 +526,48 @@ func (r *Repository) GetServiceMapMetrics(ctx context.Context, start, end time.T
 		Nodes: nodes,
 		Edges: edges,
 	}, nil
+}
+
+// serviceP99Row receives one nearest-rank p99 duration (microseconds) per
+// service from serviceP99Durations.
+type serviceP99Row struct {
+	ServiceName string
+	Duration    int64
+}
+
+// serviceP99Durations returns the nearest-rank p99 duration per service in
+// one statement: rank ceil(0.99·n) within each service's ascending
+// durations, the same convention p99DurationForQuery applies to the
+// dashboard. The rank is picked with integer arithmetic
+// (rank·100 >= n·99 and (rank-1)·100 < n·99) so no dialect-specific CEIL
+// or division is involved.
+//
+// ROW_NUMBER() and COUNT(*) OVER (PARTITION BY …) are accepted verbatim by
+// SQLite (3.25+), PostgreSQL, MySQL 8 and SQL Server, so unlike
+// batchedDeleteSQL this needs no per-driver text.
+func (r *Repository) serviceP99Durations(ctx context.Context, tenant string, start, end time.Time) (map[string]int64, error) {
+	ranked := r.db.WithContext(ctx).Table("spans").
+		Select("service_name, duration, "+
+			"ROW_NUMBER() OVER (PARTITION BY service_name ORDER BY duration) AS rank_in_service, "+
+			"COUNT(*) OVER (PARTITION BY service_name) AS service_count").
+		Where(sqlWhereTenantID, tenant).
+		Where("service_name <> ''")
+	if !start.IsZero() && !end.IsZero() {
+		ranked = ranked.Where("start_time BETWEEN ? AND ?", start, end)
+	}
+	var rows []serviceP99Row
+	err := r.db.WithContext(ctx).Table("(?) AS ranked", ranked).
+		Select("service_name, duration").
+		Where("rank_in_service * 100 >= service_count * 99 AND (rank_in_service - 1) * 100 < service_count * 99").
+		Scan(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]int64, len(rows))
+	for _, row := range rows {
+		out[row.ServiceName] = row.Duration
+	}
+	return out, nil
 }
 
 // PurgeTraces deletes traces older than the given timestamp in a single statement.

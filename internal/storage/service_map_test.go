@@ -243,16 +243,19 @@ func TestGetServiceMapMetrics_FixtureValues(t *testing.T) {
 	}
 	sortServiceMap(got)
 
-	estimated := func(count uint64) *latency.Provenance {
+	measured := func(count uint64) *latency.Provenance {
 		return &latency.Provenance{P99: &latency.Percentile{
-			Status: latency.StatusEstimated, Method: latency.MethodAverageMultiplier,
-			SampleCount: count, LowSample: true, EstimateFactor: 2.5,
+			Status: latency.StatusMeasured, Method: latency.MethodOrderedRank,
+			SampleCount: count, LowSample: true,
 		}}
 	}
+	// p99 is the nearest-rank (ceil(0.99·n)) duration per service: the
+	// largest of svc-a's two, the largest of svc-b's four, the largest of
+	// svc-c's two.
 	wantNodes := []ServiceMapNode{
-		{Name: "svc-a", TotalTraces: 2, ErrorCount: 0, AvgLatencyMs: 55, P99LatencyMs: 137.5, LatencyProvenance: estimated(2)},
-		{Name: "svc-b", TotalTraces: 4, ErrorCount: 1, AvgLatencyMs: 25, P99LatencyMs: 62.5, LatencyProvenance: estimated(4)},
-		{Name: "svc-c", TotalTraces: 2, ErrorCount: 1, AvgLatencyMs: 30, P99LatencyMs: 75, LatencyProvenance: estimated(2)},
+		{Name: "svc-a", TotalTraces: 2, ErrorCount: 0, AvgLatencyMs: 55, P99LatencyMs: 100, LatencyProvenance: measured(2)},
+		{Name: "svc-b", TotalTraces: 4, ErrorCount: 1, AvgLatencyMs: 25, P99LatencyMs: 50, LatencyProvenance: measured(4)},
+		{Name: "svc-c", TotalTraces: 2, ErrorCount: 1, AvgLatencyMs: 30, P99LatencyMs: 40, LatencyProvenance: measured(2)},
 	}
 	wantEdges := []ServiceMapEdge{
 		{Source: "svc-a", Target: "svc-b", CallCount: 2, AvgLatencyMs: 40},
@@ -469,5 +472,77 @@ func BenchmarkGetServiceMapMetrics(b *testing.B) {
 		if _, err := repo.GetServiceMapMetrics(ctx, start, end); err != nil {
 			b.Fatalf("GetServiceMapMetrics: %v", err)
 		}
+	}
+}
+
+// seedBimodalSpans inserts a deterministic bimodal population for one
+// service inside the fixture window: 90% at lowMicros, 10% at tailMicros.
+func seedBimodalSpans(t *testing.T, repo *Repository, service string, n int, lowMicros, tailMicros int64) {
+	t.Helper()
+	start, _ := serviceMapFixtureWindow()
+	spans := make([]Span, 0, n)
+	for i := 0; i < n; i++ {
+		dur := lowMicros
+		if i%10 == 9 {
+			dur = tailMicros
+		}
+		spans = append(spans, Span{
+			TenantID: "default", TraceID: fmt.Sprintf("trace-bimodal-%d", i/10),
+			SpanID: fmt.Sprintf("bimodal-%04d", i), OperationName: "op", ServiceName: service,
+			StartTime: start.Add(time.Minute), EndTime: start.Add(time.Minute + time.Duration(dur)*time.Microsecond),
+			Duration: dur, Status: "STATUS_CODE_UNSET",
+		})
+	}
+	if err := repo.BatchCreateSpans(spans); err != nil {
+		t.Fatalf("seedBimodalSpans: %v", err)
+	}
+}
+
+// TestGetServiceMapMetrics_MeasuredP99 proves the ordered-rank path (#291)
+// on a bimodal population where average × 2.5 is nowhere near the tail:
+// 900 spans at 10ms and 100 at 500ms have a nearest-rank p99 of exactly
+// 500ms, while the old estimate said 147.5ms (59ms × 2.5, 70% low). Past
+// the scan cap the same call keeps the estimate and says so.
+func TestGetServiceMapMetrics_MeasuredP99(t *testing.T) {
+	repo := newTestRepo(t)
+	seedBimodalSpans(t, repo, "bimodal", 1000, 10_000, 500_000)
+	start, end := serviceMapFixtureWindow()
+
+	got, err := repo.GetServiceMapMetrics(context.Background(), start, end)
+	if err != nil {
+		t.Fatalf("GetServiceMapMetrics: %v", err)
+	}
+	if len(got.Nodes) != 1 {
+		t.Fatalf("nodes: %+v", got.Nodes)
+	}
+	node := got.Nodes[0]
+	const trueP99, oldEstimate = 500.0, 59 * 2.5
+	if node.AvgLatencyMs != 59 || node.P99LatencyMs != trueP99 {
+		t.Fatalf("avg=%v p99=%v, want avg=59 p99=%v", node.AvgLatencyMs, node.P99LatencyMs, trueP99)
+	}
+	if oldErr := math.Abs(oldEstimate-trueP99) / trueP99; oldErr < 0.5 {
+		t.Fatalf("old estimate %v is within %.0f%% of %v; fixture no longer contradicts the multiplier", oldEstimate, oldErr*100, trueP99)
+	}
+	want := &latency.Provenance{P99: &latency.Percentile{
+		Status: latency.StatusMeasured, Method: latency.MethodOrderedRank, SampleCount: 1000,
+	}}
+	if !reflect.DeepEqual(node.LatencyProvenance, want) {
+		t.Fatalf("provenance = %+v, want %+v", node.LatencyProvenance.P99, want.P99)
+	}
+	t.Logf("true p99=%vms old estimate=%vms (avg×2.5) measured=%vms provenance=%s/%s", trueP99, oldEstimate, node.P99LatencyMs, want.P99.Status, want.P99.Method)
+
+	// Above the row cap: the estimate and its label come back.
+	orig := serviceMapSpanLimit
+	serviceMapSpanLimit = 999
+	t.Cleanup(func() { serviceMapSpanLimit = orig })
+	capped, err := repo.GetServiceMapMetrics(context.Background(), start, end)
+	if err != nil {
+		t.Fatalf("GetServiceMapMetrics above cap: %v", err)
+	}
+	wantCapped := &latency.Provenance{P99: &latency.Percentile{
+		Status: latency.StatusEstimated, Method: latency.MethodAverageMultiplier, SampleCount: 1000, EstimateFactor: 2.5,
+	}}
+	if node := capped.Nodes[0]; node.P99LatencyMs != oldEstimate || !reflect.DeepEqual(node.LatencyProvenance, wantCapped) {
+		t.Fatalf("above cap: p99=%v provenance=%+v", node.P99LatencyMs, node.LatencyProvenance.P99)
 	}
 }

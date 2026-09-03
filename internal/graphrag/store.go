@@ -95,6 +95,15 @@ type ServiceStore struct {
 	edgesByFrom  map[string][]*Edge          // CALLS edges keyed by FromID
 	edgesByTo    map[string][]*Edge          // CALLS edges keyed by ToID
 	opsByService map[string][]*OperationNode // operations keyed by service
+	// latency holds one bounded duration sketch per service (#291), keyed
+	// like Services and fed wherever UpsertService updates AvgLatency — the
+	// ingest callback and the 60s DB rebuild alike — so it shares the
+	// lifecycle of the other per-service aggregates: it resets when the
+	// tenant slice is re-created (idle eviction, restart), never on its own.
+	// A Sketch is a fixed ~2.1 KiB value (512 uint32 bins plus counters, no
+	// pointers), so the per-tenant memory is 2.1 KiB × len(Services): the
+	// same bound as the ServiceNode map itself.
+	latency map[string]*aggregate.Sketch
 }
 
 func newServiceStore() *ServiceStore {
@@ -105,6 +114,7 @@ func newServiceStore() *ServiceStore {
 		edgesByFrom:  make(map[string][]*Edge),
 		edgesByTo:    make(map[string][]*Edge),
 		opsByService: make(map[string][]*OperationNode),
+		latency:      make(map[string]*aggregate.Sketch),
 	}
 }
 
@@ -194,15 +204,14 @@ func (s *ServiceStore) UpsertService(name string, durationMs float64, isError bo
 		svc.FirstSeen = ts
 	}
 	svc.AvgLatency = svc.TotalMs / float64(svc.CallCount)
-	svc.P99Latency = svc.AvgLatency * 2.5
-	sampleCount := uint64(svc.CallCount) // #nosec G115 -- call count is increment-only.
-	svc.LatencyProvenance = &latency.Provenance{P99: &latency.Percentile{
-		Status:         latency.StatusEstimated,
-		Method:         latency.MethodAverageMultiplier,
-		SampleCount:    sampleCount,
-		LowSample:      sampleCount < latency.LowSampleThreshold,
-		EstimateFactor: 2.5,
-	}}
+	sketch, ok := s.latency[name]
+	if !ok {
+		sketch = aggregate.NewSketch()
+		s.latency[name] = sketch
+	}
+	sketch.Observe(durationMs)
+	svc.P99Latency = sketch.Quantile(0.99)
+	svc.LatencyProvenance = &latency.Provenance{P99: aggregate.PercentileFromSketch(sketch)}
 	svc.ErrorRate = float64(svc.ErrorCount) / float64(svc.CallCount)
 	svc.HealthScore = computeHealth(svc.ErrorRate, svc.AvgLatency)
 }
@@ -247,6 +256,18 @@ func (s *ServiceStore) UpsertOperation(service, operation string, durationMs flo
 			UpdatedAt: ts,
 		}
 	}
+}
+
+// latencyMedian returns the sketch median for a service, the baseline the
+// legacy anomaly detector compares the p99 against. Zero when unknown.
+func (s *ServiceStore) latencyMedian(name string) float64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	sketch, ok := s.latency[name]
+	if !ok {
+		return 0
+	}
+	return sketch.Quantile(0.5)
 }
 
 func unavailableOperationLatency() *latency.Provenance {

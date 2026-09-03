@@ -30,6 +30,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/RandomCodeSpace/otelcontext/internal/latency"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
 	"gorm.io/gorm"
 )
@@ -527,5 +528,28 @@ func TestPG_AutoMigrate_BlobTypesBecomeBytea(t *testing.T) {
 		if dataType != "bytea" {
 			t.Errorf("%s.%s: data_type = %q, want %q", c.Table, c.Column, dataType, "bytea")
 		}
+	}
+}
+
+// TestPG_ServiceMapMeasuredP99 proves the per-service ordered-rank window
+// query (#291) on PostgreSQL with the same bimodal population the SQLite
+// unit test uses: nearest-rank p99 is exactly 500ms, labelled measured.
+func TestPG_ServiceMapMeasuredP99(t *testing.T) {
+	repo, teardown := setupPGContainer(t)
+	defer teardown()
+	seedBimodalSpans(t, repo, "bimodal", 1000, 10_000, 500_000)
+	start, end := serviceMapFixtureWindow()
+
+	got, err := repo.GetServiceMapMetrics(context.Background(), start, end)
+	if err != nil {
+		t.Fatalf("GetServiceMapMetrics: %v", err)
+	}
+	if len(got.Nodes) != 1 {
+		t.Fatalf("nodes: %+v", got.Nodes)
+	}
+	node := got.Nodes[0]
+	claim := node.LatencyProvenance.P99
+	if node.P99LatencyMs != 500 || claim.Status != latency.StatusMeasured || claim.Method != latency.MethodOrderedRank || claim.SampleCount != 1000 {
+		t.Fatalf("p99=%v provenance=%+v", node.P99LatencyMs, claim)
 	}
 }

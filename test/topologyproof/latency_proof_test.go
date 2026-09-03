@@ -15,6 +15,7 @@ import (
 
 	"github.com/RandomCodeSpace/otelcontext/internal/aggregate"
 	"github.com/RandomCodeSpace/otelcontext/internal/api"
+	"github.com/RandomCodeSpace/otelcontext/internal/api/views"
 	"github.com/RandomCodeSpace/otelcontext/internal/graphrag"
 	"github.com/RandomCodeSpace/otelcontext/internal/latency"
 	"github.com/RandomCodeSpace/otelcontext/internal/mcp"
@@ -58,6 +59,7 @@ type latencyContractProof struct {
 	Sentinel      latencySentinel           `json:"sentinel"`
 	Dashboard     latencySurface            `json:"rest_dashboard"`
 	SystemGraph   latencySurface            `json:"rest_system_graph"`
+	ServiceMap    latencySurface            `json:"rest_service_map"`
 	WebSocket     latencySurface            `json:"websocket_dashboard"`
 	GraphRAG      latencySurface            `json:"graphrag_service"`
 	MCPMap        latencySurface            `json:"mcp_get_service_map"`
@@ -218,6 +220,10 @@ func TestLatencyModeProof(t *testing.T) {
 	systemNode := findGraphNode(t, systemGraph.Nodes, latencyService)
 	proof.SystemGraph = latencySurface{Value: systemNode.Metrics.P99LatencyMs, Unit: "milliseconds", Provenance: systemNode.Metrics.LatencyProvenance}
 
+	var serviceMap views.ServiceMapMetrics
+	getProofJSON(t, httpServer.URL+"/api/metrics/service-map", &serviceMap)
+	proof.ServiceMap = findServiceMapNode(t, serviceMap.Nodes, latencyService)
+
 	graphEntry := findServiceEntry(t, graphRAG.ServiceMap(context.Background(), 0), latencyService)
 	proof.GraphRAG = latencySurface{Value: graphEntry.Service.P99Latency, Unit: "milliseconds", Provenance: graphEntry.Service.LatencyProvenance}
 	if len(graphEntry.Operations) == 0 {
@@ -254,18 +260,25 @@ func TestLatencyModeProof(t *testing.T) {
 	if mode == aggregate.ModeAggregate {
 		proof.check(t, "rest_dashboard_approximate", validApproximate(proof.Dashboard, 1000), describeLatency(proof.Dashboard))
 		proof.check(t, "rest_system_graph_approximate", validApproximate(proof.SystemGraph, 1000), describeLatency(proof.SystemGraph))
+		proof.check(t, "rest_service_map_approximate", validApproximate(proof.ServiceMap, 1000), describeLatency(proof.ServiceMap))
 		proof.check(t, "websocket_approximate", validApproximate(proof.WebSocket, latencyTailMicros), describeLatency(proof.WebSocket))
 		proof.check(t, "graphrag_approximate", validApproximate(proof.GraphRAG, 1000), describeLatency(proof.GraphRAG))
 		proof.check(t, "mcp_map_approximate", validApproximate(proof.MCPMap, 1000), describeLatency(proof.MCPMap))
 		proof.check(t, "mcp_health_approximate", validApproximate(proof.MCPHealth, 1000), describeLatency(proof.MCPHealth))
 		proof.check(t, "aggregate_source_owned", systemGraph.Source == "aggregate", fmt.Sprintf("graph=%q", systemGraph.Source))
 	} else {
+		// #291: the legacy database path (service map) ranks the population
+		// exactly and the GraphRAG service store (system graph, GraphRAG, MCP)
+		// answers from its per-service sketch, so no legacy surface may report
+		// the 52.225ms average multiplier any more.
 		proof.check(t, "rest_dashboard_measured", validMeasured(proof.Dashboard, 1000, latency.MethodOrderedRank), describeLatency(proof.Dashboard))
-		proof.check(t, "rest_system_graph_estimated", validEstimated(proof.SystemGraph), describeLatency(proof.SystemGraph))
+		proof.check(t, "rest_system_graph_approximate", validApproximate(proof.SystemGraph, 1000), describeLatency(proof.SystemGraph))
+		proof.check(t, "rest_service_map_measured", validMeasured(proof.ServiceMap, 1000, latency.MethodOrderedRank), describeLatency(proof.ServiceMap))
 		proof.check(t, "websocket_measured", validMeasured(proof.WebSocket, latencyTailMicros, latency.MethodOrderedRank), describeLatency(proof.WebSocket))
-		proof.check(t, "graphrag_estimated", validEstimated(proof.GraphRAG), describeLatency(proof.GraphRAG))
-		proof.check(t, "mcp_map_estimated", validEstimated(proof.MCPMap), describeLatency(proof.MCPMap))
-		proof.check(t, "mcp_health_estimated", validEstimated(proof.MCPHealth), describeLatency(proof.MCPHealth))
+		proof.check(t, "graphrag_approximate", validApproximate(proof.GraphRAG, 1000), describeLatency(proof.GraphRAG))
+		proof.check(t, "mcp_map_approximate", validApproximate(proof.MCPMap, 1000), describeLatency(proof.MCPMap))
+		proof.check(t, "mcp_health_approximate", validApproximate(proof.MCPHealth, 1000), describeLatency(proof.MCPHealth))
+		proof.check(t, "no_legacy_surface_estimated", !anyEstimated(proof), "average × 2.5 is no longer reported by any legacy surface")
 		proof.check(t, "legacy_source_owned", systemGraph.Source == "", fmt.Sprintf("graph=%q", systemGraph.Source))
 	}
 
@@ -279,6 +292,7 @@ func TestLatencyModeProof(t *testing.T) {
 func seedLatencyRepository(t *testing.T, repo *storage.Repository, now time.Time) {
 	t.Helper()
 	traces := make([]storage.Trace, 0, latencyLowCount+latencyTailCount)
+	spans := make([]storage.Span, 0, latencyLowCount+latencyTailCount)
 	for i := 0; i < latencyLowCount+latencyTailCount; i++ {
 		duration := int64(latencyLowMicros)
 		if i >= latencyLowCount {
@@ -289,9 +303,20 @@ func seedLatencyRepository(t *testing.T, repo *storage.Repository, now time.Time
 			ServiceName: latencyService, Duration: duration, Status: "STATUS_CODE_UNSET",
 			Timestamp: now.Add(-time.Minute),
 		})
+		// The same population as spans, so the service-map database path
+		// (#291) ranks exactly what the dashboard ranks.
+		spans = append(spans, storage.Span{
+			TenantID: storage.DefaultTenantID, TraceID: fmt.Sprintf("latency-%04d", i),
+			SpanID: fmt.Sprintf("%016x", i+1), ServiceName: latencyService, OperationName: "GET /latency",
+			StartTime: now.Add(-time.Minute), EndTime: now.Add(-time.Minute + time.Duration(duration)*time.Microsecond),
+			Duration: duration, Status: "STATUS_CODE_UNSET",
+		})
 	}
 	if err := repo.BatchCreateTraces(traces); err != nil {
 		t.Fatalf("seed latency traces: %v", err)
+	}
+	if err := repo.BatchCreateSpans(spans); err != nil {
+		t.Fatalf("seed latency spans: %v", err)
 	}
 }
 
@@ -408,6 +433,17 @@ func findGraphNode(t *testing.T, nodes []api.GraphNode, name string) api.GraphNo
 	return api.GraphNode{}
 }
 
+func findServiceMapNode(t *testing.T, nodes []views.ServiceMapNode, name string) latencySurface {
+	t.Helper()
+	for _, node := range nodes {
+		if node.Name == name {
+			return latencySurface{Value: node.P99LatencyMs, Unit: "milliseconds", Provenance: node.LatencyProvenance}
+		}
+	}
+	t.Fatalf("service map omitted %q", name)
+	return latencySurface{}
+}
+
 func findServiceEntry(t *testing.T, entries []graphrag.ServiceMapEntry, name string) graphrag.ServiceMapEntry {
 	t.Helper()
 	for _, entry := range entries {
@@ -433,11 +469,20 @@ func validMeasured(surface latencySurface, want float64, method string) bool {
 		claim.SampleCount == latencyLowCount+latencyTailCount && !claim.LowSample
 }
 
-func validEstimated(surface latencySurface) bool {
-	claim := p99(surface)
-	return math.Abs(surface.Value-52.225) <= 0.01 && claim != nil &&
-		claim.Status == latency.StatusEstimated && claim.Method == latency.MethodAverageMultiplier &&
-		claim.SampleCount == latencyLowCount+latencyTailCount && claim.EstimateFactor == 2.5
+// anyEstimated reports whether any surface still carries the pre-#291
+// average-multiplier value or claim.
+func anyEstimated(proof *latencyContractProof) bool {
+	for _, surface := range []latencySurface{
+		proof.Dashboard, proof.SystemGraph, proof.ServiceMap, proof.WebSocket,
+		proof.GraphRAG, proof.MCPMap, proof.MCPHealth,
+	} {
+		claim := p99(surface)
+		if claim == nil || claim.Status == latency.StatusEstimated || claim.Method == latency.MethodAverageMultiplier ||
+			claim.EstimateFactor != 0 || math.Abs(surface.Value-52.225) <= 0.01 {
+			return true
+		}
+	}
+	return false
 }
 
 func validApproximate(surface latencySurface, exact float64) bool {
@@ -474,7 +519,7 @@ func unavailableOperation(operation *graphrag.OperationNode) bool {
 
 func allSampleCounts(proof *latencyContractProof, want int) bool {
 	for _, surface := range []latencySurface{
-		proof.Dashboard, proof.SystemGraph, proof.WebSocket,
+		proof.Dashboard, proof.SystemGraph, proof.ServiceMap, proof.WebSocket,
 		proof.GraphRAG, proof.MCPMap, proof.MCPHealth,
 	} {
 		claim := p99(surface)
