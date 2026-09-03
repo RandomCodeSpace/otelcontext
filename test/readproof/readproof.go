@@ -181,7 +181,7 @@ func ParseMetrics(text string) ([]MetricSample, error) {
 
 func parseMetricLine(line string) (MetricSample, error) {
 	s := MetricSample{Labels: map[string]string{}}
-	body := line
+	var body string
 	if i := strings.IndexByte(line, '{'); i >= 0 {
 		end := strings.LastIndexByte(line, '}')
 		if end < i {
