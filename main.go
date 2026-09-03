@@ -728,6 +728,7 @@ func main() {
 		if err != nil {
 			fatal("❌ Aggregate topology provider rejected", err)
 		}
+		provider.SetRegistry(resourceRegistry)
 		topologyProvider = provider
 		graphRAG.SetAggregateSource(provider)
 		slog.Info("🧭 GraphRAG consuming aggregate topology snapshots (raw-span rebuild retired)",
@@ -738,6 +739,7 @@ func main() {
 		if err != nil {
 			fatal("❌ Legacy topology provider rejected", err)
 		}
+		provider.SetRegistry(resourceRegistry)
 		topologyProvider = provider
 	}
 	graphRAG.Start(ctxGraphRAG)
@@ -773,6 +775,7 @@ func main() {
 	)
 
 	hub.SetTopologyProvider(topologyProvider, realtime.DefaultPublishFloor)
+	eventHub.SetTopologyProvider(topologyProvider)
 
 	// Aggregate READ path (#175). Only AGGREGATE_MODE=aggregate switches the
 	// dashboard, the WebSocket publisher and the MCP coverage metadata over;

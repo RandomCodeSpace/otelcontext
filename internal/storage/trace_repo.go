@@ -30,6 +30,12 @@ type ServiceMapNode struct {
 	AvgLatencyMs      float64             `json:"avg_latency_ms"`
 	P99LatencyMs      float64             `json:"p99_latency_ms,omitempty"`
 	LatencyProvenance *latency.Provenance `json:"latency_provenance,omitempty"`
+
+	// Additive host projection (#288), stamped by the topology provider;
+	// never read from or written to the database.
+	Kind      string   `json:"kind,omitempty" gorm:"-"`
+	HostCount int      `json:"host_count,omitempty" gorm:"-"`
+	Hosts     []string `json:"hosts,omitempty" gorm:"-"`
 }
 
 // ServiceMapEdge represents a connection between two services.

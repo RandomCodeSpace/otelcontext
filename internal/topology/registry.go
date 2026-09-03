@@ -227,9 +227,21 @@ func (r *Registry) Evict(now time.Time) int {
 
 // Snapshot returns every live entry ordered by key.
 func (r *Registry) Snapshot() []ResourceEntry {
+	return r.snapshot(func(ResourceKey) bool { return true })
+}
+
+// TenantSnapshot returns tenant's live entries ordered by key.
+func (r *Registry) TenantSnapshot(tenant string) []ResourceEntry {
+	return r.snapshot(func(key ResourceKey) bool { return key.Tenant == tenant })
+}
+
+func (r *Registry) snapshot(keep func(ResourceKey) bool) []ResourceEntry {
 	r.mu.Lock()
 	out := make([]ResourceEntry, 0, len(r.entries))
 	for key, e := range r.entries {
+		if !keep(key) {
+			continue
+		}
 		out = append(out, ResourceEntry{ResourceKey: key, Kind: e.kind, Signals: e.signals, LastSeen: time.Unix(e.lastSeen, 0).UTC()})
 	}
 	r.mu.Unlock()

@@ -32,6 +32,12 @@ type GraphNode struct {
 	Status      string      `json:"status"`
 	Metrics     NodeMetrics `json:"metrics"`
 	Alerts      []string    `json:"alerts"`
+
+	// Additive host projection (#288). Kind is service|host; a host node is
+	// excluded from the service summary.
+	Kind      string   `json:"kind,omitempty"`
+	HostCount int      `json:"host_count,omitempty"`
+	Hosts     []string `json:"hosts,omitempty"`
 }
 
 // NodeMetrics holds per-service observability metrics.
@@ -151,8 +157,14 @@ func buildGraphFromTopology(snapshot topology.Snapshot) *SystemGraphResponse {
 				LatencyProvenance: node.LatencyProvenance,
 				SpanCount1H:       node.SpanCount,
 			},
-			Alerts: alerts,
+			Alerts:    alerts,
+			Kind:      node.Kind,
+			HostCount: node.HostCount,
+			Hosts:     node.Hosts,
 		})
+		if node.Kind == topology.KindHost {
+			continue
+		}
 		totalErrorRate += node.ErrorRate
 		totalLatency += node.AvgLatencyMs
 	}
@@ -378,8 +390,13 @@ func (s *Server) buildGraphFromDB(ctx context.Context) *SystemGraphResponse {
 
 // buildSummaryResponse computes system-level aggregates and returns the final response.
 func buildSummaryResponse(nodes []GraphNode, edges []GraphEdge, totalErrorRate, totalLatency float64) *SystemGraphResponse {
-	healthy, degraded, critical := 0, 0, 0
+	// Host nodes (#288) are listed but never counted as services.
+	services, healthy, degraded, critical := 0, 0, 0, 0
 	for _, n := range nodes {
+		if n.Kind == topology.KindHost {
+			continue
+		}
+		services++
 		switch n.Status {
 		case "healthy":
 			healthy++
@@ -392,18 +409,18 @@ func buildSummaryResponse(nodes []GraphNode, edges []GraphEdge, totalErrorRate, 
 
 	overallHealth := 1.0
 	avgLatency := 0.0
-	if len(nodes) > 0 {
-		overallHealth = math.Round((1.0-totalErrorRate/float64(len(nodes)))*100) / 100
+	if services > 0 {
+		overallHealth = math.Round((1.0-totalErrorRate/float64(services))*100) / 100
 		if overallHealth < 0 {
 			overallHealth = 0
 		}
-		avgLatency = math.Round(totalLatency/float64(len(nodes))*100) / 100
+		avgLatency = math.Round(totalLatency/float64(services)*100) / 100
 	}
 
 	resp := &SystemGraphResponse{
 		Timestamp: time.Now().UTC(),
 		System: SystemSummary{
-			TotalServices:      len(nodes),
+			TotalServices:      services,
 			Healthy:            healthy,
 			Degraded:           degraded,
 			Critical:           critical,

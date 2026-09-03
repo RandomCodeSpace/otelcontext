@@ -26,6 +26,10 @@ func newFakeRefreshProvider(epoch string) *fakeRefreshProvider {
 
 func (*fakeRefreshProvider) Source() topology.Source { return topology.SourceAggregate }
 
+func (*fakeRefreshProvider) Hosts(context.Context) topology.HostProjection {
+	return topology.ProjectHosts(nil)
+}
+
 func (p *fakeRefreshProvider) Identity(context.Context) topology.Identity {
 	return topology.Identity{Epoch: p.epoch.Load().(string), Revision: p.rev.Load()}
 }

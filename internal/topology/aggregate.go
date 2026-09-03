@@ -13,6 +13,7 @@ import (
 // AggregateProvider is both the ordinary mode-selected provider and the
 // narrow aggregate projection source GraphRAG already consumes.
 type AggregateProvider struct {
+	HostReader
 	engine *aggregate.Engine
 }
 
@@ -34,6 +35,15 @@ func (p *AggregateProvider) Identity(context.Context) Identity {
 }
 
 func (p *AggregateProvider) Snapshot(ctx context.Context, q Query) (Snapshot, error) {
+	snap, err := p.snapshot(ctx, q)
+	if err != nil {
+		return snap, err
+	}
+	p.stampHosts(ctx, &snap)
+	return snap, nil
+}
+
+func (p *AggregateProvider) snapshot(ctx context.Context, q Query) (Snapshot, error) {
 	id := p.Identity(ctx)
 	tenant := storage.TenantFromContext(ctx)
 	projection := p.engine.TopologySnapshot(tenant)

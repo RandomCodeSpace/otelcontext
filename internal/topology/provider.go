@@ -76,6 +76,13 @@ type Node struct {
 	HealthScore       float64             `json:"health_score,omitempty"`
 	Status            string              `json:"status,omitempty"`
 	Alerts            []string            `json:"alerts,omitempty"`
+
+	// Host projection (#288), stamped by the provider from the resource
+	// registry. Kind is KindService or KindHost; Hosts is sorted and capped
+	// at MaxHostsPerNode while HostCount is the uncapped total.
+	Kind      string   `json:"kind,omitempty"`
+	HostCount int      `json:"host_count,omitempty"`
+	Hosts     []string `json:"hosts,omitempty"`
 }
 
 // Edge is one directed service dependency.
@@ -101,4 +108,8 @@ type Provider interface {
 	Source() Source
 	Identity(context.Context) Identity
 	Snapshot(context.Context, Query) (Snapshot, error)
+	// Hosts is the tenant-scoped host projection of the resource registry.
+	// Every provider answers it from the same registry, so legacy, shadow
+	// and aggregate agree on hosts.
+	Hosts(context.Context) HostProjection
 }

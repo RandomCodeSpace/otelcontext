@@ -60,6 +60,7 @@ var toolDefs = []Tool{
 	mkTool("get_service_map", "Returns the service topology with health scores, error rates, call counts, and dependency edges. Aggregate-backed: counts describe ALL accepted telemetry, not the sampled subset, and are complete within aggregate retention.",
 		param("depth", "number", "Max traversal depth (default 3)."),
 		param("service", "string", "Focus on a specific service and its neighbors."),
+		param("group_by", "string", "Set to \"host\" to wrap the map as {services, hosts}: `hosts` lists the tenant's hosts, each with its bounded, sorted service list. Omitted: the bare service array, unchanged."),
 	),
 	mkTool("get_service_health", "Returns detailed health metrics for a specific service: error rate, latency, request counts and dependency edges. Aggregate-backed and complete within aggregate retention. Returns an explicit \"not found in the current tenant window\" message rather than an empty guess.",
 		required("service_name"),
@@ -240,7 +241,8 @@ func (s *Server) toolGetServiceHealth(ctx context.Context, args map[string]any) 
 	}
 	for _, entry := range s.graphRAG.ServiceMap(mcpCtx(ctx), 0) {
 		if entry.Service != nil && entry.Service.Name == svcName {
-			data, err := json.Marshal(entry)
+			_, hosts := s.hosts(ctx).ServiceHosts(svcName)
+			data, err := json.Marshal(serviceHealthResult{ServiceMapEntry: entry, Hosts: hosts})
 			if err != nil {
 				return errorResult(fmt.Sprintf("failed to marshal service health: %v", err))
 			}
@@ -352,11 +354,41 @@ func (s *Server) toolGetServiceMap(ctx context.Context, args map[string]any) Too
 	} else {
 		result = s.graphRAG.ServiceMap(mcpCtx(ctx), depth)
 	}
-	data, err := json.Marshal(result)
+	// group_by=host (#288) wraps the unchanged array with the tenant's hosts.
+	var payload any = result
+	switch groupBy, _ := args["group_by"].(string); groupBy {
+	case "":
+	case "host":
+		payload = serviceMapByHost{Services: result, Hosts: s.hosts(ctx).Hosts}
+	default:
+		return errorResult(fmt.Sprintf("unsupported group_by %q (only \"host\")", groupBy))
+	}
+	data, err := json.Marshal(payload)
 	if err != nil {
 		return errorResult(fmt.Sprintf("failed to marshal service map: %v", err))
 	}
 	return textResult(string(data))
+}
+
+// serviceMapByHost is the get_service_map payload under group_by=host.
+type serviceMapByHost struct {
+	Services []graphrag.ServiceMapEntry `json:"services"`
+	Hosts    []topology.Host            `json:"hosts"`
+}
+
+// serviceHealthResult is the get_service_health payload: the entry as
+// before, plus the hosts the service was observed on.
+type serviceHealthResult struct {
+	graphrag.ServiceMapEntry
+	Hosts []string `json:"hosts"`
+}
+
+// hosts reads the tenant's host projection through the topology owner.
+func (s *Server) hosts(ctx context.Context) topology.HostProjection {
+	if s.topology == nil {
+		return topology.ProjectHosts(nil)
+	}
+	return s.topology.Hosts(mcpCtx(ctx))
 }
 
 // toolTraceGraph answers with the retained span tree and an explicit coverage

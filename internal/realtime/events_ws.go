@@ -11,6 +11,7 @@ import (
 
 	"github.com/RandomCodeSpace/otelcontext/internal/authn"
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
+	"github.com/RandomCodeSpace/otelcontext/internal/topology"
 	"github.com/coder/websocket"
 	"golang.org/x/sync/errgroup"
 )
@@ -160,6 +161,11 @@ type EventHub struct {
 	lastRev    uint64
 	published  bool
 	retryReset bool
+
+	// topology, when set, stamps the host projection (#288) onto the
+	// legacy snapshot's service map. The aggregate publisher's nodes arrive
+	// already stamped by the same provider.
+	topology topology.Provider
 }
 
 // NewEventHub creates a new event notification hub.
@@ -191,6 +197,20 @@ func (h *EventHub) SetAggregatePublisher(p AggregatePublisher, floor time.Durati
 	h.aggPub = p
 	h.publishFloor = floor
 	h.mu.Unlock()
+}
+
+// SetTopologyProvider wires the mode-selected topology owner that answers
+// host questions. Call once at startup, before the hub takes connections.
+func (h *EventHub) SetTopologyProvider(p topology.Provider) {
+	h.mu.Lock()
+	h.topology = p
+	h.mu.Unlock()
+}
+
+func (h *EventHub) topologyProvider() topology.Provider {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.topology
 }
 
 // aggregatePublisher returns the configured publisher, or nil in legacy mode.
@@ -710,6 +730,14 @@ func (h *EventHub) computeSnapshot(ctx context.Context, service string) *LiveSna
 	}
 
 	if smap, err := h.repo.GetServiceMapMetrics(ctx, start, now); err == nil {
+		if provider := h.topologyProvider(); provider != nil {
+			hosts := provider.Hosts(ctx)
+			for i := range smap.Nodes {
+				node := &smap.Nodes[i]
+				node.Kind = topology.NodeKind(node.Name)
+				node.HostCount, node.Hosts = hosts.ServiceHosts(node.Name)
+			}
+		}
 		snapshot.ServiceMap = smap
 	}
 
