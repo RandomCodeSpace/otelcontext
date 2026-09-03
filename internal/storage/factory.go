@@ -105,9 +105,8 @@ func NewDatabase(driver, dsn string) (*gorm.DB, error) {
 	// default-tuned behaviour. The set was hardened on 2026-05-24 to make
 	// the platform survivable at 120 services on SQLite.
 	//
-	// cache_size and mmap_size are budget-scaled (the pure-Go driver's page
-	// cache lives on the Go heap, so a fixed 256 MB/1 GB pair starved 4 GB
-	// hosts) — see sqliteMemorySizes for the scaling and override rules.
+	// cache_size is budget-scaled and mmap is opt-in — see sqliteMemorySizes
+	// for the sizing, the memory-objective rationale and the override rules.
 	// wal_autocheckpoint=10000 = checkpoint after 10k pages so WAL stays bounded.
 	// journal_size_limit=67108864 = hard-cap the WAL file at 64 MB.
 	if strings.ToLower(driver) == "sqlite" || driver == "" {
@@ -198,31 +197,39 @@ func getEnvPoolInt(key string, fallback int) int {
 	return fallback
 }
 
-// SQLite memory sizing bounds. The max values are the pre-2026-06 hardcoded
-// stanza (256 MB page cache, 1 GB mmap window) and double as the fallback
-// when budget detection fails — never worse than the previous behaviour.
+// SQLite page-cache bounds (KB). The ceiling is sized to the #283 memory
+// objective for the bounded SQLite profile (512 MiB RSS steady p95 for the
+// legacy shape): the read proof measured the pure-Go driver's cache as
+// ~277 MiB of anonymous RSS at the previous 256 MB ceiling, and the
+// objective only fits at 128 MB (#292).
 const (
-	sqliteCacheKBMin   = 65536      // 64 MB
-	sqliteCacheKBMax   = 262144     // 256 MB (legacy hardcoded value)
-	sqliteMmapBytesMin = 268435456  // 256 MB
-	sqliteMmapBytesMax = 1073741824 // 1 GB (legacy hardcoded value)
+	sqliteCacheKBMin = 65536  // 64 MB
+	sqliteCacheKBMax = 131072 // 128 MB
 )
 
 // sqliteMemorySizes resolves the SQLite page-cache size (in KB, applied as a
 // negative cache_size) and mmap window (in bytes) for the startup PRAGMA
-// stanza. With the pure-Go driver both budgets are Go-heap/address-space
-// costs, so they scale with the detected memory budget instead of being
-// hardcoded: cache = budget/32 clamped to [64 MB, 256 MB], mmap = budget/8
-// clamped to [256 MB, 1 GB] — a 4 GB host yields 128 MB cache + 512 MB mmap.
-// budget <= 0 (detection failed) falls back to the legacy hardcoded maxima.
+// stanza.
+//
+// The page cache scales with the detected memory budget: budget/32 clamped
+// to [64 MB, 128 MB]; budget <= 0 (detection failed) takes the ceiling. It is
+// NOT Go-heap memory — modernc's libc allocates it with its own mmap-backed
+// allocator, so it shows up as anonymous RSS that GOMEMLIMIT neither sees
+// nor bounds. cache_size is the only knob that bounds it.
+//
+// mmap is off unless the operator opts in with SQLITE_MMAP_SIZE_BYTES. A
+// window keeps every database page a scan touches resident, bounded only by
+// the window itself (formerly up to 1 GB) and growing with the file, so it
+// cannot sit inside a fixed RSS objective; with it off, reads go through the
+// bounded page cache and the kernel's own page cache, and the #281 read
+// objectives were re-proven at that setting (#292).
+//
 // Operator overrides win unconditionally: SQLITE_CACHE_SIZE_KB (> 0) and
-// SQLITE_MMAP_SIZE_BYTES (>= 0; 0 disables mmap). Invalid values are ignored.
+// SQLITE_MMAP_SIZE_BYTES (>= 0). Invalid values are ignored.
 func sqliteMemorySizes(budget int64) (cacheKB, mmapBytes int64) {
 	cacheKB = sqliteCacheKBMax
-	mmapBytes = sqliteMmapBytesMax
 	if budget > 0 {
 		cacheKB = clampInt64(budget/32/1024, sqliteCacheKBMin, sqliteCacheKBMax)
-		mmapBytes = clampInt64(budget/8, sqliteMmapBytesMin, sqliteMmapBytesMax)
 	}
 	if v, ok := getEnvInt64("SQLITE_CACHE_SIZE_KB"); ok && v > 0 {
 		cacheKB = v

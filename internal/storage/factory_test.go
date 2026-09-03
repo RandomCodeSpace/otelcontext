@@ -108,10 +108,10 @@ func TestSQLiteMemorySizes_BudgetScaling(t *testing.T) {
 		wantCacheKB int64
 		wantMmap    int64
 	}{
-		{"detection failed -> legacy hardcoded", 0, 262144, 1073741824},
-		{"4GB host -> 128MB cache, 512MB mmap", 4 << 30, 131072, 512 << 20},
-		{"1GB host clamps to floors", 1 << 30, 65536, 268435456},
-		{"64GB host clamps to ceilings", 64 << 30, 262144, 1073741824},
+		{"detection failed -> 128MB ceiling, mmap off", 0, 131072, 0},
+		{"4GB host -> 128MB cache, mmap off", 4 << 30, 131072, 0},
+		{"1GB host clamps to the 64MB floor", 1 << 30, 65536, 0},
+		{"64GB host clamps to the 128MB ceiling", 64 << 30, 131072, 0},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -137,7 +137,7 @@ func TestSQLiteMemorySizes_InvalidEnvIgnored(t *testing.T) {
 	t.Setenv("SQLITE_CACHE_SIZE_KB", "not-a-number")
 	t.Setenv("SQLITE_MMAP_SIZE_BYTES", "-1") // negative mmap is invalid
 	cacheKB, mmapBytes := sqliteMemorySizes(4 << 30)
-	if cacheKB != 131072 || mmapBytes != 512<<20 {
+	if cacheKB != 131072 || mmapBytes != 0 {
 		t.Fatalf("invalid env must fall back to budget scaling: got (%d,%d)", cacheKB, mmapBytes)
 	}
 }
