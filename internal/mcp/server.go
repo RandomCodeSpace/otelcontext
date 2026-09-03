@@ -116,7 +116,7 @@ func New(
 	if defaultTenant == "" {
 		defaultTenant = storage.DefaultTenantID
 	}
-	return &Server{
+	s := &Server{
 		repo:          repo,
 		metrics:       metrics,
 		topology:      topologyProvider,
@@ -125,6 +125,8 @@ func New(
 		callTimeout:   defaultCallTimeout,
 		cache:         newResultCache(defaultCacheTTL, 4096),
 	}
+	metrics.RegisterReadCache("mcp_result", s.cache.Stats)
+	return s
 }
 
 // SetCallLimit configures the maximum number of concurrent tools/call

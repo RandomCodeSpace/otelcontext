@@ -5,18 +5,21 @@ package graphrag
 // otelcontext_graphrag_* gauges so operators can attribute RSS growth to a
 // specific store before reaching for a heap profile.
 type StoreCounts struct {
-	Tenants      int
-	Services     int
-	Operations   int
-	Traces       int
-	Spans        int
-	LogClusters  int
-	Metrics      int
-	Anomalies    int
-	ServiceEdges int
-	TraceEdges   int
-	SignalEdges  int
-	AnomalyEdges int
+	Tenants    int
+	Services   int
+	Operations int
+	// LatencySketches counts the per-service duration sketches (#291), each
+	// a fixed-size aggregate.Sketch value.
+	LatencySketches int
+	Traces          int
+	Spans           int
+	LogClusters     int
+	Metrics         int
+	Anomalies       int
+	ServiceEdges    int
+	TraceEdges      int
+	SignalEdges     int
+	AnomalyEdges    int
 }
 
 // StoreCounts walks a tenant snapshot and takes len() under each store's
@@ -29,6 +32,7 @@ func (g *GraphRAG) StoreCounts() StoreCounts {
 		st.service.mu.RLock()
 		c.Services += len(st.service.Services)
 		c.Operations += len(st.service.Operations)
+		c.LatencySketches += len(st.service.latency)
 		c.ServiceEdges += len(st.service.Edges)
 		st.service.mu.RUnlock()
 

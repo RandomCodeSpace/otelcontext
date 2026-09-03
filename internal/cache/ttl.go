@@ -55,6 +55,14 @@ func (c *TTLCache) Get(key string) (any, bool) {
 	return e.value, true
 }
 
+// Len reports the entries currently held, expired ones included until the
+// eviction loop sweeps them.
+func (c *TTLCache) Len() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return len(c.items)
+}
+
 // Delete removes a key immediately.
 func (c *TTLCache) Delete(key string) {
 	c.mu.Lock()
