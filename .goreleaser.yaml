@@ -67,10 +67,20 @@ signs:
     output: true
 
 release:
-  # scripts/release.sh --release may already have created the GitHub release for
-  # this tag (with notes, no artifacts). `append` adds goreleaser's artifacts to
-  # that existing release instead of failing on "release already exists". If the
-  # release does not yet exist, goreleaser creates it.
+  # Draft-first. GoReleaser uploads the archives, SBOMs, checksums, signature
+  # and certificate to a DRAFT release and never publishes it: with `draft`
+  # set, GoReleaser's publish step is a no-op. Publication is a separate job in
+  # .github/workflows/release.yml that runs only after the release-candidate
+  # proofs approve limited production.
+  draft: true
+  # scripts/release.sh --release may already have created the draft for this
+  # tag (title == tag, notes, no artifacts). GitHub's get-release-by-tag lookup
+  # does not return drafts, so without this GoReleaser would open a second
+  # draft; with it, GoReleaser finds the existing draft by name, keeps its
+  # draft state, and uploads into it. When no draft exists it creates one.
+  use_existing_draft: true
+  # `mode` only governs the release NOTES when the release already exists: keep
+  # release.sh's notes and append GoReleaser's (empty, changelog disabled).
   mode: append
   # Mark the GitHub release as a pre-release when the tag carries a pre-release
   # identifier (e.g. v0.4.0-beta.1). Without this, append mode resets the

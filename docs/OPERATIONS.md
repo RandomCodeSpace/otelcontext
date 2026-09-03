@@ -118,6 +118,14 @@ Before any migration or candidate write, rollback is a selector change. After mi
 
 The disposable verifier used by the release gate is [`scripts/prove-systemd-release.sh`](../scripts/prove-systemd-release.sh). It refuses a host where any production path, account, unit, or listener already exists, and it removes every object it creates. Run it only on an isolated host.
 
+### Release promotion
+
+A release is a draft until the exact candidate is proven. `scripts/release.sh vX.Y.Z[-pre] [--release] [--dry-run]` refuses to tag unless HEAD equals `origin/main` and every status check that branch protection requires on `main` reports `success` for that commit. It then creates one annotated tag, pushes it once, and with `--release` opens a draft GitHub release with notes. Tags are never moved, deleted, or reused; a failed candidate gets a new version.
+
+`.github/workflows/release.yml` runs at the tag ref: `source identity` binds protected `main`, the tag, and the 40-character SHA; `goreleaser` uploads the four archives, four SBOMs, `checksums.txt`, `checksums.txt.sig`, and `checksums.txt.pem` to the draft; `verify signed assets` checks digests, certificate, signature identity, archive contents, version, and embedded UI; the `database lifecycle gate` (SQLite, PostgreSQL 16, MySQL 8.4, SQL Server 2022), `browser smoke · release binary`, `systemd proof · release archive`, and `linux arm64 smoke` jobs run the extracted release binary; `release candidate manifest` writes `release-candidate-v1.json` into the workflow artifact `release-candidate-<tag>-<sha>` (retained 90 days); `publish` un-drafts the release only when limited production is approved. A failed candidate stays an unpublished draft with its evidence.
+
+To re-prove an existing draft, dispatch the workflow at the tag ref: `gh workflow run release.yml --ref <tag>`. It verifies the assets already on the draft and never rebuilds them. Aggregate certification is `aggregate-release-gate.yml`, dispatched separately against the same signed Linux archive; it does not block publication and publication does not depend on it.
+
 ### Whole-origin proxy
 
 A proxy is optional. When one already fronts the browser, give OtelContext a dedicated origin and forward the whole origin to the HTTP listener: `/`, `/static/*`, `/api/*`, `/mcp`, `/ws*`, `/live`, `/ready`, and any OTLP HTTP `/v1/*` paths you choose to expose. Preserve WebSocket upgrades and streaming responses. Do not mount the client under a path prefix; it uses root-relative URLs. OTLP gRPC on port 4317 stays direct or uses the operator's existing HTTP/2 route. This is routing guidance only and does not change authentication.
