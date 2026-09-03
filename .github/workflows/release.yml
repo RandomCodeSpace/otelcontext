@@ -18,9 +18,6 @@ on:
         type: string
         default: ''
 
-permissions:
-  contents: read
-
 jobs:
   source-identity:
     name: source identity
@@ -324,6 +321,8 @@ jobs:
     name: database lifecycle gate
     needs: [source-identity, verify-assets]
     uses: ./.github/workflows/database-proof.yml
+    permissions:
+      contents: read
     with:
       run_all: true
       candidate_ref: ${{ needs.source-identity.outputs.tag }}
@@ -335,6 +334,8 @@ jobs:
     needs: [source-identity, verify-assets]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    permissions:
+      contents: read
     env:
       TAG: ${{ needs.source-identity.outputs.tag }}
       SHA: ${{ needs.source-identity.outputs.sha }}
@@ -422,6 +423,8 @@ jobs:
     needs: [source-identity, verify-assets]
     runs-on: ubuntu-24.04
     timeout-minutes: 25
+    permissions:
+      contents: read
     env:
       TAG: ${{ needs.source-identity.outputs.tag }}
       SHA: ${{ needs.source-identity.outputs.sha }}
