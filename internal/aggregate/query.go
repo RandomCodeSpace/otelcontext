@@ -148,7 +148,11 @@ func AccuracyFromSketch(s *Sketch) AccuracyMetadata {
 	}
 }
 
-func percentileProvenanceFromSketch(s *Sketch) *latency.Percentile {
+// PercentileFromSketch describes one sketch-derived percentile: approximate
+// with the sketch's own bound, unavailable when the sketch holds nothing.
+// Shared with the legacy GraphRAG ServiceStore (#291), which feeds the same
+// sketch type per service.
+func PercentileFromSketch(s *Sketch) *latency.Percentile {
 	if s == nil || s.Count() == 0 {
 		return &latency.Percentile{
 			Status: latency.StatusUnavailable,
@@ -721,7 +725,7 @@ func (e *Engine) QueryDashboard(q Query) (*DashboardResult, error) {
 		TotalLogs:         asInt64(logs),
 		ActiveServices:    int64(len(services)),
 		Accuracy:          AccuracyFromSketch(merged),
-		LatencyProvenance: latency.Provenance{P99: percentileProvenanceFromSketch(merged)},
+		LatencyProvenance: latency.Provenance{P99: PercentileFromSketch(merged)},
 		Coverage:          CoverageFull,
 		Epoch:             own.Epoch,
 		Revision:          own.Revision,
@@ -896,7 +900,7 @@ func (e *Engine) QueryTopology(q Query) (*TopologyResult, error) {
 		if acc.durCount > 0 {
 			stat.AvgLatencyMs = acc.durSum / float64(acc.durCount) / 1000.0
 		}
-		stat.LatencyProvenance = latency.Provenance{P99: percentileProvenanceFromSketch(acc.sketch)}
+		stat.LatencyProvenance = latency.Provenance{P99: PercentileFromSketch(acc.sketch)}
 		if acc.sketch != nil {
 			stat.P99LatencyMicros = acc.sketch.Quantile(0.99)
 		}

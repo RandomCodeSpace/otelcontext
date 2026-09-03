@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/RandomCodeSpace/otelcontext/internal/latency"
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 )
 
@@ -72,14 +73,16 @@ func (g *GraphRAG) detectAnomaliesForTenant(ctx context.Context, tenant string, 
 			}
 		}
 
-		// Latency degradation: p99-like check using avg * 3 as proxy
-		if svc.AvgLatency > 500 && svc.CallCount > 10 {
+		// Latency degradation on the sketch p99 (#291). The former check read
+		// avg > 500ms with avg*3 standing in for a p99; the 500ms and
+		// >10-call thresholds are unchanged and now apply to the measured tail.
+		if svc.P99Latency > 500 && svc.CallCount > 10 {
 			anomaly := AnomalyNode{
 				ID:        fmt.Sprintf("anom_%s_lat", svc.Name), // stable per (service,type); see error-spike note
 				Type:      AnomalyLatencySpike,
-				Severity:  classifyLatencySeverity(svc.AvgLatency),
+				Severity:  classifyLatencySeverity(svc.P99Latency),
 				Service:   svc.Name,
-				Evidence:  fmt.Sprintf("avg latency %.0fms", svc.AvgLatency),
+				Evidence:  fmt.Sprintf("approx. p99 %.0fms (%s)", svc.P99Latency, sketchAccuracy(svc.LatencyProvenance)),
 				Timestamp: now,
 			}
 			stores.anomalies.AddAnomaly(anomaly)
@@ -151,11 +154,22 @@ func classifyErrorSeverity(errorRate float64) AnomalySeverity {
 	}
 }
 
-func classifyLatencySeverity(avgMs float64) AnomalySeverity {
+// sketchAccuracy words the p99 claim for anomaly evidence.
+func sketchAccuracy(p *latency.Provenance) string {
+	if p == nil || p.P99 == nil {
+		return "DDSketch accuracy unavailable"
+	}
+	if p.P99.Degraded {
+		return "DDSketch degraded"
+	}
+	return fmt.Sprintf("DDSketch ±%.1f%%", p.P99.RelativeErrorBound*100)
+}
+
+func classifyLatencySeverity(ms float64) AnomalySeverity {
 	switch {
-	case avgMs > 2000:
+	case ms > 2000:
 		return SeverityCritical
-	case avgMs > 1000:
+	case ms > 1000:
 		return SeverityWarning
 	default:
 		return SeverityInfo

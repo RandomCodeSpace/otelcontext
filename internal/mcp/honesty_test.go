@@ -176,7 +176,10 @@ func TestTopologyToolsPreserveLatencyProvenance(t *testing.T) {
 	if err := json.Unmarshal([]byte(mapResult.Content[0].Text), &entries); err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 1 || entries[0].Service.LatencyProvenance == nil || entries[0].Service.LatencyProvenance.P99.Status != latency.StatusEstimated || entries[0].Service.P99Latency != 50 {
+	// Legacy GraphRAG p99 is sketch-derived since #291: approximate, within
+	// the sketch bound of the 20ms the fixture emits, no longer avg*2.5.
+	if len(entries) != 1 || entries[0].Service.LatencyProvenance == nil || entries[0].Service.LatencyProvenance.P99.Status != latency.StatusApproximate ||
+		entries[0].Service.P99Latency < 19 || entries[0].Service.P99Latency > 21 {
 		t.Fatalf("service map latency = %+v", entries)
 	}
 	if len(entries[0].Operations) != 1 || entries[0].Operations[0].LatencyProvenance.P99.Status != latency.StatusUnavailable {

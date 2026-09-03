@@ -68,7 +68,7 @@ func TestLegacySnapshotStampsHostsOnServiceMap(t *testing.T) {
 		t.Fatalf("nodes = %q, want %q", got, want)
 	}
 	raw, _ := json.Marshal(snap.ServiceMap.Nodes[0])
-	if want := `{"name":"gateway","total_traces":1,"error_count":0,"avg_latency_ms":1,"p99_latency_ms":2.5,"latency_provenance":`; len(raw) < len(want) || string(raw[:len(want)]) != want {
+	if want := `{"name":"gateway","total_traces":1,"error_count":0,"avg_latency_ms":1,"p99_latency_ms":1,"latency_provenance":{"p99":{"status":"measured","method":"ordered_rank",`; len(raw) < len(want) || string(raw[:len(want)]) != want {
 		t.Fatalf("node prefix changed: %s", raw)
 	}
 	if suffix := `,"kind":"service","host_count":2,"hosts":["node-a","node-b"]}`; string(raw[len(raw)-len(suffix):]) != suffix {

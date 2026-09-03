@@ -781,7 +781,7 @@ func renderWindows(e *topoEntry, now time.Time) []TopologyWindow {
 		if w.sketch != nil && w.sketch.Count() > 0 {
 			tw.P95Micros = w.sketch.Quantile(0.95)
 			tw.P99Micros = w.sketch.Quantile(0.99)
-			p95 := *percentileProvenanceFromSketch(w.sketch)
+			p95 := *PercentileFromSketch(w.sketch)
 			p99 := p95
 			tw.LatencyProvenance = &latency.Provenance{P95: &p95, P99: &p99}
 		}
