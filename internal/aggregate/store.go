@@ -418,6 +418,11 @@ type Selector struct {
 	Start, End int64
 	// Signal, when non-zero, restricts the read to one signal.
 	Signal Signal
+	// Signals, when non-empty, restricts the read to this set of signals. It
+	// is the multi-signal form of Signal for a query that folds several
+	// signals in one scan (the dashboard reads trace ops and logs); the two
+	// are mutually exclusive.
+	Signals []Signal
 	// SeriesIDs, when non-empty, restricts the read to these series.
 	SeriesIDs []SeriesID
 	// Limit caps returned rows. Zero takes MaxReadRows; anything above it is
@@ -501,6 +506,9 @@ func (s Selector) Validate() (int, error) {
 	}
 	if len(s.SeriesIDs) > MaxReadRows {
 		return 0, fmt.Errorf("%w: %d series ids, cap is %d", ErrSelectorUnbounded, len(s.SeriesIDs), MaxReadRows)
+	}
+	if s.Signal != SignalUnspecified && len(s.Signals) > 0 {
+		return 0, fmt.Errorf("%w: Signal and Signals are mutually exclusive", ErrSelectorUnbounded)
 	}
 	limit := s.Limit
 	if limit <= 0 || limit > MaxReadRows {

@@ -2,6 +2,7 @@ package aggregate
 
 import (
 	"math"
+	"slices"
 	"sort"
 	"testing"
 	"time"
@@ -55,6 +56,9 @@ func (s *stubStore) matching(sel Selector) []Bucket {
 			continue
 		}
 		if sel.Signal != SignalUnspecified && key.Signal != sel.Signal {
+			continue
+		}
+		if len(sel.Signals) > 0 && !slices.Contains(sel.Signals, key.Signal) {
 			continue
 		}
 		if sel.SketchOnly && (b.Delta == nil || b.Delta.Sketch == nil) {

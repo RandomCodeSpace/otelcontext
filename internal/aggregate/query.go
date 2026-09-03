@@ -693,7 +693,12 @@ func (e *Engine) QueryDashboard(q Query) (*DashboardResult, error) {
 		return nil, err
 	}
 	if hasStore {
-		sums, err := e.sumStore(sel, GroupByService|GroupBySignal)
+		// Only the two signals the switch below consumes enter the scan:
+		// edge and metric rows are half the table and every one of them was
+		// sorted by the GROUP BY just to be discarded here (#290).
+		sumSel := sel
+		sumSel.Signals = []Signal{SignalTraceOp, SignalLog}
+		sums, err := e.sumStore(sumSel, GroupByService|GroupBySignal)
 		if err != nil {
 			return nil, err
 		}
