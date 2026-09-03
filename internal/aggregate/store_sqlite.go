@@ -842,7 +842,7 @@ func mergeDeltas(tx *sql.Tx, rows []DeltaRow) (int64, error) {
 		// folding the durable history into it would double-count in memory.
 		d := r.Delta
 		key := deltaRowKey{window: r.WindowStart, series: r.SeriesID}
-		if cur, ok := existing[key]; ok {
+		if cur, ok := existing[key]; ok && cur != nil {
 			cur.Merge(d)
 			d = cur
 		} else if d != nil {
