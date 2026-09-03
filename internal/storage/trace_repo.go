@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"slices"
 	"strings"
 	"time"
 
@@ -420,20 +421,52 @@ func (r *Repository) GetServiceMapMetrics(ctx context.Context, start, end time.T
 		return nil, fmt.Errorf("failed to aggregate service map nodes: %w", err)
 	}
 
-	// Exact per-service p99 (#291): one ordered-rank query over the range,
-	// only while the range fits the same row bound the edge pass scans.
-	// Above it every node keeps the average-multiplier estimate, labelled
-	// as such.
+	// The edge pass streams the rows through database/sql directly: at a few
+	// hundred thousand spans GORM's reflective row scan was a third of the
+	// call. The nullable columns are coalesced in SQL so a plain string or
+	// int64 destination is always valid.
+	edgeQuery := r.db.WithContext(ctx).Model(&Span{}).
+		Select("span_id, COALESCE(parent_span_id, ''), COALESCE(service_name, ''), COALESCE(duration, 0)").
+		Where(sqlWhereTenantID, tenant)
+	if !start.IsZero() && !end.IsZero() {
+		edgeQuery = edgeQuery.Where("start_time BETWEEN ? AND ?", start, end)
+	}
+	rows, err := edgeQuery.Limit(serviceMapSpanLimit).Rows()
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch spans: %w", err)
+	}
+	spans := make([]serviceMapSpanRow, 0, 1024)
+	for rows.Next() {
+		var s serviceMapSpanRow
+		if err := rows.Scan(&s.SpanID, &s.ParentSpanID, &s.ServiceName, &s.Duration); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("failed to scan span: %w", err)
+		}
+		spans = append(spans, s)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, fmt.Errorf("failed to fetch spans: %w", err)
+	}
+	_ = rows.Close()
+	if len(spans) == serviceMapSpanLimit {
+		slog.Warn("GetServiceMapMetrics: edge span query hit row limit, edge topology may be incomplete", "limit", serviceMapSpanLimit)
+	}
+
+	// Exact per-service p99 (#291), only while the range fits the row bound
+	// the edge pass scans; above it every node keeps the average-multiplier
+	// estimate, labelled as such. The durations are already in hand — the
+	// edge pass reads every span in range — so the nearest rank is picked
+	// from them here instead of by a second window-function query over the
+	// same rows, which sorted the whole range a second time and on SQLite
+	// cost more than the rest of the call put together (#290).
 	var rangeSpans int64
 	for _, nr := range nodeRows {
 		rangeSpans += nr.SpanCount
 	}
 	p99ByService := map[string]int64{}
-	if rangeSpans > 0 && rangeSpans <= int64(serviceMapSpanLimit) {
-		var err error
-		if p99ByService, err = r.serviceP99Durations(ctx, tenant, start, end); err != nil {
-			return nil, fmt.Errorf("failed to rank service map latencies: %w", err)
-		}
+	if rangeSpans > 0 && rangeSpans <= int64(serviceMapSpanLimit) && len(spans) < serviceMapSpanLimit {
+		p99ByService = serviceP99Durations(spans)
 	}
 
 	nodes := make([]ServiceMapNode, 0, len(nodeRows))
@@ -466,20 +499,6 @@ func (r *Repository) GetServiceMapMetrics(ctx context.Context, start, end time.T
 			}}
 		}
 		nodes = append(nodes, node)
-	}
-
-	edgeQuery := r.db.WithContext(ctx).Model(&Span{}).
-		Select("span_id, parent_span_id, service_name, duration").
-		Where(sqlWhereTenantID, tenant)
-	if !start.IsZero() && !end.IsZero() {
-		edgeQuery = edgeQuery.Where("start_time BETWEEN ? AND ?", start, end)
-	}
-	var spans []serviceMapSpanRow
-	if err := edgeQuery.Limit(serviceMapSpanLimit).Find(&spans).Error; err != nil {
-		return nil, fmt.Errorf("failed to fetch spans: %w", err)
-	}
-	if len(spans) == serviceMapSpanLimit {
-		slog.Warn("GetServiceMapMetrics: edge span query hit row limit, edge topology may be incomplete", "limit", serviceMapSpanLimit)
 	}
 
 	// Parent resolution map (span_id → service name) is built over ALL rows,
@@ -529,46 +548,27 @@ func (r *Repository) GetServiceMapMetrics(ctx context.Context, start, end time.T
 	}, nil
 }
 
-// serviceP99Row receives one nearest-rank p99 duration (microseconds) per
-// service from serviceP99Durations.
-type serviceP99Row struct {
-	ServiceName string
-	Duration    int64
-}
-
-// serviceP99Durations returns the nearest-rank p99 duration per service in
-// one statement: rank ceil(0.99·n) within each service's ascending
-// durations, the same convention p99DurationForQuery applies to the
-// dashboard. The rank is picked with integer arithmetic
-// (rank·100 >= n·99 and (rank-1)·100 < n·99) so no dialect-specific CEIL
-// or division is involved.
-//
-// ROW_NUMBER() and COUNT(*) OVER (PARTITION BY …) are accepted verbatim by
-// SQLite (3.25+), PostgreSQL, MySQL 8 and SQL Server, so unlike
-// batchedDeleteSQL this needs no per-driver text.
-func (r *Repository) serviceP99Durations(ctx context.Context, tenant string, start, end time.Time) (map[string]int64, error) {
-	ranked := r.db.WithContext(ctx).Table("spans").
-		Select("service_name, duration, "+
-			"ROW_NUMBER() OVER (PARTITION BY service_name ORDER BY duration) AS rank_in_service, "+
-			"COUNT(*) OVER (PARTITION BY service_name) AS service_count").
-		Where(sqlWhereTenantID, tenant).
-		Where("service_name <> ''")
-	if !start.IsZero() && !end.IsZero() {
-		ranked = ranked.Where("start_time BETWEEN ? AND ?", start, end)
+// serviceP99Durations returns the nearest-rank p99 duration (microseconds)
+// per service over the edge pass's rows: rank ceil(0.99·n) within each
+// service's ascending durations, the same convention p99DurationForQuery
+// applies to the dashboard. Spans with no service name carry no node and are
+// skipped, matching the node aggregate's non-empty service-name predicate.
+func serviceP99Durations(spans []serviceMapSpanRow) map[string]int64 {
+	byService := make(map[string][]int64)
+	for _, s := range spans {
+		if s.ServiceName == "" {
+			continue
+		}
+		byService[s.ServiceName] = append(byService[s.ServiceName], s.Duration)
 	}
-	var rows []serviceP99Row
-	err := r.db.WithContext(ctx).Table("(?) AS ranked", ranked).
-		Select("service_name, duration").
-		Where("rank_in_service * 100 >= service_count * 99 AND (rank_in_service - 1) * 100 < service_count * 99").
-		Scan(&rows).Error
-	if err != nil {
-		return nil, err
+	out := make(map[string]int64, len(byService))
+	for service, durations := range byService {
+		slices.Sort(durations)
+		n := len(durations)
+		rank := (n*99 + 99) / 100 // ceil(0.99·n) in integer arithmetic
+		out[service] = durations[rank-1]
 	}
-	out := make(map[string]int64, len(rows))
-	for _, row := range rows {
-		out[row.ServiceName] = row.Duration
-	}
-	return out, nil
+	return out
 }
 
 // PurgeTraces deletes traces older than the given timestamp in a single statement.
