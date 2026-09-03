@@ -1404,19 +1404,23 @@ func (s *SQLiteStore) visitTableSketches(table string, sel Selector, visit func(
 		return fmt.Errorf("aggregate store: visit sketches: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
+	// One scratch sketch per stream: every row decodes into it and the
+	// visitor folds it away before the next row overwrites it. Allocating a
+	// 2 KiB Sketch per row made a wide-range dashboard a garbage generator
+	// first and a query second (#290).
+	var (
+		scratch Sketch
+		service int64
+		blob    sql.RawBytes
+	)
 	for rows.Next() {
-		var (
-			service int64
-			blob    []byte
-		)
 		if err := rows.Scan(&service, &blob); err != nil {
 			return fmt.Errorf("aggregate store: visit sketches: %w", err)
 		}
-		sk, err := DecodeSketch(blob)
-		if err != nil {
+		if err := DecodeSketchInto(&scratch, blob); err != nil {
 			return fmt.Errorf("aggregate store: visit sketches: decode: %w", err)
 		}
-		if err := visit(uint32(service), sk); err != nil { // #nosec G115 -- dictionary IDs are uint32
+		if err := visit(uint32(service), &scratch); err != nil { // #nosec G115 -- dictionary IDs are uint32
 			return err
 		}
 	}

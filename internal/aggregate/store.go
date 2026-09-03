@@ -594,6 +594,10 @@ type Store interface {
 	// sizes, and this read's result is whatever the caller folds the
 	// visited sketches into; the scan itself is bounded by the validated
 	// window span, the same bound SumBuckets relies on.
+	//
+	// The visited sketch is valid only for the duration of the call: the
+	// store decodes every row into one scratch value, so a visitor must
+	// merge or copy it, never retain the pointer.
 	VisitSketches(sel Selector, visit func(serviceID uint32, sk *Sketch) error) error
 
 	// ReplayMutable returns the delta-log rows for windows at or after since —
