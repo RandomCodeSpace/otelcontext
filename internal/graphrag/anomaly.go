@@ -73,19 +73,16 @@ func (g *GraphRAG) detectAnomaliesForTenant(ctx context.Context, tenant string, 
 			}
 		}
 
-		// Latency degradation: the sketch p99 against the sketch median (#291).
-		// The former check read avg > 500ms with avg*3 standing in for a p99;
-		// the 500ms and >10-call thresholds are unchanged, the tail factor of
-		// 3 is now measured against the service's own typical latency instead
-		// of assumed, so a uniformly slow service is not a degradation.
-		median := stores.service.latencyMedian(svc.Name)
-		if svc.P99Latency > 500 && svc.P99Latency > median*3 && svc.CallCount > 10 {
+		// Latency degradation on the sketch p99 (#291). The former check read
+		// avg > 500ms with avg*3 standing in for a p99; the 500ms and
+		// >10-call thresholds are unchanged and now apply to the measured tail.
+		if svc.P99Latency > 500 && svc.CallCount > 10 {
 			anomaly := AnomalyNode{
 				ID:        fmt.Sprintf("anom_%s_lat", svc.Name), // stable per (service,type); see error-spike note
 				Type:      AnomalyLatencySpike,
 				Severity:  classifyLatencySeverity(svc.P99Latency),
 				Service:   svc.Name,
-				Evidence:  fmt.Sprintf("approx. p99 %.0fms vs %.0fms median (%s)", svc.P99Latency, median, sketchAccuracy(svc.LatencyProvenance)),
+				Evidence:  fmt.Sprintf("approx. p99 %.0fms (%s)", svc.P99Latency, sketchAccuracy(svc.LatencyProvenance)),
 				Timestamp: now,
 			}
 			stores.anomalies.AddAnomaly(anomaly)

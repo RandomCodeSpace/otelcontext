@@ -65,10 +65,9 @@ func feedLatencySpan(g *GraphRAG, service string, i int, micros int64) {
 }
 
 // TestDetectAnomalies_LatencyUsesSketch proves the legacy latency check
-// compares the sketch p99 against the sketch median (#291). A service whose
-// tail is 1500ms over a 10ms median fires although its average (159ms) never
-// crossed the old avg > 500ms gate; a uniformly slow 800ms service, which the
-// old gate flagged, is not a degradation of anything.
+// gates on the sketch p99 (#291). A service whose tail is 1500ms over a 10ms
+// median fires although its average (159ms) never crossed the old avg > 500ms
+// gate; a uniformly slow 800ms service keeps firing exactly as it did before.
 func TestDetectAnomalies_LatencyUsesSketch(t *testing.T) {
 	g := New(nil, nil, nil, DefaultConfig())
 	t.Cleanup(g.Stop)
@@ -92,8 +91,8 @@ func TestDetectAnomalies_LatencyUsesSketch(t *testing.T) {
 	if tail.Severity != SeverityWarning {
 		t.Fatalf("severity = %s, want %s for a ~1500ms p99: %s", tail.Severity, SeverityWarning, tail.Evidence)
 	}
-	if _, ok := stores.anomalies.Anomalies["anom_slow_lat"]; ok {
-		t.Fatalf("uniformly slow service fired: %+v", stores.service.Services["slow"])
+	if _, ok := stores.anomalies.Anomalies["anom_slow_lat"]; !ok {
+		t.Fatalf("uniformly slow service stopped firing: %+v", stores.service.Services["slow"])
 	}
 	t.Logf("evidence: %s", tail.Evidence)
 }

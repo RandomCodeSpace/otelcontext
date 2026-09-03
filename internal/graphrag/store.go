@@ -258,18 +258,6 @@ func (s *ServiceStore) UpsertOperation(service, operation string, durationMs flo
 	}
 }
 
-// latencyMedian returns the sketch median for a service, the baseline the
-// legacy anomaly detector compares the p99 against. Zero when unknown.
-func (s *ServiceStore) latencyMedian(name string) float64 {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	sketch, ok := s.latency[name]
-	if !ok {
-		return 0
-	}
-	return sketch.Quantile(0.5)
-}
-
 func unavailableOperationLatency() *latency.Provenance {
 	percentile := func() *latency.Percentile {
 		return &latency.Percentile{
