@@ -294,24 +294,24 @@ func registerResource(reg *topology.Registry, tenant, service string, slots reso
 // resolveServiceIdentity resolves the service identity of one resource
 // (#280). A declared service.name wins. Without one, a resource carrying
 // host.name or host.id is a host entity named topology.HostPrefix + host.name
-// (host.id when there is no name) and host reports true. A resource with
-// neither keeps unknown-service. A client-declared name inside the reserved
-// host/ namespace is accepted as sent and counted on
-// otelcontext_ingest_reserved_service_prefix_total{signal}.
-func resolveServiceIdentity(slots resourceSlots, metrics *telemetry.Metrics, signal string) (name string, host bool) {
+// (host.id when there is no name); consumers recognise it with
+// topology.IsHostEntity. A resource with neither keeps unknown-service. A
+// client-declared name inside the reserved host/ namespace is accepted as sent
+// and counted on otelcontext_ingest_reserved_service_prefix_total{signal}.
+func resolveServiceIdentity(slots resourceSlots, metrics *telemetry.Metrics, signal string) string {
 	if slots.serviceName != "" {
 		if topology.IsHostEntity(slots.serviceName) {
 			metrics.RecordReservedServicePrefix(signal)
 		}
-		return slots.serviceName, false
+		return slots.serviceName
 	}
 	switch {
 	case slots.hostName != "":
-		return topology.HostPrefix + slots.hostName, true
+		return topology.HostPrefix + slots.hostName
 	case slots.host != "":
-		return topology.HostPrefix + slots.host, true
+		return topology.HostPrefix + slots.host
 	}
-	return "unknown-service", false
+	return "unknown-service"
 }
 
 func NewLogsServer(repo *storage.Repository, metrics *telemetry.Metrics, cfg *config.Config) *LogsServer {
@@ -367,7 +367,7 @@ func (s *MetricsServer) Export(ctx context.Context, req *colmetricspb.ExportMetr
 	for _, resourceMetrics := range req.ResourceMetrics {
 		resourceAttrs := resourceMetrics.Resource.Attributes
 		slots := scanResourceSlots(resourceAttrs)
-		serviceName, _ := resolveServiceIdentity(slots, s.metrics, "metrics")
+		serviceName := resolveServiceIdentity(slots, s.metrics, "metrics")
 
 		if !shouldIngestService(serviceName, s.allowedServices, s.excludedServices) {
 			continue
@@ -577,7 +577,7 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 	for idx, resourceSpans := range req.ResourceSpans {
 		g.Go(func() error {
 			slots := scanResourceSlots(resourceSpans.Resource.Attributes)
-			serviceName, _ := resolveServiceIdentity(slots, s.metrics, "traces")
+			serviceName := resolveServiceIdentity(slots, s.metrics, "traces")
 
 			if !shouldIngestService(serviceName, s.allowedServices, s.excludedServices) {
 				slog.Debug("🚫 [TRACES] Dropped service", "service", serviceName)
@@ -1071,7 +1071,7 @@ func (s *LogsServer) Export(ctx context.Context, req *collogspb.ExportLogsServic
 	for idx, resourceLogs := range req.ResourceLogs {
 		g.Go(func() error {
 			slots := scanResourceSlots(resourceLogs.Resource.Attributes)
-			serviceName, _ := resolveServiceIdentity(slots, s.metrics, "logs")
+			serviceName := resolveServiceIdentity(slots, s.metrics, "logs")
 
 			if !shouldIngestService(serviceName, s.allowedServices, s.excludedServices) {
 				slog.Debug("🚫 [LOGS] Dropped service", "service", serviceName)
