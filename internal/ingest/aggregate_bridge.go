@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -356,6 +357,19 @@ func (s resourceSlots) identity() aggregate.ResourceIdentity {
 	}
 }
 
+// pidString renders process.pid as its decimal value whether the producer sent
+// it as an OTLP int or string; the registry persists it, so the protobuf text
+// form (int_value:1234) must never reach a row.
+func pidString(v *commonpb.AnyValue) string {
+	if s := v.GetStringValue(); s != "" {
+		return s
+	}
+	if _, ok := v.GetValue().(*commonpb.AnyValue_IntValue); ok {
+		return strconv.FormatInt(v.GetIntValue(), 10)
+	}
+	return ""
+}
+
 func scanResourceSlots(attrs []*commonpb.KeyValue) resourceSlots {
 	var id resourceSlots
 	for _, kv := range attrs {
@@ -385,7 +399,7 @@ func scanResourceSlots(attrs []*commonpb.KeyValue) resourceSlots {
 			}
 		case "process.pid":
 			if id.workload == "" {
-				id.workload = kv.Value.String()
+				id.workload = pidString(kv.Value)
 				id.workloadKind = "process"
 			}
 		}

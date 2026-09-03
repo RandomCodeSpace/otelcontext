@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -159,5 +160,26 @@ func BenchmarkRegistryRegisterPresent(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		r.Register("acme", "checkout", "node-1", "pod-1", "pod", SignalTraces, now)
+	}
+}
+
+func TestRegistryRefusesOverLengthValues(t *testing.T) {
+	r := NewRegistry(nil)
+	now := time.Unix(1_700_000_000, 0)
+	long := strings.Repeat("h", RegistryMaxValueBytes+1)
+	if r.Register("acme", "checkout", long, "", "", SignalTraces, now) {
+		t.Fatal("over-length host was admitted")
+	}
+	if r.Register("acme", long, "", "", "", SignalTraces, now) {
+		t.Fatal("over-length service was admitted")
+	}
+	if got := r.Overflow("acme", RegistryKindLength); got != 2 {
+		t.Fatalf("length overflow = %d, want 2", got)
+	}
+	if !r.Register("acme", "checkout", strings.Repeat("h", RegistryMaxValueBytes), "", "", SignalTraces, now) {
+		t.Fatal("exact-length host was refused")
+	}
+	if len(r.Snapshot()) != 1 {
+		t.Fatalf("snapshot = %#v", r.Snapshot())
 	}
 }

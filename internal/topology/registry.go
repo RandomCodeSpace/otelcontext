@@ -25,6 +25,10 @@ const (
 	RegistryMaxEntriesPerTenant = 10000
 	// RegistryIdleTTL evicts an entry no signal has touched for this long.
 	RegistryIdleTTL = 24 * time.Hour
+	// RegistryMaxValueBytes bounds service, host and workload values; the
+	// persisted columns are 255 bytes wide on every adapter and an over-length
+	// value would poison every later flush of the same batch.
+	RegistryMaxValueBytes = 255
 	// RegistryFlushInterval is the dirty-tick period used by Run.
 	RegistryFlushInterval = 30 * time.Second
 	// registryDirtyGranularity bounds how often a live entry is rewritten for
@@ -34,8 +38,9 @@ const (
 
 // Overflow kinds, also the metric label values.
 const (
-	RegistryKindHost = "host"
-	RegistryKindPair = "pair"
+	RegistryKindHost   = "host"
+	RegistryKindPair   = "pair"
+	RegistryKindLength = "length"
 )
 
 // Signal is one bit of ResourceEntry.Signals.
@@ -109,6 +114,10 @@ func (r *Registry) Register(tenant, service, host, workload, kind string, signal
 	sec := now.Unix()
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if len(service) > RegistryMaxValueBytes || len(host) > RegistryMaxValueBytes || len(workload) > RegistryMaxValueBytes {
+		r.recordOverflow(tenant, RegistryKindLength)
+		return false
+	}
 	if e, ok := r.entries[key]; ok {
 		if e.signals&signal == 0 {
 			e.signals |= signal
