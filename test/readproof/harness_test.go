@@ -52,15 +52,16 @@ const (
 	// after seeding — the in-memory transient of seeding ends there, not
 	// when the rows are on disk.
 	graphRAGRefreshInterval = 60 * time.Second
-	// releaseGrace is how long a collection gets to be followed by the
-	// scavenger returning the freed heap before it counts as having had
-	// nothing to return; the observed delay ranges from a few seconds to
-	// over thirty.
-	releaseGrace = 90 * time.Second
-	// settleDeadline bounds the whole wait: the refresh tick, then the forced
-	// GC Go runs every two minutes when allocation alone does not trigger one
-	// (runtime forcegcperiod), then the release grace, plus a margin.
-	settleDeadline     = graphRAGRefreshInterval + 120*time.Second + releaseGrace + 30*time.Second
+	// settleDeadline bounds the whole wait. It is the CI budget remainder,
+	// not a scavenger estimate: the workflow gives the test 13 minutes, the
+	// aggregate prefill and the reads of either shape take under five, so
+	// eight minutes of settling still fits. The scavenger's pace is a
+	// runtime property that differs by an order of magnitude between hosts
+	// (seconds locally, minutes on a hosted 4-vCPU runner), so the harness
+	// waits for the release to be observed complete and never caps that
+	// wait with a number of its own; reaching the deadline is recorded and
+	// leaves the window to fail honestly.
+	settleDeadline     = 8 * time.Minute
 	lastGCMetric       = "go_memstats_last_gc_time_seconds"
 	heapIdleMetric     = "go_memstats_heap_idle_bytes"
 	heapReleasedMetric = "go_memstats_heap_released_bytes"
@@ -392,66 +393,93 @@ func (a *appProcess) account() MemoryAccounting {
 // inside it. The second wait is for the scavenger: the cycle is recorded
 // before the freed spans are returned to the OS, which begins several
 // seconds later, and a sample taken on that falling edge is the high-water
-// mark wearing a steady-state label. Timing cannot tell "not started" from
-// "finished", so the harness reads the runtime's own accounting: the
-// transient is returned once the idle heap it still retains
-// (heap_idle − heap_released) is below the heap in use. Then the RSS gauge
-// must hold across four readings 5 s apart. A collection after which the runtime
-// keeps retaining more than it uses for releaseGrace counts as settled with
-// the reason recorded, as does the deadline.
-func (s *rssSampler) settle(since time.Time) {
+// mark wearing a steady-state label. One collection is not enough either:
+// the GC pacer sets each cycle's heap goal from the live heap of the cycle
+// before, so the first collection after the prune runs against a goal
+// computed while the transient was still live, and the scavenger stops at a
+// ceiling that still includes it (measured: RSS flat at 617 MiB for 70 s
+// with heap_released unchanged, then a second collection released another
+// 160 MiB). The window therefore opens after the SECOND collection past
+// eligibility — the first whose goal excludes the transient — once the
+// runtime's retained idle heap (heap_idle − heap_released) is below the
+// heap in use and the RSS gauge has held across four readings 5 s apart.
+// The scavenger's pace differs by an order of magnitude between hosts, so
+// nothing here caps that wait with a number; reaching the deadline is
+// recorded and the window starts there.
+//
+// All of it runs under a trickle of the proof's own load — `load`, one call
+// per second — because an idle process is not the state the objective
+// describes: without allocation the pacer only cycles on the two-minute
+// forced GC and RSS plateaus wherever the last cycle's goal left it, and
+// the first collection under the measurement's reads then moves it again
+// (measured: 548 MiB idle, 465 MiB from the first read on). Under the
+// trickle the cycles are allocation-driven, so the pacer converges the way
+// it will during measurement. The trickle stops before measurement begins.
+func (s *rssSampler) settle(since time.Time, load request) {
 	started := time.Now()
-	rule := "steady window starts at the first GC cycle completed at least one GraphRAG refresh interval (60s) after seeding finished, once the runtime's retained idle heap (go_memstats_heap_idle_bytes - go_memstats_heap_released_bytes) is below the heap in use and the RSS gauge has held within 2% across four readings 5s apart; a collection after which retained idle stays above in-use for 90s counts as settled"
+	rule := "steady window starts after the second GC cycle completed at least one GraphRAG refresh interval (60s) after seeding finished (the first cycle whose heap goal was set from a live heap without the seeding transient), under one rest_traffic_full_range read per second, once the runtime's retained idle heap (go_memstats_heap_idle_bytes - go_memstats_heap_released_bytes) is below the heap in use and the RSS gauge has held within 2% across four readings 5s apart"
 	deadline := started.Add(settleDeadline)
 	eligible := float64(since.Add(graphRAGRefreshInterval).UnixNano()) / 1e9
 	reason := ""
-	var collectedAt time.Time
-	released := false
-	prev, stable := 0.0, 0
-settling:
+	lastGC, cycles := 0.0, 0
+	prevRSS, stable := 0.0, 0
+
+	stopLoad := make(chan struct{})
+	var loadWG sync.WaitGroup
+	if load != nil {
+		loadWG.Add(1)
+		go func() {
+			defer loadWG.Done()
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
+			for n := 0; ; n++ {
+				select {
+				case <-stopLoad:
+					return
+				case <-ticker.C:
+					ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
+					load(ctx, n)
+					cancel()
+				}
+			}
+		}()
+	}
+	defer func() {
+		close(stopLoad)
+		loadWG.Wait()
+	}()
 	for {
 		samples, err := s.app.scrapeMetrics()
 		if err == nil {
-			switch {
-			case collectedAt.IsZero():
-				if last, err := Gauge(samples, lastGCMetric); err == nil && last > eligible {
-					collectedAt = time.Now()
-				}
-			case !released:
-				idle, _ := Gauge(samples, heapIdleMetric)
-				returned, _ := Gauge(samples, heapReleasedMetric)
-				inuse, _ := Gauge(samples, heapInuseMetric)
-				if inuse > 0 && idle-returned <= inuse {
-					released = true
-				} else if time.Since(collectedAt) >= releaseGrace {
-					reason = fmt.Sprintf("; retained idle heap stayed above in-use for %.0f s after the collection", releaseGrace.Seconds())
-					break settling
-				}
-			default:
-				// The release steps down over several seconds with pauses
-				// between steps, so stability is judged on the sampling
-				// cadence across four readings (15 s), not on a 2 s poll.
-				if cur, err := Gauge(samples, RSSMetric); err == nil {
-					if prev > 0 && math.Abs(cur-prev) <= 0.02*prev {
-						stable++
-					} else {
-						stable = 0
-					}
-					prev = cur
-					if stable >= 3 {
-						break settling
-					}
-				}
-				if time.Now().Before(deadline) {
-					time.Sleep(rssInterval - 2*time.Second)
-				}
+			if last, e := Gauge(samples, lastGCMetric); e == nil && last > eligible && last != lastGC {
+				lastGC, cycles = last, cycles+1
+			}
+		}
+		if err == nil && cycles >= 2 {
+			idle, _ := Gauge(samples, heapIdleMetric)
+			returned, _ := Gauge(samples, heapReleasedMetric)
+			inuse, _ := Gauge(samples, heapInuseMetric)
+			rss, rssErr := Gauge(samples, RSSMetric)
+			flat := prevRSS > 0 && rssErr == nil && math.Abs(rss-prevRSS) <= 0.02*prevRSS
+			if inuse > 0 && idle-returned <= inuse && flat {
+				stable++
+			} else {
+				stable = 0
+			}
+			prevRSS = rss
+			if stable >= 3 {
+				break
 			}
 		}
 		if time.Now().After(deadline) {
-			reason = fmt.Sprintf("; not settled within %.0f s (gc cycle observed: %t, release observed: %t), window starts at the deadline", settleDeadline.Seconds(), !collectedAt.IsZero(), released)
+			reason = fmt.Sprintf("; not settled within %.0f s (eligible gc cycles observed: %d), window starts at the deadline", settleDeadline.Seconds(), cycles)
 			break
 		}
-		time.Sleep(2 * time.Second)
+		if cycles < 2 {
+			time.Sleep(2 * time.Second)
+		} else {
+			time.Sleep(rssInterval)
+		}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -660,6 +688,18 @@ func measure(t *testing.T, m *Measurement, fn request, o Objectives) {
 	t.Logf("%s: cold %.1f ms (HTTP %d, %d bytes, coverage header %q body %q); warm n=%d p50 %.1f p90 %.1f p99 %.1f max %.1f ms; cache hits %d; errors %d; clamp %q->%q",
 		m.Name, m.Cold.MS, m.Cold.Status, m.Cold.Bytes, m.Cold.Coverage, m.Cold.BodyCoverage, m.Requests,
 		m.Latency.P50, m.Latency.P90, m.Latency.P99, m.Latency.Max, m.CacheHits, m.Errors, m.RequestedStart, m.EffectiveStart)
+}
+
+// settleLoad is the request the settle trickle issues: the full-range
+// traffic read, an asserted endpoint that allocates enough per call for the
+// pacer to cycle on allocation rather than on the forced-GC timer.
+func settleLoad(plan []endpoint) request {
+	for _, ep := range plan {
+		if ep.m.Name == "rest_traffic_full_range" {
+			return ep.fn
+		}
+	}
+	return nil
 }
 
 // markUnmeasured stamps every endpoint that has no evidence yet with the

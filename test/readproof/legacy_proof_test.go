@@ -100,7 +100,7 @@ func TestReadLatencyLegacy(t *testing.T) {
 	proof.Prefill.MainDBByte = fileSize(filepath.Join(dir, "otelcontext.db")) + fileSize(filepath.Join(dir, "otelcontext.db-wal"))
 	t.Logf("ingest: %d traces / %d spans / %d logs in %.1f s, main db %d bytes", legacyTraces, legacyTraces*legacySpansPerTrace, legacyTraces, proof.Prefill.Seconds, proof.Prefill.MainDBByte)
 
-	sampler.settle(time.Now())
+	sampler.settle(time.Now(), settleLoad(plan))
 	measureFrom := time.Since(app.started).Seconds()
 	sampler.sample()
 	for _, ep := range plan {

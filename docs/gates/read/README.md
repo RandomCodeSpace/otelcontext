@@ -59,14 +59,29 @@ its next collection — an idle process only gets one from the two-minute
 forced GC — and then returns it to the OS several seconds later. The
 seven-day gate excludes its own warm-up with `steady_start_offset_sec`; the
 read proof does the equivalent from observable runtime state. The steady
-window starts at the first GC cycle completed at least one refresh interval
-(60 s) after seeding finished, once the runtime's retained idle heap
-(`go_memstats_heap_idle_bytes − go_memstats_heap_released_bytes`) is below
-the heap in use and the RSS gauge has held within 2% across four readings
-5 s apart. A collection after which retained idle stays above in-use for
-90 s counts as settled, and the whole wait is bounded at 300 s; either case
-is recorded in `steady_rule`. The measurement phase (the reads) runs inside
-that window, so the p95 covers the server answering the asserted endpoints.
+window starts after the **second** GC cycle completed at least one refresh
+interval (60 s) after seeding finished, once the runtime's retained idle
+heap (`go_memstats_heap_idle_bytes − go_memstats_heap_released_bytes`) is
+below the heap in use and the RSS gauge has held within 2% across four
+readings 5 s apart — all of it under a trickle of the proof's own load, one
+`rest_traffic_full_range` read per second, stopped before measurement. An
+idle process is not the state the objective describes: without allocation
+the pacer only cycles on the two-minute forced GC and RSS plateaus wherever
+the last cycle's goal left it, and the first collection under the
+measurement's reads moves it again (measured: 548 MiB idle, 465 MiB from the
+first read on); under the trickle the cycles are allocation-driven and the
+pacer converges the way it will during measurement. Why the second: the GC pacer sets each cycle's heap goal
+from the live heap of the cycle before, so the first collection after the
+prune runs against a goal computed while the transient was still live and
+the scavenger stops at a ceiling that still includes it (measured: RSS flat
+at 617 MiB for 70 s with `heap_released` unchanged, then the next collection
+released another 160 MiB). The scavenger's pace is a runtime property that
+differs by an order of magnitude between hosts (seconds here, minutes on a
+hosted 4-vCPU runner), so the harness never caps that wait with a number of
+its own; the only bound is the CI budget remainder (8 min), and reaching it
+is recorded in `steady_rule` and leaves the window to fail honestly. The
+measurement phase (the reads) runs inside that window, so the p95 covers the
+server answering the asserted endpoints.
 
 With about eight samples the nearest-rank p95 is the maximum, which is the
 strict reading and the intended one.

@@ -110,7 +110,7 @@ func TestReadLatencyAggregate(t *testing.T) {
 	proof.ReadySeconds = round3(time.Since(app.started).Seconds())
 	t.Logf("ready after %.1f s", proof.ReadySeconds)
 
-	sampler.settle(time.Now())
+	sampler.settle(time.Now(), settleLoad(plan))
 	measureFrom := time.Since(app.started).Seconds()
 	sampler.sample()
 	for _, ep := range plan {
