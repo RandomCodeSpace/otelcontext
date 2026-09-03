@@ -183,3 +183,14 @@ func TestRegistryRefusesOverLengthValues(t *testing.T) {
 		t.Fatalf("snapshot = %#v", r.Snapshot())
 	}
 }
+
+func TestIsHostEntity(t *testing.T) {
+	if !IsHostEntity(HostPrefix + "node-a") {
+		t.Fatal("host/node-a is not a host entity")
+	}
+	for _, name := range []string{"checkout", "hosted/x", "", "HOST/node-a"} {
+		if IsHostEntity(name) {
+			t.Fatalf("%q reported as a host entity", name)
+		}
+	}
+}

@@ -107,7 +107,10 @@ unbounded bucket.
 
 **Dimensions.** Configured `AGGREGATE_METRIC_DIMS` keys are extracted from each
 point's attributes into the SeriesKey `DimsID`, identically for all three point
-types. Missing any configured key yields `DimsID=0` (all-or-nothing). String,
+types. A key the point lacks falls back to the same key on the resource
+attributes (#279), which is how `system.cpu.utilization:host.name` splits per
+host; a point attribute always outranks the resource one. Missing any
+configured key from both yields `DimsID=0` (all-or-nothing). String,
 int, bool and double attribute values are supported; array and kvlist values
 are refused from identity and counted on
 `otelcontext_ingest_metrics_dims_rejected_total{reason="unsupported_value_type"}`.

@@ -6,6 +6,7 @@ import (
 	"hash/fnv"
 	"log/slog"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -42,6 +43,17 @@ const (
 	RegistryKindPair   = "pair"
 	RegistryKindLength = "length"
 )
+
+// HostPrefix is the reserved service-name namespace of host entities (#280):
+// a resource carrying host.id or host.name and no service.name is identified
+// as HostPrefix + host.name (host.id when there is no name). The registry
+// schema is unchanged; the entity kind is derived from the name.
+const HostPrefix = "host/"
+
+// IsHostEntity reports whether service names a host entity.
+func IsHostEntity(service string) bool {
+	return strings.HasPrefix(service, HostPrefix)
+}
 
 // Signal is one bit of ResourceEntry.Signals.
 type Signal uint8
