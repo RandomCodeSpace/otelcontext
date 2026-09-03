@@ -1,0 +1,126 @@
+{
+  "schema_version": "otelcontext.ingest-baseline.v1",
+  "generated_at": "2026-09-03T22:46:00Z",
+  "git_sha": "f49edcea2c3011b6da49fcfc46abaadeb60aafc3",
+  "git_dirty": false,
+  "go_version": "go version go1.26.2 linux/amd64",
+  "binary_sha256": "26ef3a41dffdab5322edd3ee073781fd999c07dc567c04eb7ddc34064a313155",
+  "loadsim_sha256": "34eeaa745418b895776bd336cee028338ee5149644903f2d29c284dbba706dba",
+  "hardware": {
+    "cpu_model": "AMD EPYC 9354P 32-Core Processor",
+    "cpus_total": 8,
+    "memory_total_bytes": 33653841920,
+    "kernel": "6.8.0-136-generic",
+    "confinement": "taskset",
+    "server_cpus": "0,1",
+    "server_gomaxprocs": 2,
+    "loadsim_cpus": "2,3",
+    "is_gate_box": false,
+    "note": "Developer workstation, not the 2-vCPU gate box: 8-CPU AMD EPYC 9354P VM, 32 GiB, server pinned to CPUs 0-1 with GOMAXPROCS=2, loadsim on CPUs 2-3, data and binaries on /dev/shm (tmpfs)."
+  },
+  "protocol": {
+    "loadsim_profile": "aggregate-acceptance",
+    "services": 150,
+    "offered_points_per_sec": 10050,
+    "batch_interval_ms": 250,
+    "settle_sec": 30,
+    "sustained_sec": 120,
+    "profile_offset_sec": 30,
+    "profile_sec": 60,
+    "window_boundary_unix": 1788475500,
+    "window_boundary_offset_sec": 60,
+    "started_at": "2026-09-03T22:43:30Z",
+    "ended_at": "2026-09-03T22:46:00Z"
+  },
+  "server_env": {
+    "AGGREGATE_MODE": "aggregate",
+    "AGGREGATE_SYNCHRONOUS": "NORMAL",
+    "API_KEY": "",
+    "API_RATE_LIMIT_RPS": "0",
+    "APP_ENV": "development",
+    "DATA_DISK_BUDGET_MB": "1000000",
+    "DB_DRIVER": "sqlite",
+    "EXEMPLAR_RETENTION_DAYS": "2",
+    "GOMAXPROCS": "2",
+    "HOT_RETENTION_DAYS": "8",
+    "INGEST_ASYNC_ENABLED": "true",
+    "LOG_FTS_ENABLED": "true",
+    "MCP_ENABLED": "true",
+    "OTELCONTEXT_ALLOW_SQLITE_PROD": "false",
+    "SAMPLING_RATE": "1.0",
+    "TLS_AUTO_SELFSIGNED": "false"
+  },
+  "sustained": {
+    "duration_sec": 120.000614162,
+    "points_sent": 1206004,
+    "points_acked": 1206004,
+    "points_acked_per_sec": 10049.981897358482,
+    "requests_ok": 216002,
+    "requests_err": 0,
+    "resource_exhausted": 0,
+    "ack_latency_all_signals": {
+      "samples": 216002,
+      "min_ms": 13.023914,
+      "p50_ms": 50.274127,
+      "p90_ms": 77.448919,
+      "p95_ms": 92.291629,
+      "p99_ms": 154.373946,
+      "p999_ms": 242.194916,
+      "max_ms": 302.806316,
+      "mean_ms": 53.77223524978472
+    },
+    "ack_latency_by_signal": {
+      "logs": {
+        "samples": 72000,
+        "min_ms": 13.023914,
+        "p50_ms": 48.078199,
+        "p90_ms": 74.199585,
+        "p95_ms": 88.146782,
+        "p99_ms": 148.982473,
+        "p999_ms": 232.238765,
+        "max_ms": 291.6139,
+        "mean_ms": 51.146845330347226
+      },
+      "metrics": {
+        "samples": 72002,
+        "min_ms": 14.034227,
+        "p50_ms": 51.290411,
+        "p90_ms": 78.955835,
+        "p95_ms": 94.320308,
+        "p99_ms": 156.403463,
+        "p999_ms": 248.206542,
+        "max_ms": 300.847777,
+        "mean_ms": 54.98967367249521
+      },
+      "spans": {
+        "samples": 72000,
+        "min_ms": 14.213449,
+        "p50_ms": 51.429091,
+        "p90_ms": 79.004754,
+        "p95_ms": 94.072497,
+        "p99_ms": 157.859879,
+        "p999_ms": 246.720484,
+        "max_ms": 302.806316,
+        "mean_ms": 55.18015292877778
+      }
+    }
+  },
+  "server_counters_delta": {
+    "aggregate_input_points_total": 1467368,
+    "aggregate_commits_total": 3283,
+    "aggregate_deltas_total": 792880,
+    "aggregate_admission_rejected_total": 0,
+    "aggregate_late_points_total": 0,
+    "aggregate_identity_overflow_total": 149848,
+    "ingest_pipeline_dropped_total": 0
+  },
+  "artifacts": {
+    "loadsim_report": "loadsim-report.json",
+    "cpu_profile": "cpu.pprof",
+    "allocs_profile": "allocs.pprof",
+    "server_log": "server.log",
+    "loadsim_log": "loadsim.log",
+    "metrics_before": "metrics-before.prom",
+    "metrics_after": "metrics-after.prom"
+  }
+}
