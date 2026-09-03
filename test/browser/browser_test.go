@@ -235,10 +235,15 @@ func waitReady(ctx context.Context, baseURL string) error {
 }
 
 type requestRecord struct {
+	At       string `json:"at"`
 	Phase    string `json:"phase"`
 	Method   string `json:"method"`
 	URL      string `json:"url"`
 	PostData string `json:"post_data,omitempty"`
+}
+
+func stamp() string {
+	return time.Now().Format("15:04:05.000")
 }
 
 type eventRecorder struct {
@@ -251,16 +256,35 @@ type eventRecorder struct {
 	failedRequests     []string
 	unexpectedFailures []string
 	externalRequests   []string
+	requestURLs        map[network.RequestID]string
+	responseStatus     map[network.RequestID]int64
+	phases             []string
 }
 
 func newEventRecorder(rawOrigin string) *eventRecorder {
 	origin, _ := url.Parse(rawOrigin)
-	return &eventRecorder{origin: origin, phase: "setup"}
+	return &eventRecorder{
+		origin:         origin,
+		phase:          "setup",
+		requestURLs:    make(map[network.RequestID]string),
+		responseStatus: make(map[network.RequestID]int64),
+	}
+}
+
+// lenientPhase names the phases whose console errors and failed requests are
+// expected: a forced graph failure, a server restart, and full page reloads.
+func lenientPhase(phase string) bool {
+	switch phase {
+	case "forced-error", "websocket-recovery", "theme-persistence", "host-group-reload":
+		return true
+	}
+	return false
 }
 
 func (r *eventRecorder) setPhase(phase string) {
 	r.mu.Lock()
 	r.phase = phase
+	r.phases = append(r.phases, stamp()+" "+phase)
 	r.mu.Unlock()
 }
 
@@ -273,6 +297,7 @@ func (r *eventRecorder) snapshot() map[string]any {
 		"failed_requests":     append([]string(nil), r.failedRequests...),
 		"unexpected_failures": append([]string(nil), r.unexpectedFailures...),
 		"external_requests":   append([]string(nil), r.externalRequests...),
+		"phases":              append([]string(nil), r.phases...),
 		"requests":            append([]requestRecord(nil), r.requests...),
 	}
 }
@@ -306,6 +331,7 @@ func (r *eventRecorder) listen(ctx context.Context) {
 				}
 			}
 			record := requestRecord{
+				At:       stamp(),
 				Phase:    phase,
 				Method:   event.Request.Method,
 				URL:      event.Request.URL,
@@ -314,6 +340,7 @@ func (r *eventRecorder) listen(ctx context.Context) {
 			if len(r.requests) < 500 {
 				r.requests = append(r.requests, record)
 			}
+			r.requestURLs[event.RequestID] = event.Request.URL
 			if requestURL, err := url.Parse(event.Request.URL); err == nil {
 				switch requestURL.Scheme {
 				case "http", "https", "ws", "wss":
@@ -322,10 +349,18 @@ func (r *eventRecorder) listen(ctx context.Context) {
 					}
 				}
 			}
+		case *network.EventResponseReceived:
+			r.responseStatus[event.RequestID] = event.Response.Status
 		case *network.EventLoadingFailed:
-			message := phase + ": " + event.ErrorText
+			message := phase + ": " + event.ErrorText + " " + r.requestURLs[event.RequestID] + " at " + stamp()
+			// Chrome reports a conditional fetch answered 304 as an aborted
+			// load once it serves the cached body; the page saw a success.
+			revalidated := event.ErrorText == "net::ERR_ABORTED" && r.responseStatus[event.RequestID] == http.StatusNotModified
+			if revalidated {
+				message += " (304 revalidation)"
+			}
 			r.failedRequests = append(r.failedRequests, message)
-			if phase != "forced-error" && phase != "websocket-recovery" && phase != "theme-persistence" {
+			if !revalidated && !lenientPhase(phase) {
 				r.unexpectedFailures = append(r.unexpectedFailures, message)
 			}
 		case *cdpruntime.EventExceptionThrown:
@@ -333,13 +368,13 @@ func (r *eventRecorder) listen(ctx context.Context) {
 		case *cdpruntime.EventConsoleAPICalled:
 			message := fmt.Sprintf("%s: %s", phase, event.Type)
 			r.console = append(r.console, message)
-			if event.Type == cdpruntime.APITypeError && phase != "forced-error" && phase != "websocket-recovery" && phase != "theme-persistence" {
+			if event.Type == cdpruntime.APITypeError && !lenientPhase(phase) {
 				r.unexpectedFailures = append(r.unexpectedFailures, message)
 			}
 		case *cdplog.EventEntryAdded:
 			message := fmt.Sprintf("%s: %s: %s", phase, event.Entry.Level, event.Entry.Text)
 			r.console = append(r.console, message)
-			if event.Entry.Level == cdplog.LevelError && phase != "forced-error" && phase != "websocket-recovery" && phase != "theme-persistence" {
+			if event.Entry.Level == cdplog.LevelError && !lenientPhase(phase) {
 				r.unexpectedFailures = append(r.unexpectedFailures, message)
 			}
 		}
@@ -685,6 +720,33 @@ func tracePayload(service, spanID, parentSpanID string, start, end int64) map[st
 	}
 }
 
+func postOTLP(t *testing.T, endpoint string, payload map[string]any) {
+	t.Helper()
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal OTLP payload: %v", err)
+	}
+	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("create OTLP request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	client := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{Proxy: nil}}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("export OTLP payload: %v", err)
+	}
+	responseBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	_ = resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		t.Fatalf("export OTLP payload to %s = %d: %s", endpoint, resp.StatusCode, strings.TrimSpace(string(responseBody)))
+	}
+	if len(bytes.TrimSpace(responseBody)) > 0 {
+		t.Logf("OTLP response from %s: %s", endpoint, strings.TrimSpace(string(responseBody)))
+	}
+}
+
 func injectTopology(t *testing.T, baseURL string) {
 	t.Helper()
 	now := time.Now().UTC().UnixNano()
@@ -692,29 +754,139 @@ func injectTopology(t *testing.T, baseURL string) {
 		tracePayload("gateway", "1111111111111111", "", now, now+int64(12*time.Millisecond)),
 		tracePayload("checkout", "2222222222222222", "1111111111111111", now+int64(time.Millisecond), now+int64(10*time.Millisecond)),
 	}
-	client := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{Proxy: nil}}
 	for _, resource := range resources {
-		body, err := json.Marshal(map[string]any{"resourceSpans": []map[string]any{resource}})
-		if err != nil {
-			t.Fatalf("marshal OTLP trace: %v", err)
+		postOTLP(t, baseURL+"/v1/traces", map[string]any{"resourceSpans": []map[string]any{resource}})
+	}
+}
+
+// tracePayloadOnHost is tracePayload with a host.name resource attribute.
+func tracePayloadOnHost(service, host, spanID, parentSpanID string, start, end int64) map[string]any {
+	payload := tracePayload(service, spanID, parentSpanID, start, end)
+	resource := payload["resource"].(map[string]any)
+	resource["attributes"] = append(resource["attributes"].([]map[string]any), map[string]any{
+		"key":   "host.name",
+		"value": map[string]any{"stringValue": host},
+	})
+	return payload
+}
+
+// hostMetricsPayload is a hostmetrics-shaped resource: host.name, no
+// service.name, one gauge point per metric.
+func hostMetricsPayload(host string, now int64, values map[string]float64) map[string]any {
+	names := make([]string, 0, len(values))
+	for name := range values {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	metrics := make([]map[string]any, 0, len(names))
+	for _, name := range names {
+		metrics = append(metrics, map[string]any{
+			"name": name,
+			"gauge": map[string]any{"dataPoints": []map[string]any{{
+				"timeUnixNano": strconv.FormatInt(now, 10),
+				"asDouble":     values[name],
+			}}},
+		})
+	}
+	return map[string]any{"resourceMetrics": []map[string]any{{
+		"resource": map[string]any{
+			"attributes": []map[string]any{{
+				"key":   "host.name",
+				"value": map[string]any{"stringValue": host},
+			}},
+		},
+		"scopeMetrics": []map[string]any{{"metrics": metrics}},
+	}}}
+}
+
+// injectHostFixture seeds the host-grouping fixture: gateway on node-a,
+// checkout on node-a and node-b, and a hostmetrics-only node-c reporting CPU
+// and memory utilization but no filesystem metric.
+func injectHostFixture(t *testing.T, baseURL string) {
+	t.Helper()
+	now := time.Now().UTC().UnixNano()
+	resources := []map[string]any{
+		tracePayloadOnHost("gateway", "node-a", "3333333333333333", "", now, now+int64(12*time.Millisecond)),
+		tracePayloadOnHost("checkout", "node-a", "4444444444444444", "3333333333333333", now+int64(time.Millisecond), now+int64(9*time.Millisecond)),
+		tracePayloadOnHost("checkout", "node-b", "5555555555555555", "3333333333333333", now+int64(2*time.Millisecond), now+int64(10*time.Millisecond)),
+	}
+	for _, resource := range resources {
+		postOTLP(t, baseURL+"/v1/traces", map[string]any{"resourceSpans": []map[string]any{resource}})
+	}
+	postOTLP(t, baseURL+"/v1/metrics", hostMetricsPayload("node-c", now, map[string]float64{
+		"system.cpu.utilization":    0.42,
+		"system.memory.utilization": 0.61,
+	}))
+}
+
+func getJSON(ctx context.Context, rawURL string, target any) (string, error) {
+	client := &http.Client{Timeout: 2 * time.Second, Transport: &http.Transport{Proxy: nil}}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	_ = resp.Body.Close()
+	if readErr != nil {
+		return string(body), readErr
+	}
+	return string(body), json.Unmarshal(body, target)
+}
+
+// waitHosts polls /api/hosts until the fixture's three hosts are projected
+// with checkout and gateway both on node-a.
+func waitHosts(ctx context.Context, baseURL string) error {
+	type host struct {
+		Name     string   `json:"name"`
+		Services []string `json:"services"`
+	}
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	var last string
+	for {
+		var hosts []host
+		body, err := getJSON(ctx, baseURL+"/api/hosts", &hosts)
+		last = body
+		if err == nil && len(hosts) == 3 && hosts[0].Name == "node-a" && strings.Join(hosts[0].Services, ",") == "checkout,gateway" &&
+			hosts[1].Name == "node-b" && hosts[2].Name == "node-c" {
+			return nil
 		}
-		req, err := http.NewRequest(http.MethodPost, baseURL+"/v1/traces", bytes.NewReader(body))
-		if err != nil {
-			t.Fatalf("create OTLP request: %v", err)
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("wait for host projection: %w; last response: %s", ctx.Err(), last)
+		case <-ticker.C:
 		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Accept", "application/json")
-		resp, err := client.Do(req)
-		if err != nil {
-			t.Fatalf("export OTLP trace: %v", err)
+	}
+}
+
+// waitHostMetric polls the metrics API until the TSDB has flushed node-c's
+// CPU gauge into a bucket the host panel can read.
+func waitHostMetric(ctx context.Context, baseURL string) error {
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	var last string
+	for {
+		end := time.Now().UTC()
+		query := url.Values{
+			"name":         {"system.cpu.utilization"},
+			"service_name": {"host/node-c"},
+			"start":        {end.Add(-time.Hour).Format(time.RFC3339)},
+			"end":          {end.Format(time.RFC3339)},
 		}
-		responseBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
-		_ = resp.Body.Close()
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			t.Fatalf("export OTLP trace = %d: %s", resp.StatusCode, strings.TrimSpace(string(responseBody)))
+		var buckets []map[string]any
+		body, err := getJSON(ctx, baseURL+"/api/metrics?"+query.Encode(), &buckets)
+		last = body
+		if err == nil && len(buckets) > 0 {
+			return nil
 		}
-		if len(bytes.TrimSpace(responseBody)) > 0 {
-			t.Logf("OTLP trace response: %s", strings.TrimSpace(string(responseBody)))
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("wait for host/node-c metric bucket: %w; last response: %s", ctx.Err(), last)
+		case <-ticker.C:
 		}
 	}
 }
@@ -1111,6 +1283,140 @@ func TestProtectedBrowserWorkflow(t *testing.T) {
 	`, 5*time.Second)
 	smoke.screenshot("mobile-map")
 	smoke.complete("mobile-map-list-inspector")
+
+	smoke.phase("host-group")
+	if err := chromedp.Run(ctx, chromedp.EmulateViewport(1280, 900)); err != nil {
+		t.Fatalf("restore desktop viewport: %v", err)
+	}
+	requireJS(t, ctx, `!matchMedia("(max-width: 767px)").matches`, 5*time.Second)
+	injectHostFixture(t, app.baseURL())
+	hostsCtx, hostsCancel := context.WithTimeout(context.Background(), readyTimeout)
+	if err := waitHosts(hostsCtx, app.baseURL()); err != nil {
+		hostsCancel()
+		t.Fatal(err)
+	}
+	hostsCancel()
+	requireJS(t, ctx, `!document.querySelector("#refresh-button").disabled`, 10*time.Second)
+	if err := chromedp.Run(ctx, chromedp.Click("#refresh-button", chromedp.ByQuery)); err != nil {
+		t.Fatalf("refresh host fixture: %v", err)
+	}
+	requireJS(t, ctx, `document.querySelector("#host-group-button").getAttribute("aria-disabled") === "false"`, 10*time.Second)
+	if err := chromedp.Run(ctx, chromedp.Evaluate(`document.querySelector("#host-group-button").focus()`, nil)); err != nil {
+		t.Fatalf("focus host toggle: %v", err)
+	}
+	requireJS(t, ctx, `document.activeElement === document.querySelector("#host-group-button")`, 5*time.Second)
+	if err := chromedp.Run(ctx, chromedp.Click("#host-group-button", chromedp.ByQuery)); err != nil {
+		t.Fatalf("toggle host grouping: %v", err)
+	}
+	requireJS(t, ctx, `
+		(() => {
+			const headings = Array.from(document.querySelectorAll("#service-list .host-heading"));
+			const checkout = document.querySelectorAll('#service-list [data-service="checkout"]');
+			let heading = checkout.length === 1 ? checkout[0].previousElementSibling : null;
+			while (heading && !heading.classList.contains("host-heading")) heading = heading.previousElementSibling;
+			return document.querySelector("#host-group-button").getAttribute("aria-pressed") === "true" &&
+				new URL(location.href).searchParams.get("group") === "host" &&
+				headings.map((item) => item.dataset.host + ":" + item.querySelector(".host-count").textContent).join("|") ===
+					"node-a:2 services|node-b:1 service|node-c:0 services" &&
+				checkout.length === 1 && heading && heading.dataset.host === "node-a" &&
+				checkout[0].querySelector(".service-meta").textContent.includes("2 hosts") &&
+				document.querySelectorAll("#graph-clusters .cluster-heading[data-host]").length === 3 &&
+				document.querySelectorAll("#graph-nodes .service-node").length === 2 &&
+				document.querySelector("#service-count").textContent.trim() === "2" &&
+				document.querySelector("#pulse-services").textContent.trim() === "2";
+		})()
+	`, 10*time.Second)
+	smoke.screenshot("host-group-desktop")
+	if err := chromedp.Run(ctx, chromedp.Evaluate(`
+		(() => {
+			const heading = document.querySelector('#graph-clusters .cluster-heading[data-host="node-c"]');
+			heading.focus();
+			heading.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+		})()
+	`, nil)); err != nil {
+		t.Fatalf("open host panel from map heading: %v", err)
+	}
+	requireJS(t, ctx, `
+		!document.querySelector("#inspector").inert &&
+		document.querySelector("#inspector-title").textContent.trim() === "node-c" &&
+		document.querySelector("#inspector-tabs").hidden &&
+		new URL(location.href).searchParams.get("host") === "node-c" &&
+		document.querySelectorAll('#inspector-body [data-metric]').length === 3 &&
+		document.querySelector("#inspector-body").textContent.includes("Services · 0")
+	`, 5*time.Second)
+	metricCtx, metricCancel := context.WithTimeout(context.Background(), 45*time.Second)
+	if err := waitHostMetric(metricCtx, app.baseURL()); err != nil {
+		metricCancel()
+		t.Fatal(err)
+	}
+	metricCancel()
+	if err := chromedp.Run(ctx, chromedp.Click("#refresh-button", chromedp.ByQuery)); err != nil {
+		t.Fatalf("refresh host metrics: %v", err)
+	}
+	requireJS(t, ctx, `
+		(() => {
+			const value = (name) => document.querySelector('#inspector-body [data-metric="' + name + '"] strong').textContent.trim();
+			return value("system.cpu.utilization") === "42%" &&
+				value("system.memory.utilization") === "61%" &&
+				value("system.filesystem.utilization") === "not reported" &&
+				document.querySelectorAll('#inspector-body [data-metric="system.cpu.utilization"] .spark').length === 1;
+		})()
+	`, 15*time.Second)
+	smoke.screenshot("host-panel-desktop")
+	if err := chromedp.Run(ctx,
+		chromedp.Click("#close-inspector-button", chromedp.ByQuery),
+		chromedp.Click(`#service-list [data-service="checkout"]`, chromedp.ByQuery),
+	); err != nil {
+		t.Fatalf("open checkout from grouped list: %v", err)
+	}
+	requireJS(t, ctx, `
+		document.querySelector("#inspector-title").textContent.trim() === "checkout" &&
+		!document.querySelector("#inspector-tabs").hidden &&
+		document.querySelectorAll("#inspector-body .host-chip").length === 2
+	`, 5*time.Second)
+	if err := chromedp.Run(ctx, chromedp.Evaluate(`document.querySelector('#inspector-body .host-chip[data-host="node-b"]').focus()`, nil)); err != nil {
+		t.Fatalf("focus host chip: %v", err)
+	}
+	requireJS(t, ctx, `document.activeElement && document.activeElement.dataset.host === "node-b"`, 5*time.Second)
+	if err := chromedp.Run(ctx, chromedp.Evaluate(`document.activeElement.click()`, nil)); err != nil {
+		t.Fatalf("activate host chip: %v", err)
+	}
+	requireJS(t, ctx, `
+		document.querySelector("#inspector-title").textContent.trim() === "node-b" &&
+		!!document.querySelector('#inspector-body .dependency-row[data-service="checkout"]')
+	`, 5*time.Second)
+	// A fresh load on a phone-sized viewport: the reload cancels in-flight
+	// polling requests, which is expected and scoped to this sub-phase.
+	smoke.phase("host-group-reload")
+	if err := chromedp.Run(ctx, chromedp.EmulateViewport(390, 844)); err != nil {
+		t.Fatalf("set mobile viewport for host grouping: %v", err)
+	}
+	if err := chromedp.Run(ctx, chromedp.Navigate(app.baseURL()+"/?group=host")); err != nil {
+		t.Fatalf("reload host grouping on mobile: %v", err)
+	}
+	requireJS(t, ctx, `document.readyState === "complete" && !!document.querySelector("#host-group-button")`, 10*time.Second)
+	smoke.phase("host-group")
+	requireJS(t, ctx, `
+		matchMedia("(max-width: 767px)").matches &&
+		document.querySelector("#host-group-button").getAttribute("aria-pressed") === "true" &&
+		!document.querySelector("#mobile-list").hidden &&
+		document.querySelectorAll("#mobile-list .host-heading").length === 3 &&
+		document.documentElement.scrollWidth <= document.documentElement.clientWidth &&
+		document.body.scrollWidth <= document.body.clientWidth
+	`, 15*time.Second)
+	smoke.screenshot("host-group-mobile")
+	if err := chromedp.Run(ctx, chromedp.Click(`#mobile-list .host-heading[data-host="node-a"]`, chromedp.ByQuery)); err != nil {
+		t.Fatalf("open mobile host panel: %v", err)
+	}
+	requireJS(t, ctx, `
+		!document.querySelector("#inspector").inert &&
+		document.querySelector("#inspector-title").textContent.trim() === "node-a" &&
+		document.querySelectorAll("#inspector-body .dependency-row").length === 2 &&
+		document.documentElement.scrollWidth <= document.documentElement.clientWidth &&
+		document.body.scrollWidth <= document.body.clientWidth
+	`, 10*time.Second)
+	smoke.screenshot("host-panel-mobile")
+	smoke.complete("host-group")
 
 	smoke.validateInventory()
 	assertNoUnexpectedBrowserEvents(t, recorder)

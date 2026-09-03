@@ -82,6 +82,12 @@
       "contract": "At 390 by 844, map and list navigation plus the inspector remain operable without page overflow."
     },
     {
+      "id": "host-grouping-and-panel",
+      "proof": "browser",
+      "phase": "host-group",
+      "contract": "Host mode groups the map and list by host from /api/hosts, keeps host entities out of the service ranking, and the host panel reads CPU, memory and disk through /api/metrics or says not reported; toggle, cluster headings and host chips are keyboard reachable and the grouped list stays readable on mobile."
+    },
+    {
       "id": "node-free-client-source",
       "proof": "source",
       "phase": "source-contract",

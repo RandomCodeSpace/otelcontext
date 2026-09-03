@@ -81,9 +81,14 @@
               <p class="eyebrow">Live topology</p>
               <h1 id="map-heading">Service constellation</h1>
             </div>
-            <div class="view-switch" aria-label="View">
-              <button id="map-view-button" type="button" aria-pressed="true">Map</button>
-              <button id="list-view-button" type="button" aria-pressed="false">List</button>
+            <div class="view-controls">
+              <div class="view-switch" aria-label="View">
+                <button id="map-view-button" type="button" aria-pressed="true">Map</button>
+                <button id="list-view-button" type="button" aria-pressed="false">List</button>
+              </div>
+              <button class="group-toggle" id="host-group-button" type="button" aria-pressed="false" aria-disabled="true" title="Loading hosts…">
+                <i class="host-mark" aria-hidden="true"></i>By host
+              </button>
             </div>
             <label class="search-field">
               <span class="sr-only">Find a service</span>
@@ -130,6 +135,7 @@
                 </defs>
                 <g id="graph-viewport">
                   <g id="graph-rings" aria-hidden="true"></g>
+                  <g id="graph-clusters"></g>
                   <g id="graph-edges" aria-hidden="true"></g>
                   <g id="graph-nodes"></g>
                 </g>
@@ -150,6 +156,7 @@
                 <span><i class="status-dot healthy"></i>Healthy</span>
                 <span><i class="status-dot degraded"></i>Degraded</span>
                 <span><i class="status-dot critical"></i>Critical</span>
+                <span><i class="host-mark"></i>Host</span>
               </div>
             </div>
 
@@ -160,7 +167,7 @@
         <aside class="service-rail" aria-labelledby="services-heading">
           <div class="rail-heading">
             <div>
-              <p class="eyebrow">Worst first</p>
+              <p class="eyebrow" id="rail-eyebrow">Worst first</p>
               <h2 id="services-heading">Services</h2>
             </div>
             <span id="service-count">0</span>
@@ -176,7 +183,7 @@
       <header class="inspector-header">
         <span class="service-status" id="inspector-status" aria-hidden="true"></span>
         <div>
-          <p class="eyebrow">Service inspector</p>
+          <p class="eyebrow" id="inspector-eyebrow">Service inspector</p>
           <h2 id="inspector-title">Service</h2>
         </div>
         <span class="health-value" id="inspector-health"></span>
@@ -184,7 +191,7 @@
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg>
         </button>
       </header>
-      <div class="inspector-tabs" role="tablist" aria-label="Inspector sections">
+      <div class="inspector-tabs" id="inspector-tabs" role="tablist" aria-label="Inspector sections">
         <button id="tab-overview" role="tab" type="button" aria-selected="true" data-tab="overview">Overview</button>
         <button id="tab-why" role="tab" type="button" aria-selected="false" data-tab="why">Why</button>
         <button id="tab-impact" role="tab" type="button" aria-selected="false" data-tab="impact">Impact</button>
@@ -230,6 +237,7 @@
           <div><dt><kbd>/</kbd></dt><dd>Find a service</dd></div>
           <div><dt><kbd>?</kbd></dt><dd>Show this shortcut sheet</dd></div>
           <div><dt><kbd>F</kbd></dt><dd>Fit the service map</dd></div>
+          <div><dt><kbd>H</kbd></dt><dd>Group by host</dd></div>
           <div><dt><kbd>Enter</kbd></dt><dd>Open a focused service</dd></div>
           <div><dt><kbd>←</kbd> / <kbd>→</kbd></dt><dd>Move between inspector tabs</dd></div>
           <div><dt><kbd>Esc</kbd></dt><dd>Close the open panel</dd></div>
