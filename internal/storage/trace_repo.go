@@ -385,14 +385,15 @@ type serviceMapNodeRow struct {
 
 // serviceMapSpanRow is the narrow projection scanned for the edge pass. It is
 // deliberately NOT Span: AttributesJSON (CompressedText) zstd-decompresses
-// per row in Scan(), which dominated the cost of the old full-row load.
+// per row in Scan(), which dominated the cost of the old full-row load. It
+// carries exactly the four columns the edge pass reads: the old projection
+// also pulled status and start_time, and parsing a datetime string per row
+// for a column nothing consumed was most of what remained (#290).
 type serviceMapSpanRow struct {
 	SpanID       string
 	ParentSpanID string
 	ServiceName  string
 	Duration     int64
-	Status       string
-	StartTime    time.Time
 }
 
 // GetServiceMapMetrics computes topology metrics from spans scoped to the
@@ -468,7 +469,7 @@ func (r *Repository) GetServiceMapMetrics(ctx context.Context, start, end time.T
 	}
 
 	edgeQuery := r.db.WithContext(ctx).Model(&Span{}).
-		Select("span_id, parent_span_id, service_name, duration, status, start_time").
+		Select("span_id, parent_span_id, service_name, duration").
 		Where(sqlWhereTenantID, tenant)
 	if !start.IsZero() && !end.IsZero() {
 		edgeQuery = edgeQuery.Where("start_time BETWEEN ? AND ?", start, end)
