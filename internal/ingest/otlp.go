@@ -284,12 +284,34 @@ func (s *MetricsServer) SetResourceRegistry(r *topology.Registry) {
 
 // registerResource records one resource batch in the registry. now is the
 // Export's arrival time; a nil registry is a no-op.
-func registerResource(reg *topology.Registry, tenant, service string, attrs []*commonpb.KeyValue, signal topology.Signal, now time.Time) {
+func registerResource(reg *topology.Registry, tenant, service string, slots resourceSlots, signal topology.Signal, now time.Time) {
 	if reg == nil {
 		return
 	}
-	slots := scanResourceSlots(attrs)
 	reg.Register(tenant, service, slots.host, slots.workload, slots.workloadKind, signal, now)
+}
+
+// resolveServiceIdentity resolves the service identity of one resource
+// (#280). A declared service.name wins. Without one, a resource carrying
+// host.name or host.id is a host entity named topology.HostPrefix + host.name
+// (host.id when there is no name) and host reports true. A resource with
+// neither keeps unknown-service. A client-declared name inside the reserved
+// host/ namespace is accepted as sent and counted on
+// otelcontext_ingest_reserved_service_prefix_total{signal}.
+func resolveServiceIdentity(slots resourceSlots, metrics *telemetry.Metrics, signal string) (name string, host bool) {
+	if slots.serviceName != "" {
+		if topology.IsHostEntity(slots.serviceName) {
+			metrics.RecordReservedServicePrefix(signal)
+		}
+		return slots.serviceName, false
+	}
+	switch {
+	case slots.hostName != "":
+		return topology.HostPrefix + slots.hostName, true
+	case slots.host != "":
+		return topology.HostPrefix + slots.host, true
+	}
+	return "unknown-service", false
 }
 
 func NewLogsServer(repo *storage.Repository, metrics *telemetry.Metrics, cfg *config.Config) *LogsServer {
@@ -343,27 +365,29 @@ func (s *MetricsServer) Export(ctx context.Context, req *colmetricspb.ExportMetr
 	var rejected metricRejections
 
 	for _, resourceMetrics := range req.ResourceMetrics {
-		serviceName := getServiceName(resourceMetrics.Resource.Attributes)
+		resourceAttrs := resourceMetrics.Resource.Attributes
+		slots := scanResourceSlots(resourceAttrs)
+		serviceName, _ := resolveServiceIdentity(slots, s.metrics, "metrics")
 
 		if !shouldIngestService(serviceName, s.allowedServices, s.excludedServices) {
 			continue
 		}
 
-		tenantID := resolveTenant(ctx, resourceMetrics.Resource.Attributes, s.defaultTenant, s.trustResourceTenant)
-		registerResource(s.resourceRegistry, tenantID, serviceName, resourceMetrics.Resource.Attributes, topology.SignalMetrics, start)
+		tenantID := resolveTenant(ctx, resourceAttrs, s.defaultTenant, s.trustResourceTenant)
+		registerResource(s.resourceRegistry, tenantID, serviceName, slots, topology.SignalMetrics, start)
 
 		var producerIdentity aggregate.ResourceIdentity
 		if reducer != nil {
-			producerIdentity = aggregateResourceIdentity(resourceMetrics.Resource.Attributes)
+			producerIdentity = slots.identity()
 		}
 
 		for _, scopeMetrics := range resourceMetrics.ScopeMetrics {
 			for _, m := range scopeMetrics.Metrics {
 				switch data := m.Data.(type) {
 				case *metricspb.Metric_Gauge:
-					s.exportNumberPoints(reducer, m, data.Gauge.GetDataPoints(), serviceName, tenantID, producerIdentity)
+					s.exportNumberPoints(reducer, m, data.Gauge.GetDataPoints(), serviceName, tenantID, producerIdentity, resourceAttrs)
 				case *metricspb.Metric_Sum:
-					s.exportNumberPoints(reducer, m, data.Sum.GetDataPoints(), serviceName, tenantID, producerIdentity)
+					s.exportNumberPoints(reducer, m, data.Sum.GetDataPoints(), serviceName, tenantID, producerIdentity, resourceAttrs)
 				case *metricspb.Metric_Histogram:
 					// Distribution points have no legacy consumer: the TSDB
 					// ring buffer holds scalars only. They exist for aggregate
@@ -379,7 +403,7 @@ func (s *MetricsServer) Export(ctx context.Context, req *colmetricspb.ExportMetr
 							continue
 						}
 						res := reducer.ReduceHistogramPoint(aggregateHistogramInput(
-							tenantID, serviceName, m.Name, producerIdentity, temporality, p))
+							tenantID, serviceName, m.Name, producerIdentity, resourceAttrs, temporality, p))
 						rejected.record(s.metrics, pointTypeHistogram, res)
 					}
 				case *metricspb.Metric_ExponentialHistogram:
@@ -392,7 +416,7 @@ func (s *MetricsServer) Export(ctx context.Context, req *colmetricspb.ExportMetr
 							continue
 						}
 						res := reducer.ReduceExponentialHistogramPoint(aggregateExpHistogramInput(
-							tenantID, serviceName, m.Name, producerIdentity, temporality, p))
+							tenantID, serviceName, m.Name, producerIdentity, resourceAttrs, temporality, p))
 						rejected.record(s.metrics, pointTypeExpHistogram, res)
 					}
 				case *metricspb.Metric_Summary:
@@ -448,6 +472,7 @@ func (s *MetricsServer) exportNumberPoints(
 	points []*metricspb.NumberDataPoint,
 	serviceName, tenantID string,
 	producerIdentity aggregate.ResourceIdentity,
+	resourceAttrs []*commonpb.KeyValue,
 ) {
 	// In AGGREGATE_MODE=aggregate main.go constructs neither the TSDB
 	// aggregator nor the metric callback, and this collapses to zero: no
@@ -484,6 +509,9 @@ func (s *MetricsServer) exportNumberPoints(
 				Monotonic:   monotonic,
 				Resource:    producerIdentity,
 				Attributes:  p.Attributes,
+				// Resource attributes are the fallback for a configured
+				// dimension the point lacks (#279).
+				ResourceAttributes: resourceAttrs,
 			})
 		}
 
@@ -548,7 +576,8 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 
 	for idx, resourceSpans := range req.ResourceSpans {
 		g.Go(func() error {
-			serviceName := getServiceName(resourceSpans.Resource.Attributes)
+			slots := scanResourceSlots(resourceSpans.Resource.Attributes)
+			serviceName, _ := resolveServiceIdentity(slots, s.metrics, "traces")
 
 			if !shouldIngestService(serviceName, s.allowedServices, s.excludedServices) {
 				slog.Debug("🚫 [TRACES] Dropped service", "service", serviceName)
@@ -558,7 +587,7 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 			tenantID := resolveTenant(ctx, resourceSpans.Resource.Attributes, s.defaultTenant, s.trustResourceTenant)
 			// Pre-sample, like the topology observer: host identity must not
 			// depend on SAMPLING_RATE (#279).
-			registerResource(s.resourceRegistry, tenantID, serviceName, resourceSpans.Resource.Attributes, topology.SignalTraces, start)
+			registerResource(s.resourceRegistry, tenantID, serviceName, slots, topology.SignalTraces, start)
 
 			localSpans := make([]storage.Span, 0)
 			localTraces := make([]storage.Trace, 0)
@@ -1041,7 +1070,8 @@ func (s *LogsServer) Export(ctx context.Context, req *collogspb.ExportLogsServic
 
 	for idx, resourceLogs := range req.ResourceLogs {
 		g.Go(func() error {
-			serviceName := getServiceName(resourceLogs.Resource.Attributes)
+			slots := scanResourceSlots(resourceLogs.Resource.Attributes)
+			serviceName, _ := resolveServiceIdentity(slots, s.metrics, "logs")
 
 			if !shouldIngestService(serviceName, s.allowedServices, s.excludedServices) {
 				slog.Debug("🚫 [LOGS] Dropped service", "service", serviceName)
@@ -1049,7 +1079,7 @@ func (s *LogsServer) Export(ctx context.Context, req *collogspb.ExportLogsServic
 			}
 
 			tenantID := resolveTenant(ctx, resourceLogs.Resource.Attributes, s.defaultTenant, s.trustResourceTenant)
-			registerResource(s.resourceRegistry, tenantID, serviceName, resourceLogs.Resource.Attributes, topology.SignalLogs, start)
+			registerResource(s.resourceRegistry, tenantID, serviceName, slots, topology.SignalLogs, start)
 
 			localLogs := make([]storage.Log, 0)
 			exemplarRes := s.exemplar.NewReservation()
@@ -1339,16 +1369,6 @@ func hasPriorityLog(logs []storage.Log) bool {
 		}
 	}
 	return false
-}
-
-// Helper to extract service.name from attributes
-func getServiceName(attrs []*commonpb.KeyValue) string {
-	for _, kv := range attrs {
-		if kv.Key == "service.name" {
-			return kv.Value.GetStringValue()
-		}
-	}
-	return "unknown-service"
 }
 
 // ParseSeverity is the exported wrapper for parseSeverity. Used by main.go

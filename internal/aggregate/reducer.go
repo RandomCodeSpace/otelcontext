@@ -147,6 +147,9 @@ type MetricInput struct {
 	// tuple is extracted from them here, against a request-local scratch, so
 	// the hot path never allocates a per-point map (#199 Q4).
 	Attributes []*commonpb.KeyValue
+	// ResourceAttributes are the RAW OTLP resource attributes; a configured
+	// dimension key the point lacks falls back to them (#279).
+	ResourceAttributes []*commonpb.KeyValue
 }
 
 // Reducer collapses one Export request into deltas.
@@ -422,12 +425,14 @@ func (r *Reducer) ReduceLog(in LogInput) {
 	}
 }
 
-// dimsIDFor resolves the DimsID of one metric point from its attributes.
+// dimsIDFor resolves the DimsID of one metric point from its attributes,
+// falling back to the resource attributes for a key the point lacks (#279).
 //
-// Missing any configured key yields 0, the "no configured dims" sentinel and
-// the existing all-or-nothing contract. The scan allocates no per-point map:
-// the configured tuple is bounded, so a request-local scratch holds it.
-func (r *Reducer) dimsIDFor(tenantID uint32, metricName string, attrs []*commonpb.KeyValue) uint32 {
+// Missing any configured key from both yields 0, the "no configured dims"
+// sentinel and the existing all-or-nothing contract. The scan allocates no
+// per-point map: the configured tuple is bounded, so a request-local scratch
+// holds it.
+func (r *Reducer) dimsIDFor(tenantID uint32, metricName string, attrs, resourceAttrs []*commonpb.KeyValue) uint32 {
 	keys := r.eng.dims.Get(metricName)
 	if len(keys) == 0 {
 		return 0
@@ -435,7 +440,7 @@ func (r *Reducer) dimsIDFor(tenantID uint32, metricName string, attrs []*commonp
 	if r.dims == nil {
 		r.dims = &dimScratch{}
 	}
-	values, rejected, ok := r.dims.resolve(keys, attrs)
+	values, rejected, ok := r.dims.resolveWith(keys, attrs, resourceAttrs)
 	if rejected {
 		r.stats.DimsRejected++
 	}
@@ -448,12 +453,12 @@ func (r *Reducer) dimsIDFor(tenantID uint32, metricName string, attrs []*commonp
 // metricSeriesKey builds the metric SeriesKey for one point, including its
 // configured dimension tuple. It is shared by every metric point shape so the
 // three of them cannot drift apart on identity (#199 Q4).
-func (r *Reducer) metricSeriesKey(tenantID uint32, service, name string, attrs []*commonpb.KeyValue) SeriesKey {
+func (r *Reducer) metricSeriesKey(tenantID uint32, service, name string, attrs, resourceAttrs []*commonpb.KeyValue) SeriesKey {
 	return SeriesKey{
 		TenantID:  tenantID,
 		ServiceID: r.eng.cache.Intern(tenantID, KindService, service),
 		NameID:    r.eng.cache.Intern(tenantID, KindMetricName, name),
-		DimsID:    r.dimsIDFor(tenantID, name, attrs),
+		DimsID:    r.dimsIDFor(tenantID, name, attrs, resourceAttrs),
 		Signal:    SignalMetric,
 	}
 }
@@ -539,7 +544,7 @@ func (r *Reducer) reduceFold(c HistogramCommon, fold HistogramFold) MetricPointR
 		r.rejectTenant(SignalMetric)
 		return MetricPointResult{Outcome: MetricPointExcluded}
 	}
-	key := r.metricSeriesKey(tenantID, c.Service, c.Name, c.Attributes)
+	key := r.metricSeriesKey(tenantID, c.Service, c.Name, c.Attributes, c.ResourceAttributes)
 	r.delta(key, window).ObserveHistogram(fold)
 	r.identify(key, window, topoIdentity{Kind: topoMetric, Tenant: c.Tenant, A: c.Service, B: c.Name})
 	r.stats.Accepted[SignalMetric]++
@@ -588,7 +593,7 @@ func (r *Reducer) ReduceMetricPoint(in MetricInput) {
 		r.rejectTenant(SignalMetric)
 		return
 	}
-	key := r.metricSeriesKey(tenantID, in.Service, in.Name, in.Attributes)
+	key := r.metricSeriesKey(tenantID, in.Service, in.Name, in.Attributes, in.ResourceAttributes)
 
 	switch {
 	// Gauges and cumulative non-monotonic sums (UpDownCounter): gauge-like,

@@ -51,6 +51,18 @@ most recently published tag.
 
 ### Changed
 
+- Host-only telemetry has a home (#280, #287): a resource carrying `host.name`
+  or `host.id` and no `service.name` is identified as `host/<host.name>`
+  (`host/<host.id>` without a name) in legacy and aggregate modes, so
+  hostmetrics no longer collapse across hosts under `unknown-service`. A
+  resource with neither attribute keeps `unknown-service`. The `host/` prefix
+  is reserved: a client-declared `service.name` inside it is accepted as sent
+  and counted on `otelcontext_ingest_reserved_service_prefix_total{signal}`.
+- `AGGREGATE_METRIC_DIMS` keys fall back to the resource attribute when the
+  point lacks them (#279), so `system.cpu.utilization:host.name` splits per
+  host. A key missing from both point and resource still yields `DimsID=0`;
+  the dim caps and `otelcontext_ingest_metrics_dims_rejected_total` are
+  unchanged.
 - Dashboard, traffic, service-map, and WebSocket reads come from the
   aggregate engine in aggregate mode; the UI shows coverage badges,
   accuracy labels, and epoch-aware WebSocket state.

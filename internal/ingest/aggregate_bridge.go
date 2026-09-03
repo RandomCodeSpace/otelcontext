@@ -326,27 +326,26 @@ func aggregateEdgeInput(caller string, in aggregate.SpanInput) aggregate.EdgeInp
 	}
 }
 
-// aggregateResourceIdentity extracts the stable resource identity used to
-// derive a metric producer's ProducerID (#166). Only the first-present value
-// per slot is taken: attributes that vary per export would fragment baselines.
-func aggregateResourceIdentity(attrs []*commonpb.KeyValue) aggregate.ResourceIdentity {
-	return scanResourceSlots(attrs).identity()
-}
-
 // resourceSlots is the stable identity slice of one OTLP resource, read once
-// per resource batch and shared by the aggregate producer identity and the
-// resource registry (#279). host is host.id else host.name; workload is
-// k8s.pod.uid else container.id else process.pid; workloadKind names the
-// slot that filled workload (pod|container|process) or "".
+// per resource batch and shared by service identity resolution, the aggregate
+// producer identity and the resource registry (#279, #280). host is host.id
+// else host.name (hostName keeps host.name alone, the preferred host-entity
+// name); workload is k8s.pod.uid else container.id else process.pid;
+// workloadKind names the slot that filled workload (pod|container|process)
+// or "".
 type resourceSlots struct {
 	serviceInstanceID string
 	serviceNamespace  string
 	serviceName       string
 	host              string
+	hostName          string
 	workload          string
 	workloadKind      string
 }
 
+// identity is the stable resource identity used to derive a metric producer's
+// ProducerID (#166). Only the first-present value per slot is taken:
+// attributes that vary per export would fragment baselines.
 func (s resourceSlots) identity() aggregate.ResourceIdentity {
 	return aggregate.ResourceIdentity{
 		ServiceInstanceID: s.serviceInstanceID,
@@ -386,8 +385,9 @@ func scanResourceSlots(attrs []*commonpb.KeyValue) resourceSlots {
 		case "host.id":
 			id.host = kv.Value.GetStringValue()
 		case "host.name":
+			id.hostName = kv.Value.GetStringValue()
 			if id.host == "" {
-				id.host = kv.Value.GetStringValue()
+				id.host = id.hostName
 			}
 		case "k8s.pod.uid":
 			id.workload = kv.Value.GetStringValue()
@@ -464,21 +464,22 @@ func histogramCommonFields(
 	tenant, service, name string,
 	res aggregate.ResourceIdentity,
 	temporality aggregate.Temporality,
-	attrs []*commonpb.KeyValue,
+	attrs, resourceAttrs []*commonpb.KeyValue,
 	timeNanos, startNanos uint64,
 	count uint64,
 	sum, minV, maxV *float64,
 ) aggregate.HistogramCommon {
 	c := aggregate.HistogramCommon{
-		Tenant:      tenant,
-		Service:     service,
-		Name:        name,
-		Resource:    res,
-		Timestamp:   time.Unix(0, int64(timeNanos)),  // #nosec G115 -- OTLP nanos fit int64 until year 2262
-		StartTime:   time.Unix(0, int64(startNanos)), // #nosec G115 -- OTLP nanos fit int64 until year 2262
-		Temporality: temporality,
-		Attributes:  attrs,
-		Count:       count,
+		Tenant:             tenant,
+		Service:            service,
+		Name:               name,
+		Resource:           res,
+		Timestamp:          time.Unix(0, int64(timeNanos)),  // #nosec G115 -- OTLP nanos fit int64 until year 2262
+		StartTime:          time.Unix(0, int64(startNanos)), // #nosec G115 -- OTLP nanos fit int64 until year 2262
+		Temporality:        temporality,
+		Attributes:         attrs,
+		ResourceAttributes: resourceAttrs,
+		Count:              count,
 	}
 	if sum != nil {
 		c.Sum, c.HasSum = *sum, true
@@ -496,12 +497,13 @@ func histogramCommonFields(
 func aggregateHistogramInput(
 	tenant, service, name string,
 	res aggregate.ResourceIdentity,
+	resourceAttrs []*commonpb.KeyValue,
 	temporality aggregate.Temporality,
 	p *metricspb.HistogramDataPoint,
 ) aggregate.HistogramInput {
 	return aggregate.HistogramInput{
 		HistogramCommon: histogramCommonFields(tenant, service, name, res, temporality,
-			p.Attributes, p.TimeUnixNano, p.StartTimeUnixNano, p.Count, p.Sum, p.Min, p.Max),
+			p.Attributes, resourceAttrs, p.TimeUnixNano, p.StartTimeUnixNano, p.Count, p.Sum, p.Min, p.Max),
 		Bounds:       p.ExplicitBounds,
 		BucketCounts: p.BucketCounts,
 	}
@@ -511,12 +513,13 @@ func aggregateHistogramInput(
 func aggregateExpHistogramInput(
 	tenant, service, name string,
 	res aggregate.ResourceIdentity,
+	resourceAttrs []*commonpb.KeyValue,
 	temporality aggregate.Temporality,
 	p *metricspb.ExponentialHistogramDataPoint,
 ) aggregate.ExponentialHistogramInput {
 	return aggregate.ExponentialHistogramInput{
 		HistogramCommon: histogramCommonFields(tenant, service, name, res, temporality,
-			p.Attributes, p.TimeUnixNano, p.StartTimeUnixNano, p.Count, p.Sum, p.Min, p.Max),
+			p.Attributes, resourceAttrs, p.TimeUnixNano, p.StartTimeUnixNano, p.Count, p.Sum, p.Min, p.Max),
 		Scale:     p.Scale,
 		ZeroCount: p.ZeroCount,
 		Positive:  expBuckets(p.Positive),

@@ -140,6 +140,9 @@ type HistogramCommon struct {
 
 	Temporality Temporality
 	Attributes  []*commonpb.KeyValue
+	// ResourceAttributes are the RAW OTLP resource attributes; a configured
+	// dimension key the point lacks falls back to them (#279).
+	ResourceAttributes []*commonpb.KeyValue
 
 	Count  uint64
 	Sum    float64

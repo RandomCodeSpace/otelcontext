@@ -183,6 +183,11 @@ type Metrics struct {
 	// value has no canonical scalar rendering, so it cannot be interned.
 	// The point is still aggregated, under DimsID=0.
 	IngestMetricsDimsRejectedTotal *prometheus.CounterVec
+	// IngestReservedServicePrefixTotal — resources whose client-declared
+	// service.name sits inside the reserved host/ namespace (#280). The name
+	// is accepted as sent; the count tells an operator a client is minting
+	// host entities by hand. Label signal=traces|logs|metrics.
+	IngestReservedServicePrefixTotal *prometheus.CounterVec
 
 	// HTTPOTLPThrottledTotal — count of HTTP 429s issued by the OTLP HTTP
 	// receiver when the async ingest pipeline is full. Mirrors the gRPC
@@ -660,6 +665,10 @@ func New() *Metrics {
 		Name: "otelcontext_ingest_metrics_dims_rejected_total",
 		Help: "Metric points whose configured dimension tuple was refused from series identity. reason=unsupported_value_type. The point is still aggregated under DimsID=0.",
 	}, []string{"reason"})
+	m.IngestReservedServicePrefixTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "otelcontext_ingest_reserved_service_prefix_total",
+		Help: "Resources whose client-declared service.name starts with the reserved host/ prefix. The name is accepted as sent. signal=traces|logs|metrics.",
+	}, []string{"signal"})
 	m.AggregateInputPointsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "otelcontext_aggregate_input_points_total",
 		Help: "Points offered to the aggregate reducer, per signal, counted before sampling and severity gates.",
@@ -894,6 +903,15 @@ func (m *Metrics) RecordMetricDimsRejected(reason string, n uint64) {
 		return
 	}
 	m.IngestMetricsDimsRejectedTotal.WithLabelValues(reason).Add(float64(n))
+}
+
+// RecordReservedServicePrefix counts one resource whose client-declared
+// service.name starts with the reserved host/ prefix. Nil-safe.
+func (m *Metrics) RecordReservedServicePrefix(signal string) {
+	if m == nil || m.IngestReservedServicePrefixTotal == nil {
+		return
+	}
+	m.IngestReservedServicePrefixTotal.WithLabelValues(signal).Inc()
 }
 
 // RecordExemplarEligible implements ingest.ExemplarMetrics.
