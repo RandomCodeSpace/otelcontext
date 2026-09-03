@@ -376,6 +376,13 @@ Cut tools (clients now receive an `unknown tool` RPC error): `get_system_graph`,
 Cacheable surface (5s TTL via `MCP_CACHE_TTL_MS`): `get_anomaly_timeline`,
 `get_service_map`, `get_service_health`, `root_cause_analysis`, `impact_analysis`.
 
+Tenant scope: the MCP endpoint sits behind the HTTP auth gate, so a bound
+principal (tenant key or trusted external identity) pins every `tools/call`
+and the SSE stream to its tenant; a contradicting `X-Tenant-ID` is ignored and
+counted on `OtelContext_auth_tenant_conflicts_total{surface="mcp",reason="header"}`.
+Operator and unauthenticated requests keep the header-then-`DEFAULT_TENANT`
+precedence, and the 5s cache is keyed by the effective tenant.
+
 Every error-identifying tool returns a `root_cause` block:
 ```json
 {"root_cause": {"service": "...", "operation": "...", "error_message": "...", "span_id": "...", "trace_id": "..."}}
