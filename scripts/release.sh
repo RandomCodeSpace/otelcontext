@@ -64,7 +64,7 @@ REPO="$(gh repo view --json nameWithOwner --jq .nameWithOwner)" || fail "cannot 
 # HEAD. Workflow jobs report as check-runs; external analyzers (SonarCloud)
 # report as commit statuses. Missing, pending, skipped, or failed refuses.
 echo "▸ checking required status checks for $SHA on $REPO…"
-required_raw="$(gh api "repos/$REPO/branches/main/protection/required_status_checks" --jq '.contexts[]')" \
+required_raw="$(gh api "repos/$REPO/branches/main" --jq '.protection.required_status_checks.contexts[]')" \
   || fail "cannot read required status checks for main"
 mapfile -t required <<<"$required_raw"
 [ -n "${required[0]:-}" ] || fail "main has no required status checks; refusing to tag unprotected source"
