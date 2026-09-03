@@ -806,21 +806,23 @@ func joinStatus(signal Signal, statusClass, severity StatusClass) StatusClass {
 // uniform across every column. The read is a point lookup into the mutable
 // window's few thousand rows, which stay in the page cache.
 //
-// Two prepared statements, one Exec per row, and one scratch buffer reused
-// across rows. Batching rows into multi-row VALUES was measured and is SLOWER
-// with this driver (~105 ms vs ~87 ms for a 5,000-row commit): the cost is in
-// per-parameter binding, which a wider statement does not avoid, and an
-// 800-parameter statement pays extra to compile.
+// The read side is one SELECT per (window, chunk of series IDs) rather than
+// one per row: this driver re-parses a prepared statement's SQL on every
+// Query/Exec, and at ~240 rows a commit the per-row point read was paying
+// the parser more than it paid the B-tree (#293, ~15 % of server CPU at
+// 10k pts/s). The write side stays one prepared Exec per row: batching rows
+// into multi-row VALUES was measured and is SLOWER with this driver (~105 ms
+// vs ~87 ms for a 5,000-row commit): the cost is in per-parameter binding,
+// which a wider statement does not avoid, and an 800-parameter statement
+// pays extra to compile.
 func mergeDeltas(tx *sql.Tx, rows []DeltaRow) (int64, error) {
 	if len(rows) == 0 {
 		return 0, nil
 	}
-	sel, err := tx.Prepare(`SELECT ` + deltaColumnList + `
-		FROM aggregate_delta_log WHERE window_start = ? AND series_id = ?`)
+	existing, err := readDeltaRows(tx, rows)
 	if err != nil {
-		return 0, fmt.Errorf("aggregate store: prepare delta read: %w", err)
+		return 0, err
 	}
-	defer func() { _ = sel.Close() }()
 	stmt, err := tx.Prepare(`INSERT OR REPLACE INTO aggregate_delta_log
 		(series_id, window_start, ` + deltaColumnList + `)
 		VALUES (?,?,` + deltaValuePlaceholders + `)`)
@@ -839,15 +841,18 @@ func mergeDeltas(tx *sql.Tx, rows []DeltaRow) (int64, error) {
 		// applies that same delta to the shards after the commit returns, and
 		// folding the durable history into it would double-count in memory.
 		d := r.Delta
-		existing, err := scanDelta(sel.QueryRow(r.WindowStart, int64(r.SeriesID)).Scan, nil)
-		switch {
-		case err == nil:
-			existing.Merge(d)
-			d = existing
-		case errors.Is(err, sql.ErrNoRows):
-		default:
-			return 0, fmt.Errorf("aggregate store: read delta (series %d, window %d): %w", r.SeriesID, r.WindowStart, err)
+		key := deltaRowKey{window: r.WindowStart, series: r.SeriesID}
+		if cur, ok := existing[key]; ok && cur != nil {
+			cur.Merge(d)
+			d = cur
+		} else if d != nil {
+			// A later row for the same key (the batch is keyed by routed
+			// identity, so none is expected) must merge into what this
+			// iteration wrote, exactly as a per-row re-read would have seen
+			// it — and never into r.Delta itself.
+			d = d.Clone()
 		}
+		existing[key] = d
 
 		var sketch []byte
 		if d != nil && d.Sketch != nil {
@@ -864,6 +869,63 @@ func mergeDeltas(tx *sql.Tx, rows []DeltaRow) (int64, error) {
 		bytes += deltaRowBytes + int64(len(sketch))
 	}
 	return bytes, nil
+}
+
+type deltaRowKey struct {
+	window int64
+	series SeriesID
+}
+
+// mergeReadChunk bounds the IN list of one delta-log read. SQLite's default
+// variable limit is far higher; the bound keeps the statement text small
+// enough that parsing it stays a rounding error next to the B-tree lookups.
+const mergeReadChunk = 500
+
+// readDeltaRows fetches the durable delta-log rows the batch is about to
+// merge into, keyed by (window, series), one SELECT per window and chunk.
+func readDeltaRows(tx *sql.Tx, rows []DeltaRow) (map[deltaRowKey]*AggregateDelta, error) {
+	byWindow := make(map[int64][]any, 2)
+	for _, r := range rows {
+		byWindow[r.WindowStart] = append(byWindow[r.WindowStart], int64(r.SeriesID))
+	}
+	out := make(map[deltaRowKey]*AggregateDelta, len(rows))
+	for window, ids := range byWindow {
+		for len(ids) > 0 {
+			n := min(len(ids), mergeReadChunk)
+			chunk := ids[:n]
+			ids = ids[n:]
+			query := `SELECT series_id, ` + deltaColumnList + `
+				FROM aggregate_delta_log WHERE window_start = ? AND series_id IN (?` +
+				strings.Repeat(",?", n-1) + `)`
+			args := make([]any, 0, n+1)
+			args = append(args, window)
+			args = append(args, chunk...)
+			if err := scanDeltaRows(tx, query, args, window, out); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return out, nil
+}
+
+func scanDeltaRows(tx *sql.Tx, query string, args []any, window int64, out map[deltaRowKey]*AggregateDelta) error {
+	res, err := tx.Query(query, args...)
+	if err != nil {
+		return fmt.Errorf("aggregate store: read deltas (window %d): %w", window, err)
+	}
+	defer func() { _ = res.Close() }()
+	for res.Next() {
+		var id int64
+		d, err := scanDelta(res.Scan, &id)
+		if err != nil {
+			return fmt.Errorf("aggregate store: read delta (window %d): %w", window, err)
+		}
+		out[deltaRowKey{window: window, series: SeriesID(id)}] = d // #nosec G115 -- series IDs are written from SeriesID
+	}
+	if err := res.Err(); err != nil {
+		return fmt.Errorf("aggregate store: read deltas (window %d): %w", window, err)
+	}
+	return nil
 }
 
 // deltaRowBytes is the fixed on-disk cost of a delta row before its sketch:

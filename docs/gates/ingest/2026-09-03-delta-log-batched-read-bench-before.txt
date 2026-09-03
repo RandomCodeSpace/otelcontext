@@ -1,0 +1,27 @@
+BenchmarkCacheInternHit-8              	34320734	        34.69 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReduceSpans/spans=10-8        	   77719	     15315 ns/op	        10.00 deltas	   29712 B/op	      32 allocs/op
+BenchmarkReduceSpans/spans=100-8       	   20762	     50373 ns/op	        18.00 deltas	   54992 B/op	      52 allocs/op
+BenchmarkReduceSpans/spans=1000-8      	    3606	    357127 ns/op	        20.00 deltas	   60176 B/op	      56 allocs/op
+BenchmarkApplyDeltas-8                 	    3324	    378503 ns/op	   62206 B/op	      67 allocs/op
+BenchmarkNormalizePathStatic-8         	18522301	        66.45 ns/op	       0 B/op	       0 allocs/op
+BenchmarkNormalizePathRewrite-8        	 5385262	       200.6 ns/op	      64 B/op	       1 allocs/op
+BenchmarkNormalizeSpanName-8           	 9926338	       109.0 ns/op	      32 B/op	       1 allocs/op
+BenchmarkNormalizeOperationRoute-8     	684032343	         1.869 ns/op	       0 B/op	       0 allocs/op
+BenchmarkSketchObserve-8               	43065627	        27.79 ns/op	       0 B/op	       0 allocs/op
+BenchmarkSketchObserveFullRange-8      	35599435	        29.81 ns/op	       0 B/op	       0 allocs/op
+BenchmarkSketchMerge-8                 	 1569390	       760.8 ns/op	       0 B/op	       0 allocs/op
+BenchmarkSketchEncode-8                	 1000000	      1161 ns/op	       209.0 bins	       509.0 encoded_B	       0 B/op	       0 allocs/op
+BenchmarkSketchDecode-8                	  475158	      2510 ns/op	    2304 B/op	       1 allocs/op
+BenchmarkSketchQuantile-8              	 4655608	       240.9 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCommitGroup5kSeries-8
+       4	 308664124 ns/op	      5000 deltas/commit	34210236 B/op	  420776 allocs/op
+BenchmarkFinalizeWindow-8
+       7	 144823423 ns/op
+BenchmarkWriterApply-8
+     349	   3245588 ns/op	    4664 B/op	      24 allocs/op
+BenchmarkTemplateMinerMine-8           	 2178680	       562.4 ns/op	     268 B/op	       1 allocs/op
+BenchmarkTemplateMinerMineParallel-8   	 1925008	       604.3 ns/op	     268 B/op	       1 allocs/op
+BenchmarkTemplateMinerTokenize-8       	 3248838	       390.5 ns/op	     268 B/op	       1 allocs/op
+BenchmarkQueryDashboardSevenDay-8      	       1	6964030745 ns/op
+PASS
+ok  	github.com/RandomCodeSpace/otelcontext/internal/aggregate	93.860s
