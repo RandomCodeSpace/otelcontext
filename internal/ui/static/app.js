@@ -2,6 +2,17 @@ const SVG_NS = "http://www.w3.org/2000/svg";
 const GOLDEN_ANGLE = 2.399963229728653;
 const POLL_INTERVAL_MS = 30000;
 const TOOL_CACHE_MS = 300000;
+const HOST_PREFIX = "host/";
+const HOST_METRICS_WINDOW_MS = 3600000;
+// Standard hostmetrics names. The first three always render; the usage pair
+// renders only when the host reports it.
+const HOST_METRICS = [
+  { name: "system.cpu.utilization", label: "CPU", kind: "ratio", always: true },
+  { name: "system.memory.utilization", label: "Memory", kind: "ratio", always: true },
+  { name: "system.filesystem.utilization", label: "Disk", kind: "ratio", always: true },
+  { name: "system.memory.usage", label: "Memory used", kind: "bytes" },
+  { name: "system.filesystem.usage", label: "Disk used", kind: "bytes" },
+];
 
 const byId = (id) => document.getElementById(id);
 const dom = {
@@ -37,8 +48,11 @@ const dom = {
   retry: byId("retry-button"),
   mapView: byId("map-view-button"),
   listView: byId("list-view-button"),
+  hostGroup: byId("host-group-button"),
   map: byId("service-map"),
+  graphDescription: byId("graph-description"),
   rings: byId("graph-rings"),
+  clusters: byId("graph-clusters"),
   edges: byId("graph-edges"),
   nodes: byId("graph-nodes"),
   minimapButton: byId("minimap-button"),
@@ -51,6 +65,7 @@ const dom = {
   fit: byId("fit-button"),
   serviceList: byId("service-list"),
   serviceCount: byId("service-count"),
+  railEyebrow: byId("rail-eyebrow"),
   severity: byId("severity-summary"),
   impactBanner: byId("impact-banner"),
   impactLabel: byId("impact-label"),
@@ -58,6 +73,8 @@ const dom = {
   inspector: byId("inspector"),
   inspectorScrim: byId("inspector-scrim"),
   inspectorTitle: byId("inspector-title"),
+  inspectorEyebrow: byId("inspector-eyebrow"),
+  inspectorTabs: byId("inspector-tabs"),
   inspectorStatus: byId("inspector-status"),
   inspectorHealth: byId("inspector-health"),
   inspectorBody: byId("inspector-body"),
@@ -74,6 +91,11 @@ const state = {
   error: "",
   refreshing: false,
   selected: null,
+  selectedHost: null,
+  groupBy: "service",
+  hosts: null,
+  hostsError: "",
+  hostMetrics: new Map(),
   activeTab: "overview",
   impactRoot: null,
   query: "",
@@ -206,6 +228,81 @@ function formatMB(value) {
   return trimFixed(size, size < 10 ? 1 : 0) + "MB";
 }
 
+function formatBytes(value) {
+  const size = Number(value);
+  if (!Number.isFinite(size)) return "—";
+  if (size < 1048576) return trimFixed(size / 1024, 0) + "KB";
+  return formatMB(size / 1048576);
+}
+
+function isHostNode(node) {
+  return Boolean(node) && (node.kind === "host" || String(node.id).startsWith(HOST_PREFIX));
+}
+
+function hostsAvailable() {
+  return Array.isArray(state.hosts) && state.hosts.length > 0;
+}
+
+function hostGroupReason() {
+  if (hostsAvailable()) return "";
+  if (state.hosts === null) return state.hostsError ? "Host list unavailable: " + state.hostsError : "Loading hosts…";
+  return "No hosts reported yet.";
+}
+
+function hostByName(name) {
+  return (state.hosts || []).find((host) => host.name === name) || null;
+}
+
+// nodeHosts lists the hosts a service was observed on: the node's own stamp
+// when present, else the registry listing (the graph response is cached for
+// a few seconds and can lag the host list).
+function nodeHosts(node) {
+  if (Array.isArray(node.hosts) && node.hosts.length) return node.hosts;
+  const listed = [];
+  for (const host of state.hosts || []) {
+    if (Array.isArray(host.services) && host.services.includes(node.id)) listed.push(host.name);
+  }
+  return listed;
+}
+
+function nodeHostCount(node) {
+  return Math.max(finite(node.host_count, 0), nodeHosts(node).length);
+}
+
+// hostOfNode is the cluster a node belongs to: its own host for a host
+// entity, else the first host it was seen on.
+function hostOfNode(node) {
+  if (isHostNode(node)) {
+    return Array.isArray(node.hosts) && node.hosts.length ? node.hosts[0] : node.id.slice(HOST_PREFIX.length);
+  }
+  return nodeHosts(node)[0];
+}
+
+// hostClusters folds the graph into one cluster per host in host order,
+// with services that no host claims last under a null host.
+function hostClusters() {
+  const byHost = new Map();
+  for (const host of state.hosts || []) byHost.set(host.name, { host: host, members: [] });
+  const unassigned = { host: null, members: [] };
+  for (const node of state.graph ? state.graph.nodes : []) {
+    const cluster = byHost.get(hostOfNode(node));
+    (cluster || unassigned).members.push(node);
+  }
+  const clusters = Array.from(byHost.values());
+  if (unassigned.members.length) clusters.push(unassigned);
+  return clusters;
+}
+
+function clusterServiceCount(cluster) {
+  if (cluster.host) return finite(cluster.host.service_count, 0);
+  return cluster.members.filter((node) => !isHostNode(node)).length;
+}
+
+function clusterLabel(cluster) {
+  const count = clusterServiceCount(cluster);
+  return (cluster.host ? cluster.host.name : "No host") + " · " + count + (count === 1 ? " service" : " services");
+}
+
 function normalizeStatus(node) {
   const raw = String(node && node.status || "").toLowerCase();
   const score = finite(node && node.health_score, 1);
@@ -230,8 +327,10 @@ function statusRank(node) {
   return order[normalizeStatus(node)] === undefined ? 2 : order[normalizeStatus(node)];
 }
 
+// sortedNodes is the worst-first service ranking. Host entities are not
+// services and never enter it.
 function sortedNodes() {
-  const nodes = state.graph && Array.isArray(state.graph.nodes) ? state.graph.nodes.slice() : [];
+  const nodes = state.graph && Array.isArray(state.graph.nodes) ? state.graph.nodes.filter((node) => !isHostNode(node)) : [];
   nodes.sort((a, b) => {
     const statusDiff = statusRank(a) - statusRank(b);
     if (statusDiff !== 0) return statusDiff;
@@ -264,7 +363,9 @@ function updateURL(changes) {
 
 function readURL() {
   const params = new URLSearchParams(window.location.search);
-  state.selected = params.get("service");
+  state.selectedHost = params.get("host");
+  state.selected = state.selectedHost ? null : params.get("service");
+  state.groupBy = params.get("group") === "host" ? "host" : "service";
   const tab = params.get("tab");
   state.activeTab = ["overview", "why", "impact", "dependencies"].includes(tab) ? tab : "overview";
   state.impactRoot = params.get("impact");
@@ -506,11 +607,31 @@ async function refresh(options) {
     renderStates();
   }
 
+  // The host list rides the existing poll only while something shows it; an
+  // idle service view adds no request. Explicit refreshes and the first load
+  // always fetch it so the toggle knows whether hosts exist.
+  const wantHosts = !silent || state.hosts === null || state.groupBy === "host" || Boolean(state.selectedHost);
   const results = await Promise.allSettled([
     fetchJSON("/api/system/graph"),
     fetchJSON("/api/metrics/dashboard"),
     fetchJSON("/api/stats"),
+    wantHosts ? fetchJSON("/api/hosts") : Promise.reject(new Error("skipped")),
   ]);
+
+  if (wantHosts) {
+    if (results[3].status === "fulfilled") {
+      state.hosts = Array.isArray(results[3].value) ? results[3].value.filter((host) => host && typeof host.name === "string") : [];
+      state.hostsError = "";
+    } else if (state.hosts === null) {
+      state.hostsError = results[3].reason && results[3].reason.message ? results[3].reason.message : "Unknown response";
+    }
+  }
+  if (state.selectedHost) {
+    // Silent refreshes arrive with every WebSocket snapshot; the panel's
+    // five series follow the slower poll cadence unless asked explicitly.
+    const loaded = state.hostMetrics.get(state.selectedHost);
+    if (!silent || !loaded || Date.now() - loaded.loadedAt > POLL_INTERVAL_MS) loadHostMetrics(state.selectedHost);
+  }
 
   if (results[0].status === "fulfilled") {
     state.graph = normalizeGraph(results[0].value);
@@ -624,7 +745,7 @@ function summaryItem(status, value, label) {
 
 function renderSeverity() {
   const counts = { healthy: 0, degraded: 0, critical: 0 };
-  for (const node of state.graph ? state.graph.nodes : []) {
+  for (const node of sortedNodes()) {
     const status = normalizeStatus(node);
     if (counts[status] !== undefined) counts[status] += 1;
   }
@@ -654,6 +775,7 @@ function serviceButton(node) {
   const tail = formatP99(metrics.p99_latency_ms, metrics.latency_provenance);
   let detail = tail.value + " " + tail.label.toLowerCase() + " · " + formatRatio(metrics.error_rate, 1) + " error";
   if (state.anomalies.has(node.id)) detail += " · anomaly";
+  if (state.groupBy === "host" && nodeHostCount(node) > 1) detail += " · " + nodeHostCount(node) + " hosts";
   main.appendChild(textElement("span", "service-meta", detail));
   main.title = tail.explanation;
   const health = textElement("span", "service-health", formatRatio(node.health_score, 0));
@@ -668,21 +790,57 @@ function filteredSortedNodes() {
   return sortedNodes().filter((node) => !query || node.id.toLowerCase().includes(query));
 }
 
+function hostHeading(cluster) {
+  const count = clusterServiceCount(cluster);
+  const heading = document.createElement(cluster.host ? "button" : "p");
+  heading.className = "host-heading";
+  if (cluster.host) {
+    heading.type = "button";
+    heading.dataset.host = cluster.host.name;
+    heading.setAttribute("aria-current", cluster.host.name === state.selectedHost ? "true" : "false");
+    heading.setAttribute("aria-label", clusterLabel(cluster) + ", open host panel");
+    heading.addEventListener("click", () => openHost(cluster.host.name));
+  }
+  const mark = document.createElement("i");
+  mark.className = "host-mark";
+  mark.setAttribute("aria-hidden", "true");
+  heading.append(
+    mark,
+    textElement("span", "host-name", cluster.host ? cluster.host.name : "No host"),
+    textElement("span", "host-count", count + (count === 1 ? " service" : " services"))
+  );
+  return heading;
+}
+
+// groupedRows renders the host-mode list: one heading per host, then the
+// worst-first rows of the services whose first host it is.
+function groupedRows(filtered) {
+  const visible = new Set(filtered.map((node) => node.id));
+  const fragment = document.createDocumentFragment();
+  for (const cluster of hostClusters()) {
+    const members = cluster.members.filter((node) => visible.has(node.id));
+    if (state.query && !members.length) continue;
+    fragment.appendChild(hostHeading(cluster));
+    for (const node of filtered) {
+      if (members.includes(node)) fragment.appendChild(serviceButton(node));
+    }
+  }
+  return fragment;
+}
+
 function renderServiceLists() {
   const all = sortedNodes();
   const filtered = filteredSortedNodes();
-  const railFragment = document.createDocumentFragment();
-  const mobileFragment = document.createDocumentFragment();
-  for (const node of filtered) {
-    railFragment.appendChild(serviceButton(node));
-    mobileFragment.appendChild(serviceButton(node));
+  const hostMode = state.groupBy === "host";
+  const fragments = [document.createDocumentFragment(), document.createDocumentFragment()];
+  for (const fragment of fragments) {
+    if (hostMode) fragment.appendChild(groupedRows(filtered));
+    else for (const node of filtered) fragment.appendChild(serviceButton(node));
+    if (filtered.length === 0 && all.length > 0) fragment.appendChild(textElement("p", "quiet", "No services match this search."));
   }
-  if (filtered.length === 0 && all.length > 0) {
-    railFragment.appendChild(textElement("p", "quiet", "No services match this search."));
-    mobileFragment.appendChild(textElement("p", "quiet", "No services match this search."));
-  }
-  dom.serviceList.replaceChildren(railFragment);
-  dom.mobileList.replaceChildren(mobileFragment);
+  dom.serviceList.replaceChildren(fragments[0]);
+  dom.mobileList.replaceChildren(fragments[1]);
+  dom.railEyebrow.textContent = hostMode ? "By host" : "Worst first";
   dom.serviceCount.textContent = String(all.length);
   dom.searchCount.textContent = state.query ? String(filtered.length) + " found" : "";
 }
@@ -743,6 +901,64 @@ function graphLayout(nodes, edges) {
   return positions;
 }
 
+// hostLayout places one golden-angle spiral of cluster centres, then a
+// smaller spiral of members inside each. Deterministic like graphLayout.
+function hostLayout(clusters) {
+  const positions = new Map();
+  const rings = [];
+  const count = clusters.length;
+  const spread = count === 1 ? 0 : 335;
+  const radius = count <= 1 ? 170 : Math.max(50, Math.min(165, 300 / Math.sqrt(count)));
+  clusters.forEach((cluster, index) => {
+    const distance = spread * Math.sqrt((index + 0.4) / count);
+    const angle = index * GOLDEN_ANGLE;
+    const cx = 500 + distance * Math.cos(angle);
+    const cy = 500 + distance * Math.sin(angle);
+    const members = cluster.members.slice().sort((a, b) => a.id.localeCompare(b.id));
+    members.forEach((node, member) => {
+      const inner = members.length === 1 ? 0 : (radius - 30) * Math.sqrt((member + 0.4) / members.length);
+      const turn = member * GOLDEN_ANGLE;
+      positions.set(node.id, { x: cx + inner * Math.cos(turn), y: cy + inner * Math.sin(turn) });
+    });
+    rings.push({ cluster: cluster, x: cx, y: cy, r: radius });
+  });
+  return { positions: positions, rings: rings };
+}
+
+function renderClusterRings(rings) {
+  for (const ring of rings) {
+    dom.rings.appendChild(svgElement("circle", { class: "cluster-ring", cx: ring.x, cy: ring.y, r: ring.r }));
+    const host = ring.cluster.host;
+    const heading = svgElement("g", {
+      class: "cluster-heading",
+      transform: "translate(" + ring.x + " " + (ring.y - ring.r - 10) + ")",
+    });
+    if (host) {
+      heading.setAttribute("tabindex", "0");
+      heading.setAttribute("role", "button");
+      heading.setAttribute("aria-label", clusterLabel(ring.cluster) + ", open host panel");
+      heading.dataset.host = host.name;
+      if (host.name === state.selectedHost) heading.classList.add("is-selected");
+      heading.addEventListener("click", (event) => {
+        event.stopPropagation();
+        openHost(host.name);
+      });
+      heading.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          openHost(host.name);
+        }
+      });
+    } else {
+      heading.setAttribute("aria-hidden", "true");
+    }
+    const text = svgElement("text", { class: "cluster-label", "text-anchor": "middle" });
+    text.textContent = clusterLabel(ring.cluster);
+    heading.appendChild(text);
+    dom.clusters.appendChild(heading);
+  }
+}
+
 function downstreamDepths(root, edges, maxDepth) {
   const outgoing = new Map();
   for (const edge of edges) {
@@ -773,14 +989,29 @@ function graphSearchMatches() {
 
 function renderGraph() {
   dom.rings.replaceChildren();
+  dom.clusters.replaceChildren();
   dom.edges.replaceChildren();
   dom.nodes.replaceChildren();
   dom.minimapEdges.replaceChildren();
   dom.minimapNodes.replaceChildren();
   if (!state.graph || state.graph.nodes.length === 0) return;
 
+  const hostMode = state.groupBy === "host";
+  dom.graphDescription.textContent = hostMode
+    ? "Services are clustered by host. Select a service or a host heading to inspect it."
+    : "Services are arranged by dependency criticality. Select a service to inspect it.";
   const edges = cleanEdges(state.graph.nodes, state.graph.edges);
-  const positions = graphLayout(state.graph.nodes, edges);
+  let positions;
+  if (hostMode) {
+    const layout = hostLayout(hostClusters());
+    positions = layout.positions;
+    renderClusterRings(layout.rings);
+  } else {
+    positions = graphLayout(state.graph.nodes, edges);
+    for (const radius of [100, 200, 300, 400]) {
+      dom.rings.appendChild(svgElement("circle", { class: "graph-ring", cx: 500, cy: 500, r: radius }));
+    }
+  }
   const searchMatches = graphSearchMatches();
   const impact = state.impactRoot ? downstreamDepths(state.impactRoot, edges, 5) : null;
   const selectedNeighbors = new Set();
@@ -790,10 +1021,6 @@ function renderGraph() {
       if (edge.source === state.selected) selectedNeighbors.add(edge.target);
       if (edge.target === state.selected) selectedNeighbors.add(edge.source);
     }
-  }
-
-  for (const radius of [100, 200, 300, 400]) {
-    dom.rings.appendChild(svgElement("circle", { class: "graph-ring", cx: 500, cy: 500, r: radius }));
   }
 
   const edgeFragment = document.createDocumentFragment();
@@ -841,16 +1068,47 @@ function renderGraph() {
   for (const node of state.graph.nodes) {
     const point = positions.get(node.id);
     if (!point) continue;
-    const status = normalizeStatus(node);
+    const hostNode = isHostNode(node);
+    const status = hostNode ? "unknown" : normalizeStatus(node);
     const group = svgElement("g", {
       class: "service-node",
       transform: "translate(" + point.x + " " + point.y + ")",
       tabindex: "0",
       role: "button",
       "data-status": status,
-      "aria-label": node.id + ", " + status + ", health " + formatRatio(node.health_score, 0),
+      "aria-label": hostNode
+        ? node.id + ", host, open host panel"
+        : node.id + ", " + status + ", health " + formatRatio(node.health_score, 0),
     });
     group.dataset.service = node.id;
+    if (hostNode) {
+      // A host entity is a diamond with no edges; activating it opens the host panel.
+      group.dataset.kind = "host";
+      const side = nodeRadius * 1.7;
+      group.appendChild(svgElement("rect", { class: "node-halo", x: -side / 2 - 7, y: -side / 2 - 7, width: side + 14, height: side + 14, transform: "rotate(45)" }));
+      group.appendChild(svgElement("rect", { class: "node-core", x: -side / 2, y: -side / 2, width: side, height: side, transform: "rotate(45)" }));
+      if (showAllLabels || searchMatches && searchMatches.has(node.id)) {
+        const label = svgElement("text", { class: "node-label", x: nodeRadius + 9, y: 6 });
+        label.textContent = node.id.length > 24 ? node.id.slice(0, 23) + "…" : node.id;
+        group.appendChild(label);
+      }
+      const title = svgElement("title");
+      title.textContent = node.id + " — host";
+      group.appendChild(title);
+      const open = () => openHost(hostOfNode(node));
+      group.addEventListener("click", (event) => {
+        event.stopPropagation();
+        open();
+      });
+      group.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          open();
+        }
+      });
+      nodeFragment.appendChild(group);
+      continue;
+    }
     if (node.id === state.selected) group.classList.add("is-selected");
     if (searchMatches && searchMatches.has(node.id)) group.classList.add("is-search-match");
     if (impact && impact.has(node.id)) group.classList.add("is-impact");
@@ -870,6 +1128,11 @@ function renderGraph() {
       });
       label.textContent = node.id.length > 24 ? node.id.slice(0, 23) + "…" : node.id;
       group.appendChild(label);
+      if (hostMode && nodeHostCount(node) > 1) {
+        const sub = svgElement("text", { class: "node-sub", x: nodeRadius + 9, y: 22 });
+        sub.textContent = nodeHostCount(node) + " hosts";
+        group.appendChild(sub);
+      }
     }
     const title = svgElement("title");
     const tail = formatP99(node.metrics.p99_latency_ms, node.metrics.latency_provenance);
@@ -915,6 +1178,38 @@ function renderViewSwitch() {
   const mapMode = state.mobileMode === "map";
   dom.mapView.setAttribute("aria-pressed", mapMode ? "true" : "false");
   dom.listView.setAttribute("aria-pressed", mapMode ? "false" : "true");
+  const reason = hostGroupReason();
+  dom.hostGroup.setAttribute("aria-pressed", state.groupBy === "host" ? "true" : "false");
+  dom.hostGroup.setAttribute("aria-disabled", reason ? "true" : "false");
+  dom.hostGroup.title = reason || "Group services by host";
+}
+
+async function setGroupBy(mode) {
+  if (mode === "host" && !hostsAvailable()) {
+    // Hosts may have appeared since the last explicit refresh; ask once
+    // before refusing, so the toggle never needs a page reload to wake up.
+    try {
+      const hosts = await fetchJSON("/api/hosts");
+      state.hosts = Array.isArray(hosts) ? hosts.filter((host) => host && typeof host.name === "string") : [];
+      state.hostsError = "";
+    } catch (error) {
+      if (state.hosts === null) state.hostsError = error && error.message ? error.message : "Unknown response";
+    }
+    if (!hostsAvailable()) {
+      renderViewSwitch();
+      showToast(hostGroupReason());
+      return;
+    }
+  }
+  state.groupBy = mode;
+  updateURL({ group: mode === "host" ? "host" : null });
+  if (mode === "host" && isMobile()) {
+    state.mobileMode = "list";
+    state.mobileModeChosen = true;
+    updateURL({ flow: "0" });
+  }
+  renderAll();
+  showToast(mode === "host" ? "Grouped by host: " + state.hosts.length + (state.hosts.length === 1 ? " host" : " hosts") : "Grouped by service");
 }
 
 function isMobile() {
@@ -925,7 +1220,7 @@ function chooseInitialMobileMode() {
   if (state.mobileModeChosen || !state.graph) return;
   const requested = new URLSearchParams(window.location.search).get("flow");
   if (requested === "1") state.mobileMode = "map";
-  else if (requested === "0") state.mobileMode = "list";
+  else if (requested === "0" || state.groupBy === "host") state.mobileMode = "list";
   else state.mobileMode = state.graph.nodes.length > 40 ? "list" : "map";
   state.mobileModeChosen = true;
 }
@@ -992,7 +1287,183 @@ function renderOverview(node) {
     section.appendChild(list);
   }
   wrapper.appendChild(section);
+
+  const hosts = nodeHosts(node);
+  if (hosts.length) {
+    const hostSection = document.createElement("section");
+    hostSection.className = "section";
+    const count = nodeHostCount(node);
+    hostSection.appendChild(textElement("h3", "section-title", "Hosts · " + count));
+    const row = document.createElement("div");
+    row.className = "chip-row";
+    for (const host of hosts) {
+      const chip = textElement("button", "host-chip", host);
+      chip.type = "button";
+      chip.dataset.host = host;
+      chip.setAttribute("aria-label", "Open host " + host);
+      chip.addEventListener("click", () => openHost(host));
+      row.appendChild(chip);
+    }
+    if (count > hosts.length) row.appendChild(textElement("span", "quiet", "+" + (count - hosts.length) + " more"));
+    hostSection.appendChild(row);
+    wrapper.appendChild(hostSection);
+  }
   return wrapper;
+}
+
+function sparkline(values) {
+  const svg = svgElement("svg", { class: "spark", viewBox: "0 0 100 28", "aria-hidden": "true" });
+  let min = Infinity;
+  let max = -Infinity;
+  for (const value of values) {
+    min = Math.min(min, value);
+    max = Math.max(max, value);
+  }
+  const span = max - min || 1;
+  const points = values.map((value, index) => {
+    const x = values.length === 1 ? 50 : index / (values.length - 1) * 100;
+    return x.toFixed(1) + "," + (26 - (value - min) / span * 24).toFixed(1);
+  });
+  svg.appendChild(svgElement("polyline", { points: points.join(" ") }));
+  // A lone sample is a point, not a line; make it visible.
+  const last = points[points.length - 1].split(",");
+  svg.appendChild(svgElement("circle", { cx: last[0], cy: last[1], r: 2 }));
+  return svg;
+}
+
+function bucketValue(bucket) {
+  const count = finite(bucket.count, 0);
+  return count > 0 ? finite(bucket.sum, 0) / count : finite(bucket.max, NaN);
+}
+
+function hostMetricCard(spec, buckets) {
+  const card = document.createElement("div");
+  card.className = "stat-card";
+  card.dataset.metric = spec.name;
+  card.append(textElement("span", "stat-label", spec.label));
+  const values = (buckets || []).map(bucketValue).filter(Number.isFinite);
+  if (!buckets) {
+    card.setAttribute("aria-busy", "true");
+    card.append(textElement("strong", "", "…"));
+    return card;
+  }
+  if (!values.length) {
+    card.classList.add("is-empty");
+    card.append(textElement("strong", "", "not reported"));
+    card.title = spec.name + " has no samples in the last hour";
+    return card;
+  }
+  const latest = values[values.length - 1];
+  card.append(textElement("strong", "", spec.kind === "ratio" ? formatRatio(latest, 0) : formatBytes(latest)));
+  card.appendChild(sparkline(values));
+  card.title = spec.name + ": " + values.length + (values.length === 1 ? " bucket" : " buckets") + " in the last hour";
+  return card;
+}
+
+function renderHostPanel(host) {
+  const wrapper = document.createElement("div");
+  const entry = state.hostMetrics.get(state.selectedHost) || null;
+  const resources = document.createElement("section");
+  resources.className = "section";
+  const head = document.createElement("div");
+  head.className = "section-head";
+  head.appendChild(textElement("h3", "section-title", "Resources · last hour"));
+  if (entry && entry.coverage) {
+    const badge = textElement("span", "coverage-tag", entry.coverage + " coverage");
+    badge.title = "Reported by the metrics API";
+    head.appendChild(badge);
+  }
+  resources.appendChild(head);
+  const grid = document.createElement("div");
+  grid.className = "stat-grid resource-grid";
+  for (const spec of HOST_METRICS) {
+    const buckets = entry ? entry.series.get(spec.name) : null;
+    if (!spec.always && !(buckets && buckets.length)) continue;
+    grid.appendChild(hostMetricCard(spec, buckets === undefined ? null : buckets));
+  }
+  resources.appendChild(grid);
+  if (entry && entry.error) resources.appendChild(textElement("p", "quiet", "Metrics unavailable: " + entry.error));
+  wrapper.appendChild(resources);
+
+  const services = document.createElement("section");
+  services.className = "section";
+  const listed = host && Array.isArray(host.services) ? host.services : [];
+  const total = host ? finite(host.service_count, listed.length) : 0;
+  services.appendChild(textElement("h3", "section-title", "Services · " + total));
+  if (!host) {
+    services.appendChild(textElement("p", "quiet", state.selectedHost + " is not in the current host list. It may have stopped reporting."));
+  } else if (!listed.length) {
+    services.appendChild(textElement("p", "quiet", "No services reported on this host."));
+  } else {
+    const list = document.createElement("ul");
+    list.className = "dependency-list";
+    for (const id of listed) {
+      const node = state.graph ? state.graph.nodes.find((candidate) => candidate.id === id) : null;
+      const item = document.createElement("li");
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "dependency-row";
+      button.dataset.service = id;
+      button.append(
+        textElement("strong", "", id),
+        textElement("span", "", node ? normalizeStatus(node) + " · health " + formatRatio(node.health_score, 0) : "not in the current graph")
+      );
+      button.addEventListener("click", () => openInspector(id));
+      item.appendChild(button);
+      list.appendChild(item);
+    }
+    services.appendChild(list);
+    if (total > listed.length) services.appendChild(textElement("p", "quiet", "+" + (total - listed.length) + " more not listed"));
+  }
+  wrapper.appendChild(services);
+  if (host) {
+    const seen = new Date(host.last_seen);
+    const signals = Array.isArray(host.signals) && host.signals.length ? host.signals.join(", ") : "none";
+    wrapper.appendChild(textElement("p", "quiet", "Signals: " + signals + (Number.isNaN(seen.getTime()) ? "" : " · last seen " + seen.toLocaleString())));
+  }
+  return wrapper;
+}
+
+async function fetchSeries(path) {
+  const response = await fetch(path, { headers: { Accept: "application/json" }, cache: "no-cache" });
+  if (!response.ok) throw new Error((await response.text()).trim() || "HTTP " + response.status);
+  const data = await response.json();
+  return { buckets: Array.isArray(data) ? data : [], coverage: response.headers.get("OtelContext-Data-Coverage") || "" };
+}
+
+// loadHostMetrics reads the host's hostmetrics series through the ordinary
+// metrics API. Previous samples stay on screen while a refresh is in flight.
+async function loadHostMetrics(host) {
+  const previous = state.hostMetrics.get(host);
+  const entry = {
+    series: previous ? previous.series : new Map(),
+    coverage: previous ? previous.coverage : "",
+    error: "",
+    loadedAt: Date.now(),
+  };
+  state.hostMetrics.set(host, entry);
+  const end = new Date();
+  const start = new Date(end.getTime() - HOST_METRICS_WINDOW_MS);
+  const query = "&service_name=" + encodeURIComponent(HOST_PREFIX + host)
+    + "&start=" + encodeURIComponent(start.toISOString()) + "&end=" + encodeURIComponent(end.toISOString());
+  const results = await Promise.allSettled(HOST_METRICS.map((spec) => fetchSeries("/api/metrics?name=" + encodeURIComponent(spec.name) + query)));
+  const series = new Map();
+  let coverage = "";
+  let error = "";
+  results.forEach((result, index) => {
+    if (result.status === "fulfilled") {
+      series.set(HOST_METRICS[index].name, result.value.buckets);
+      if (result.value.coverage && coverage !== "sampled") coverage = result.value.coverage;
+    } else {
+      series.set(HOST_METRICS[index].name, []);
+      error = result.reason && result.reason.message ? result.reason.message : "request failed";
+    }
+  });
+  if (state.hostMetrics.get(host) !== entry) return;
+  entry.series = series;
+  entry.coverage = coverage;
+  entry.error = error;
+  if (state.selectedHost === host) renderInspector();
 }
 
 function dependencyRow(id, edge) {
@@ -1265,7 +1736,7 @@ function renderImpact(node) {
 
 function renderInspector() {
   const node = currentNode();
-  if (!state.selected) {
+  if (!state.selected && !state.selectedHost) {
     dom.inspector.setAttribute("aria-hidden", "true");
     dom.inspector.inert = true;
     dom.inspectorScrim.hidden = true;
@@ -1274,6 +1745,17 @@ function renderInspector() {
   dom.inspector.setAttribute("aria-hidden", "false");
   dom.inspector.inert = false;
   dom.inspectorScrim.hidden = !isMobile();
+  dom.inspectorTabs.hidden = Boolean(state.selectedHost);
+  dom.inspectorEyebrow.textContent = state.selectedHost ? "Host inspector" : "Service inspector";
+  if (state.selectedHost) {
+    const host = hostByName(state.selectedHost);
+    dom.inspectorTitle.textContent = state.selectedHost;
+    dom.inspectorStatus.className = "service-status host";
+    dom.inspectorHealth.textContent = host ? formatCount(host.service_count) + (finite(host.service_count, 0) === 1 ? " service" : " services") : "Not reporting";
+    dom.inspectorHealth.style.color = host ? "var(--muted)" : "var(--faint)";
+    dom.inspectorBody.replaceChildren(renderHostPanel(host));
+    return;
+  }
   dom.inspectorTitle.textContent = state.selected;
   dom.inspectorStatus.className = "service-status " + (node ? normalizeStatus(node) : "unknown");
   dom.inspectorHealth.textContent = node ? formatRatio(node.health_score, 0) : "Not reporting";
@@ -1304,24 +1786,38 @@ function renderInspector() {
 
 function openInspector(service) {
   state.selected = service;
-  updateURL({ service: service, tab: state.activeTab === "overview" ? null : state.activeTab });
+  state.selectedHost = null;
+  updateURL({ service: service, host: null, tab: state.activeTab === "overview" ? null : state.activeTab });
   renderGraph();
   renderServiceLists();
   renderInspector();
   window.setTimeout(() => dom.closeInspector.focus(), 0);
 }
 
-function closeInspector() {
-  const selected = state.selected;
+function openHost(host) {
   state.selected = null;
-  updateURL({ service: null, tab: null });
+  state.selectedHost = host;
+  updateURL({ host: host, service: null, tab: null });
   renderGraph();
   renderServiceLists();
   renderInspector();
-  if (selected) {
-    const source = document.querySelector("[data-service=" + CSS.escape(selected) + "]");
-    if (source) source.focus();
-  }
+  loadHostMetrics(host);
+  showToast("Host " + host + " opened.");
+  window.setTimeout(() => dom.closeInspector.focus(), 0);
+}
+
+function closeInspector() {
+  const selected = state.selected;
+  const selectedHost = state.selectedHost;
+  state.selected = null;
+  state.selectedHost = null;
+  updateURL({ service: null, host: null, tab: null });
+  renderGraph();
+  renderServiceLists();
+  renderInspector();
+  const selector = selected ? "[data-service=" + CSS.escape(selected) + "]" : selectedHost ? "[data-host=" + CSS.escape(selectedHost) + "]" : "";
+  const source = selector ? document.querySelector(selector) : null;
+  if (source) source.focus();
 }
 
 function selectTab(tabName, focus) {
@@ -1335,6 +1831,13 @@ function selectTab(tabName, focus) {
 }
 
 function renderAll() {
+  // Host mode cannot outlive its data: once the host list is known to be
+  // empty or unreachable, fall back to the service view and say why.
+  if (state.groupBy === "host" && !hostsAvailable() && (state.hosts !== null || state.hostsError)) {
+    state.groupBy = "service";
+    updateURL({ group: null });
+    showToast("Host grouping turned off: " + hostGroupReason());
+  }
   renderStates();
   renderPulse();
   renderSeverity();
@@ -1561,6 +2064,7 @@ function bindEvents() {
   });
   dom.mapView.addEventListener("click", () => setMobileMode("map"));
   dom.listView.addEventListener("click", () => setMobileMode("list"));
+  dom.hostGroup.addEventListener("click", () => setGroupBy(state.groupBy === "host" ? "service" : "host"));
   dom.zoomIn.addEventListener("click", () => zoomAt(0.8));
   dom.zoomOut.addEventListener("click", () => zoomAt(1.25));
   dom.fit.addEventListener("click", () => setViewBox({ x: 0, y: 0, width: 1000, height: 1000 }));
@@ -1619,7 +2123,12 @@ function bindEvents() {
       setViewBox({ x: 0, y: 0, width: 1000, height: 1000 });
       return;
     }
-    if (event.key === "Escape" && state.selected) {
+    if (event.key.toLowerCase() === "h" && !editable && !event.ctrlKey && !event.metaKey && !event.altKey) {
+      event.preventDefault();
+      setGroupBy(state.groupBy === "host" ? "service" : "host");
+      return;
+    }
+    if (event.key === "Escape" && (state.selected || state.selectedHost)) {
       event.preventDefault();
       closeInspector();
     }
@@ -1631,6 +2140,7 @@ function bindEvents() {
   window.addEventListener("popstate", () => {
     readURL();
     renderAll();
+    if (state.selectedHost) loadHostMetrics(state.selectedHost);
   });
   window.addEventListener("resize", () => {
     renderStates();
