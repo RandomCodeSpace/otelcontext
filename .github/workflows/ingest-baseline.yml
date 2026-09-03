@@ -1,0 +1,139 @@
+name: ingest baseline
+# Weekly ingest baseline (issue #293, decision #282). Builds the exact
+# otelcontext and loadsim binaries, runs the server in AGGREGATE_MODE=aggregate
+# pinned to two CPUs (taskset -c 0,1, GOMAXPROCS=2), drives it with
+# `loadsim --direct` at ~10k points/s for 120 s (aligned so one five-minute
+# window boundary falls inside the measured phase; up to a five-minute wait),
+# profiles the steady state, and uploads ingest-baseline-v1.json plus the raw
+# evidence for 90 days. Budget: ~2 min build, <=5 min alignment, 2.5 min run.
+#
+# This is an artifact and a comparison, never a required check: hosted-runner
+# noise would make a pass/fail gate a flake generator. The seven-day gate
+# (docs/gates/) remains the only certification.
+#
+# All actions SHA-pinned per Scorecard `Pinned-Dependencies`; top-level
+# `permissions: read-all`, the one job scopes up to pull-requests: write only
+# so it can post the comparison comment when a PR number is supplied.
+on:
+  schedule:
+    - cron: '37 3 * * 0'  # Sundays 03:37 UTC
+  workflow_dispatch:
+    inputs:
+      baseline:
+        description: >-
+          Committed baseline to compare against (path under docs/gates/ingest/).
+          Empty = the newest *-aggregate-ingest-baseline.json in that directory.
+        required: false
+        default: ''
+      pr_number:
+        description: >-
+          Pull request number to post the comparison comment on. Empty = no comment;
+          the comparison still lands in the job summary and the artifact.
+        required: false
+        default: ''
+
+permissions: read-all
+
+jobs:
+  ingest-baseline:
+    name: ingest baseline · aggregate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      CGO_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: build server and loadsim
+        run: |
+          echo "OUT_DIR=${RUNNER_TEMP}/ingest-baseline" >> "${GITHUB_ENV}"
+          mkdir -p "${RUNNER_TEMP}/bin"
+          go build -trimpath -o "${RUNNER_TEMP}/bin/otelcontext" .
+          go build -trimpath -tags loadtest -o "${RUNNER_TEMP}/bin/loadsim" ./test/loadsim
+
+      - name: run ingest baseline protocol
+        env:
+          OTELCONTEXT_BIN: ${{ runner.temp }}/bin/otelcontext
+          LOADSIM_BIN: ${{ runner.temp }}/bin/loadsim
+          HARDWARE_NOTE: >-
+            GitHub-hosted ${{ runner.os }} runner (${{ runner.arch }}), not the 2-vCPU gate box.
+            Server pinned to CPUs 0-1 with GOMAXPROCS=2, loadsim on CPUs 2-3, data under RUNNER_TEMP.
+        run: scripts/ingest-baseline.sh run
+
+      - name: check artifact shape
+        if: ${{ always() }}
+        run: |
+          jq -e '
+            .schema_version == "otelcontext.ingest-baseline.v1" and
+            (.binary_sha256 | length) == 64 and
+            (.sustained.points_sent | type) == "number" and
+            (.sustained.points_acked | type) == "number" and
+            (.sustained.points_acked_per_sec | type) == "number" and
+            (.sustained.ack_latency_all_signals.p99_ms | type) == "number" and
+            .hardware.confinement == "taskset"
+          ' "${OUT_DIR}/ingest-baseline-v1.json"
+          test -s "${OUT_DIR}/cpu.pprof"
+          test -s "${OUT_DIR}/allocs.pprof"
+
+      - name: compare against committed baseline
+        id: compare
+        env:
+          BASELINE_INPUT: ${{ inputs.baseline }}
+        run: |
+          baseline="${BASELINE_INPUT}"
+          if [[ -n "${baseline}" && ! "${baseline}" =~ ^docs/gates/ingest/[A-Za-z0-9._-]+\.json$ ]]; then
+            echo "baseline must be a file under docs/gates/ingest/, got: ${baseline}" >&2
+            exit 1
+          fi
+          if [[ -z "${baseline}" ]]; then
+            baseline="$(find docs/gates/ingest -maxdepth 1 -name '*-aggregate-ingest-baseline.json' 2>/dev/null | sort | tail -n 1 || true)"
+          fi
+          if [[ -z "${baseline}" || ! -f "${baseline}" ]]; then
+            echo "no committed baseline to compare against (${BASELINE_INPUT:-none})"
+            echo "compared=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          scripts/ingest-baseline.sh compare "${baseline}" "${OUT_DIR}/ingest-baseline-v1.json" \
+            "${OUT_DIR}/ingest-ab-v1.json" | tee "${OUT_DIR}/comparison.md"
+          {
+            echo "## ingest baseline vs \`${baseline}\`"
+            echo
+            echo "Hosted-runner numbers are informational: the verdict is only meaningful between runs on the same hardware."
+            echo
+            cat "${OUT_DIR}/comparison.md"
+          } >> "${GITHUB_STEP_SUMMARY}"
+          echo "compared=true" >> "${GITHUB_OUTPUT}"
+
+      - name: post comparison comment
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.pr_number != '' && steps.compare.outputs.compared == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          [[ "${PR_NUMBER}" =~ ^[0-9]+$ ]] || { echo "pr_number must be numeric" >&2; exit 1; }
+          {
+            echo "### ingest baseline (\`${GITHUB_SHA::12}\`, hosted runner)"
+            echo
+            echo "Informational only — see the #282 rule; the A/B that counts is the same-hardware run committed under \`docs/gates/ingest/\`. [Run](${RUN_URL})"
+            echo
+            cat "${OUT_DIR}/comparison.md"
+          } > "${OUT_DIR}/comment.md"
+          gh pr comment "${PR_NUMBER}" --repo "${GITHUB_REPOSITORY}" --body-file "${OUT_DIR}/comment.md"
+
+      - name: upload ingest baseline
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ingest-baseline-${{ github.sha }}
+          path: ${{ runner.temp }}/ingest-baseline
+          if-no-files-found: error
+          retention-days: 90
