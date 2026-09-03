@@ -519,6 +519,7 @@ func extractArchive(archivePath, dest string) (files, execs []string, err error)
 	}
 	defer gz.Close()
 	tr := tar.NewReader(gz)
+	cleanDest := filepath.Clean(dest)
 	files, execs = []string{}, []string{}
 	for {
 		hdr, err := tr.Next()
@@ -537,7 +538,10 @@ func extractArchive(archivePath, dest string) (files, execs []string, err error)
 				return nil, nil, fmt.Errorf("unsafe tar path %q", hdr.Name)
 			}
 		}
-		target := filepath.Join(dest, filepath.FromSlash(name))
+		target := filepath.Join(cleanDest, filepath.FromSlash(name))
+		if !strings.HasPrefix(target, cleanDest+string(os.PathSeparator)) {
+			return nil, nil, fmt.Errorf("unsafe tar path %q", hdr.Name)
+		}
 		switch hdr.Typeflag {
 		case tar.TypeDir:
 			if err := os.MkdirAll(target, 0o755); err != nil {
