@@ -19,6 +19,7 @@ type legacyRepository interface {
 // LegacyProvider preserves the existing historical repository query and the
 // current GraphRAG/graph/DB preference for live topology.
 type LegacyProvider struct {
+	HostReader
 	repo     legacyRepository
 	graph    *graph.Graph
 	graphRAG *graphrag.GraphRAG
@@ -37,6 +38,15 @@ func (*LegacyProvider) Source() Source { return SourceLegacy }
 func (*LegacyProvider) Identity(context.Context) Identity { return Identity{} }
 
 func (p *LegacyProvider) Snapshot(ctx context.Context, q Query) (Snapshot, error) {
+	snap, err := p.snapshot(ctx, q)
+	if err != nil {
+		return snap, err
+	}
+	p.stampHosts(ctx, &snap)
+	return snap, nil
+}
+
+func (p *LegacyProvider) snapshot(ctx context.Context, q Query) (Snapshot, error) {
 	if !q.Start.IsZero() || !q.End.IsZero() {
 		return p.rangeSnapshot(ctx, q)
 	}

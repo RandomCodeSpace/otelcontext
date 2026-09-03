@@ -141,6 +141,12 @@ type ServiceMapNode struct {
 	AvgLatencyMs      float64             `json:"avg_latency_ms"`
 	P99LatencyMs      float64             `json:"p99_latency_ms,omitempty"`
 	LatencyProvenance *latency.Provenance `json:"latency_provenance,omitempty"`
+
+	// Additive host projection (#288): kind is service|host, hosts is sorted
+	// and capped at topology.MaxHostsPerNode, host_count is the full total.
+	Kind      string   `json:"kind,omitempty"`
+	HostCount int      `json:"host_count,omitempty"`
+	Hosts     []string `json:"hosts,omitempty"`
 }
 
 // ServiceMapEdge is an edge on the service topology view.
@@ -496,6 +502,9 @@ func ServiceMapMetricsFromTopology(snapshot topology.Snapshot) ServiceMapMetrics
 			AvgLatencyMs:      node.AvgLatencyMs,
 			P99LatencyMs:      node.P99LatencyMs,
 			LatencyProvenance: node.LatencyProvenance,
+			Kind:              node.Kind,
+			HostCount:         node.HostCount,
+			Hosts:             node.Hosts,
 		}
 	}
 	edges := make([]ServiceMapEdge, len(snapshot.Edges))

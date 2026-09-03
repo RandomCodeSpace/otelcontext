@@ -179,6 +179,9 @@ func (p *EnginePublisher) Snapshot(ctx context.Context, service string) *LiveSna
 				AvgLatencyMs:      n.AvgLatencyMs,
 				P99LatencyMs:      n.P99LatencyMs,
 				LatencyProvenance: n.LatencyProvenance,
+				Kind:              n.Kind,
+				HostCount:         n.HostCount,
+				Hosts:             n.Hosts,
 			})
 		}
 		for _, e := range topologySnapshot.Edges {

@@ -256,6 +256,10 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	// System Graph (AI-consumable topology + health)
 	mux.HandleFunc("GET /api/system/graph", s.handleGetSystemGraph)
 
+	// Hosts (#288): the resource registry projected through the topology owner
+	mux.HandleFunc("GET /api/hosts", s.handleGetHosts)
+	mux.HandleFunc("GET /api/hosts/{host}", s.handleGetHost)
+
 	// Traces
 	mux.HandleFunc("GET /api/traces", s.handleGetTraces)
 	mux.HandleFunc("GET /api/traces/{id}", s.handleGetTraceByID)

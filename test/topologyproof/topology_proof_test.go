@@ -46,6 +46,41 @@ type proofAssertion struct {
 	Detail string `json:"detail"`
 }
 
+// proofHost is the mode-independent part of a host answer (#288): the same
+// registry fixture must yield this list in every mode.
+type proofHost struct {
+	Name     string   `json:"name"`
+	Services []string `json:"services"`
+}
+
+// expectedProofHosts is what the registry fixture in TestTopologyModeProof
+// projects to. host/node-c is a host entity: listed as a host, never as a
+// service.
+var expectedProofHosts = []proofHost{
+	{Name: "node-a", Services: []string{"gateway"}},
+	{Name: "node-b", Services: []string{"gateway"}},
+	{Name: "node-c", Services: []string{}},
+}
+
+func proofHostFixture(t *testing.T, provider *scriptedProvider) {
+	t.Helper()
+	registry := topology.NewRegistry(nil)
+	now := time.Now().UTC()
+	for _, r := range []struct {
+		service, host, workload, kind string
+		signal                        topology.Signal
+	}{
+		{"gateway", "node-a", "", "", topology.SignalTraces},
+		{"gateway", "node-b", "pod-1", "pod", topology.SignalTraces | topology.SignalLogs},
+		{topology.HostPrefix + "node-c", "node-c", "", "", topology.SignalMetrics},
+	} {
+		if !registry.Register(storage.DefaultTenantID, r.service, r.host, r.workload, r.kind, r.signal, now) {
+			t.Fatalf("register fixture %s@%s", r.service, r.host)
+		}
+	}
+	provider.SetRegistry(registry)
+}
+
 type modeProof struct {
 	SchemaVersion    string                    `json:"schema_version"`
 	Mode             string                    `json:"mode"`
@@ -56,6 +91,7 @@ type modeProof struct {
 	EmptyReplacement string                    `json:"empty_replacement"`
 	Reconnect        string                    `json:"reconnect"`
 	Coverage         string                    `json:"coverage"`
+	Hosts            []proofHost               `json:"hosts"`
 	Assertions       map[string]proofAssertion `json:"assertions"`
 }
 
@@ -102,6 +138,7 @@ func (p *modeProof) write(t *testing.T) {
 }
 
 type scriptedProvider struct {
+	topology.HostReader
 	mu       sync.RWMutex
 	source   topology.Source
 	identity topology.Identity
@@ -120,7 +157,7 @@ func (p *scriptedProvider) Identity(context.Context) topology.Identity {
 	return p.identity
 }
 
-func (p *scriptedProvider) Snapshot(context.Context, topology.Query) (topology.Snapshot, error) {
+func (p *scriptedProvider) Snapshot(ctx context.Context, _ topology.Query) (topology.Snapshot, error) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	if p.err != nil {
@@ -129,6 +166,12 @@ func (p *scriptedProvider) Snapshot(context.Context, topology.Query) (topology.S
 	snapshot := p.snapshot
 	snapshot.Nodes = append([]topology.Node(nil), snapshot.Nodes...)
 	snapshot.Edges = append([]topology.Edge(nil), snapshot.Edges...)
+	hosts := p.Hosts(ctx)
+	for i := range snapshot.Nodes {
+		node := &snapshot.Nodes[i]
+		node.Kind = topology.NodeKind(node.Name)
+		node.HostCount, node.Hosts = hosts.ServiceHosts(node.Name)
+	}
 	return snapshot, nil
 }
 
@@ -281,7 +324,7 @@ func (p providerPublisher) Snapshot(ctx context.Context, _ string) *realtime.Liv
 	}
 	nodes := make([]storage.ServiceMapNode, len(snapshot.Nodes))
 	for i, node := range snapshot.Nodes {
-		nodes[i] = storage.ServiceMapNode{Name: node.Name, TotalTraces: node.TotalTraces, ErrorCount: node.ErrorCount, AvgLatencyMs: node.AvgLatencyMs, P99LatencyMs: node.P99LatencyMs, LatencyProvenance: node.LatencyProvenance}
+		nodes[i] = storage.ServiceMapNode{Name: node.Name, TotalTraces: node.TotalTraces, ErrorCount: node.ErrorCount, AvgLatencyMs: node.AvgLatencyMs, P99LatencyMs: node.P99LatencyMs, LatencyProvenance: node.LatencyProvenance, Kind: node.Kind, HostCount: node.HostCount, Hosts: node.Hosts}
 	}
 	edges := make([]storage.ServiceMapEdge, len(snapshot.Edges))
 	for i, edge := range snapshot.Edges {
@@ -348,6 +391,7 @@ func TestTopologyModeProof(t *testing.T) {
 		proof.Coverage = "omitted (legacy-compatible)"
 	}
 	proof.EdgeSet = []proofEdge{{Source: "gateway", Target: target}}
+	proofHostFixture(t, provider)
 
 	repo := proofRepository(t)
 	seedLegacyEdge(t, repo, target)
@@ -364,6 +408,7 @@ func TestTopologyModeProof(t *testing.T) {
 	go rawHub.Run()
 
 	eventHub := realtime.NewEventHub(repo, nil, nil)
+	eventHub.SetTopologyProvider(provider)
 	if mode == aggregate.ModeAggregate {
 		eventHub.SetAggregatePublisher(providerPublisher{provider: provider}, proofFloor)
 	}
@@ -417,12 +462,34 @@ func TestTopologyModeProof(t *testing.T) {
 		proof.check(t, "mcp_coverage", strings.Contains(mapTool, `"coverage":"full"`) && strings.Contains(mapTool, `"source":"aggregate"`), compact(mapTool))
 	}
 
+	// Host projection (#288): one registry fixture, one answer in every mode.
+	proof.Hosts = proofHostsOf(getHosts(t, httpServer.URL+"/api/hosts"))
+	proof.check(t, "rest_hosts_identical", fmt.Sprint(proof.Hosts) == fmt.Sprint(expectedProofHosts), fmt.Sprintf("hosts=%v want=%v", proof.Hosts, expectedProofHosts))
+	hostDetail := getHosts(t, httpServer.URL+"/api/hosts/node-b")
+	unknownHost, err := http.Get(httpServer.URL + "/api/hosts/node-z") //nolint:gosec // local httptest endpoint
+	if err != nil {
+		t.Fatalf("GET unknown host: %v", err)
+	}
+	unknownHost.Body.Close()
+	proof.check(t, "rest_host_detail", len(hostDetail) == 1 && hostDetail[0].Name == "node-b" && fmt.Sprint(hostDetail[0].Services) == "[gateway]" && unknownHost.StatusCode == http.StatusNotFound, fmt.Sprintf("detail=%+v unknown_status=%d", hostDetail, unknownHost.StatusCode))
+	mapNodes := decodeNodes(t, serviceMap.Nodes)
+	graphNodes := decodeNodes(t, systemGraph.Nodes)
+	nodeHostsOK := mapNodes["gateway"].Kind == "service" && mapNodes["gateway"].HostCount == 2 && fmt.Sprint(mapNodes["gateway"].Hosts) == "[node-a node-b]" &&
+		mapNodes[target].Kind == "service" && mapNodes[target].HostCount == 0 &&
+		graphNodes["gateway"].Kind == "service" && fmt.Sprint(graphNodes["gateway"].Hosts) == "[node-a node-b]"
+	proof.check(t, "rest_nodes_carry_hosts", nodeHostsOK, fmt.Sprintf("service_map=%+v system_graph=%+v", mapNodes, graphNodes))
+	groupedTool := callTool(t, mcpHTTP.URL, "get_service_map", map[string]any{"group_by": "host"})
+	proof.check(t, "mcp_group_by_host", !strings.Contains(mapTool, `"hosts"`) && strings.Contains(groupedTool, `"services":[`) && strings.Contains(groupedTool, `"hosts":[{"name":"node-a","service_count":1,"services":["gateway"]`) && strings.Contains(groupedTool, `{"name":"node-c","service_count":0,"services":[]`), compact(groupedTool))
+	gatewayHealth := callTool(t, mcpHTTP.URL, "get_service_health", map[string]any{"service_name": "gateway"})
+	proof.check(t, "mcp_service_health_hosts", strings.Contains(gatewayHealth, `"hosts":["node-a","node-b"]`), compact(gatewayHealth))
+
 	sse := immediateSSE(t, mcpServer)
 	proof.check(t, "mcp_sse", strings.Contains(sse, target) && !strings.Contains(sse, forbidden) && strings.Contains(sse, "notifications/resources/updated"), compact(sse))
 
 	eventConn := dialWS(t, httpServer.URL+"/ws/events")
 	initialEvent := readEventSnapshot(t, eventConn, 2*time.Second)
 	proof.check(t, "websocket_events", initialEvent.ServiceMap != nil && hasStorageEdge(initialEvent.ServiceMap.Edges, target, forbidden), fmt.Sprintf("snapshot=%+v", initialEvent.ServiceMap))
+	proof.check(t, "websocket_events_hosts", initialEvent.ServiceMap != nil && storageNodeHosts(initialEvent.ServiceMap.Nodes, "gateway") == "service [node-a node-b]", fmt.Sprintf("snapshot=%+v", initialEvent.ServiceMap))
 	proof.check(t, "reconnect_immediate", initialEvent.Type == "live_snapshot" && (source != topology.SourceAggregate || initialEvent.Reset), fmt.Sprintf("type=%q reset=%v", initialEvent.Type, initialEvent.Reset))
 
 	rawConn := dialWS(t, httpServer.URL+"/ws")
@@ -551,6 +618,73 @@ func proofGraphRAG(t *testing.T, mode string, provider *scriptedProvider, target
 		cancel()
 		graphRAG.Stop()
 	}
+}
+
+// nodeWire is the additive host projection on a REST node (#288); name is
+// the service-map key, id the system-graph key.
+type nodeWire struct {
+	Name      string   `json:"name"`
+	ID        string   `json:"id"`
+	Kind      string   `json:"kind"`
+	HostCount int      `json:"host_count"`
+	Hosts     []string `json:"hosts"`
+}
+
+func decodeNodes(t *testing.T, raw []json.RawMessage) map[string]nodeWire {
+	t.Helper()
+	out := make(map[string]nodeWire, len(raw))
+	for _, item := range raw {
+		var node nodeWire
+		if err := json.Unmarshal(item, &node); err != nil {
+			t.Fatalf("decode node: %v (%s)", err, item)
+		}
+		key := node.Name
+		if key == "" {
+			key = node.ID
+		}
+		out[key] = node
+	}
+	return out
+}
+
+// getHosts decodes /api/hosts (an array) or /api/hosts/{host} (one object).
+func getHosts(t *testing.T, url string) []topology.Host {
+	t.Helper()
+	response := getTopologyResponse(t, url)
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read %s: %v", url, err)
+	}
+	var hosts []topology.Host
+	if bytes.HasPrefix(bytes.TrimSpace(body), []byte("{")) {
+		var host topology.Host
+		if err := json.Unmarshal(body, &host); err != nil {
+			t.Fatalf("decode host: %v (%s)", err, body)
+		}
+		return []topology.Host{host}
+	}
+	if err := json.Unmarshal(body, &hosts); err != nil {
+		t.Fatalf("decode hosts: %v (%s)", err, body)
+	}
+	return hosts
+}
+
+func proofHostsOf(hosts []topology.Host) []proofHost {
+	out := make([]proofHost, 0, len(hosts))
+	for _, h := range hosts {
+		out = append(out, proofHost{Name: h.Name, Services: h.Services})
+	}
+	return out
+}
+
+func storageNodeHosts(nodes []storage.ServiceMapNode, name string) string {
+	for _, node := range nodes {
+		if node.Name == name {
+			return fmt.Sprintf("%s %v", node.Kind, node.Hosts)
+		}
+	}
+	return "missing"
 }
 
 func getTopology(t *testing.T, url string) topologyWire {

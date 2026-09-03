@@ -364,7 +364,7 @@ for the full rationale.
 | Tool | Input | Source |
 |------|-------|--------|
 | `get_anomaly_timeline` | `{since?, service?}` | In-memory (instant) — triage entry point |
-| `get_service_map` | `{depth?, service?}` | In-memory (instant) — topology + health overlay |
+| `get_service_map` | `{depth?, service?, group_by?}` | In-memory (instant) — topology + health overlay; `group_by: "host"` wraps the array as `{services, hosts}` |
 | `get_service_health` | `{service_name}` | In-memory (instant) — per-service drill-down |
 | `root_cause_analysis` | `{service, time_range?}` | In-memory (instant) — ranked probable causes |
 | `impact_analysis` | `{service, depth?}` | In-memory (instant) — blast radius |

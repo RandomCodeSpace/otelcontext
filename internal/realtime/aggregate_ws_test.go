@@ -183,6 +183,7 @@ func TestAggregateWSProviderErrorRetainsLastGoodIdentity(t *testing.T) {
 	hub.lastEpoch = "epoch-1"
 	hub.lastRev = 1
 	client := &clientFilter{send: make(chan []byte, 1)}
+	client.seeded.Store(true)
 	hub.clients[nil] = client
 
 	hub.publishIfChanged()
@@ -336,5 +337,26 @@ func TestWebSocketDashboardPreservesMicrosecondsAndProvenance(t *testing.T) {
 	}
 	if wire.Dashboard.P99 != 1_000_000 || wire.Dashboard.LatencyProvenance.P99.Status != latency.StatusApproximate {
 		t.Fatalf("wire dashboard = %+v", wire.Dashboard)
+	}
+}
+
+// TestAggregateWSConnectSeedIsNotRepublished: a client seeded at connect time
+// already holds the current revision. The first loop tick after that must not
+// send the same revision again; the next revision still arrives.
+func TestAggregateWSConnectSeedIsNotRepublished(t *testing.T) {
+	f := newWSFixture(t, time.Hour) // no tick fires on its own
+	seed := f.read(t, 2*time.Second)
+	if !seed.Reset {
+		t.Fatal("connect snapshot is not flagged reset")
+	}
+
+	// A tick at the seeded revision publishes nothing; the next revision is
+	// therefore the very next message on the wire.
+	f.hub.publishIfChanged()
+	f.pub.rev.Store(seed.Revision + 1)
+	f.hub.publishIfChanged()
+	next := f.read(t, 2*time.Second)
+	if next.Revision != seed.Revision+1 || next.Reset {
+		t.Fatalf("next snapshot = rev %d reset %v, want rev %d reset false (a duplicate seed revision would arrive first)", next.Revision, next.Reset, seed.Revision+1)
 	}
 }

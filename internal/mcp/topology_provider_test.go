@@ -16,9 +16,12 @@ type fakeMCPTopologyProvider struct {
 	revision atomic.Uint64
 	snapshot topology.Snapshot
 	err      error
+	hosts    topology.HostProjection
 }
 
 func (*fakeMCPTopologyProvider) Source() topology.Source { return topology.SourceAggregate }
+
+func (p *fakeMCPTopologyProvider) Hosts(context.Context) topology.HostProjection { return p.hosts }
 
 func (p *fakeMCPTopologyProvider) Identity(context.Context) topology.Identity {
 	return topology.Identity{Epoch: p.epoch, Revision: p.revision.Load()}

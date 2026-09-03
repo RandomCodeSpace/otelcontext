@@ -16,9 +16,12 @@ type fakeTopologyProvider struct {
 	identity topology.Identity
 	snapshot topology.Snapshot
 	err      error
+	hosts    topology.HostProjection
 }
 
 func (f *fakeTopologyProvider) Source() topology.Source { return f.source }
+
+func (f *fakeTopologyProvider) Hosts(context.Context) topology.HostProjection { return f.hosts }
 
 func (f *fakeTopologyProvider) Identity(context.Context) topology.Identity { return f.identity }
 
