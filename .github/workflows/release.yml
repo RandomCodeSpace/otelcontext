@@ -1,8 +1,11 @@
 name: Release (artifacts + signing)
 
-# Builds release artifacts and signs them when a version tag is pushed. The
-# browser-native UI is committed under internal/ui/static and Go embeds it
-# directly, so release jobs need only the Go toolchain.
+# Runs only at a version tag ref. GoReleaser stages a signed DRAFT release
+# (release.draft in .goreleaser.yaml); every proof job consumes the exact draft
+# assets; the draft is published only after the limited-production manifest is
+# approved. A workflow_dispatch at a tag ref (gh workflow run release.yml
+# --ref vX.Y.Z) re-proves the existing draft assets without rebuilding them.
+# Job names are a contract with test/releasecandidate manifest: do not rename.
 on:
   push:
     tags:
@@ -10,24 +13,131 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Existing tag to (re)build + sign (e.g. v0.3.1)'
-        required: true
+        description: 'Tag being re-proved; must equal the dispatched tag ref'
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read
 
 jobs:
-  database-proof:
-    name: Database lifecycle gate
-    uses: ./.github/workflows/database-proof.yml
-    with:
-      run_all: true
-      candidate_ref: ${{ inputs.tag || github.ref }}
+  source-identity:
+    name: source identity
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      checks: read
+      statuses: read
+    outputs:
+      tag: ${{ steps.identity.outputs.tag }}
+      sha: ${{ steps.identity.outputs.sha }}
+      started_at: ${{ steps.identity.outputs.started_at }}
+    steps:
+      - name: Checkout tag ref
+        # actions/checkout v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        # actions/setup-go v7.0.0
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Bind tag, commit, protected main, and required checks
+        id: identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          test "${GITHUB_REF_TYPE}" = "tag"
+          if [ -n "${INPUT_TAG}" ]; then
+            test "${INPUT_TAG}" = "${GITHUB_REF_NAME}"
+          fi
+          tag="${GITHUB_REF_NAME}"
+          sha="$(git rev-parse "${tag}^{commit}")"
+          [[ "${sha}" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git cat-file -t "${tag}")" = "tag"
+          test "$(git rev-parse HEAD)" = "${sha}"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "${sha}" origin/main
+
+          work="${RUNNER_TEMP}/source-identity"
+          install -d -m 0755 "${work}/artifact"
+          # The protection endpoint itself needs administration:read, which the
+          # workflow token cannot hold; the branch object exposes the same
+          # required contexts publicly.
+          gh api "repos/${GITHUB_REPOSITORY}/branches/main" \
+            --jq '.protection.required_status_checks.contexts[]' > "${work}/required-contexts.txt"
+          test -s "${work}/required-contexts.txt"
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/commits/${sha}/check-runs?per_page=100" \
+            --jq '.check_runs[]' | jq -s . > "${work}/check-runs.json"
+          gh api "repos/${GITHUB_REPOSITORY}/commits/${sha}/status" > "${work}/status.json"
+          : > "${work}/required-checks.jsonl"
+          while IFS= read -r context; do
+            jq -nc --arg name "${context}" \
+              --slurpfile runs "${work}/check-runs.json" \
+              --slurpfile status "${work}/status.json" '
+              ([$runs[0][] | select(.name == $name)] | sort_by(.started_at) | last) as $run
+              | ([$status[0].statuses[]? | select(.context == $name)] | sort_by(.updated_at) | last) as $st
+              | if $run != null then
+                  {name:$name, conclusion:(if $run.status == "completed" then ($run.conclusion // "missing") else $run.status end), url:($run.html_url // "")}
+                elif $st != null then
+                  {name:$name, conclusion:$st.state, url:($st.target_url // "")}
+                else
+                  {name:$name, conclusion:"missing", url:""}
+                end' >> "${work}/required-checks.jsonl"
+          done < "${work}/required-contexts.txt"
+          echo "required checks for ${sha}:"
+          jq -r '"  " + .conclusion + "\t" + .name' "${work}/required-checks.jsonl"
+          failing="$(jq -r 'select(.conclusion != "success") | .name' "${work}/required-checks.jsonl")"
+          if [ -n "${failing}" ]; then
+            echo "required checks are not all successful for ${sha}:" >&2
+            printf '  %s\n' "${failing}" >&2
+            exit 1
+          fi
+
+          jq -n \
+            --arg tag "${tag}" --arg sha "${sha}" --arg ref "${GITHUB_REF}" \
+            --arg go_version "$(go version | awk '{print $3}')" \
+            --arg event "${GITHUB_EVENT_NAME}" \
+            --slurpfile checks "${work}/required-checks.jsonl" '
+            {schema_version:"otelcontext.source-identity.v1",tag:$tag,sha:$sha,ref:$ref,ref_type:"tag",
+             protected_main:true,clean_tree:true,go_version:$go_version,annotated_tag:true,
+             required_checks:$checks,event:$event}' > "${work}/artifact/source-identity-v1.json"
+          cat "${work}/artifact/source-identity-v1.json"
+          {
+            echo "tag=${tag}"
+            echo "sha=${sha}"
+            echo "started_at=${started_at}"
+          } >> "${GITHUB_OUTPUT}"
+          echo "SOURCE_IDENTITY_DIR=${work}/artifact" >> "${GITHUB_ENV}"
+
+      - name: Upload source identity
+        # actions/upload-artifact v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: source-identity-${{ steps.identity.outputs.tag }}-${{ steps.identity.outputs.sha }}
+          path: ${{ env.SOURCE_IDENTITY_DIR }}
+          if-no-files-found: error
+          retention-days: 90
 
   goreleaser:
-    name: GoReleaser (build · sbom · sign)
-    needs: database-proof
-    runs-on: ubuntu-latest
+    name: goreleaser
+    # A dispatch re-proves the existing draft assets; only the tag push builds.
+    if: ${{ github.event_name == 'push' }}
+    needs: source-identity
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     permissions:
       contents: write
       id-token: write
@@ -39,15 +149,25 @@ jobs:
           egress-policy: audit
 
       - name: Checkout tag
-        # actions/checkout v4.2.2
+        # actions/checkout v7.0.1
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ github.ref }}
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Verify immutable candidate identity
+        env:
+          TAG: ${{ needs.source-identity.outputs.tag }}
+          SHA: ${{ needs.source-identity.outputs.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${SHA}"
+          test "$(git rev-parse "${TAG}^{commit}")" = "${SHA}"
+          test -z "$(git status --porcelain --untracked-files=all)"
+
       - name: Set up Go
-        # actions/setup-go v6.2.0
+        # actions/setup-go v7.0.0
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
         with:
           go-version-file: go.mod
@@ -65,7 +185,7 @@ jobs:
         # anchore/sbom-action v0.24.0
         uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610
 
-      - name: Run GoReleaser
+      - name: Run GoReleaser (draft release)
         # goreleaser/goreleaser-action v6.2.1
         uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94
         with:
@@ -75,3 +195,743 @@ jobs:
           CGO_ENABLED: '0'
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           COSIGN_EXPERIMENTAL: '1'
+
+  verify-assets:
+    name: verify signed assets
+    needs: [source-identity, goreleaser]
+    if: ${{ always() && needs.source-identity.result == 'success' && (needs.goreleaser.result == 'success' || needs.goreleaser.result == 'skipped') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      # Draft release assets are only listed for push access; contents:read
+      # cannot see the draft, so this download job needs contents:write.
+      contents: write
+    env:
+      TAG: ${{ needs.source-identity.outputs.tag }}
+      SHA: ${{ needs.source-identity.outputs.sha }}
+      GH_TOKEN: ${{ github.token }}
+    outputs:
+      binary_sha256: ${{ steps.candidate.outputs.binary_sha256 }}
+      archive: ${{ steps.candidate.outputs.archive }}
+      artifact: candidate-linux-amd64-${{ needs.source-identity.outputs.tag }}-${{ needs.source-identity.outputs.sha }}
+    steps:
+      - name: Initialize external evidence path
+        run: |
+          set -euo pipefail
+          proof_root="${RUNNER_TEMP}/otelcontext-release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          case "${proof_root}" in
+            "${GITHUB_WORKSPACE}"|"${GITHUB_WORKSPACE}"/*)
+              echo "proof root must be outside the checkout" >&2
+              exit 1
+              ;;
+          esac
+          install -d -m 0755 "${proof_root}/release" "${proof_root}/extracted" "${proof_root}/artifacts" "${proof_root}/candidate"
+          echo "PROOF_ROOT=${proof_root}" >> "${GITHUB_ENV}"
+
+      - name: Checkout tag
+        # actions/checkout v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify immutable candidate identity
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${SHA}"
+          test "$(git rev-parse "${TAG}^{commit}")" = "${SHA}"
+          test -z "$(git status --porcelain --untracked-files=all)"
+
+      - name: Set up Go
+        # actions/setup-go v7.0.0
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install cosign
+        # sigstore/cosign-installer v3.9.2
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
+        with:
+          cosign-release: 'v2.6.5'
+
+      - name: Download draft release assets
+        run: |
+          set -euo pipefail
+          gh release download "${TAG}" --repo "${GITHUB_REPOSITORY}" --dir "${PROOF_ROOT}/release"
+          ls -l "${PROOF_ROOT}/release"
+
+      - name: Build the source-bound release tool
+        # `go run` collapses every child exit status to 1; the tool's own
+        # statuses are part of its contract, so invoke the built binary.
+        run: |
+          set -euo pipefail
+          install -d -m 0755 "${PROOF_ROOT}/bin"
+          go build -trimpath -o "${PROOF_ROOT}/bin/releasecandidate" ./test/releasecandidate
+
+      - name: Verify signed assets against the tag checkout
+        run: |
+          set -euo pipefail
+          "${PROOF_ROOT}/bin/releasecandidate" verify-assets \
+            --tag "${TAG}" \
+            --sha "${SHA}" \
+            --assets "${PROOF_ROOT}/release" \
+            --extract "${PROOF_ROOT}/extracted" \
+            --source-root "${GITHUB_WORKSPACE}" \
+            --identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/${TAG}" \
+            --out "${PROOF_ROOT}/artifacts/release-assets-v1.json"
+
+      - name: Stage the Linux amd64 candidate
+        id: candidate
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          archive="otelcontext_${version}_linux_amd64.tar.gz"
+          candidate="${PROOF_ROOT}/candidate"
+          for name in "${archive}" "${archive}.sbom.json" checksums.txt checksums.txt.sig checksums.txt.pem; do
+            install -m 0644 "${PROOF_ROOT}/release/${name}" "${candidate}/${name}"
+          done
+          install -m 0755 "${PROOF_ROOT}/extracted/linux_amd64/otelcontext" "${candidate}/otelcontext"
+          (cd "${candidate}" && sha256sum otelcontext > binary.sha256)
+          binary_sha="$(awk '{print $1}' "${candidate}/binary.sha256")"
+          test "${#binary_sha}" -eq 64
+          {
+            echo "binary_sha256=${binary_sha}"
+            echo "archive=${archive}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Upload release asset verification
+        if: ${{ always() }}
+        # actions/upload-artifact v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: release-assets-${{ env.TAG }}-${{ env.SHA }}
+          path: ${{ env.PROOF_ROOT }}/artifacts
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Upload Linux amd64 candidate
+        # actions/upload-artifact v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: candidate-linux-amd64-${{ env.TAG }}-${{ env.SHA }}
+          path: ${{ env.PROOF_ROOT }}/candidate
+          if-no-files-found: error
+          retention-days: 90
+
+  database-proof:
+    name: database lifecycle gate
+    needs: [source-identity, verify-assets]
+    uses: ./.github/workflows/database-proof.yml
+    with:
+      run_all: true
+      candidate_ref: ${{ needs.source-identity.outputs.tag }}
+      candidate_artifact: ${{ needs.verify-assets.outputs.artifact }}
+      candidate_binary_sha256: ${{ needs.verify-assets.outputs.binary_sha256 }}
+
+  browser-smoke:
+    name: browser smoke · release binary
+    needs: [source-identity, verify-assets]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      TAG: ${{ needs.source-identity.outputs.tag }}
+      SHA: ${{ needs.source-identity.outputs.sha }}
+      CGO_ENABLED: '1'
+    steps:
+      - name: Initialize external evidence path
+        run: |
+          set -euo pipefail
+          proof_root="${RUNNER_TEMP}/otelcontext-release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          case "${proof_root}" in
+            "${GITHUB_WORKSPACE}"|"${GITHUB_WORKSPACE}"/*)
+              echo "proof root must be outside the checkout" >&2
+              exit 1
+              ;;
+          esac
+          install -d -m 0755 "${proof_root}/candidate" "${proof_root}/browser"
+          echo "PROOF_ROOT=${proof_root}" >> "${GITHUB_ENV}"
+
+      - name: Checkout tag
+        # actions/checkout v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify immutable candidate identity
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${SHA}"
+          test "$(git rev-parse "${TAG}^{commit}")" = "${SHA}"
+          test -z "$(git status --porcelain --untracked-files=all)"
+
+      - name: Set up Go
+        # actions/setup-go v7.0.0
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download Linux amd64 candidate
+        # actions/download-artifact v7.0.0
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+        with:
+          name: ${{ needs.verify-assets.outputs.artifact }}
+          path: ${{ env.PROOF_ROOT }}/candidate
+
+      - name: Bind the exact release binary
+        env:
+          CANDIDATE_BINARY_SHA256: ${{ needs.verify-assets.outputs.binary_sha256 }}
+        run: |
+          set -euo pipefail
+          echo "${CANDIDATE_BINARY_SHA256}  ${PROOF_ROOT}/candidate/otelcontext" | sha256sum --check -
+          chmod 0755 "${PROOF_ROOT}/candidate/otelcontext"
+          cp "${PROOF_ROOT}/candidate/binary.sha256" "${PROOF_ROOT}/browser/binary.sha256"
+          test "$("${PROOF_ROOT}/candidate/otelcontext" --version)" = "OtelContext version ${TAG}"
+
+      - name: Run protected browser workflow
+        env:
+          OTELCONTEXT_BINARY: ${{ env.PROOF_ROOT }}/candidate/otelcontext
+          CHROME_BIN: google-chrome
+          BROWSER_SMOKE_ARTIFACTS: ${{ env.PROOF_ROOT }}/browser/artifacts
+        run: go test -tags=browser -count=1 -timeout 150s -run '^TestProtectedBrowserWorkflow$' ./test/browser
+
+      - name: Verify latency wording in the embedded client
+        env:
+          OTELCONTEXT_BINARY: ${{ env.PROOF_ROOT }}/candidate/otelcontext
+          OTELCONTEXT_BROWSER_CASE: latency
+          CHROME_BIN: google-chrome
+          BROWSER_SMOKE_ARTIFACTS: ${{ env.PROOF_ROOT }}/browser/artifacts
+        run: go test -tags=browser -count=1 -timeout 150s -run '^TestLatencyLabels$' ./test/browser
+
+      - name: Upload browser diagnostics
+        if: ${{ always() }}
+        # actions/upload-artifact v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: browser-smoke-release-${{ env.TAG }}-${{ env.SHA }}
+          path: ${{ env.PROOF_ROOT }}/browser
+          if-no-files-found: error
+          retention-days: 90
+
+  systemd-proof:
+    name: systemd proof · release archive
+    needs: [source-identity, verify-assets]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      TAG: ${{ needs.source-identity.outputs.tag }}
+      SHA: ${{ needs.source-identity.outputs.sha }}
+      PREVIOUS_TAG: v0.4.0-beta.2
+      PREVIOUS_ARCHIVE_NAME: otelcontext_0.4.0-beta.2_linux_amd64.tar.gz
+    steps:
+      - name: Initialize external evidence path
+        run: |
+          set -euo pipefail
+          proof_root="${RUNNER_TEMP}/otelcontext-release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          case "${proof_root}" in
+            "${GITHUB_WORKSPACE}"|"${GITHUB_WORKSPACE}"/*)
+              echo "proof root must be outside the checkout" >&2
+              exit 1
+              ;;
+          esac
+          install -d -m 0755 "${proof_root}/systemd/candidate" "${proof_root}/systemd/previous"
+          echo "PROOF_ROOT=${proof_root}" >> "${GITHUB_ENV}"
+
+      - name: Checkout tag
+        # actions/checkout v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify immutable candidate identity
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${SHA}"
+          test "$(git rev-parse "${TAG}^{commit}")" = "${SHA}"
+          test -z "$(git status --porcelain --untracked-files=all)"
+
+      - name: Set up Go
+        # actions/setup-go v7.0.0
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install cosign
+        # sigstore/cosign-installer v3.9.2
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
+        with:
+          cosign-release: 'v2.6.5'
+
+      - name: Download Linux amd64 candidate
+        # actions/download-artifact v7.0.0
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+        with:
+          name: ${{ needs.verify-assets.outputs.artifact }}
+          path: ${{ env.PROOF_ROOT }}/systemd/candidate
+
+      - name: Bind the exact release archive
+        env:
+          CANDIDATE_BINARY_SHA256: ${{ needs.verify-assets.outputs.binary_sha256 }}
+          CANDIDATE_ARCHIVE: ${{ needs.verify-assets.outputs.archive }}
+        run: |
+          set -euo pipefail
+          candidate="${PROOF_ROOT}/systemd/candidate"
+          echo "${CANDIDATE_BINARY_SHA256}  ${candidate}/otelcontext" | sha256sum --check -
+          for name in "${CANDIDATE_ARCHIVE}" "${CANDIDATE_ARCHIVE}.sbom.json" checksums.txt checksums.txt.sig checksums.txt.pem; do
+            test -s "${candidate}/${name}"
+          done
+          (cd "${candidate}" && grep " ${CANDIDATE_ARCHIVE}$" checksums.txt | sha256sum --check -)
+
+      - name: Download signed previous release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download "${PREVIOUS_TAG}" --repo "${GITHUB_REPOSITORY}" --dir "${PROOF_ROOT}/systemd/previous" \
+            --pattern "${PREVIOUS_ARCHIVE_NAME}" \
+            --pattern "${PREVIOUS_ARCHIVE_NAME}.sbom.json" \
+            --pattern checksums.txt \
+            --pattern checksums.txt.sig \
+            --pattern checksums.txt.pem
+
+      - name: Start isolated Ubuntu systemd host
+        run: |
+          set -euo pipefail
+          go_root="$(go env GOROOT)"
+          cosign_path="$(command -v cosign)"
+          docker run --detach --name otelcontext-systemd-proof \
+            --privileged --cgroupns=private \
+            --tmpfs /run --tmpfs /run/lock \
+            --volume "${GITHUB_WORKSPACE}:/workspace:ro" \
+            --volume "${PROOF_ROOT}/systemd:/proof-input" \
+            --volume "${go_root}:/usr/local/go:ro" \
+            --volume "${cosign_path}:/usr/local/bin/cosign:ro" \
+            ubuntu:24.04@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517 \
+            /bin/bash -c 'export DEBIAN_FRONTEND=noninteractive; apt-get update; apt-get install -y --no-install-recommends systemd systemd-sysv ca-certificates coreutils curl dbus findutils gawk grep gzip iproute2 jq openssl passwd sed tar util-linux; exec /sbin/init'
+          ready=0
+          for ((attempt = 0; attempt < 60; attempt++)); do
+            state="$(docker inspect --format '{{.State.Status}}' otelcontext-systemd-proof)"
+            if [[ "${state}" != "running" ]]; then
+              docker logs otelcontext-systemd-proof
+              exit 1
+            fi
+            system_state="$(docker exec otelcontext-systemd-proof systemctl is-system-running 2>/dev/null || true)"
+            if [[ "${system_state}" == "running" || "${system_state}" == "degraded" ]]; then
+              ready=1
+              break
+            fi
+            sleep 2
+          done
+          if [[ "${ready}" -ne 1 ]]; then
+            docker logs otelcontext-systemd-proof
+            exit 1
+          fi
+          docker exec otelcontext-systemd-proof systemd-analyze --version
+
+      - name: Run certifying disposable production-shaped proof
+        env:
+          CANDIDATE_ARCHIVE: ${{ needs.verify-assets.outputs.archive }}
+        # OTELCONTEXT_PROOF_SOURCE and OTELCONTEXT_PROOF_CERTIFICATE_IDENTITY stay
+        # unset: this is a certifying run against release.yml@refs/tags/<tag>.
+        run: |
+          set -euo pipefail
+          proof_dir="${PROOF_ROOT}/systemd/proof"
+          docker exec \
+            --env "PATH=/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+            --env "SUDO_UID=$(id -u)" \
+            --env "SUDO_GID=$(id -g)" \
+            --env "OTELCONTEXT_PREVIOUS_ARCHIVE=/proof-input/previous/${PREVIOUS_ARCHIVE_NAME}" \
+            --env "OTELCONTEXT_PREVIOUS_TAG=${PREVIOUS_TAG}" \
+            --env "OTELCONTEXT_COSIGN=/usr/local/bin/cosign" \
+            otelcontext-systemd-proof \
+            /workspace/scripts/prove-systemd-release.sh \
+              --archive "/proof-input/candidate/${CANDIDATE_ARCHIVE}" \
+              --tag "${TAG}" \
+              --sha "${SHA}" \
+              --proof-dir "/proof-input/proof"
+          jq -e --arg sha "${SHA}" --arg tag "${TAG}" '
+            .schema_version == "otelcontext.systemd-proof.v1" and
+            .tag == $tag and
+            .sha == $sha and
+            .source_proof == false and
+            .certifying == true and
+            .automatic_restarts == 1 and
+            (.fingerprints | [.initial,.restart,.crash_recovery,.rollback,.upgrade] | unique | length) == 1 and
+            all(.assertions[]; .passed == true)
+          ' "${proof_dir}/systemd-proof-v1.json"
+
+      - name: Remove isolated systemd host
+        if: ${{ always() }}
+        run: |
+          if docker inspect otelcontext-systemd-proof >/dev/null 2>&1; then
+            docker rm --force otelcontext-systemd-proof
+          fi
+
+      - name: Upload systemd proof
+        if: ${{ always() }}
+        # actions/upload-artifact v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: systemd-proof-${{ env.TAG }}-${{ env.SHA }}
+          path: ${{ env.PROOF_ROOT }}/systemd/proof
+          if-no-files-found: error
+          retention-days: 90
+
+  arm64-smoke:
+    name: linux arm64 smoke
+    needs: [source-identity, verify-assets]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    permissions:
+      # Draft release assets are only listed for push access; contents:read
+      # cannot see the draft, so this download job needs contents:write.
+      contents: write
+    env:
+      TAG: ${{ needs.source-identity.outputs.tag }}
+      SHA: ${{ needs.source-identity.outputs.sha }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Initialize external evidence path
+        run: |
+          set -euo pipefail
+          proof_root="${RUNNER_TEMP}/otelcontext-release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          install -d -m 0755 "${proof_root}/release" "${proof_root}/extracted" "${proof_root}/arm64-smoke" "${proof_root}/state/dlq"
+          echo "PROOF_ROOT=${proof_root}" >> "${GITHUB_ENV}"
+
+      - name: Install cosign
+        # sigstore/cosign-installer v3.9.2
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
+        with:
+          cosign-release: 'v2.6.5'
+
+      - name: Download and verify the signed Linux arm64 archive
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          archive="otelcontext_${version}_linux_arm64.tar.gz"
+          gh release download "${TAG}" --repo "${GITHUB_REPOSITORY}" --dir "${PROOF_ROOT}/release" \
+            --pattern "${archive}" \
+            --pattern checksums.txt \
+            --pattern checksums.txt.sig \
+            --pattern checksums.txt.pem
+          cd "${PROOF_ROOT}/release"
+          grep " ${archive}$" checksums.txt | sha256sum --check -
+          if grep -q '^-----BEGIN CERTIFICATE-----' checksums.txt.pem; then
+            cp checksums.txt.pem checksums-certificate.pem
+          else
+            base64 --decode checksums.txt.pem > checksums-certificate.pem
+          fi
+          cosign verify-blob \
+            --certificate checksums-certificate.pem \
+            --signature checksums.txt.sig \
+            --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/${TAG}" \
+            --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+            checksums.txt
+          tar -tzf "${archive}" | grep -Ev '^(/|\.\./|.*/\.\./)' | grep -Fxq otelcontext
+          tar -xzf "${archive}" -C "${PROOF_ROOT}/extracted"
+          binary="${PROOF_ROOT}/extracted/otelcontext"
+          test -f "${binary}"
+          chmod 0755 "${binary}"
+          version_output="$("${binary}" --version)"
+          test "${version_output}" = "OtelContext version ${TAG}"
+          {
+            echo "ARCHIVE_SHA=$(sha256sum "${archive}" | awk '{print $1}')"
+            echo "BINARY_SHA=$(sha256sum "${binary}" | awk '{print $1}')"
+            echo "BINARY=${binary}"
+            echo "VERSION_OUTPUT=${version_output}"
+          } >> "${GITHUB_ENV}"
+
+      - name: Start, probe, and stop the arm64 binary
+        run: |
+          set -euo pipefail
+          smoke="${PROOF_ROOT}/arm64-smoke"
+          state="${PROOF_ROOT}/state"
+          assertions="${smoke}/assertions.jsonl"
+          : > "${assertions}"
+          live_ms=-1
+          ready_ms=-1
+          exit_code=-1
+          pid=""
+          record() {
+            jq -nc --arg name "$1" --argjson passed "$2" '{name:$name,passed:$passed}' >> "${assertions}"
+          }
+          write_report() {
+            jq -n \
+              --arg tag "${TAG}" --arg sha "${SHA}" \
+              --arg archive_sha256 "${ARCHIVE_SHA}" --arg binary_sha256 "${BINARY_SHA}" \
+              --arg version "${VERSION_OUTPUT}" \
+              --argjson live_ms "${live_ms}" --argjson ready_ms "${ready_ms}" --argjson exit_code "${exit_code}" \
+              --slurpfile assertions "${assertions}" '
+              {schema_version:"otelcontext.arm64-smoke.v1",tag:$tag,sha:$sha,archive_sha256:$archive_sha256,
+               binary_sha256:$binary_sha256,version:$version,live_ms:$live_ms,ready_ms:$ready_ms,
+               exit_code:$exit_code,assertions:$assertions}' > "${smoke}/arm64-smoke-v1.json"
+          }
+          finish() {
+            local status=$?
+            trap - EXIT
+            if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
+              kill -KILL "${pid}" 2>/dev/null || true
+            fi
+            write_report
+            cat "${smoke}/arm64-smoke-v1.json"
+            exit "${status}"
+          }
+          trap finish EXIT
+          record signed_archive_verified true
+          record version_matches_tag true
+
+          free_port() {
+            python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'
+          }
+          http_port="$(free_port)"
+          grpc_port="$(free_port)"
+          started_ms="$(date +%s%3N)"
+          env \
+            AGGREGATE_MODE=legacy \
+            APP_ENV=development \
+            DB_DRIVER=sqlite \
+            DB_DSN="${state}/otelcontext.db" \
+            DATA_DISK_PATH="${state}" \
+            DLQ_PATH="${state}/dlq" \
+            HTTP_PORT="${http_port}" \
+            GRPC_PORT="${grpc_port}" \
+            PPROF_ADDR="" \
+            "${BINARY}" > "${smoke}/server.log" 2>&1 &
+          pid=$!
+
+          probe() {
+            local path="$1" deadline=$((SECONDS + 30)) code
+            while ((SECONDS < deadline)); do
+              code="$(curl --silent --output /dev/null --max-time 2 --write-out '%{http_code}' "http://127.0.0.1:${http_port}${path}" || true)"
+              if [[ "${code}" == "200" ]]; then
+                echo $(( $(date +%s%3N) - started_ms ))
+                return 0
+              fi
+              if ! kill -0 "${pid}" 2>/dev/null; then
+                return 1
+              fi
+              sleep 1
+            done
+            return 1
+          }
+          if live_ms="$(probe /live)"; then
+            record live_200_within_30s true
+          else
+            live_ms=-1
+            record live_200_within_30s false
+            exit 1
+          fi
+          if ready_ms="$(probe /ready)"; then
+            record ready_200_within_30s true
+          else
+            ready_ms=-1
+            record ready_200_within_30s false
+            exit 1
+          fi
+          root_code="$(curl --silent --output "${smoke}/index.html" --max-time 5 --write-out '%{http_code}' "http://127.0.0.1:${http_port}/" || true)"
+          if [[ "${root_code}" == "200" ]]; then
+            record root_200 true
+          else
+            record root_200 false
+            exit 1
+          fi
+
+          kill -TERM "${pid}"
+          stopped=0
+          for ((attempt = 0; attempt < 30; attempt++)); do
+            if ! kill -0 "${pid}" 2>/dev/null; then
+              stopped=1
+              break
+            fi
+            sleep 1
+          done
+          if [[ "${stopped}" -ne 1 ]]; then
+            record sigterm_exit_0_within_30s false
+            exit 1
+          fi
+          set +e
+          wait "${pid}"
+          exit_code=$?
+          set -e
+          pid=""
+          if [[ "${exit_code}" -eq 0 ]]; then
+            record sigterm_exit_0_within_30s true
+          else
+            record sigterm_exit_0_within_30s false
+            exit 1
+          fi
+
+      - name: Upload arm64 smoke evidence
+        if: ${{ always() }}
+        # actions/upload-artifact v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: linux-arm64-smoke-${{ env.TAG }}-${{ env.SHA }}
+          path: ${{ env.PROOF_ROOT }}/arm64-smoke
+          if-no-files-found: error
+          retention-days: 90
+
+  manifest:
+    name: release candidate manifest
+    needs: [source-identity, verify-assets, database-proof, browser-smoke, systemd-proof, arm64-smoke]
+    if: ${{ always() && needs.source-identity.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    env:
+      TAG: ${{ needs.source-identity.outputs.tag }}
+      SHA: ${{ needs.source-identity.outputs.sha }}
+      GH_TOKEN: ${{ github.token }}
+    outputs:
+      manifest_sha256: ${{ steps.manifest.outputs.manifest_sha256 }}
+      artifact: release-candidate-${{ needs.source-identity.outputs.tag }}-${{ needs.source-identity.outputs.sha }}
+    steps:
+      - name: Initialize external evidence path
+        run: |
+          set -euo pipefail
+          proof_root="${RUNNER_TEMP}/otelcontext-release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          case "${proof_root}" in
+            "${GITHUB_WORKSPACE}"|"${GITHUB_WORKSPACE}"/*)
+              echo "proof root must be outside the checkout" >&2
+              exit 1
+              ;;
+          esac
+          install -d -m 0755 "${proof_root}/manifest/evidence"
+          echo "PROOF_ROOT=${proof_root}" >> "${GITHUB_ENV}"
+
+      - name: Checkout tag
+        # actions/checkout v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify immutable candidate identity
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${SHA}"
+          test "$(git rev-parse "${TAG}^{commit}")" = "${SHA}"
+          test -z "$(git status --porcelain --untracked-files=all)"
+
+      - name: Set up Go
+        # actions/setup-go v7.0.0
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download every proof artifact of this run
+        # actions/download-artifact v7.0.0
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+        with:
+          path: ${{ env.PROOF_ROOT }}/manifest/evidence
+
+      - name: Build the source-bound release tool
+        # `go run` collapses every child exit status to 1; exit 3 ("written
+        # but not approved") must survive, so invoke the built binary.
+        run: |
+          set -euo pipefail
+          install -d -m 0755 "${PROOF_ROOT}/bin"
+          go build -trimpath -o "${PROOF_ROOT}/bin/releasecandidate" ./test/releasecandidate
+
+      - name: Build release-candidate-v1.json
+        id: manifest
+        env:
+          STARTED_AT: ${{ needs.source-identity.outputs.started_at }}
+        run: |
+          set -euo pipefail
+          root="${PROOF_ROOT}/manifest"
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}/jobs?per_page=100" \
+            > "${root}/jobs.json"
+          set +e
+          "${PROOF_ROOT}/bin/releasecandidate" manifest \
+            --tag "${TAG}" \
+            --sha "${SHA}" \
+            --repository "${GITHUB_REPOSITORY}" \
+            --workflow-file .github/workflows/release.yml \
+            --workflow-ref "${GITHUB_REF}" \
+            --run-id "${GITHUB_RUN_ID}" \
+            --run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --run-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            --started-at "${STARTED_AT}" \
+            --finished-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --source "${root}/evidence/source-identity-${TAG}-${SHA}/source-identity-v1.json" \
+            --assets "${root}/evidence/release-assets-${TAG}-${SHA}/release-assets-v1.json" \
+            --jobs "${root}/jobs.json" \
+            --evidence "${root}/evidence" \
+            --out "${root}/release-candidate-v1.json"
+          status=$?
+          set -e
+          echo "manifest exit status: ${status}"
+          printf '%s\n' "${status}" > "${root}/manifest.exit-code"
+          test -s "${root}/release-candidate-v1.json"
+          jq '.conclusions' "${root}/release-candidate-v1.json"
+          echo "manifest_sha256=$(sha256sum "${root}/release-candidate-v1.json" | awk '{print $1}')" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload release candidate evidence
+        if: ${{ always() }}
+        # actions/upload-artifact v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: release-candidate-${{ env.TAG }}-${{ env.SHA }}
+          path: ${{ env.PROOF_ROOT }}/manifest
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Enforce limited-production approval
+        run: |
+          set -euo pipefail
+          status="$(cat "${PROOF_ROOT}/manifest/manifest.exit-code")"
+          jq -e '.conclusions.limited_production.approved == true' "${PROOF_ROOT}/manifest/release-candidate-v1.json"
+          test "${status}" -eq 0
+
+  publish:
+    name: publish
+    needs: [source-identity, manifest]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.source-identity.outputs.tag }}
+      SHA: ${{ needs.source-identity.outputs.sha }}
+      GH_TOKEN: ${{ github.token }}
+      MANIFEST_SHA256: ${{ needs.manifest.outputs.manifest_sha256 }}
+      EVIDENCE_ARTIFACT: ${{ needs.manifest.outputs.artifact }}
+    steps:
+      - name: Publish the approved draft
+        run: |
+          set -euo pipefail
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          is_draft="$(gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" --json isDraft --jq .isDraft)"
+          if [[ "${is_draft}" != "true" ]]; then
+            echo "release ${TAG} is already published; notes left unchanged"
+            exit 0
+          fi
+          notes="${RUNNER_TEMP}/release-notes.md"
+          gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" --json body --jq '.body // ""' > "${notes}"
+          {
+            printf '\n\n## Release evidence\n\n'
+            echo "- Candidate: \`${TAG}\` at \`${SHA}\`"
+            echo "- Workflow run: ${run_url}"
+            echo "- Evidence artifact: \`${EVIDENCE_ARTIFACT}\` (retained 90 days)"
+            echo "- \`release-candidate-v1.json\` sha256: \`${MANIFEST_SHA256}\`"
+            printf '\n| Profile | Limited-production conclusion |\n|---|---|\n'
+            echo "| PostgreSQL 16, legacy mode | approved |"
+            echo "| SQLite, legacy mode | approved within the documented five-service, low-write bound |"
+            echo "| MySQL 8.4 | preview |"
+            echo "| SQL Server 2022 | experimental |"
+            echo "| Aggregate and aggregate-shadow modes | available, unapproved pending the aggregate release gate |"
+          } >> "${notes}"
+          gh release edit "${TAG}" --repo "${GITHUB_REPOSITORY}" --draft=false --notes-file "${notes}"
+          gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" --json isDraft,isPrerelease,tagName

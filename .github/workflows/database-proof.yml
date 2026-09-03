@@ -17,6 +17,14 @@ on:
         description: Exact tag or commit to prove.
         type: string
         default: ''
+      candidate_artifact:
+        description: Same-run artifact carrying the exact release binary as `otelcontext`; empty builds from source.
+        type: string
+        default: ''
+      candidate_binary_sha256:
+        description: Expected sha256 of the release binary inside candidate_artifact.
+        type: string
+        default: ''
   workflow_dispatch:
     inputs:
       run_all:
@@ -58,9 +66,29 @@ jobs:
         run: echo "sha=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
 
       - name: Build candidate once
+        if: ${{ inputs.candidate_artifact == '' }}
         run: |
           mkdir -p "${RUNNER_TEMP}/database-proof" "${RUNNER_TEMP}/signed-baselines"
           go build -trimpath -o "${RUNNER_TEMP}/otelcontext" .
+          sha256sum "${RUNNER_TEMP}/otelcontext" > "${RUNNER_TEMP}/database-proof/binary.sha256"
+
+      - name: Download exact release candidate
+        if: ${{ inputs.candidate_artifact != '' }}
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ inputs.candidate_artifact }}
+          path: ${{ runner.temp }}/candidate
+
+      - name: Bind exact release candidate
+        if: ${{ inputs.candidate_artifact != '' }}
+        env:
+          CANDIDATE_BINARY_SHA256: ${{ inputs.candidate_binary_sha256 }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/database-proof" "${RUNNER_TEMP}/signed-baselines"
+          [[ "${CANDIDATE_BINARY_SHA256}" =~ ^[0-9a-f]{64}$ ]]
+          echo "${CANDIDATE_BINARY_SHA256}  ${RUNNER_TEMP}/candidate/otelcontext" | sha256sum --check -
+          install -m 0755 "${RUNNER_TEMP}/candidate/otelcontext" "${RUNNER_TEMP}/otelcontext"
           sha256sum "${RUNNER_TEMP}/otelcontext" > "${RUNNER_TEMP}/database-proof/binary.sha256"
 
       - name: Verify and extract signed baseline binaries
@@ -137,7 +165,7 @@ jobs:
           name: database-proof-sqlite-${{ steps.source.outputs.sha }}
           path: ${{ runner.temp }}/database-proof
           if-no-files-found: error
-          retention-days: ${{ github.event_name == 'schedule' && 30 || github.event_name == 'workflow_call' && 90 || 14 }}
+          retention-days: ${{ github.event_name == 'schedule' && 30 || inputs.candidate_artifact != '' && 90 || 14 }}
 
   postgres:
     name: database proof · postgres-16
@@ -192,9 +220,29 @@ jobs:
           createdb --host=127.0.0.1 --username=otel otelcontext_restore
 
       - name: Build candidate once
+        if: ${{ inputs.candidate_artifact == '' }}
         run: |
           mkdir -p "${RUNNER_TEMP}/database-proof" "${RUNNER_TEMP}/signed-baselines"
           go build -trimpath -o "${RUNNER_TEMP}/otelcontext" .
+          sha256sum "${RUNNER_TEMP}/otelcontext" > "${RUNNER_TEMP}/database-proof/binary.sha256"
+
+      - name: Download exact release candidate
+        if: ${{ inputs.candidate_artifact != '' }}
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ inputs.candidate_artifact }}
+          path: ${{ runner.temp }}/candidate
+
+      - name: Bind exact release candidate
+        if: ${{ inputs.candidate_artifact != '' }}
+        env:
+          CANDIDATE_BINARY_SHA256: ${{ inputs.candidate_binary_sha256 }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/database-proof" "${RUNNER_TEMP}/signed-baselines"
+          [[ "${CANDIDATE_BINARY_SHA256}" =~ ^[0-9a-f]{64}$ ]]
+          echo "${CANDIDATE_BINARY_SHA256}  ${RUNNER_TEMP}/candidate/otelcontext" | sha256sum --check -
+          install -m 0755 "${RUNNER_TEMP}/candidate/otelcontext" "${RUNNER_TEMP}/otelcontext"
           sha256sum "${RUNNER_TEMP}/otelcontext" > "${RUNNER_TEMP}/database-proof/binary.sha256"
 
       - name: Verify and extract signed baseline binaries
@@ -282,11 +330,13 @@ jobs:
           name: database-proof-postgres-16-${{ steps.source.outputs.sha }}
           path: ${{ runner.temp }}/database-proof
           if-no-files-found: error
-          retention-days: ${{ github.event_name == 'schedule' && 30 || github.event_name == 'workflow_call' && 90 || 14 }}
+          retention-days: ${{ github.event_name == 'schedule' && 30 || inputs.candidate_artifact != '' && 90 || 14 }}
 
   mysql:
     name: database proof · mysql-8.4
-    if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_call' && inputs.run_all) || (github.event_name == 'workflow_dispatch' && inputs.run_all) }}
+    # github.event_name is the caller's event inside a called workflow, so the
+    # gate keys on inputs.run_all (false/empty on pull_request and push).
+    if: ${{ github.event_name == 'schedule' || inputs.run_all }}
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     env:
@@ -319,9 +369,29 @@ jobs:
         run: echo "sha=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
 
       - name: Build candidate once
+        if: ${{ inputs.candidate_artifact == '' }}
         run: |
           mkdir -p "${RUNNER_TEMP}/database-proof/native"
           go build -trimpath -o "${RUNNER_TEMP}/otelcontext" .
+          sha256sum "${RUNNER_TEMP}/otelcontext" > "${RUNNER_TEMP}/database-proof/binary.sha256"
+
+      - name: Download exact release candidate
+        if: ${{ inputs.candidate_artifact != '' }}
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ inputs.candidate_artifact }}
+          path: ${{ runner.temp }}/candidate
+
+      - name: Bind exact release candidate
+        if: ${{ inputs.candidate_artifact != '' }}
+        env:
+          CANDIDATE_BINARY_SHA256: ${{ inputs.candidate_binary_sha256 }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/database-proof/native"
+          [[ "${CANDIDATE_BINARY_SHA256}" =~ ^[0-9a-f]{64}$ ]]
+          echo "${CANDIDATE_BINARY_SHA256}  ${RUNNER_TEMP}/candidate/otelcontext" | sha256sum --check -
+          install -m 0755 "${RUNNER_TEMP}/candidate/otelcontext" "${RUNNER_TEMP}/otelcontext"
           sha256sum "${RUNNER_TEMP}/otelcontext" > "${RUNNER_TEMP}/database-proof/binary.sha256"
 
       - name: Run candidate-bound native fresh-target restore proof
@@ -369,7 +439,9 @@ jobs:
 
   sqlserver:
     name: database proof · sqlserver-2022
-    if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_call' && inputs.run_all) || (github.event_name == 'workflow_dispatch' && inputs.run_all) }}
+    # github.event_name is the caller's event inside a called workflow, so the
+    # gate keys on inputs.run_all (false/empty on pull_request and push).
+    if: ${{ github.event_name == 'schedule' || inputs.run_all }}
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     env:
@@ -411,9 +483,29 @@ jobs:
           docker exec "${SQLSERVER_ID}" /opt/mssql-tools18/bin/sqlcmd -S 127.0.0.1 -U sa -P 'Otc-${{ github.run_id }}-Proof!' -C -b -Q "CREATE DATABASE [otelcontext]"
 
       - name: Build candidate once
+        if: ${{ inputs.candidate_artifact == '' }}
         run: |
           mkdir -p "${RUNNER_TEMP}/database-proof/native"
           go build -trimpath -o "${RUNNER_TEMP}/otelcontext" .
+          sha256sum "${RUNNER_TEMP}/otelcontext" > "${RUNNER_TEMP}/database-proof/binary.sha256"
+
+      - name: Download exact release candidate
+        if: ${{ inputs.candidate_artifact != '' }}
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ inputs.candidate_artifact }}
+          path: ${{ runner.temp }}/candidate
+
+      - name: Bind exact release candidate
+        if: ${{ inputs.candidate_artifact != '' }}
+        env:
+          CANDIDATE_BINARY_SHA256: ${{ inputs.candidate_binary_sha256 }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/database-proof/native"
+          [[ "${CANDIDATE_BINARY_SHA256}" =~ ^[0-9a-f]{64}$ ]]
+          echo "${CANDIDATE_BINARY_SHA256}  ${RUNNER_TEMP}/candidate/otelcontext" | sha256sum --check -
+          install -m 0755 "${RUNNER_TEMP}/candidate/otelcontext" "${RUNNER_TEMP}/otelcontext"
           sha256sum "${RUNNER_TEMP}/otelcontext" > "${RUNNER_TEMP}/database-proof/binary.sha256"
 
       - name: Run candidate-bound native fresh-target restore proof
