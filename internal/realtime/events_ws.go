@@ -85,6 +85,10 @@ type clientFilter struct {
 	service string
 	tenant  string
 	closed  atomic.Bool
+	// seeded is set once the connect-time full snapshot has been attempted.
+	// The revision loop skips an unseeded client: an incremental snapshot
+	// delivered ahead of the reset seed would be applied to nothing.
+	seeded atomic.Bool
 }
 
 // matches reports whether an entry belongs to this client's scope.
@@ -385,6 +389,7 @@ func (h *EventHub) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		h.retryReset = true
 		h.mu.Unlock()
 	}
+	cf.seeded.Store(true)
 
 	// Read loop: client can send {"service":"xxx"} to change filter. The
 	// tenant scope is not negotiable and is deliberately absent here.
@@ -519,6 +524,9 @@ func (h *EventHub) flushSnapshots() {
 func (h *EventHub) groupByScopeLocked() map[scopeKey][]*clientFilter {
 	groups := make(map[scopeKey][]*clientFilter, len(h.clients))
 	for _, cf := range h.clients {
+		if !cf.seeded.Load() {
+			continue
+		}
 		k := scopeKey{tenant: cf.tenant, service: cf.service}
 		groups[k] = append(groups[k], cf)
 	}
@@ -586,7 +594,8 @@ func (h *EventHub) sendSnapshotTo(cf *clientFilter) bool {
 	if snapshot == nil {
 		return false
 	}
-	if h.aggregatePublisher() != nil {
+	aggregate := h.aggregatePublisher() != nil
+	if aggregate {
 		snapshot.Reset = true
 	}
 	msg, err := json.Marshal(snapshot)
@@ -594,6 +603,16 @@ func (h *EventHub) sendSnapshotTo(cf *clientFilter) bool {
 		return false
 	}
 	h.deliver(cf, msg)
+	if aggregate {
+		// The seed carries the identity the client now holds. Until the loop
+		// has published once, adopt it so the next tick does not re-send the
+		// same revision to a client that already has it.
+		h.mu.Lock()
+		if !h.published {
+			h.lastEpoch, h.lastRev, h.published = snapshot.Epoch, snapshot.Revision, true
+		}
+		h.mu.Unlock()
+	}
 	return true
 }
 
