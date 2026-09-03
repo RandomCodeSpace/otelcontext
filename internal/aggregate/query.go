@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/RandomCodeSpace/otelcontext/internal/latency"
@@ -396,13 +397,100 @@ func (e *Engine) readMutable(tenantID uint32, start, end int64, signal Signal, v
 	return own
 }
 
-// sumStore runs the SQL aggregation over the store-owned sub-range.
+// Store reads over a wide range fan out across the read pool (#290). A
+// seven-day dashboard is one sequential scan of every bucket row in range;
+// nothing about a SUM or a sketch merge needs that order, so the range is cut
+// into contiguous window sub-ranges and each is read on its own connection.
+// Sub-ranges never share a window, so nothing is counted twice, and each is
+// one statement over both durable tables, so a window the finalizer moves
+// between them is seen exactly once inside its chunk (the guarantee a single
+// UNION ALL statement already gave).
+const (
+	// storeReadFanout is the most chunks one read is split into. It matches
+	// the store's read pool: a wider fan-out would only queue on the pool.
+	storeReadFanout = 4
+	// storeReadChunkMinWindows is the smallest chunk worth a connection; a
+	// narrower range is read in one statement.
+	storeReadChunkMinWindows = 6
+)
+
+// splitSelector cuts sel into at most storeReadFanout contiguous sub-ranges
+// on window boundaries. A range too narrow to split comes back as itself.
+func splitSelector(sel Selector) []Selector {
+	windowSecs := int64(WindowSize / time.Second)
+	windows := (sel.End - sel.Start) / windowSecs
+	parts := int(windows / storeReadChunkMinWindows)
+	if parts > storeReadFanout {
+		parts = storeReadFanout
+	}
+	if parts <= 1 {
+		return []Selector{sel}
+	}
+	out := make([]Selector, 0, parts)
+	per := (windows + int64(parts) - 1) / int64(parts)
+	for start := sel.Start; start < sel.End; start += per * windowSecs {
+		chunk := sel
+		chunk.Start = start
+		chunk.End = min(start+per*windowSecs, sel.End)
+		out = append(out, chunk)
+	}
+	return out
+}
+
+// sumStore runs the SQL aggregation over the store-owned sub-range, one
+// chunk per connection, and re-sums the grouped rows the chunks return.
 func (e *Engine) sumStore(sel Selector, by GroupBy) ([]SumRow, error) {
 	st := e.Store()
 	if st == nil {
 		return nil, nil
 	}
-	return st.SumBuckets(sel, by)
+	chunks := splitSelector(sel)
+	if len(chunks) == 1 {
+		return st.SumBuckets(sel, by)
+	}
+	results := make([][]SumRow, len(chunks))
+	errs := make([]error, len(chunks))
+	var wg sync.WaitGroup
+	for i, chunk := range chunks {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results[i], errs[i] = st.SumBuckets(chunk, by)
+		}()
+	}
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			return nil, err
+		}
+	}
+	type groupKey struct {
+		window        int64
+		service, name uint32
+		signal        Signal
+	}
+	merged := make(map[groupKey]int)
+	var out []SumRow
+	for _, rows := range results {
+		for _, r := range rows {
+			key := groupKey{r.WindowStart, r.ServiceID, r.NameID, r.Signal}
+			i, ok := merged[key]
+			if !ok {
+				merged[key] = len(out)
+				out = append(out, r)
+				continue
+			}
+			acc := &out[i]
+			acc.Count += r.Count
+			acc.ErrorCount += r.ErrorCount
+			acc.RequestCount += r.RequestCount
+			acc.ErrorRequestCount += r.ErrorRequestCount
+			acc.DurationCount += r.DurationCount
+			acc.DurationSum += r.DurationSum
+			acc.LogCount += r.LogCount
+		}
+	}
+	return out, nil
 }
 
 // mergeStoreSketches folds every store-owned sketch in sel's range into merge.
@@ -414,6 +502,12 @@ func (e *Engine) sumStore(sel Selector, by GroupBy) ([]SumRow, error) {
 // identities just to apply a service filter. A sketch merge is commutative
 // and associative, so VisitSketches streams the rows once in table order,
 // and the filter memoizes ONE dictionary lookup per distinct service ID.
+//
+// The range is read in chunks on the read pool (see splitSelector). Each
+// chunk folds its rows into one sketch per service; the per-service results
+// are merged across chunks and handed to visit once per service, so the
+// visitor runs on the calling goroutine and sees one sketch per service
+// instead of one per stored row.
 func (e *Engine) visitStoreSketches(sel Selector, filter map[string]struct{}, visit func(uint32, *Sketch)) error {
 	st := e.Store()
 	if st == nil {
@@ -421,11 +515,52 @@ func (e *Engine) visitStoreSketches(sel Selector, filter map[string]struct{}, vi
 	}
 	sel.Signal = SignalTraceOp
 	sel.SketchOnly = true
+	chunks := splitSelector(sel)
+	perChunk := make([]map[uint32]*Sketch, len(chunks))
+	errs := make([]error, len(chunks))
+	var wg sync.WaitGroup
+	for i, chunk := range chunks {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			perChunk[i], errs[i] = e.collectStoreSketches(st, chunk, filter)
+		}()
+	}
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			return err
+		}
+	}
+	byService := make(map[uint32]*Sketch)
+	var order []uint32
+	for _, m := range perChunk {
+		for serviceID, sk := range m {
+			acc := byService[serviceID]
+			if acc == nil {
+				byService[serviceID] = sk
+				order = append(order, serviceID)
+				continue
+			}
+			acc.Merge(sk)
+		}
+	}
+	for _, serviceID := range order {
+		visit(serviceID, byService[serviceID])
+	}
+	return nil
+}
+
+// collectStoreSketches streams one chunk's sketch rows and folds them into one
+// sketch per service, applying the service filter with one memoized
+// dictionary lookup per distinct service ID.
+func (e *Engine) collectStoreSketches(st Store, sel Selector, filter map[string]struct{}) (map[uint32]*Sketch, error) {
 	var verdict map[uint32]bool
 	if filter != nil {
 		verdict = make(map[uint32]bool, len(filter))
 	}
-	return st.VisitSketches(sel, func(serviceID uint32, sk *Sketch) error {
+	out := make(map[uint32]*Sketch)
+	err := st.VisitSketches(sel, func(serviceID uint32, sk *Sketch) error {
 		if filter != nil {
 			ok, seen := verdict[serviceID]
 			if !seen {
@@ -436,9 +571,15 @@ func (e *Engine) visitStoreSketches(sel Selector, filter map[string]struct{}, vi
 				return nil
 			}
 		}
-		visit(serviceID, sk)
+		acc := out[serviceID]
+		if acc == nil {
+			acc = NewSketchAtScaleUnchecked(sk.Scale())
+			out[serviceID] = acc
+		}
+		acc.Merge(sk)
 		return nil
 	})
+	return out, err
 }
 
 func (e *Engine) mergeStoreSketches(sel Selector, filter map[string]struct{}, merge func(*Sketch)) error {
@@ -693,7 +834,12 @@ func (e *Engine) QueryDashboard(q Query) (*DashboardResult, error) {
 		return nil, err
 	}
 	if hasStore {
-		sums, err := e.sumStore(sel, GroupByService|GroupBySignal)
+		// Only the two signals the switch below consumes enter the scan:
+		// edge and metric rows are half the table and every one of them was
+		// sorted by the GROUP BY just to be discarded here (#290).
+		sumSel := sel
+		sumSel.Signals = []Signal{SignalTraceOp, SignalLog}
+		sums, err := e.sumStore(sumSel, GroupByService|GroupBySignal)
 		if err != nil {
 			return nil, err
 		}

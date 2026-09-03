@@ -128,67 +128,90 @@ func (s *Sketch) firstPopulated() (int32, bool) {
 // The saturation counter is not part of the format and decodes to zero: it is
 // an operational signal about a live sketch, not part of its value.
 func DecodeSketch(data []byte) (*Sketch, error) {
+	s := &Sketch{}
+	if err := DecodeSketchInto(s, data); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+// DecodeSketchInto parses a serialized sketch into dst, replacing whatever dst
+// held. It is DecodeSketch without the allocation: a Sketch is a 2 KiB dense
+// array, and a wide-range read decodes one per stored row, so the streaming
+// readers reuse one scratch value per stream instead of leaving hundreds of
+// thousands of them to the collector. On error dst is unspecified.
+func DecodeSketchInto(dst *Sketch, data []byte) error {
 	if len(data) < sketchHeaderLen {
-		return nil, fmt.Errorf("%w: %d header bytes", ErrSketchTruncated, len(data))
+		return fmt.Errorf("%w: %d header bytes", ErrSketchTruncated, len(data))
 	}
 	if data[0] != SketchEncodingVersion {
-		return nil, fmt.Errorf("%w: 0x%02x", ErrSketchVersion, data[0])
+		return fmt.Errorf("%w: 0x%02x", ErrSketchVersion, data[0])
 	}
 	scale := data[1]
 	if scale > SketchMaxScale {
-		return nil, fmt.Errorf("%w: %d", ErrSketchScale, scale)
+		return fmt.Errorf("%w: %d", ErrSketchScale, scale)
 	}
 	flags := data[2]
 	if flags&^sketchFlagCollapsed != 0 {
-		return nil, fmt.Errorf("%w: reserved flag bits 0x%02x", ErrSketchCorrupt, flags)
+		return fmt.Errorf("%w: reserved flag bits 0x%02x", ErrSketchCorrupt, flags)
 	}
 
 	r := sketchReader{buf: data, pos: sketchHeaderLen}
 	zeroCount, err := r.uvarint("zero_count")
 	if err != nil {
-		return nil, err
+		return err
 	}
 	count, err := r.uvarint("count")
 	if err != nil {
-		return nil, err
+		return err
 	}
 	bits, err := r.uint64("sum")
 	if err != nil {
-		return nil, err
+		return err
 	}
 	sum := math.Float64frombits(bits)
 	if math.IsNaN(sum) || math.IsInf(sum, 0) {
-		return nil, fmt.Errorf("%w: non-finite sum", ErrSketchCorrupt)
+		return fmt.Errorf("%w: non-finite sum", ErrSketchCorrupt)
 	}
 	numBins, err := r.uvarint("num_bins")
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if numBins > SketchMaxSerializedBins {
-		return nil, fmt.Errorf("%w: %d bins exceeds the %d cap", ErrSketchCorrupt, numBins, SketchMaxSerializedBins)
+		return fmt.Errorf("%w: %d bins exceeds the %d cap", ErrSketchCorrupt, numBins, SketchMaxSerializedBins)
 	}
 	firstIndex, err := r.varint("first_index")
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	s := &Sketch{
-		scale:     scale,
-		sum:       sum,
-		count:     count,
-		zeroCount: zeroCount,
-		collapsed: flags&sketchFlagCollapsed != 0,
-	}
-	if err := decodeBins(&r, s, int(numBins), firstIndex); err != nil {
-		return nil, err
+	dst.reset()
+	dst.scale = scale
+	dst.sum = sum
+	dst.count = count
+	dst.zeroCount = zeroCount
+	dst.collapsed = flags&sketchFlagCollapsed != 0
+	if err := decodeBins(&r, dst, int(numBins), firstIndex); err != nil {
+		return err
 	}
 	if r.pos != len(data) {
-		return nil, fmt.Errorf("%w: %d trailing bytes", ErrSketchCorrupt, len(data)-r.pos)
+		return fmt.Errorf("%w: %d trailing bytes", ErrSketchCorrupt, len(data)-r.pos)
 	}
-	if count < zeroCount || count-zeroCount < s.binTotal {
-		return nil, fmt.Errorf("%w: count %d below zero_count %d plus bin total %d", ErrSketchCorrupt, count, zeroCount, s.binTotal)
+	if count < zeroCount || count-zeroCount < dst.binTotal {
+		return fmt.Errorf("%w: count %d below zero_count %d plus bin total %d", ErrSketchCorrupt, count, zeroCount, dst.binTotal)
 	}
-	return s, nil
+	return nil
+}
+
+// reset returns the sketch to the empty state, clearing only the bins the
+// previous contents populated rather than the whole dense array.
+func (s *Sketch) reset() {
+	if s.hasBins {
+		clear(s.bins[:s.maxIdx-s.minIdx+1])
+	}
+	s.sum, s.count, s.zeroCount, s.binTotal, s.saturations = 0, 0, 0, 0, 0
+	s.minIdx, s.maxIdx, s.scale = 0, 0, 0
+	s.collapsed, s.hasBins = false, false
 }
 
 // decodeBins reads the bin block into s and sets the window bounds.

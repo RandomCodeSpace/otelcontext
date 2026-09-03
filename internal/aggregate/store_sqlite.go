@@ -1217,7 +1217,7 @@ func (s *SQLiteStore) ReadBuckets(sel Selector) (BucketPage, error) {
 	sb.WriteString(`SELECT window_start, series_id, src, ` + deltaColumnList + ` FROM (`)
 	args = appendBucketUnion(&sb, sel,
 		`t.window_start AS window_start, t.series_id AS series_id, `+
-			aliasColumns("t.", deltaColumnList), args)
+			aliasColumns("t.", deltaColumnList), false, args)
 	sb.WriteString(`)`)
 	if !sel.After.zero() {
 		// Keyset resume over the TOTAL order (window, series, source). The
@@ -1289,36 +1289,70 @@ func (s *SQLiteStore) SumBuckets(sel Selector, by GroupBy) ([]SumRow, error) {
 		return nil, err
 	}
 	var (
-		sb    strings.Builder
-		args  []any
-		group []string
+		sb         strings.Builder
+		args       []any
+		group      []string
+		outerKeys  strings.Builder
+		branchKeys strings.Builder
 	)
-	sb.WriteString(`SELECT `)
+	// The series row is joined only when a group key lives on it. A
+	// window-only grouping (the traffic chart) needs nothing from
+	// aggregate_series beyond the membership test the filter already
+	// applies, and skipping the join is a third of that scan (#290).
+	joinSeries := by&(GroupByService|GroupByName|GroupBySignal) != 0
 	for _, g := range [...]struct {
 		flag GroupBy
 		col  string
+		src  string
 	}{
-		{GroupByWindow, "window_start"},
-		{GroupByService, "service_id"},
-		{GroupByName, "name_id"},
-		{GroupBySignal, "signal"},
+		{GroupByWindow, "window_start", "t.window_start"},
+		{GroupByService, "service_id", "s.service_id"},
+		{GroupByName, "name_id", "s.name_id"},
+		{GroupBySignal, "signal", "s.signal"},
 	} {
 		if by&g.flag != 0 {
-			sb.WriteString(g.col)
+			outerKeys.WriteString(g.col)
+			branchKeys.WriteString(g.src)
 			group = append(group, g.col)
 		} else {
-			sb.WriteString("0")
+			outerKeys.WriteString("0")
+			branchKeys.WriteString("0")
 		}
-		sb.WriteString(", ")
+		outerKeys.WriteString(", ")
+		branchKeys.WriteString(" AS " + g.col + ", ")
 	}
-	sb.WriteString(`COALESCE(SUM(point_count),0), COALESCE(SUM(error_count),0),
+	// Each durable table is aggregated in its own branch and the outer query
+	// only re-sums the two grouped results. Aggregating over the UNION ALL as
+	// one derived table hid the scan order from the planner, so even a
+	// window-only grouping — whose rows arrive in primary-key order — was
+	// pushed through a sorter over every bucket row in range. Inside a branch
+	// the planner sees the scan and groups by window without sorting; the
+	// outer sort covers a few hundred grouped rows, not a few hundred
+	// thousand (#290).
+	sb.WriteString(`SELECT ` + outerKeys.String() +
+		`COALESCE(SUM(point_count),0), COALESCE(SUM(error_count),0),
 		COALESCE(SUM(request_count),0), COALESCE(SUM(error_request_count),0),
 		COALESCE(SUM(duration_count),0), COALESCE(SUM(duration_sum),0),
 		COALESCE(SUM(log_count),0) FROM (`)
-	args = appendBucketUnion(&sb, sel,
-		`t.window_start AS window_start, s.service_id AS service_id,
-			s.name_id AS name_id, s.signal AS signal, `+
-			aliasColumns("t.", sumColumnList), args)
+	branch := branchKeys.String() +
+		`SUM(t.point_count) AS point_count, SUM(t.error_count) AS error_count,
+		SUM(t.request_count) AS request_count, SUM(t.error_request_count) AS error_request_count,
+		SUM(t.duration_count) AS duration_count, SUM(t.duration_sum) AS duration_sum,
+		SUM(t.log_count) AS log_count`
+	for i, src := range bucketSources {
+		if i > 0 {
+			sb.WriteString(` UNION ALL `)
+		}
+		fmt.Fprintf(&sb, `SELECT %s FROM %s t`, branch, src.table)
+		if joinSeries {
+			sb.WriteString(` JOIN aggregate_series s ON s.id = t.series_id`)
+		}
+		sb.WriteString(` WHERE `)
+		args = appendBucketFilter(&sb, sel, args)
+		if len(group) > 0 {
+			sb.WriteString(` GROUP BY ` + strings.Join(group, ", "))
+		}
+	}
 	sb.WriteString(`)`)
 	if len(group) > 0 {
 		sb.WriteString(` GROUP BY ` + strings.Join(group, ", "))
@@ -1385,38 +1419,31 @@ func (s *SQLiteStore) visitTableSketches(table string, sel Selector, visit func(
 	)
 	// The table name is one of the two bucketSources literals, never input.
 	fmt.Fprintf(&sb, `SELECT s.service_id, t.sketch FROM %s t
-		JOIN aggregate_series s ON s.id = t.series_id
-		WHERE t.window_start >= ? AND t.window_start < ? AND s.tenant_id = ?
-		AND t.sketch IS NOT NULL`, table)
-	args = append(args, sel.Start, sel.End, int64(sel.TenantID))
-	if sel.Signal != SignalUnspecified {
-		sb.WriteString(` AND s.signal = ?`)
-		args = append(args, int64(sel.Signal))
-	}
-	if len(sel.SeriesIDs) > 0 {
-		sb.WriteString(` AND t.series_id IN (` + placeholders(len(sel.SeriesIDs)) + `)`)
-		for _, id := range sel.SeriesIDs {
-			args = append(args, int64(id))
-		}
-	}
+		JOIN aggregate_series s ON s.id = t.series_id WHERE `, table)
+	sel.SketchOnly = true
+	args = appendBucketFilter(&sb, sel, args)
 	rows, err := s.reader.Query(sb.String(), args...)
 	if err != nil {
 		return fmt.Errorf("aggregate store: visit sketches: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
+	// One scratch sketch per stream: every row decodes into it and the
+	// visitor folds it away before the next row overwrites it. Allocating a
+	// 2 KiB Sketch per row made a wide-range dashboard a garbage generator
+	// first and a query second (#290).
+	var (
+		scratch Sketch
+		service int64
+		blob    sql.RawBytes
+	)
 	for rows.Next() {
-		var (
-			service int64
-			blob    []byte
-		)
 		if err := rows.Scan(&service, &blob); err != nil {
 			return fmt.Errorf("aggregate store: visit sketches: %w", err)
 		}
-		sk, err := DecodeSketch(blob)
-		if err != nil {
+		if err := DecodeSketchInto(&scratch, blob); err != nil {
 			return fmt.Errorf("aggregate store: visit sketches: decode: %w", err)
 		}
-		if err := visit(uint32(service), sk); err != nil { // #nosec G115 -- dictionary IDs are uint32
+		if err := visit(uint32(service), &scratch); err != nil { // #nosec G115 -- dictionary IDs are uint32
 			return err
 		}
 	}
@@ -1444,30 +1471,59 @@ var bucketSources = [...]struct {
 
 // appendBucketUnion writes the UNION ALL over both durable tables with the
 // given per-row projection and appends its bind arguments. The projection is
-// evaluated against alias `t` (the table) and `s` (its aggregate_series join).
-func appendBucketUnion(sb *strings.Builder, sel Selector, projection string, args []any) []any {
+// evaluated against alias `t` (the table) and, when joinSeries is set, `s`
+// (its aggregate_series row).
+func appendBucketUnion(sb *strings.Builder, sel Selector, projection string, joinSeries bool, args []any) []any {
 	for i, src := range bucketSources {
 		if i > 0 {
 			sb.WriteString(` UNION ALL `)
 		}
-		fmt.Fprintf(sb, `SELECT %d AS src, %s FROM %s t
-			JOIN aggregate_series s ON s.id = t.series_id
-			WHERE t.window_start >= ? AND t.window_start < ? AND s.tenant_id = ?`,
-			src.src, projection, src.table)
-		args = append(args, sel.Start, sel.End, int64(sel.TenantID))
-		if sel.Signal != SignalUnspecified {
-			sb.WriteString(` AND s.signal = ?`)
-			args = append(args, int64(sel.Signal))
+		fmt.Fprintf(sb, `SELECT %d AS src, %s FROM %s t`, src.src, projection, src.table)
+		if joinSeries {
+			sb.WriteString(` JOIN aggregate_series s ON s.id = t.series_id`)
 		}
-		if len(sel.SeriesIDs) > 0 {
-			sb.WriteString(` AND t.series_id IN (` + placeholders(len(sel.SeriesIDs)) + `)`)
-			for _, id := range sel.SeriesIDs {
-				args = append(args, int64(id))
-			}
+		sb.WriteString(` WHERE `)
+		args = appendBucketFilter(sb, sel, args)
+	}
+	return args
+}
+
+// appendBucketFilter writes the row predicate every bucket read shares and
+// appends its bind arguments: the window range on the table's primary key,
+// then tenant and signal scope as a membership test of series_id against a
+// subquery over aggregate_series.
+//
+// The scope used to be a JOIN predicate on the series row. That gave the
+// planner a choice, and the wrong one — looping over series and range-
+// scanning the bucket table per series — is catastrophic on a wide range;
+// the right one still probed the series index once per bucket row. The
+// subquery is materialized once into an in-memory list (LIST SUBQUERY in the
+// plan), the bucket scan stays the outer loop, and a row that fails the scope
+// never reaches the join or the aggregator. Measured at 144 windows x 6,000
+// series it halved the traffic SUM and the sketch stream (#290).
+func appendBucketFilter(sb *strings.Builder, sel Selector, args []any) []any {
+	sb.WriteString(`t.window_start >= ? AND t.window_start < ?
+		AND t.series_id IN (SELECT id FROM aggregate_series WHERE tenant_id = ?`)
+	args = append(args, sel.Start, sel.End, int64(sel.TenantID))
+	switch {
+	case sel.Signal != SignalUnspecified:
+		sb.WriteString(` AND signal = ?`)
+		args = append(args, int64(sel.Signal))
+	case len(sel.Signals) > 0:
+		sb.WriteString(` AND signal IN (` + placeholders(len(sel.Signals)) + `)`)
+		for _, sig := range sel.Signals {
+			args = append(args, int64(sig))
 		}
-		if sel.SketchOnly {
-			sb.WriteString(` AND t.sketch IS NOT NULL`)
+	}
+	sb.WriteString(`)`)
+	if len(sel.SeriesIDs) > 0 {
+		sb.WriteString(` AND t.series_id IN (` + placeholders(len(sel.SeriesIDs)) + `)`)
+		for _, id := range sel.SeriesIDs {
+			args = append(args, int64(id))
 		}
+	}
+	if sel.SketchOnly {
+		sb.WriteString(` AND t.sketch IS NOT NULL`)
 	}
 	return args
 }

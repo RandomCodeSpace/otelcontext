@@ -361,8 +361,8 @@ func TestGetServiceMapMetrics_CancelledContext(t *testing.T) {
 
 // TestGetServiceMapMetrics_EdgeQueryError exercises the second (edge-pass)
 // error branch. The node aggregate runs via Scan, which does not pass through
-// GORM's Query callback chain; the edge scan runs via Find, which does. A
-// before-query callback therefore fires exactly once — for the edge query —
+// GORM's Row callback chain; the edge scan runs via Rows, which does. A
+// before-row callback therefore fires exactly once — for the edge query —
 // and cancels the context just before it executes, failing only that query.
 func TestGetServiceMapMetrics_EdgeQueryError(t *testing.T) {
 	repo := newTestRepo(t)
@@ -370,13 +370,13 @@ func TestGetServiceMapMetrics_EdgeQueryError(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	err := repo.db.Callback().Query().Before("gorm:query").Register("test_cancel_edge_query", func(*gorm.DB) {
+	err := repo.db.Callback().Row().Before("gorm:row").Register("test_cancel_edge_query", func(*gorm.DB) {
 		cancel()
 	})
 	if err != nil {
 		t.Fatalf("register callback: %v", err)
 	}
-	t.Cleanup(func() { _ = repo.db.Callback().Query().Remove("test_cancel_edge_query") })
+	t.Cleanup(func() { _ = repo.db.Callback().Row().Remove("test_cancel_edge_query") })
 
 	if _, err := repo.GetServiceMapMetrics(ctx, time.Time{}, time.Time{}); err == nil {
 		t.Fatal("expected edge query error after context cancellation")

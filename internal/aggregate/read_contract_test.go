@@ -521,8 +521,11 @@ func TestPercentilePathReadsEverySketchBearingRow(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("mergeStoreSketches: %v", err)
 	}
-	if visited != rows-withoutSketch {
-		t.Fatalf("sketch stream visited %d rows, want %d sketch-bearing rows", visited, rows-withoutSketch)
+	// The stream is folded per service before the visitor sees it (#290), so
+	// the visit count is one per service; what proves every sketch-bearing
+	// row was read is the merged observation count.
+	if visited != 1 {
+		t.Fatalf("sketch stream visited %d service sketches, want 1", visited)
 	}
 	if merged == nil || merged.Count() != want {
 		t.Fatalf("merged sketch observed %v of %d observations", merged, want)
@@ -531,12 +534,12 @@ func TestPercentilePathReadsEverySketchBearingRow(t *testing.T) {
 	// The service filter is applied per distinct service ID, not per row. A
 	// filter naming the seeded service must observe everything; a filter
 	// naming an absent service must observe nothing.
-	kept := 0
-	if err := e.mergeStoreSketches(sel, map[string]struct{}{"svc": {}}, func(*Sketch) { kept++ }); err != nil {
+	var kept uint64
+	if err := e.mergeStoreSketches(sel, map[string]struct{}{"svc": {}}, func(sk *Sketch) { kept += sk.Count() }); err != nil {
 		t.Fatalf("mergeStoreSketches(filter=svc): %v", err)
 	}
-	if kept != rows-withoutSketch {
-		t.Fatalf("filter for the seeded service kept %d rows, want %d", kept, rows-withoutSketch)
+	if kept != want {
+		t.Fatalf("filter for the seeded service observed %d of %d observations", kept, want)
 	}
 	dropped := 0
 	if err := e.mergeStoreSketches(sel, map[string]struct{}{"absent": {}}, func(*Sketch) { dropped++ }); err != nil {
