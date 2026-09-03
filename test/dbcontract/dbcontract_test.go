@@ -567,8 +567,14 @@ func fingerprintRows(t *testing.T, driver, dsn string, value fixture, stale bool
 	}{
 		"traces": {"trace_id", traceIDs}, "spans": {"span_id", spanIDs}, "logs": {"body", logBodies}, "metric_buckets": {"name", metricNames},
 	} {
+		column := query.column
+		if driver == "mssql" && table == "logs" {
+			// logs.body is a text column on SQL Server, which cannot be
+			// compared with IN; compare its nvarchar cast instead.
+			column = "CAST(body AS NVARCHAR(MAX))"
+		}
 		var count int64
-		if err := db.Table(table).Where(query.column+" IN ?", query.values).Count(&count).Error; err != nil {
+		if err := db.Table(table).Where(column+" IN ?", query.values).Count(&count).Error; err != nil {
 			t.Fatalf("count %s: %v", table, err)
 		}
 		switch table {

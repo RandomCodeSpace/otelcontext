@@ -25,8 +25,9 @@ func TestCompressedText(t *testing.T) {
 			}
 
 			if tt.text == "" {
-				if value != "" {
-					t.Errorf("Expected empty value for empty text, got %v", value)
+				empty, ok := value.([]byte)
+				if !ok || len(empty) != 0 {
+					t.Errorf("Expected empty []byte for empty text, got %T %v", value, value)
 				}
 				return
 			}

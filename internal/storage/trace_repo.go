@@ -539,7 +539,7 @@ func (r *Repository) PurgeTracesBatched(ctx context.Context, olderThan time.Time
 			return total, err
 		}
 		result := r.db.WithContext(ctx).Exec(
-			"DELETE FROM traces WHERE id IN (SELECT id FROM traces WHERE timestamp < ? ORDER BY id LIMIT ?)",
+			batchedDeleteSQL(r.driver, "traces", "timestamp < ?"),
 			olderThan, batchSize,
 		)
 		if result.Error != nil {
@@ -564,7 +564,7 @@ func (r *Repository) PurgeTracesBatched(ctx context.Context, olderThan time.Time
 			return total, err
 		}
 		result := r.db.WithContext(ctx).Exec(
-			"DELETE FROM spans WHERE id IN (SELECT id FROM spans WHERE start_time < ? AND trace_id NOT IN (SELECT trace_id FROM traces) ORDER BY id LIMIT ?)",
+			batchedDeleteSQL(r.driver, "spans", "start_time < ? AND trace_id NOT IN (SELECT trace_id FROM traces)"),
 			olderThan, batchSize,
 		)
 		if result.Error != nil {

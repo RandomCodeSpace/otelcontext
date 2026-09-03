@@ -239,7 +239,7 @@ func (r *Repository) PurgeLogsBatched(ctx context.Context, olderThan time.Time, 
 			return total, err
 		}
 		result := r.db.WithContext(ctx).Exec(
-			"DELETE FROM logs WHERE id IN (SELECT id FROM logs WHERE timestamp < ? ORDER BY id LIMIT ?)",
+			batchedDeleteSQL(driver, "logs", "timestamp < ?"),
 			olderThan, batchSize,
 		)
 		if result.Error != nil {
