@@ -204,13 +204,13 @@ func TestManifestBlocked(t *testing.T) {
 				return map[string]string{"assets": rewriteJSON(t, filepath.Join(fixture, "release-assets-v1.json"), func(doc map[string]any) {
 					for _, c := range doc["checks"].([]any) {
 						check := c.(map[string]any)
-						if check["name"] == "archive-shape" {
+						if check["name"] == "archives" {
 							check["passed"] = false
 						}
 					}
 				})}
 			},
-			want: `release assets: check "archive-shape" failed`,
+			want: `release assets: check "archives" failed`,
 		},
 	}
 	for _, tc := range cases {

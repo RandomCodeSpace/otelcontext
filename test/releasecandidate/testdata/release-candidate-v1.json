@@ -308,7 +308,7 @@
     ],
     "checks": [
       {
-        "name": "asset-set",
+        "name": "assets",
         "passed": true,
         "detail": "ok"
       },
@@ -328,12 +328,12 @@
         "detail": "ok"
       },
       {
-        "name": "archive-shape",
+        "name": "archives",
         "passed": true,
         "detail": "ok"
       },
       {
-        "name": "embedded-ui",
+        "name": "embedded_ui",
         "passed": true,
         "detail": "ok"
       },
@@ -343,7 +343,7 @@
         "detail": "ok"
       },
       {
-        "name": "sbom",
+        "name": "sboms",
         "passed": true,
         "detail": "ok"
       }
