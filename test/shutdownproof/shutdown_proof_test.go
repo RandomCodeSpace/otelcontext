@@ -53,7 +53,7 @@ var requiredOwners = []string{
 	"ingest_pipeline", "aggregate_writer", "tsdb", "graphrag",
 	"service_graph", "dlq", "disk_watchdog", "retention",
 	"partitions", "tracer", "database_health", "boot_workers",
-	"aggregate_store", "main_database",
+	"resource_registry", "aggregate_store", "main_database",
 }
 
 type lockedBuffer struct {

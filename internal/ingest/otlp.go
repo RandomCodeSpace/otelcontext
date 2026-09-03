@@ -16,6 +16,7 @@ import (
 	"github.com/RandomCodeSpace/otelcontext/internal/config"
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 	"github.com/RandomCodeSpace/otelcontext/internal/telemetry"
+	"github.com/RandomCodeSpace/otelcontext/internal/topology"
 	"github.com/RandomCodeSpace/otelcontext/internal/tsdb"
 	collogspb "go.opentelemetry.io/proto/otlp/collector/logs/v1"
 	colmetricspb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
@@ -131,7 +132,11 @@ type TraceServer struct {
 	// exemplar, when set (AGGREGATE_MODE=aggregate), is the ONLY raw-retention
 	// gate: the adaptive Sampler is retired in that mode (#161). nil in
 	// legacy/shadow, where the Sampler keeps governing the raw path unchanged.
-	exemplar            *ExemplarPolicy
+	exemplar *ExemplarPolicy
+	// resourceRegistry, when set, records every resource batch's
+	// (tenant, service, host, workload) BEFORE the sampler so host identity
+	// is independent of SAMPLING_RATE (#279). nil = disabled.
+	resourceRegistry    *topology.Registry
 	minSeverity         int
 	allowedServices     map[string]bool
 	excludedServices    map[string]bool
@@ -152,7 +157,9 @@ type LogsServer struct {
 	aggregateEngine *aggregate.Engine
 	// exemplar — see TraceServer.exemplar. In aggregate mode INFO/DEBUG logs
 	// are aggregate-only and ERROR/FATAL/WARN are budgeted per service/window.
-	exemplar            *ExemplarPolicy
+	exemplar *ExemplarPolicy
+	// resourceRegistry — see TraceServer.resourceRegistry.
+	resourceRegistry    *topology.Registry
 	minSeverity         int
 	allowedServices     map[string]bool
 	excludedServices    map[string]bool
@@ -168,7 +175,9 @@ type MetricsServer struct {
 	aggregator     *tsdb.Aggregator
 	metricCallback func(tsdb.RawMetric)
 	// aggregateEngine — see TraceServer.aggregateEngine.
-	aggregateEngine     *aggregate.Engine
+	aggregateEngine *aggregate.Engine
+	// resourceRegistry — see TraceServer.resourceRegistry.
+	resourceRegistry    *topology.Registry
 	allowedServices     map[string]bool
 	excludedServices    map[string]bool
 	defaultTenant       string
@@ -256,6 +265,33 @@ func (s *LogsServer) SetExemplarPolicy(p *ExemplarPolicy) {
 	s.exemplar = p
 }
 
+// SetResourceRegistry wires the bounded resource registry (#279). Every
+// resource batch registers its host identity ahead of the sampler; passing
+// nil disables registration.
+func (s *TraceServer) SetResourceRegistry(r *topology.Registry) {
+	s.resourceRegistry = r
+}
+
+// SetResourceRegistry — see TraceServer.SetResourceRegistry.
+func (s *LogsServer) SetResourceRegistry(r *topology.Registry) {
+	s.resourceRegistry = r
+}
+
+// SetResourceRegistry — see TraceServer.SetResourceRegistry.
+func (s *MetricsServer) SetResourceRegistry(r *topology.Registry) {
+	s.resourceRegistry = r
+}
+
+// registerResource records one resource batch in the registry. now is the
+// Export's arrival time; a nil registry is a no-op.
+func registerResource(reg *topology.Registry, tenant, service string, attrs []*commonpb.KeyValue, signal topology.Signal, now time.Time) {
+	if reg == nil {
+		return
+	}
+	slots := scanResourceSlots(attrs)
+	reg.Register(tenant, service, slots.host, slots.workload, slots.workloadKind, signal, now)
+}
+
 func NewLogsServer(repo *storage.Repository, metrics *telemetry.Metrics, cfg *config.Config) *LogsServer {
 	return &LogsServer{
 		repo:                repo,
@@ -314,6 +350,7 @@ func (s *MetricsServer) Export(ctx context.Context, req *colmetricspb.ExportMetr
 		}
 
 		tenantID := resolveTenant(ctx, resourceMetrics.Resource.Attributes, s.defaultTenant, s.trustResourceTenant)
+		registerResource(s.resourceRegistry, tenantID, serviceName, resourceMetrics.Resource.Attributes, topology.SignalMetrics, start)
 
 		var producerIdentity aggregate.ResourceIdentity
 		if reducer != nil {
@@ -519,6 +556,9 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 			}
 
 			tenantID := resolveTenant(ctx, resourceSpans.Resource.Attributes, s.defaultTenant, s.trustResourceTenant)
+			// Pre-sample, like the topology observer: host identity must not
+			// depend on SAMPLING_RATE (#279).
+			registerResource(s.resourceRegistry, tenantID, serviceName, resourceSpans.Resource.Attributes, topology.SignalTraces, start)
 
 			localSpans := make([]storage.Span, 0)
 			localTraces := make([]storage.Trace, 0)
@@ -1009,6 +1049,7 @@ func (s *LogsServer) Export(ctx context.Context, req *collogspb.ExportLogsServic
 			}
 
 			tenantID := resolveTenant(ctx, resourceLogs.Resource.Attributes, s.defaultTenant, s.trustResourceTenant)
+			registerResource(s.resourceRegistry, tenantID, serviceName, resourceLogs.Resource.Attributes, topology.SignalLogs, start)
 
 			localLogs := make([]storage.Log, 0)
 			exemplarRes := s.exemplar.NewReservation()

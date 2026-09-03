@@ -35,6 +35,7 @@ var shutdownOwners = []string{
 	"tracer",
 	"database_health",
 	"boot_workers",
+	"resource_registry",
 	"aggregate_store",
 	"main_database",
 }

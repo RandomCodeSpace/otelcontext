@@ -359,9 +359,36 @@ func loadFixture(t *testing.T) fixture {
 }
 
 func resource(service string) *resourcepb.Resource {
-	return &resourcepb.Resource{Attributes: []*commonpb.KeyValue{{
-		Key: "service.name", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: service}},
-	}}}
+	return &resourcepb.Resource{Attributes: []*commonpb.KeyValue{
+		{Key: "service.name", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: service}}},
+		{Key: "host.name", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: resourceHost(service)}}},
+		{Key: "container.id", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "ctr-" + service}}},
+	}}
+}
+
+// resourceHost is the host.name every fixture resource of service carries.
+func resourceHost(service string) string { return "node-" + service }
+
+// registryRows counts resource_registry rows holding each fixture service on
+// its fixture host (#279). Written on the dirty tick and at shutdown.
+func registryRows(t *testing.T, driver, dsn string, value fixture) int64 {
+	t.Helper()
+	db, err := storage.NewDatabase(driver, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sqlDB, sqlErr := db.DB(); sqlErr == nil {
+		defer func() { _ = sqlDB.Close() }()
+	}
+	hosts := make([]string, 0, len(value.Services))
+	for _, service := range value.Services {
+		hosts = append(hosts, resourceHost(service))
+	}
+	var count int64
+	if err := db.Table("resource_registry").Where("service_name IN ? AND host IN ?", value.Services, hosts).Count(&count).Error; err != nil {
+		t.Fatalf("count resource_registry: %v", err)
+	}
+	return count
 }
 
 func decodeHex(value string) []byte {
@@ -1288,6 +1315,7 @@ func TestDatabaseLifecycle(t *testing.T) {
 		t.Fatalf("first shutdown exit=%d err=%v\n%s", exit, err, app.log.String())
 	}
 	preRestart := waitForRows(t, driver, dsn, value, true)
+	preRestartRegistry := registryRows(t, driver, dsn, value)
 	if err := app.start(); err != nil {
 		t.Fatal(err)
 	}
@@ -1302,6 +1330,7 @@ func TestDatabaseLifecycle(t *testing.T) {
 	if exit, err := app.stop(); err != nil || exit != 0 {
 		t.Fatalf("restart shutdown exit=%d err=%v\n%s", exit, err, app.log.String())
 	}
+	postRestartRegistry := registryRows(t, driver, dsn, value)
 	if !reflect.DeepEqual(preRestart, postRestart) {
 		t.Fatalf("restart fingerprint changed: before=%#v after=%#v", preRestart, postRestart)
 	}
@@ -1324,6 +1353,7 @@ func TestDatabaseLifecycle(t *testing.T) {
 		{Name: "stale_rows_purged_live_rows_retained", Passed: reflect.DeepEqual(preRestart, postRestart)},
 		{Name: "graceful_restart_preserved_fingerprint", Passed: preRestart.Digest == postRestart.Digest},
 		{Name: "fresh_target_restore_preserved_fingerprint", Passed: restore.SourceFingerprint == restore.RestoredFingerprint},
+		{Name: "resource_registry_rows_for_fixture_services", Passed: preRestartRegistry == int64(len(value.Services)) && postRestartRegistry == int64(len(value.Services))},
 	}
 	for _, check := range assertions {
 		if !check.Passed {

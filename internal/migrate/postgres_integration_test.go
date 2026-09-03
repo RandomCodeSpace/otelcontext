@@ -147,15 +147,22 @@ VALUES ('','pg-inv',CURRENT_TIMESTAMP,'detected','warning','checkout')`).Error; 
 		}
 	})
 
-	t.Run("prerelease baseline is metadata-only", func(t *testing.T) {
+	t.Run("prerelease baseline records version two behind current", func(t *testing.T) {
 		db := newPostgresMigrationDB(t, baseDSN, admin, &sequence)
-		applyPostgresFixture(t, db, CurrentVersion)
+		applyPostgresFixture(t, db, 2)
 		result, err := Baseline(context.Background(), db, "postgres", "v0.4.0-beta.2")
 		if err != nil {
 			t.Fatal(err)
 		}
-		if result.Status.State != StateExact || result.BeforeFingerprint != result.AfterFingerprint {
+		if result.Status.State != StateBehind || result.RecordedVersion != 2 || result.BeforeFingerprint != result.AfterFingerprint {
 			t.Fatalf("result=%#v", result)
+		}
+		status, err := Up(context.Background(), db, "postgres")
+		if err != nil {
+			t.Fatalf("Up: %v", err)
+		}
+		if status.State != StateExact || !db.Migrator().HasTable("resource_registry") {
+			t.Fatalf("upgrade from beta baseline did not add resource_registry: %#v", status)
 		}
 	})
 
