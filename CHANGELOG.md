@@ -62,6 +62,12 @@ most recently published tag.
 - `scripts/release.sh --release` marks the GitHub release as a pre-release
   only when the tag carries a pre-release identifier, matching GoReleaser's
   `prerelease: auto`.
+- Draft-first releases (#253): `scripts/release.sh` tags only when every
+  required status check on protected `main` is `success` for HEAD, gains
+  `--dry-run`, and `--release` now opens a draft; `.goreleaser.yaml` sets
+  `release.draft: true` and `use_existing_draft: true` so signed assets land
+  on that draft, and `release.yml` publishes it only after the
+  release-candidate proofs approve limited production.
 - Dependency refresh across 15 update PRs: OTel collector/SDK group, gRPC +
   protobuf, GORM group, React group, vite group, lucide-react 1.x,
   Radix tabs, azure azcore, klauspost/compress, glebarez/go-sqlite,

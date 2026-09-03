@@ -40,8 +40,11 @@ gate-build: gate-tools
 gate-run: gate-build
 	./bin/gate -config test/gate/gate.config.json -out docs/gates
 
-## release verifies the Go build and cuts a tag. The committed browser UI is
-## embedded automatically by go:embed, including for go install.
+## release verifies the Go build and the required status checks on main, then
+## cuts an annotated tag once (RELEASE=--release also opens a draft GitHub
+## release; RELEASE=--dry-run only reports). The release workflow builds, signs,
+## proves and publishes the draft. The committed browser UI is embedded
+## automatically by go:embed, including for go install.
 release:
 	./scripts/release.sh $(VERSION) $(RELEASE)
 
