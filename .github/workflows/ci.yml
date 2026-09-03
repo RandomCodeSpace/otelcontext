@@ -300,6 +300,78 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # Read-latency proof (#289, decision #281). Advisory until #290 turns both
+  # shapes green; it is deliberately not in branch protection and never
+  # continue-on-error — red is the intended state until the paths are fixed.
+  read-latency-proof:
+    name: read latency proof · ${{ matrix.shape }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        shape: [legacy, aggregate]
+    env:
+      CGO_ENABLED: "1"
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: build exact read-proof binary and prefill tool
+        run: |
+          mkdir -p "${RUNNER_TEMP}/read-proof"
+          go build -trimpath -o "${RUNNER_TEMP}/read-proof/otelcontext" .
+          go build -tags prefill -o "${RUNNER_TEMP}/read-proof/aggprefill" ./test/aggprefill
+
+      - name: run read latency proof
+        env:
+          OTELCONTEXT_READPROOF_BINARY: ${{ runner.temp }}/read-proof/otelcontext
+          OTELCONTEXT_AGGPREFILL_BINARY: ${{ runner.temp }}/read-proof/aggprefill
+          OTELCONTEXT_PROOF_DIR: ${{ runner.temp }}/read-proof/artifacts
+          # The decision's shape is seven days (2016 windows); that prefill
+          # writes 12M bucket rows and takes ~24 min on 8 cores, so hosted CI
+          # seeds 144 windows (12 h) and the artifact records both numbers.
+          OTELCONTEXT_READPROOF_PREFILL_WINDOWS: "144"
+          READPROOF_SHAPE: ${{ matrix.shape }}
+        run: |
+          set -o pipefail
+          mkdir -p "${OTELCONTEXT_PROOF_DIR}"
+          case "${READPROOF_SHAPE}" in
+            legacy) test_name=TestReadLatencyLegacy ;;
+            aggregate) test_name=TestReadLatencyAggregate ;;
+          esac
+          go test -tags=readproof -count=1 -v -timeout=13m \
+            -run "^${test_name}\$" ./test/readproof 2>&1 \
+            | tee "${OTELCONTEXT_PROOF_DIR}/${READPROOF_SHAPE}-test.log"
+
+      - name: check artifact shape
+        if: ${{ always() }}
+        env:
+          READPROOF_SHAPE: ${{ matrix.shape }}
+        run: |
+          jq -e --arg shape "${READPROOF_SHAPE}" '
+            .schema_version == "otelcontext.read-latency.v1" and
+            .shape == $shape and
+            (.binary_sha256 | length) == 64 and
+            (.measurements | length) >= 9 and
+            (.assertions | length) >= 12 and
+            all(.assertions[]; (.measured | type) == "number" and (.objective | type) == "number" and (.detail | length) > 0) and
+            (.rss.samples | length) >= 1
+          ' "${RUNNER_TEMP}/read-proof/artifacts/read-latency-v1.json"
+
+      - name: upload read latency proof
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: read-latency-${{ matrix.shape }}-${{ github.sha }}
+          path: ${{ runner.temp }}/read-proof/artifacts
+          if-no-files-found: error
+          retention-days: 14
+
   database-backup-proof:
     name: database backup proof · ${{ matrix.profile }}
     runs-on: ubuntu-24.04
