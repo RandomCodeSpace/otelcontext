@@ -12,7 +12,7 @@ name: ingest baseline
 # (docs/gates/) remains the only certification.
 #
 # All actions SHA-pinned per Scorecard `Pinned-Dependencies`; top-level
-# `permissions: read-all`, the one job scopes up to pull-requests: write only
+# `permissions: contents: read`, the one job scopes up to pull-requests: write only
 # so it can post the comparison comment when a PR number is supplied.
 on:
   schedule:
@@ -32,7 +32,8 @@ on:
         required: false
         default: ''
 
-permissions: read-all
+permissions:
+  contents: read
 
 jobs:
   ingest-baseline:
