@@ -48,7 +48,10 @@ type Call struct {
 	Status   int     `json:"status"`
 	Bytes    int     `json:"bytes"`
 	Coverage string  `json:"coverage"`
-	Error    string  `json:"error,omitempty"`
+	// BodyCoverage is the `coverage` field of an object-shaped body; the
+	// dashboard and service-map views carry coverage there, not in the header.
+	BodyCoverage string `json:"body_coverage,omitempty"`
+	Error        string `json:"error,omitempty"`
 }
 
 // Measurement is one endpoint's evidence.
@@ -56,6 +59,7 @@ type Measurement struct {
 	Name      string `json:"name"`
 	Kind      string `json:"kind"` // rest | mcp
 	Path      string `json:"path,omitempty"`
+	Query     string `json:"query,omitempty"`
 	Tool      string `json:"tool,omitempty"`
 	Arguments string `json:"arguments,omitempty"`
 	// Cache is "client" when the request is what a real client sends and
@@ -72,11 +76,16 @@ type Measurement struct {
 	SamplesMS     []float64   `json:"samples_ms"`
 	Status        int         `json:"status"`
 	Coverage      string      `json:"coverage"`
-	ResponseBytes int         `json:"response_bytes"`
-	MaxBytes      int         `json:"response_bytes_max"`
-	CacheHits     int         `json:"cache_hits"`
-	Errors        int         `json:"errors"`
-	Error         string      `json:"error,omitempty"`
+	BodyCoverage  string      `json:"body_coverage,omitempty"`
+	// RequestedStart and EffectiveStart are the aggregate range-clamp
+	// headers (#217), present only when the server shortened the range.
+	RequestedStart string `json:"requested_start,omitempty"`
+	EffectiveStart string `json:"effective_start,omitempty"`
+	ResponseBytes  int    `json:"response_bytes"`
+	MaxBytes       int    `json:"response_bytes_max"`
+	CacheHits      int    `json:"cache_hits"`
+	Errors         int    `json:"errors"`
+	Error          string `json:"error,omitempty"`
 }
 
 // RSSSample is one VmRSS reading, offset from server start.

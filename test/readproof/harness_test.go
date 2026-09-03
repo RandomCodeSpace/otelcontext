@@ -13,6 +13,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -26,6 +27,7 @@ import (
 	"time"
 
 	"github.com/RandomCodeSpace/otelcontext/internal/aggregate"
+	"github.com/RandomCodeSpace/otelcontext/internal/api"
 )
 
 const (
@@ -382,8 +384,10 @@ func (a *appProcess) mcpRequest(tool string, args map[string]any, nonce bool) re
 
 type timedCall struct {
 	Call
-	cacheHit bool
-	rpcError string
+	cacheHit       bool
+	rpcError       string
+	requestedStart string
+	effectiveStart string
 }
 
 func (a *appProcess) do(req *http.Request) timedCall {
@@ -399,7 +403,11 @@ func (a *appProcess) do(req *http.Request) timedCall {
 		Status:   resp.StatusCode,
 		Bytes:    len(body),
 		Coverage: resp.Header.Get(aggregate.CoverageHeader),
-	}, cacheHit: resp.Header.Get("X-Cache") == "HIT"}
+	},
+		cacheHit:       resp.Header.Get("X-Cache") == "HIT",
+		requestedStart: resp.Header.Get(api.RequestedStartHeader),
+		effectiveStart: resp.Header.Get(api.EffectiveStartHeader),
+	}
 	if readErr != nil {
 		call.Error = readErr.Error()
 		return call
@@ -407,6 +415,14 @@ func (a *appProcess) do(req *http.Request) timedCall {
 	if resp.StatusCode != http.StatusOK {
 		call.Error = fmt.Sprintf("HTTP %d: %s", resp.StatusCode, tail(strings.TrimSpace(string(body)), 200))
 		return call
+	}
+	if req.Method == http.MethodGet && bytes.HasPrefix(bytes.TrimSpace(body), []byte("{")) {
+		var view struct {
+			Coverage string `json:"coverage"`
+		}
+		if err := json.Unmarshal(body, &view); err == nil {
+			call.BodyCoverage = view.Coverage
+		}
 	}
 	if req.Method == http.MethodPost {
 		var envelope struct {
@@ -469,6 +485,9 @@ func measure(t *testing.T, m *Measurement, fn request, o Objectives) {
 		m.SamplesMS = append(m.SamplesMS, c.MS)
 		m.Status = c.Status
 		m.Coverage = c.Coverage
+		m.BodyCoverage = c.BodyCoverage
+		m.RequestedStart = c.requestedStart
+		m.EffectiveStart = c.effectiveStart
 		m.ResponseBytes = c.Bytes
 		if c.Bytes > m.MaxBytes {
 			m.MaxBytes = c.Bytes
@@ -488,9 +507,9 @@ func measure(t *testing.T, m *Measurement, fn request, o Objectives) {
 	if m.Requests < o.Requests && m.Error == "" {
 		m.Error = fmt.Sprintf("budget of %.0f s exhausted after %d requests", endpointBudget.Seconds(), m.Requests)
 	}
-	t.Logf("%s: cold %.1f ms (HTTP %d, %d bytes, coverage %q); warm n=%d p50 %.1f p90 %.1f p99 %.1f max %.1f ms; cache hits %d; errors %d",
-		m.Name, m.Cold.MS, m.Cold.Status, m.Cold.Bytes, m.Cold.Coverage, m.Requests,
-		m.Latency.P50, m.Latency.P90, m.Latency.P99, m.Latency.Max, m.CacheHits, m.Errors)
+	t.Logf("%s: cold %.1f ms (HTTP %d, %d bytes, coverage header %q body %q); warm n=%d p50 %.1f p90 %.1f p99 %.1f max %.1f ms; cache hits %d; errors %d; clamp %q->%q",
+		m.Name, m.Cold.MS, m.Cold.Status, m.Cold.Bytes, m.Cold.Coverage, m.Cold.BodyCoverage, m.Requests,
+		m.Latency.P50, m.Latency.P90, m.Latency.P99, m.Latency.Max, m.CacheHits, m.Errors, m.RequestedStart, m.EffectiveStart)
 }
 
 // markUnmeasured stamps every endpoint that has no evidence yet with the
@@ -506,9 +525,22 @@ func markUnmeasured(p *Proof, reason string) {
 
 // endpoints lists the surfaces both shapes share; the legacy shape appends
 // the GraphRAG-backed system graph. rcaService is the root_cause_analysis
-// argument, a service the prefill is known to contain.
-func endpoints(app *appProcess, rcaService string) []endpoint {
+// argument, a service the prefill is known to contain. The three REST
+// surfaces are measured twice: at the UI's default range and, as
+// `<name>_full_range`, with explicit start/end spanning the whole seeded
+// horizon — the SUM-over-every-window path #219 optimised.
+func endpoints(app *appProcess, rcaService string, fullStart, fullEnd time.Time) []endpoint {
 	type ep = endpoint
+	fullRange := url.Values{
+		"start": {fullStart.UTC().Format(time.RFC3339)},
+		"end":   {fullEnd.UTC().Format(time.RFC3339)},
+	}.Encode()
+	rest := func(name, path string) []ep {
+		return []ep{
+			{&Measurement{Name: name, Kind: "rest", Path: path, Asserted: true}, app.restRequest(path)},
+			{&Measurement{Name: name + "_full_range", Kind: "rest", Path: path, Query: fullRange, Asserted: true}, app.restRequest(path + "?" + fullRange)},
+		}
+	}
 	tools := []struct {
 		name string
 		args map[string]any
@@ -517,11 +549,10 @@ func endpoints(app *appProcess, rcaService string) []endpoint {
 		{"get_anomaly_timeline", map[string]any{}},
 		{"root_cause_analysis", map[string]any{"service": rcaService}},
 	}
-	out := []ep{
-		{&Measurement{Name: "rest_dashboard", Kind: "rest", Path: "/api/metrics/dashboard", Asserted: true}, app.restRequest("/api/metrics/dashboard")},
-		{&Measurement{Name: "rest_traffic", Kind: "rest", Path: "/api/metrics/traffic", Asserted: true}, app.restRequest("/api/metrics/traffic")},
-		{&Measurement{Name: "rest_service_map", Kind: "rest", Path: "/api/metrics/service-map", Asserted: true}, app.restRequest("/api/metrics/service-map")},
-	}
+	var out []ep
+	out = append(out, rest("rest_dashboard", "/api/metrics/dashboard")...)
+	out = append(out, rest("rest_traffic", "/api/metrics/traffic")...)
+	out = append(out, rest("rest_service_map", "/api/metrics/service-map")...)
 	for _, tool := range tools {
 		args, _ := json.Marshal(tool.args)
 		out = append(out,
@@ -544,7 +575,8 @@ func newProof(t *testing.T, shape, binary string, o Objectives) *Proof {
 		Measurements:  []*Measurement{},
 		Notes: []string{
 			"warm percentiles are exact ordered (nearest-rank) over the timed requests; the cold call is the first request ever issued to the endpoint",
-			"REST requests use the default range (no query parameters), exactly as the embedded UI polls; server-side dashboard (10s) and service-map (30s) caches are in play as they are for any client",
+			"rest_*: the default range (no query parameters), exactly as the embedded UI polls; rest_*_full_range: explicit start/end spanning the whole seeded horizon; server-side dashboard (10s) and service-map (30s) caches are in play as they are for any client",
+			"coverage is the OtelContext-Data-Coverage header; body_coverage is the `coverage` field of object-shaped bodies (dashboard, service-map); requested_start/effective_start appear only when the aggregate range clamp shortened the request",
 			"mcp_*: arguments a real client sends, so the 5s MCP result cache serves most warm calls; mcp_*_miss: an ignored `_nonce` argument defeats the cache key and is recorded, not asserted",
 			"rss is recorded for #292 and not asserted; steady_p95 covers samples taken from the start of the measurement phase",
 		},

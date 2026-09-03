@@ -53,7 +53,11 @@ func TestReadLatencyLegacy(t *testing.T) {
 	dir := stateDir(t)
 	app := newAppProcess(t, binary, dir, "legacy")
 	proof.ServerEnv = app.env
-	plan := endpoints(app, legacyRCAService)
+	// The history spans the two days ending at ingest time; one extra window
+	// of margin keeps the oldest trace inside the range.
+	fullEnd := time.Now().UTC()
+	fullStart := fullEnd.Add(-legacyDays*24*time.Hour - 5*time.Minute)
+	plan := endpoints(app, legacyRCAService, fullStart, fullEnd)
 	plan = append(plan, endpoint{&Measurement{Name: "rest_system_graph", Kind: "rest", Path: "/api/system/graph", Asserted: true}, app.restRequest("/api/system/graph")})
 	for _, ep := range plan {
 		proof.Measurements = append(proof.Measurements, ep.m)

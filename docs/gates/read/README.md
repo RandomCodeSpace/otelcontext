@@ -38,10 +38,19 @@ objective, and missing evidence is a failed assertion with its reason.
 | `aggregate` | `test/aggprefill`, 120 services, 6,000 series, `AGGREGATE_MODE=aggregate`, SQLite | `/api/metrics/dashboard`, `/api/metrics/traffic`, `/api/metrics/service-map`, MCP `get_service_map`, `get_anomaly_timeline`, `root_cause_analysis` | ≤ 500 ms | ≤ 2 s |
 | `legacy` | 5 services, 2 days of exemplars over OTLP HTTP (43,200 traces, 4 spans + 1 log each), `AGGREGATE_MODE=legacy`, SQLite | same REST endpoints plus `/api/system/graph`, same MCP tools | ≤ 300 ms | ≤ 1 s |
 
-REST calls use the default range (no query parameters), exactly as the
-embedded UI polls. The decision names `/api/graph`; the GraphRAG-backed REST
-surface in this codebase is `GET /api/system/graph`, which is what the legacy
-shape measures.
+Each REST endpoint is measured twice. `rest_<name>` uses the default range
+(no query parameters), exactly as the embedded UI polls.
+`rest_<name>_full_range` passes explicit `start`/`end` (RFC3339) spanning the
+whole seeded horizon — every prefilled window in the aggregate shape, the
+full two days in the legacy shape — so the wide-range SUM path #219 optimised
+is exercised; both variants are asserted against the same objectives. The
+`coverage` column is the `OtelContext-Data-Coverage` header (only
+`/api/metrics/traffic` sets it); `body_coverage` is the `coverage` field the
+dashboard and service-map bodies carry; `requested_start`/`effective_start`
+appear only when the aggregate range clamp (#217) shortened the request.
+
+The decision names `/api/graph`; the GraphRAG-backed REST surface in this
+codebase is `GET /api/system/graph`, which is what the legacy shape measures.
 
 **Prefill depth.** The decision's aggregate shape is seven days (2,016
 five-minute windows). That prefill writes 12M bucket rows and takes about 24

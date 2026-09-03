@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/RandomCodeSpace/otelcontext/internal/aggregate"
 )
 
 const (
@@ -53,7 +55,13 @@ func TestReadLatencyAggregate(t *testing.T) {
 	dir := stateDir(t)
 	app := newAppProcess(t, binary, dir, "aggregate")
 	proof.ServerEnv = app.env
-	plan := endpoints(app, aggregateRCAService)
+	// The prefill seeds `windows` aligned five-minute windows ending at the
+	// current one, so the full horizon starts (windows-1) windows before the
+	// current window's start; ending at now keeps a seven-day request inside
+	// the engine's read-range cap.
+	fullEnd := time.Now().UTC()
+	fullStart := time.Unix(aggregate.WindowStart(fullEnd), 0).UTC().Add(-time.Duration(windows-1) * aggregate.WindowSize)
+	plan := endpoints(app, aggregateRCAService, fullStart, fullEnd)
 	for _, ep := range plan {
 		proof.Measurements = append(proof.Measurements, ep.m)
 	}
