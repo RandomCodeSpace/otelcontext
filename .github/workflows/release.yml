@@ -141,7 +141,7 @@ jobs:
     steps:
       - name: Harden runner egress
         # step-security/harden-runner v2.19.0
-        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1
         with:
           egress-policy: audit
 
@@ -378,7 +378,7 @@ jobs:
 
       - name: Download Linux amd64 candidate
         # actions/download-artifact v7.0.0
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: ${{ needs.verify-assets.outputs.artifact }}
           path: ${{ env.PROOF_ROOT }}/candidate
@@ -474,7 +474,7 @@ jobs:
 
       - name: Download Linux amd64 candidate
         # actions/download-artifact v7.0.0
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: ${{ needs.verify-assets.outputs.artifact }}
           path: ${{ env.PROOF_ROOT }}/systemd/candidate
@@ -838,7 +838,7 @@ jobs:
 
       - name: Download every proof artifact of this run
         # actions/download-artifact v7.0.0
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           path: ${{ env.PROOF_ROOT }}/manifest/evidence
 
