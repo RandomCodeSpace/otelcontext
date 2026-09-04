@@ -6,8 +6,6 @@ import (
 	"testing"
 
 	"gorm.io/gorm"
-
-	"github.com/RandomCodeSpace/otelcontext/internal/membudget"
 )
 
 func TestNewDatabase_UnsupportedDriver(t *testing.T) {
@@ -100,45 +98,29 @@ func pragmaInt64(t *testing.T, db *gorm.DB, pragma string) int64 {
 	return v
 }
 
-func TestSQLiteMemorySizes_BudgetScaling(t *testing.T) {
+func TestSQLiteMemorySizes_FixedToObjective(t *testing.T) {
 	clearSQLiteMemoryEnv(t)
-	cases := []struct {
-		name        string
-		budget      int64
-		wantCacheKB int64
-		wantMmap    int64
-	}{
-		{"detection failed -> 128MB ceiling, mmap off", 0, 131072, 0},
-		{"4GB host -> 128MB cache, mmap off", 4 << 30, 131072, 0},
-		{"1GB host clamps to the 64MB floor", 1 << 30, 65536, 0},
-		{"64GB host clamps to the 128MB ceiling", 64 << 30, 131072, 0},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			cacheKB, mmapBytes := sqliteMemorySizes(tc.budget)
-			if cacheKB != tc.wantCacheKB || mmapBytes != tc.wantMmap {
-				t.Fatalf("sqliteMemorySizes(%d)=(%d,%d) want (%d,%d)",
-					tc.budget, cacheKB, mmapBytes, tc.wantCacheKB, tc.wantMmap)
-			}
-		})
+	cacheKB, mmapBytes := sqliteMemorySizes()
+	if cacheKB != 65536 || mmapBytes != 0 {
+		t.Fatalf("sqliteMemorySizes()=(%d,%d) want (65536,0): 64MB cache, mmap off", cacheKB, mmapBytes)
 	}
 }
 
-func TestSQLiteMemorySizes_EnvOverridesWinOverBudget(t *testing.T) {
+func TestSQLiteMemorySizes_EnvOverridesWin(t *testing.T) {
 	t.Setenv("SQLITE_CACHE_SIZE_KB", "12345")
-	t.Setenv("SQLITE_MMAP_SIZE_BYTES", "0") // 0 = disable mmap, a legitimate override
-	cacheKB, mmapBytes := sqliteMemorySizes(4 << 30)
-	if cacheKB != 12345 || mmapBytes != 0 {
-		t.Fatalf("env overrides ignored: got (%d,%d) want (12345,0)", cacheKB, mmapBytes)
+	t.Setenv("SQLITE_MMAP_SIZE_BYTES", "33554432")
+	cacheKB, mmapBytes := sqliteMemorySizes()
+	if cacheKB != 12345 || mmapBytes != 33554432 {
+		t.Fatalf("env overrides ignored: got (%d,%d) want (12345,33554432)", cacheKB, mmapBytes)
 	}
 }
 
 func TestSQLiteMemorySizes_InvalidEnvIgnored(t *testing.T) {
 	t.Setenv("SQLITE_CACHE_SIZE_KB", "not-a-number")
 	t.Setenv("SQLITE_MMAP_SIZE_BYTES", "-1") // negative mmap is invalid
-	cacheKB, mmapBytes := sqliteMemorySizes(4 << 30)
-	if cacheKB != 131072 || mmapBytes != 0 {
-		t.Fatalf("invalid env must fall back to budget scaling: got (%d,%d)", cacheKB, mmapBytes)
+	cacheKB, mmapBytes := sqliteMemorySizes()
+	if cacheKB != 65536 || mmapBytes != 0 {
+		t.Fatalf("invalid env must fall back to the defaults: got (%d,%d)", cacheKB, mmapBytes)
 	}
 }
 
@@ -160,14 +142,12 @@ func TestNewDatabase_SQLitePragmas_EnvOverrideRoundTrip(t *testing.T) {
 	}
 }
 
-func TestNewDatabase_SQLitePragmas_BudgetScaledRoundTrip(t *testing.T) {
+func TestNewDatabase_SQLitePragmas_DefaultRoundTrip(t *testing.T) {
 	clearSQLiteMemoryEnv(t)
 
-	// Whatever this host's budget resolves to, the live connection must carry
-	// the same numbers the sizing function computes — proves the wiring, not
-	// the host RAM.
-	budget, _ := membudget.Detect()
-	wantCacheKB, wantMmap := sqliteMemorySizes(budget)
+	// The live connection must carry the same numbers the sizing function
+	// computes — proves the wiring.
+	wantCacheKB, wantMmap := sqliteMemorySizes()
 
 	db, err := NewDatabase("sqlite", filepath.Join(t.TempDir(), "scaled.db"))
 	if err != nil {

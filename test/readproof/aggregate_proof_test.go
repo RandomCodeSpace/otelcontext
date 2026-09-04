@@ -110,13 +110,15 @@ func TestReadLatencyAggregate(t *testing.T) {
 	proof.ReadySeconds = round3(time.Since(app.started).Seconds())
 	t.Logf("ready after %.1f s", proof.ReadySeconds)
 
-	sampler.settle(time.Now(), settleLoad(plan))
+	sampler.settle(time.Now(), workload(plan))
 	measureFrom := time.Since(app.started).Seconds()
+	before := app.mappings()
 	sampler.sample()
 	for _, ep := range plan {
 		measure(t, ep.m, ep.fn, objectives)
 	}
 	proof.Memory = app.account()
+	proof.Memory.MappingsBefore, proof.Memory.MappingsAfter = before, app.mappings()
 	proof.RSS = sampler.finish(measureFrom)
 	logMemory(t, proof)
 }

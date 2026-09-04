@@ -124,11 +124,17 @@ type RSS struct {
 	SteadyFromSeconds float64     `json:"steady_from_s"`
 	// SettleSeconds is how long the harness waited after seeding for the
 	// runtime's first GC cycle; SteadyRule says how the window was chosen.
-	SettleSeconds  float64 `json:"settle_s"`
-	SteadyRule     string  `json:"steady_rule"`
-	SteadyP95Bytes int64   `json:"steady_p95_bytes"`
-	SteadySamples  int     `json:"steady_samples"`
-	Error          string  `json:"error,omitempty"`
+	SettleSeconds float64 `json:"settle_s"`
+	SteadyRule    string  `json:"steady_rule"`
+	// SteadyReached is false when the harness ran out of budget before the
+	// RSS gauge plateaued under the read workload; SteadyReason says where
+	// it stood. The assertion then fails: an under-sampled p95 is not
+	// evidence.
+	SteadyReached  bool   `json:"steady_reached"`
+	SteadyReason   string `json:"steady_reason,omitempty"`
+	SteadyP95Bytes int64  `json:"steady_p95_bytes"`
+	SteadySamples  int    `json:"steady_samples"`
+	Error          string `json:"error,omitempty"`
 }
 
 // MemoryAccounting says where the memory sits at the end of the measurement
@@ -151,7 +157,81 @@ type MemoryAccounting struct {
 	LatencySketchBytes int64 `json:"graphrag_latency_sketch_bytes"`
 	// ReadCacheEntries is otelcontext_read_cache_entries by cache name.
 	ReadCacheEntries map[string]int64 `json:"read_cache_entries"`
-	Error            string           `json:"error,omitempty"`
+	// MappingsBefore and MappingsAfter break the RSS down by mapping owner
+	// from /proc/<pid>/smaps at the start and the end of the read phase, so
+	// growth under reads is attributed rather than guessed.
+	MappingsBefore Mappings `json:"mappings_before_reads"`
+	MappingsAfter  Mappings `json:"mappings_after_reads"`
+	Error          string   `json:"error,omitempty"`
+}
+
+// Mappings is the resident set broken down by mapping owner, in bytes, from
+// one /proc/<pid>/smaps read. The Go runtime names its mappings (Linux
+// prctl PR_SET_VMA), which is what separates the heap from everything else.
+type Mappings struct {
+	Seconds    float64 `json:"t_s"`
+	TotalBytes int64   `json:"total_bytes"`
+	// GoHeapBytes is "[anon: Go: heap]": the runtime heap arenas.
+	GoHeapBytes int64 `json:"go_heap_bytes"`
+	// GoRuntimeBytes is every other named Go mapping (metadata, GC bits,
+	// spans, scavenger structures) plus the main thread stack and vDSO.
+	GoRuntimeBytes int64 `json:"go_runtime_bytes"`
+	// OtherAnonBytes is unnamed anonymous memory: with the pure-Go SQLite
+	// driver this is modernc's libc allocator — the page cache, the sorter
+	// and temp tables — plus anything else outside the Go heap.
+	OtherAnonBytes int64 `json:"other_anon_bytes"`
+	// FileBytes is file-backed and shmem-backed residency: an mmapped
+	// database, shared libraries, tmpfs files.
+	FileBytes int64 `json:"file_bytes"`
+	// BinaryBytes is the executable's own text and data.
+	BinaryBytes int64  `json:"binary_bytes"`
+	Error       string `json:"error,omitempty"`
+}
+
+// ParseSmaps classifies every mapping in a /proc/<pid>/smaps payload and
+// sums its Rss; binary is the executable path.
+func ParseSmaps(text, binary string) Mappings {
+	var m Mappings
+	add := func(*Mappings, int64) {}
+	for _, line := range strings.Split(text, "\n") {
+		if len(line) > 0 && isHexByte(line[0]) && strings.Contains(line, "-") && strings.Count(line, " ") >= 4 {
+			fields := strings.Fields(line)
+			name := ""
+			if len(fields) >= 6 {
+				name = strings.Join(fields[5:], " ")
+			}
+			switch {
+			case name == "[anon: Go: heap]":
+				add = func(m *Mappings, b int64) { m.GoHeapBytes += b }
+			case strings.HasPrefix(name, "[anon: Go:"), strings.HasPrefix(name, "[stack"), name == "[vdso]", name == "[vvar]", name == "[vsyscall]":
+				add = func(m *Mappings, b int64) { m.GoRuntimeBytes += b }
+			case name == "" || name == "[heap]" || strings.HasPrefix(name, "[anon"):
+				add = func(m *Mappings, b int64) { m.OtherAnonBytes += b }
+			case name == binary:
+				add = func(m *Mappings, b int64) { m.BinaryBytes += b }
+			default:
+				add = func(m *Mappings, b int64) { m.FileBytes += b }
+			}
+			continue
+		}
+		if strings.HasPrefix(line, "Rss:") {
+			fields := strings.Fields(line)
+			if len(fields) >= 3 && fields[2] == "kB" {
+				if kb, err := strconv.ParseInt(fields[1], 10, 64); err == nil {
+					add(&m, kb*1024)
+					m.TotalBytes += kb * 1024
+				}
+			}
+		}
+	}
+	if m.TotalBytes == 0 {
+		m.Error = "no Rss lines parsed"
+	}
+	return m
+}
+
+func isHexByte(c byte) bool {
+	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')
 }
 
 // MetricSample is one line of Prometheus text exposition.
@@ -422,6 +502,9 @@ func rssAssertion(r *RSS, o Objectives) Assertion {
 		a.Detail = "no steady-state RSS samples: " + r.Error
 	case r.SteadySamples == 0:
 		a.Detail = "no steady-state RSS samples: the measurement phase never started"
+	case !r.SteadyReached:
+		a.Detail = fmt.Sprintf("no steady state reached under the read workload: %s (p95 of the %d samples taken anyway %.1f MiB, peak %.1f MiB)",
+			r.SteadyReason, r.SteadySamples, mib(r.SteadyP95Bytes), mib(r.PeakBytes))
 	case r.SteadyP95Bytes > o.RSSSteadyP95Bytes:
 		a.Detail = fmt.Sprintf("rss steady p95 %.1f MiB > %.0f MiB objective over %d samples (peak %.1f MiB, heap in use peak %.1f MiB)",
 			mib(r.SteadyP95Bytes), mib(o.RSSSteadyP95Bytes), r.SteadySamples, mib(r.PeakBytes), mib(r.HeapPeakBytes))

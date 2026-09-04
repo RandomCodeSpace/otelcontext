@@ -100,13 +100,15 @@ func TestReadLatencyLegacy(t *testing.T) {
 	proof.Prefill.MainDBByte = fileSize(filepath.Join(dir, "otelcontext.db")) + fileSize(filepath.Join(dir, "otelcontext.db-wal"))
 	t.Logf("ingest: %d traces / %d spans / %d logs in %.1f s, main db %d bytes", legacyTraces, legacyTraces*legacySpansPerTrace, legacyTraces, proof.Prefill.Seconds, proof.Prefill.MainDBByte)
 
-	sampler.settle(time.Now(), settleLoad(plan))
+	sampler.settle(time.Now(), workload(plan))
 	measureFrom := time.Since(app.started).Seconds()
+	before := app.mappings()
 	sampler.sample()
 	for _, ep := range plan {
 		measure(t, ep.m, ep.fn, objectives)
 	}
 	proof.Memory = app.account()
+	proof.Memory.MappingsBefore, proof.Memory.MappingsAfter = before, app.mappings()
 	proof.RSS = sampler.finish(measureFrom)
 	logMemory(t, proof)
 }

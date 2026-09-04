@@ -18,8 +18,6 @@ import (
 	"gorm.io/gorm/logger"
 
 	_ "github.com/microsoft/go-mssqldb/azuread"
-
-	"github.com/RandomCodeSpace/otelcontext/internal/membudget"
 )
 
 // NewDatabase creates a GORM database connection for any supported driver.
@@ -105,13 +103,12 @@ func NewDatabase(driver, dsn string) (*gorm.DB, error) {
 	// default-tuned behaviour. The set was hardened on 2026-05-24 to make
 	// the platform survivable at 120 services on SQLite.
 	//
-	// cache_size is budget-scaled and mmap is opt-in — see sqliteMemorySizes
-	// for the sizing, the memory-objective rationale and the override rules.
+	// cache_size is fixed to the memory objective and mmap is opt-in — see
+	// sqliteMemorySizes for the rationale and the override rules.
 	// wal_autocheckpoint=10000 = checkpoint after 10k pages so WAL stays bounded.
 	// journal_size_limit=67108864 = hard-cap the WAL file at 64 MB.
 	if strings.ToLower(driver) == "sqlite" || driver == "" {
-		budget, budgetSource := membudget.Detect()
-		cacheKB, mmapBytes := sqliteMemorySizes(budget)
+		cacheKB, mmapBytes := sqliteMemorySizes()
 		// Best-effort, deliberately NOT fail-closed, and ordered BEFORE the
 		// stanza below: auto_vacuum only takes effect on databases this
 		// process creates, and the journal_mode=WAL switch initializes the
@@ -137,11 +134,7 @@ func NewDatabase(driver, dsn string) (*gorm.DB, error) {
 				return nil, fmt.Errorf("sqlite pragma %q failed: %w", p, err)
 			}
 		}
-		if budgetSource == "" {
-			budgetSource = "none (fallback to hardcoded ceilings)"
-		}
-		log.Printf("📊 SQLite memory tuning: cache=%d KB, mmap=%d MB (budget=%d MB, source=%s)",
-			cacheKB, mmapBytes/(1<<20), budget/(1<<20), budgetSource)
+		log.Printf("📊 SQLite memory tuning: cache=%d KB, mmap=%d MB", cacheKB, mmapBytes/(1<<20))
 	}
 
 	// Configure Connection Pool — configurable via env vars for non-SQLite drivers.
@@ -197,25 +190,24 @@ func getEnvPoolInt(key string, fallback int) int {
 	return fallback
 }
 
-// SQLite page-cache bounds (KB). The ceiling is sized to the #283 memory
-// objective for the bounded SQLite profile (512 MiB RSS steady p95 for the
-// legacy shape): the read proof measured the pure-Go driver's cache as
-// ~277 MiB of anonymous RSS at the previous 256 MB ceiling, and the
-// objective only fits at 128 MB (#292).
-const (
-	sqliteCacheKBMin = 65536  // 64 MB
-	sqliteCacheKBMax = 131072 // 128 MB
-)
+// sqliteCacheKB is the SQLite page cache (KB, applied as a negative
+// cache_size). It is sized to the #283 memory objective for the bounded
+// SQLite profile (512 MiB RSS steady p95 for the legacy shape), not to the
+// host: the read proof measured the pure-Go driver's allocator holding
+// about twice the configured cache as anonymous RSS — 277 MiB at the former
+// 256 MB ceiling, 249 MiB at 128 MB, 125 MiB at 64 MB — and the objective
+// only fits at 64 MB once the Go heap's own GC goal is counted (#292).
+const sqliteCacheKB = 65536 // 64 MB
 
-// sqliteMemorySizes resolves the SQLite page-cache size (in KB, applied as a
-// negative cache_size) and mmap window (in bytes) for the startup PRAGMA
-// stanza.
+// sqliteMemorySizes resolves the SQLite page-cache size (in KB) and mmap
+// window (in bytes) for the startup PRAGMA stanza.
 //
-// The page cache scales with the detected memory budget: budget/32 clamped
-// to [64 MB, 128 MB]; budget <= 0 (detection failed) takes the ceiling. It is
-// NOT Go-heap memory — modernc's libc allocates it with its own mmap-backed
-// allocator, so it shows up as anonymous RSS that GOMEMLIMIT neither sees
-// nor bounds. cache_size is the only knob that bounds it.
+// The page cache is NOT Go-heap memory — modernc's libc allocates it with
+// its own mmap-backed allocator, so it shows up as anonymous RSS that
+// GOMEMLIMIT neither sees nor bounds, at roughly twice the configured size
+// (page cache plus the sorter and temp space the wide-range reads use,
+// retained by the allocator). cache_size is the only knob that bounds it,
+// which is why it is fixed rather than scaled with the host budget.
 //
 // mmap is off unless the operator opts in with SQLITE_MMAP_SIZE_BYTES. A
 // window keeps every database page a scan touches resident, bounded only by
@@ -226,11 +218,8 @@ const (
 //
 // Operator overrides win unconditionally: SQLITE_CACHE_SIZE_KB (> 0) and
 // SQLITE_MMAP_SIZE_BYTES (>= 0). Invalid values are ignored.
-func sqliteMemorySizes(budget int64) (cacheKB, mmapBytes int64) {
-	cacheKB = sqliteCacheKBMax
-	if budget > 0 {
-		cacheKB = clampInt64(budget/32/1024, sqliteCacheKBMin, sqliteCacheKBMax)
-	}
+func sqliteMemorySizes() (cacheKB, mmapBytes int64) {
+	cacheKB = sqliteCacheKB
 	if v, ok := getEnvInt64("SQLITE_CACHE_SIZE_KB"); ok && v > 0 {
 		cacheKB = v
 	}
@@ -238,16 +227,6 @@ func sqliteMemorySizes(budget int64) (cacheKB, mmapBytes int64) {
 		mmapBytes = v
 	}
 	return cacheKB, mmapBytes
-}
-
-func clampInt64(v, lo, hi int64) int64 {
-	if v < lo {
-		return lo
-	}
-	if v > hi {
-		return hi
-	}
-	return v
 }
 
 func getEnvInt64(key string) (int64, bool) {

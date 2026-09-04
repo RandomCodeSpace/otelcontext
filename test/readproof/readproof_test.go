@@ -94,8 +94,9 @@ func TestSummarizeRSSAndAssertion(t *testing.T) {
 	}
 
 	o := Objectives{Requests: 200, WarmP99MS: 300, ColdMS: 1000, RSSSteadyP95Bytes: 512 * MiB}
-	pass := &Proof{Objectives: o, RSS: RSS{SteadySamples: 8, SteadyP95Bytes: 400 * MiB, PeakBytes: 700 * MiB, HeapPeakBytes: 300 * MiB}}
-	fail := &Proof{Objectives: o, RSS: RSS{SteadySamples: 8, SteadyP95Bytes: 925 * MiB, PeakBytes: 925 * MiB}}
+	pass := &Proof{Objectives: o, RSS: RSS{SteadyReached: true, SteadySamples: 8, SteadyP95Bytes: 400 * MiB, PeakBytes: 700 * MiB, HeapPeakBytes: 300 * MiB}}
+	fail := &Proof{Objectives: o, RSS: RSS{SteadyReached: true, SteadySamples: 8, SteadyP95Bytes: 925 * MiB, PeakBytes: 925 * MiB}}
+	climbing := &Proof{Objectives: o, RSS: RSS{SteadySamples: 8, SteadyP95Bytes: 480 * MiB, PeakBytes: 480 * MiB, SteadyReason: "rss still moving, 461.0 -> 574.0 MiB over the last 15 s"}}
 	none := &Proof{Objectives: o, RSS: RSS{Error: "connection refused"}}
 	unasserted := &Proof{Objectives: Objectives{Requests: 200, WarmP99MS: 300, ColdMS: 1000}, RSS: RSS{SteadySamples: 1, SteadyP95Bytes: 5 * MiB}}
 	check := func(p *Proof, passed bool, detail string) {
@@ -112,9 +113,39 @@ func TestSummarizeRSSAndAssertion(t *testing.T) {
 	}
 	check(pass, true, "400.0 MiB <= 512 MiB objective over 8 samples (peak 700.0 MiB, heap in use peak 300.0 MiB)")
 	check(fail, false, "925.0 MiB > 512 MiB objective")
+	check(climbing, false, "no steady state reached under the read workload: rss still moving, 461.0 -> 574.0 MiB")
 	check(none, false, "no steady-state RSS samples: connection refused")
 	if got := Evaluate(unasserted); len(got) != 0 {
 		t.Errorf("no RSS objective must add no assertion, got %+v", got)
+	}
+}
+
+func TestParseSmaps(t *testing.T) {
+	smaps := `c000000000-c004000000 rw-p 00000000 00:00 0                          [anon: Go: heap]
+Size:              65536 kB
+Rss:               40960 kB
+7f0000000000-7f0000100000 rw-p 00000000 00:00 0                          [anon: Go: gc bits]
+Rss:                 512 kB
+7f0001000000-7f0011000000 rw-p 00000000 00:00 0
+Rss:              131072 kB
+7f0020000000-7f0030000000 r--s 00000000 00:2a 12345                      /dev/shm/x/otelcontext.db
+Rss:               20480 kB
+55d000000000-55d003000000 r-xp 00000000 08:01 999                        /dev/shm/rp/otelcontext
+Rss:               27648 kB
+7ffd00000000-7ffd00021000 rw-p 00000000 00:00 0                          [stack]
+Rss:                 132 kB
+7ffd00100000-7ffd00102000 r-xp 00000000 00:00 0                          [vdso]
+Rss:                   8 kB
+`
+	m := ParseSmaps(smaps, "/dev/shm/rp/otelcontext")
+	want := Mappings{TotalBytes: (40960 + 512 + 131072 + 20480 + 27648 + 132 + 8) * 1024,
+		GoHeapBytes: 40960 * 1024, GoRuntimeBytes: (512 + 132 + 8) * 1024, OtherAnonBytes: 131072 * 1024,
+		FileBytes: 20480 * 1024, BinaryBytes: 27648 * 1024}
+	if m != want {
+		t.Errorf("ParseSmaps = %+v, want %+v", m, want)
+	}
+	if empty := ParseSmaps("", "x"); empty.Error == "" {
+		t.Error("empty smaps must carry an error")
 	}
 }
 

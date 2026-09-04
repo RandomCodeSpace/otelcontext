@@ -407,40 +407,43 @@ func (a *appProcess) account() MemoryAccounting {
 // nothing here caps that wait with a number; reaching the deadline is
 // recorded and the window starts there.
 //
-// All of it runs under a trickle of the proof's own load — `load`, one call
-// per second — because an idle process is not the state the objective
-// describes: without allocation the pacer only cycles on the two-minute
-// forced GC and RSS plateaus wherever the last cycle's goal left it, and
-// the first collection under the measurement's reads then moves it again
-// (measured: 548 MiB idle, 465 MiB from the first read on). Under the
-// trickle the cycles are allocation-driven, so the pacer converges the way
-// it will during measurement. The trickle stops before measurement begins.
-func (s *rssSampler) settle(since time.Time, load request) {
+// All of it runs under the proof's own read workload — every asserted
+// endpoint, called round-robin back to back — because an idle process is
+// not the state the objective describes: without allocation the pacer only
+// cycles on the two-minute forced GC and RSS plateaus wherever the last
+// cycle's goal left it, and memory outside the Go heap (the SQLite page
+// cache, sorter and temp space behind the wide-range reads) only reaches
+// its working size once those reads have run. "Steady" therefore means
+// steady under reads: the RSS gauge within 2% of the first reading of a
+// run across four readings 5 s apart, so a slow climb that stays under 2%
+// per step is still a climb. The workload stops before measurement begins.
+// Running out of budget before that plateau leaves SteadyReached false and
+// the assertion fails with where the gauge stood.
+func (s *rssSampler) settle(since time.Time, workload []request) {
 	started := time.Now()
-	rule := "steady window starts after the second GC cycle completed at least one GraphRAG refresh interval (60s) after seeding finished (the first cycle whose heap goal was set from a live heap without the seeding transient), under one rest_traffic_full_range read per second, once the runtime's retained idle heap (go_memstats_heap_idle_bytes - go_memstats_heap_released_bytes) is below the heap in use and the RSS gauge has held within 2% across four readings 5s apart"
+	rule := "steady window starts after the second GC cycle completed at least one GraphRAG refresh interval (60s) after seeding finished (the first cycle whose heap goal was set from a live heap without the seeding transient), under the proof's own read workload (every asserted endpoint round-robin), once the runtime's retained idle heap (go_memstats_heap_idle_bytes - go_memstats_heap_released_bytes) is below the heap in use and the RSS gauge has held within 2% of the first of four readings 5s apart"
 	deadline := started.Add(settleDeadline)
 	eligible := float64(since.Add(graphRAGRefreshInterval).UnixNano()) / 1e9
-	reason := ""
 	lastGC, cycles := 0.0, 0
-	prevRSS, stable := 0.0, 0
+	first, last, stable := 0.0, 0.0, 0
+	reached := false
 
 	stopLoad := make(chan struct{})
 	var loadWG sync.WaitGroup
-	if load != nil {
+	if len(workload) > 0 {
 		loadWG.Add(1)
 		go func() {
 			defer loadWG.Done()
-			ticker := time.NewTicker(time.Second)
-			defer ticker.Stop()
 			for n := 0; ; n++ {
 				select {
 				case <-stopLoad:
 					return
-				case <-ticker.C:
-					ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
-					load(ctx, n)
-					cancel()
+				default:
 				}
+				ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
+				workload[n%len(workload)](ctx, n)
+				cancel()
+				time.Sleep(50 * time.Millisecond)
 			}
 		}()
 	}
@@ -451,8 +454,8 @@ func (s *rssSampler) settle(since time.Time, load request) {
 	for {
 		samples, err := s.app.scrapeMetrics()
 		if err == nil {
-			if last, e := Gauge(samples, lastGCMetric); e == nil && last > eligible && last != lastGC {
-				lastGC, cycles = last, cycles+1
+			if gc, e := Gauge(samples, lastGCMetric); e == nil && gc > eligible && gc != lastGC {
+				lastGC, cycles = gc, cycles+1
 			}
 		}
 		if err == nil && cycles >= 2 {
@@ -460,19 +463,23 @@ func (s *rssSampler) settle(since time.Time, load request) {
 			returned, _ := Gauge(samples, heapReleasedMetric)
 			inuse, _ := Gauge(samples, heapInuseMetric)
 			rss, rssErr := Gauge(samples, RSSMetric)
-			flat := prevRSS > 0 && rssErr == nil && math.Abs(rss-prevRSS) <= 0.02*prevRSS
-			if inuse > 0 && idle-returned <= inuse && flat {
-				stable++
-			} else {
-				stable = 0
+			if rssErr == nil {
+				last = rss
 			}
-			prevRSS = rss
+			switch {
+			case rssErr != nil || inuse <= 0 || idle-returned > inuse:
+				first, stable = 0, 0
+			case first > 0 && math.Abs(rss-first) <= 0.02*first:
+				stable++
+			default:
+				first, stable = rss, 0
+			}
 			if stable >= 3 {
+				reached = true
 				break
 			}
 		}
 		if time.Now().After(deadline) {
-			reason = fmt.Sprintf("; not settled within %.0f s (eligible gc cycles observed: %d), window starts at the deadline", settleDeadline.Seconds(), cycles)
 			break
 		}
 		if cycles < 2 {
@@ -484,7 +491,40 @@ func (s *rssSampler) settle(since time.Time, load request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.rss.SettleSeconds = round3(time.Since(started).Seconds())
-	s.rss.SteadyRule = rule + reason
+	s.rss.SteadyRule = rule
+	s.rss.SteadyReached = reached
+	if !reached {
+		s.rss.SteadyReason = fmt.Sprintf("not settled within %.0f s: eligible gc cycles observed %d, rss %.1f MiB against a run first reading of %.1f MiB", settleDeadline.Seconds(), cycles, last/MiB, first/MiB)
+	}
+}
+
+// workload lists the asserted endpoints' requests, the read load the settle
+// runs under.
+func workload(plan []endpoint) []request {
+	var out []request
+	for _, ep := range plan {
+		if ep.m.Asserted {
+			out = append(out, ep.fn)
+		}
+	}
+	return out
+}
+
+// mappings reads the server's /proc/<pid>/smaps and breaks its RSS down by
+// owner.
+func (a *appProcess) mappings() Mappings {
+	at := round3(time.Since(a.started).Seconds())
+	cmd := a.cmd
+	if cmd == nil || cmd.Process == nil {
+		return Mappings{Seconds: at, Error: "server not running"}
+	}
+	raw, err := os.ReadFile("/proc/" + strconv.Itoa(cmd.Process.Pid) + "/smaps")
+	if err != nil {
+		return Mappings{Seconds: at, Error: err.Error()}
+	}
+	m := ParseSmaps(string(raw), a.binary)
+	m.Seconds = at
+	return m
 }
 
 func (s *rssSampler) finish(steadyFrom float64) RSS {
@@ -690,18 +730,6 @@ func measure(t *testing.T, m *Measurement, fn request, o Objectives) {
 		m.Latency.P50, m.Latency.P90, m.Latency.P99, m.Latency.Max, m.CacheHits, m.Errors, m.RequestedStart, m.EffectiveStart)
 }
 
-// settleLoad is the request the settle trickle issues: the full-range
-// traffic read, an asserted endpoint that allocates enough per call for the
-// pacer to cycle on allocation rather than on the forced-GC timer.
-func settleLoad(plan []endpoint) request {
-	for _, ep := range plan {
-		if ep.m.Name == "rest_traffic_full_range" {
-			return ep.fn
-		}
-	}
-	return nil
-}
-
 // markUnmeasured stamps every endpoint that has no evidence yet with the
 // reason, so a setup failure still yields a complete assertion table.
 func markUnmeasured(p *Proof, reason string) {
@@ -785,6 +813,13 @@ func logMemory(t *testing.T, p *Proof) {
 	a := p.Memory
 	t.Logf("memory accounting at t=%.1fs: rss %.1f MiB, heap in use %.1f MiB; registry pairs %d hosts %d; graphrag entities %v edges %v latency sketches %.2f MiB; read caches %v%s",
 		a.Seconds, mib(a.RSSBytes), mib(a.HeapInuseBytes), a.RegistryPairEntries, a.RegistryHostEntries, a.GraphRAGEntities, a.GraphRAGEdges, mib(a.LatencySketchBytes), a.ReadCacheEntries, errSuffix(a.Error))
+	for _, m := range []struct {
+		label string
+		m     Mappings
+	}{{"before reads", a.MappingsBefore}, {"after reads", a.MappingsAfter}} {
+		t.Logf("rss by mapping %s at t=%.1fs: total %.1f MiB = go heap %.1f + go runtime %.1f + other anon (libc/sqlite) %.1f + file/shmem %.1f + binary %.1f%s",
+			m.label, m.m.Seconds, mib(m.m.TotalBytes), mib(m.m.GoHeapBytes), mib(m.m.GoRuntimeBytes), mib(m.m.OtherAnonBytes), mib(m.m.FileBytes), mib(m.m.BinaryBytes), errSuffix(m.m.Error))
+	}
 }
 
 func errSuffix(err string) string {

@@ -63,14 +63,20 @@ window starts after the **second** GC cycle completed at least one refresh
 interval (60 s) after seeding finished, once the runtime's retained idle
 heap (`go_memstats_heap_idle_bytes − go_memstats_heap_released_bytes`) is
 below the heap in use and the RSS gauge has held within 2% across four
-readings 5 s apart — all of it under a trickle of the proof's own load, one
-`rest_traffic_full_range` read per second, stopped before measurement. An
-idle process is not the state the objective describes: without allocation
+readings 5 s apart, measured against the **first** reading of the run so a
+slow climb that stays under 2% per step is still a climb — all of it under
+the proof's own read workload (every asserted endpoint, round-robin, back
+to back), stopped before measurement. "Steady" means steady under reads: an
+idle process is not the state the objective describes — without allocation
 the pacer only cycles on the two-minute forced GC and RSS plateaus wherever
 the last cycle's goal left it, and the first collection under the
 measurement's reads moves it again (measured: 548 MiB idle, 465 MiB from the
-first read on); under the trickle the cycles are allocation-driven and the
-pacer converges the way it will during measurement. Why the second: the GC pacer sets each cycle's heap goal
+first read on) — and the memory outside the Go heap behind the wide-range
+reads only reaches its working size once those reads have run. Under the
+workload the cycles are allocation-driven and the pacer converges the way
+it will during measurement. If the budget runs out before that plateau,
+`rss.steady_reached` is false, `steady_reason` says where the gauge stood,
+and the assertion **fails**: an under-sampled p95 is not evidence. Why the second: the GC pacer sets each cycle's heap goal
 from the live heap of the cycle before, so the first collection after the
 prune runs against a goal computed while the transient was still live and
 the scavenger stops at a ceiling that still includes it (measured: RSS flat
@@ -87,15 +93,21 @@ With about eight samples the nearest-rank p95 is the maximum, which is the
 strict reading and the intended one.
 
 Where the memory went at the 144-window depth, measured while sizing the
-fix: the pure-Go SQLite page cache is **not** Go heap (modernc's libc
-allocates it outside the heap, invisible to `GOMEMLIMIT`) and measured
-~277 MiB of anonymous RSS at the former 256 MB ceiling; the former 1 GB
-`mmap_size` window kept every page a full-range scan touched resident
-(124–155 MiB for the 173 MB legacy file, growing with the file); the Go heap
-after the transient holds ~65 MiB live. The fix (#292) is at that owner:
-the page-cache ceiling is 128 MB and mmap is opt-in via
-`SQLITE_MMAP_SIZE_BYTES` — both re-proven against the latency objectives
-above. `OTELCONTEXT_READPROOF_PPROF_ADDR=127.0.0.1:6060` opens the measured
+fix (`memory_accounting.mappings_before_reads` / `mappings_after_reads`
+carry the same breakdown for every run, from `/proc/<pid>/smaps`): the
+pure-Go SQLite page cache is **not** Go heap (modernc's libc allocates it
+outside the heap, invisible to `GOMEMLIMIT`) and its allocator holds about
+twice the configured cache as anonymous RSS — 277 MiB at the former 256 MB
+ceiling, 249 MiB at 128 MB, 125 MiB at 64 MB, flat before and after the
+reads; the former 1 GB `mmap_size` window kept every page a full-range scan
+touched resident (124–155 MiB for the 173 MB legacy file, growing with the
+file); the Go heap holds ~65–130 MiB live after the transient and its arena
+grows toward the GC goal (2× live) under sustained reads, which is the
+climb a hosted runner shows during the read phase. The fix (#292) is at the
+SQLite owner: the page cache is fixed at 64 MB and mmap is opt-in via
+`SQLITE_MMAP_SIZE_BYTES` — re-proven against the latency objectives above
+(legacy steady p95 344 MiB locally, all latency assertions green).
+`OTELCONTEXT_READPROOF_PPROF_ADDR=127.0.0.1:6060` opens the measured
 server's pprof listener so a future exceedance can be attributed the same
 way.
 
