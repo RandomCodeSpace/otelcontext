@@ -59,7 +59,6 @@ const dom = {
   map: byId("service-map"),
   graphDescription: byId("graph-description"),
   rings: byId("graph-rings"),
-  clusters: byId("graph-clusters"),
   edges: byId("graph-edges"),
   nodes: byId("graph-nodes"),
   minimapButton: byId("minimap-button"),
@@ -908,61 +907,54 @@ function graphLayout(nodes, edges) {
   return positions;
 }
 
-// hostLayout places one golden-angle spiral of cluster centres, then a
-// smaller spiral of members inside each. Deterministic like graphLayout.
-function hostLayout(clusters) {
-  const positions = new Map();
-  const rings = [];
-  const count = clusters.length;
-  const spread = count === 1 ? 0 : 335;
-  const radius = count <= 1 ? 170 : Math.max(50, Math.min(165, 300 / Math.sqrt(count)));
-  clusters.forEach((cluster, index) => {
-    const distance = spread * Math.sqrt((index + 0.4) / count);
-    const angle = index * GOLDEN_ANGLE;
-    const cx = 500 + distance * Math.cos(angle);
-    const cy = 500 + distance * Math.sin(angle);
-    const members = cluster.members.slice().sort((a, b) => a.id.localeCompare(b.id));
-    members.forEach((node, member) => {
-      const inner = members.length === 1 ? 0 : (radius - 30) * Math.sqrt((member + 0.4) / members.length);
-      const turn = member * GOLDEN_ANGLE;
-      positions.set(node.id, { x: cx + inner * Math.cos(turn), y: cy + inner * Math.sin(turn) });
-    });
-    rings.push({ cluster: cluster, x: cx, y: cy, r: radius });
-  });
-  return { positions: positions, rings: rings };
+// hostNodes synthesizes one host node per registry host the graph does not
+// already carry as a host entity, so host mode draws every host once.
+function hostNodes(nodes) {
+  const present = new Set(nodes.filter(isHostNode).map(hostOfNode));
+  const output = [];
+  for (const host of state.hosts || []) {
+    if (!present.has(host.name)) output.push({ id: HOST_PREFIX + host.name, kind: "host", hosts: [host.name] });
+  }
+  return output;
 }
 
-function renderClusterRings(rings) {
-  for (const ring of rings) {
-    dom.rings.appendChild(svgElement("circle", { class: "cluster-ring", cx: ring.x, cy: ring.y, r: ring.r }));
-    const host = ring.cluster.host;
-    const heading = svgElement("g", {
-      class: "cluster-heading",
-      transform: "translate(" + ring.x + " " + (ring.y - ring.r - 10) + ")",
-    });
-    if (host) {
-      heading.setAttribute("tabindex", "0");
-      heading.setAttribute("role", "button");
-      heading.setAttribute("aria-label", clusterLabel(ring.cluster) + ", open host panel");
-      heading.dataset.host = host.name;
-      if (host.name === state.selectedHost) heading.classList.add("is-selected");
-      heading.addEventListener("click", (event) => {
-        event.stopPropagation();
-        openHost(host.name);
-      });
-      heading.addEventListener("keydown", (event) => {
-        if (event.key === "Enter" || event.key === " ") {
-          event.preventDefault();
-          openHost(host.name);
-        }
-      });
-    } else {
-      heading.setAttribute("aria-hidden", "true");
+// runsOnEdges is one placement edge per (service, host) pair. They exist
+// for drawing and layout only and never enter the call-edge traversals.
+function runsOnEdges(nodes) {
+  const hostIds = new Set(nodes.filter(isHostNode).map((node) => node.id));
+  const output = [];
+  for (const node of nodes) {
+    if (isHostNode(node)) continue;
+    for (const host of nodeHosts(node)) {
+      const target = HOST_PREFIX + host;
+      if (hostIds.has(target)) output.push({ source: node.id, target: target, kind: "runs_on" });
     }
-    const text = svgElement("text", { class: "cluster-label", "text-anchor": "middle" });
-    text.textContent = clusterLabel(ring.cluster);
-    heading.appendChild(text);
-    dom.clusters.appendChild(heading);
+  }
+  return output;
+}
+
+function hostNodeLabel(name) {
+  const host = hostByName(name);
+  if (!host) return name + ", host";
+  const count = finite(host.service_count, 0);
+  return name + ", " + count + (count === 1 ? " service" : " services");
+}
+
+function renderRunsOnEdges(placements, positions, fragment) {
+  for (const edge of placements) {
+    const source = positions.get(edge.source);
+    const target = positions.get(edge.target);
+    if (!source || !target) continue;
+    fragment.appendChild(svgElement("line", {
+      class: "runs-on-edge",
+      "data-kind": edge.kind,
+      "data-source": edge.source,
+      "data-target": edge.target,
+      x1: source.x,
+      y1: source.y,
+      x2: target.x,
+      y2: target.y,
+    }));
   }
 }
 
@@ -996,7 +988,6 @@ function graphSearchMatches() {
 
 function renderGraph() {
   dom.rings.replaceChildren();
-  dom.clusters.replaceChildren();
   dom.edges.replaceChildren();
   dom.nodes.replaceChildren();
   dom.minimapEdges.replaceChildren();
@@ -1005,19 +996,16 @@ function renderGraph() {
 
   const hostMode = state.groupBy === "host";
   dom.graphDescription.textContent = hostMode
-    ? "Services are clustered by host. Select a service or a host heading to inspect it."
+    ? "Hosts share the map with services; a dashed edge links a service to each host it runs on. Select a service or a host to inspect it."
     : "Services are arranged by dependency criticality. Select a service to inspect it.";
+  const nodes = hostMode ? state.graph.nodes.concat(hostNodes(state.graph.nodes)) : state.graph.nodes;
   const edges = cleanEdges(state.graph.nodes, state.graph.edges);
-  let positions;
-  if (hostMode) {
-    const layout = hostLayout(hostClusters());
-    positions = layout.positions;
-    renderClusterRings(layout.rings);
-  } else {
-    positions = graphLayout(state.graph.nodes, edges);
-    for (const radius of [100, 200, 300, 400]) {
-      dom.rings.appendChild(svgElement("circle", { class: "graph-ring", cx: 500, cy: 500, r: radius }));
-    }
+  // Placement edges enter the layout scoring only, so a host ranks with the
+  // services it carries; every traversal below reads the call edges alone.
+  const placements = hostMode ? runsOnEdges(nodes) : [];
+  const positions = graphLayout(nodes, edges.concat(placements));
+  for (const radius of [100, 200, 300, 400]) {
+    dom.rings.appendChild(svgElement("circle", { class: "graph-ring", cx: 500, cy: 500, r: radius }));
   }
   const searchMatches = graphSearchMatches();
   const impact = state.impactRoot ? downstreamDepths(state.impactRoot, edges, 5) : null;
@@ -1031,6 +1019,7 @@ function renderGraph() {
   }
 
   const edgeFragment = document.createDocumentFragment();
+  renderRunsOnEdges(placements, positions, edgeFragment);
   for (const edge of edges) {
     const source = positions.get(edge.source);
     const target = positions.get(edge.target);
@@ -1068,14 +1057,15 @@ function renderGraph() {
   }
   dom.edges.appendChild(edgeFragment);
 
-  const count = state.graph.nodes.length;
+  const count = nodes.length;
   const nodeRadius = count > 140 ? 7 : count > 70 ? 9 : count > 30 ? 11 : 14;
   const showAllLabels = count <= 42;
   const nodeFragment = document.createDocumentFragment();
-  for (const node of state.graph.nodes) {
+  for (const node of nodes) {
     const point = positions.get(node.id);
     if (!point) continue;
     const hostNode = isHostNode(node);
+    const hostName = hostNode ? hostOfNode(node) : "";
     const status = hostNode ? "unknown" : normalizeStatus(node);
     const group = svgElement("g", {
       class: "service-node",
@@ -1084,25 +1074,27 @@ function renderGraph() {
       role: "button",
       "data-status": status,
       "aria-label": hostNode
-        ? node.id + ", host, open host panel"
+        ? hostNodeLabel(hostName)
         : node.id + ", " + status + ", health " + formatRatio(node.health_score, 0),
     });
     group.dataset.service = node.id;
     if (hostNode) {
-      // A host entity is a diamond with no edges; activating it opens the host panel.
+      // A host is a diamond; activating it opens the host panel.
       group.dataset.kind = "host";
+      group.dataset.host = hostName;
+      if (hostName === state.selectedHost) group.classList.add("is-selected");
       const side = nodeRadius * 1.7;
       group.appendChild(svgElement("rect", { class: "node-halo", x: -side / 2 - 7, y: -side / 2 - 7, width: side + 14, height: side + 14, transform: "rotate(45)" }));
       group.appendChild(svgElement("rect", { class: "node-core", x: -side / 2, y: -side / 2, width: side, height: side, transform: "rotate(45)" }));
       if (showAllLabels || searchMatches && searchMatches.has(node.id)) {
         const label = svgElement("text", { class: "node-label", x: nodeRadius + 9, y: 6 });
-        label.textContent = node.id.length > 24 ? node.id.slice(0, 23) + "…" : node.id;
+        label.textContent = hostName.length > 24 ? hostName.slice(0, 23) + "…" : hostName;
         group.appendChild(label);
       }
       const title = svgElement("title");
-      title.textContent = node.id + " — host";
+      title.textContent = hostName + " — host";
       group.appendChild(title);
-      const open = () => openHost(hostOfNode(node));
+      const open = () => openHost(hostName);
       group.addEventListener("click", (event) => {
         event.stopPropagation();
         open();

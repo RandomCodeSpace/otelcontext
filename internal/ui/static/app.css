@@ -11,6 +11,8 @@
   --faint: #737e90;
   --accent: #8b95ff;
   --accent-soft: #8b95ff1f;
+  --edge-runs-on: color-mix(in srgb, var(--accent) 55%, transparent);
+  --edge-runs-on-dash: 5 5;
   --healthy: #39d59b;
   --degraded: #f7bd45;
   --critical: #ff7078;
@@ -920,41 +922,12 @@ h2 {
   vector-effect: non-scaling-stroke;
 }
 
-.cluster-ring {
-  fill: color-mix(in srgb, var(--accent) 4%, transparent);
-  stroke: color-mix(in srgb, var(--accent) 45%, var(--line));
-  stroke-dasharray: 4 6;
+.runs-on-edge {
+  stroke: var(--edge-runs-on);
+  stroke-dasharray: var(--edge-runs-on-dash);
+  stroke-linecap: round;
   stroke-width: 1;
   vector-effect: non-scaling-stroke;
-}
-
-.cluster-heading {
-  cursor: pointer;
-}
-
-.cluster-label {
-  fill: var(--muted);
-  font-family: var(--font-mono);
-  font-size: 15px;
-  font-weight: 700;
-  paint-order: stroke;
-  stroke: var(--surface);
-  stroke-linejoin: round;
-  stroke-width: 5px;
-}
-
-.cluster-heading:hover .cluster-label,
-.cluster-heading:focus .cluster-label,
-.cluster-heading.is-selected .cluster-label {
-  fill: var(--accent);
-}
-
-.cluster-heading:focus {
-  outline: none;
-}
-
-.cluster-heading:focus-visible .cluster-label {
-  text-decoration: underline;
 }
 
 .graph-edge {

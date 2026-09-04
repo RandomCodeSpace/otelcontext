@@ -1320,8 +1320,13 @@ func TestProtectedBrowserWorkflow(t *testing.T) {
 					"node-a:2 services|node-b:1 service|node-c:0 services" &&
 				checkout.length === 1 && heading && heading.dataset.host === "node-a" &&
 				checkout[0].querySelector(".service-meta").textContent.includes("2 hosts") &&
-				document.querySelectorAll("#graph-clusters .cluster-heading[data-host]").length === 3 &&
-				document.querySelectorAll("#graph-nodes .service-node").length === 2 &&
+				document.querySelectorAll('#graph-nodes .service-node[data-kind="host"]').length === 3 &&
+				document.querySelectorAll('#graph-nodes .service-node:not([data-kind="host"])').length === 2 &&
+				Array.from(document.querySelectorAll('#graph-edges .runs-on-edge[data-kind="runs_on"]'))
+					.map((edge) => edge.dataset.source + ">" + edge.dataset.target).sort().join("|") ===
+					"checkout>host/node-a|checkout>host/node-b|gateway>host/node-a" &&
+				document.querySelectorAll("#graph-edges .graph-edge").length === 1 &&
+				document.querySelector('#graph-nodes .service-node[data-kind="host"][data-host="node-a"]').getAttribute("aria-label") === "node-a, 2 services" &&
 				document.querySelector("#service-count").textContent.trim() === "2" &&
 				document.querySelector("#pulse-services").textContent.trim() === "2";
 		})()
@@ -1329,12 +1334,23 @@ func TestProtectedBrowserWorkflow(t *testing.T) {
 	smoke.screenshot("host-group-desktop")
 	if err := chromedp.Run(ctx, chromedp.Evaluate(`
 		(() => {
-			const heading = document.querySelector('#graph-clusters .cluster-heading[data-host="node-c"]');
-			heading.focus();
-			heading.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+			const node = document.querySelector('#graph-nodes .service-node[data-kind="host"][data-host="node-b"]');
+			node.focus();
+			node.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
 		})()
 	`, nil)); err != nil {
-		t.Fatalf("open host panel from map heading: %v", err)
+		t.Fatalf("open host panel from map host node: %v", err)
+	}
+	requireJS(t, ctx, `
+		!document.querySelector("#inspector").inert &&
+		document.querySelector("#inspector-title").textContent.trim() === "node-b" &&
+		document.querySelector("#inspector-tabs").hidden &&
+		new URL(location.href).searchParams.get("host") === "node-b" &&
+		document.querySelector("#inspector-body").textContent.includes("Services · 1") &&
+		document.querySelector('#graph-nodes .service-node[data-kind="host"][data-host="node-b"]').classList.contains("is-selected")
+	`, 5*time.Second)
+	if err := chromedp.Run(ctx, chromedp.Click(`#graph-nodes .service-node[data-kind="host"][data-host="node-c"]`, chromedp.ByQuery)); err != nil {
+		t.Fatalf("open host panel by clicking map host node: %v", err)
 	}
 	requireJS(t, ctx, `
 		!document.querySelector("#inspector").inert &&
@@ -1398,14 +1414,19 @@ func TestProtectedBrowserWorkflow(t *testing.T) {
 	if err := chromedp.Run(ctx, chromedp.EmulateViewport(390, 844)); err != nil {
 		t.Fatalf("set mobile viewport for host grouping: %v", err)
 	}
-	if err := chromedp.Run(ctx, chromedp.Navigate(app.baseURL()+"/?group=host")); err != nil {
+	if err := chromedp.Run(ctx, chromedp.Navigate(app.baseURL()+"/?group=host&impact=gateway")); err != nil {
 		t.Fatalf("reload host grouping on mobile: %v", err)
 	}
 	requireJS(t, ctx, `document.readyState === "complete" && !!document.querySelector("#host-group-button")`, 10*time.Second)
 	smoke.phase("host-group")
+	// Runs-on edges are not calls: the blast radius of gateway still counts
+	// checkout alone, not the hosts it is drawn against.
 	requireJS(t, ctx, `
 		matchMedia("(max-width: 767px)").matches &&
 		document.querySelector("#host-group-button").getAttribute("aria-pressed") === "true" &&
+		!document.querySelector("#impact-banner").hidden &&
+		document.querySelector("#impact-banner").textContent.includes("Blast radius of gateway — 1 downstream") &&
+		document.querySelectorAll('#graph-edges .runs-on-edge').length === 3 &&
 		!document.querySelector("#mobile-list").hidden &&
 		document.querySelectorAll("#mobile-list .host-heading").length === 3 &&
 		document.documentElement.scrollWidth <= document.documentElement.clientWidth &&
