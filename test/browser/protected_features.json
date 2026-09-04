@@ -85,7 +85,7 @@
       "id": "host-grouping-and-panel",
       "proof": "browser",
       "phase": "host-group",
-      "contract": "Host mode groups the map and list by host from /api/hosts, keeps host entities out of the service ranking, and the host panel reads CPU, memory and disk through /api/metrics or says not reported; toggle, cluster headings and host chips are keyboard reachable and the grouped list stays readable on mobile."
+      "contract": "Host mode draws every host from /api/hosts as a diamond node in the service layout with one dashed runs-on edge per service placement, excluded from call traversals so the blast radius is unchanged; the list groups by host, host entities stay out of the service ranking, and the host panel reads CPU, memory and disk through /api/metrics or says not reported; toggle, host nodes and host chips are keyboard reachable and the grouped list stays readable on mobile."
     },
     {
       "id": "node-free-client-source",
