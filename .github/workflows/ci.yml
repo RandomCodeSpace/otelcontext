@@ -360,7 +360,11 @@ jobs:
             (.measurements | length) >= 9 and
             (.assertions | length) >= 12 and
             all(.assertions[]; (.measured | type) == "number" and (.objective | type) == "number" and (.detail | length) > 0) and
-            (.rss.samples | length) >= 1
+            (.rss.samples | length) >= 1 and
+            (.objectives.rss_steady_p95_bytes > 0) and
+            (.rss.steady_samples >= 1) and
+            (.memory_accounting.graphrag_entities | length) >= 1 and
+            (.memory_accounting.read_cache_entries | length) >= 1
           ' "${RUNNER_TEMP}/read-proof/artifacts/read-latency-v1.json"
 
       - name: upload read latency proof

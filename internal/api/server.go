@@ -143,13 +143,15 @@ func (s *Server) thresholds() ReadinessThresholds {
 
 // NewServer creates a new API server.
 func NewServer(repo *storage.Repository, hub *realtime.Hub, eventHub *realtime.EventHub, metrics *telemetry.Metrics) *Server {
-	return &Server{
+	s := &Server{
 		repo:     repo,
 		hub:      hub,
 		eventHub: eventHub,
 		metrics:  metrics,
 		cache:    cache.New(),
 	}
+	metrics.RegisterReadCache("api_ttl", s.cache.Len)
+	return s
 }
 
 // SetGraph wires the in-memory service graph into the API server.

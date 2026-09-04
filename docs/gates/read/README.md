@@ -25,11 +25,91 @@ objective, and missing evidence is a failed assertion with its reason.
   sends, so the server's 5 s result cache serves most warm calls, and that
   is the asserted number; `mcp_<tool>_miss` adds an ignored `_nonce` argument
   that defeats the cache key and is recorded for reference only.
-- `rss` — the server's `VmRSS` sampled every 5 s across the run, with the peak
-  and the p95 over samples taken during the measurement phase. Recorded, not
-  asserted (#292 owns that objective).
+- `rss` — the server's own `otelcontext_process_resident_memory_bytes` and
+  `otelcontext_go_heap_inuse_bytes` (#292) scraped from `/metrics/prometheus`
+  every 5 s across the run (`samples[]` carry `t_s`, `bytes`,
+  `heap_inuse_bytes`), with `peak_bytes`, `heap_inuse_peak_bytes`, and the
+  **steady p95** the #283 objective is asserted against: the exact ordered
+  p95 over samples taken at or after `steady_from_s`. `settle_s` and
+  `steady_rule` record how that window was chosen (below).
+- `memory_accounting` — one `/metrics/prometheus` read at the end of the
+  measurement phase saying where the memory sits: `rss_bytes` and
+  `heap_inuse_bytes` at that instant, the resource registry
+  (`registry_pair_entries`, `registry_host_entries`, summed over tenants),
+  the GraphRAG census by entity and edge store (`graphrag_entities`,
+  `graphrag_edges`; `latency_sketches` is the #291 per-service sketch count
+  and `graphrag_latency_sketch_bytes` is that count × `sizeof(aggregate.Sketch)`),
+  and the read caches (`read_cache_entries` by `api_ttl` — dashboard,
+  service-map and ETag entries — and `mcp_result`).
 - `assertions[]` — two per asserted endpoint, `<name>.cold_ms` and
-  `<name>.warm_p99_ms`.
+  `<name>.warm_p99_ms`, plus `rss.steady_p95_bytes`.
+
+## Memory objective and the steady window (from #283)
+
+| Shape | RSS steady p95 |
+|---|---|
+| `legacy` (bounded SQLite, 5 services) | ≤ 512 MiB |
+| `aggregate` (120 services) | ≤ 2 GiB |
+
+Seeding is a transient the objective does not describe: the legacy shape
+exports two days of spans in under twenty seconds, every seeded span is
+backdated past the GraphRAG trace TTL and sits in memory until the next
+60 s refresh tick prunes it, and the Go runtime keeps the freed heap until
+its next collection — an idle process only gets one from the two-minute
+forced GC — and then returns it to the OS several seconds later. The
+seven-day gate excludes its own warm-up with `steady_start_offset_sec`; the
+read proof does the equivalent from observable runtime state. The steady
+window starts after the **second** GC cycle completed at least one refresh
+interval (60 s) after seeding finished, once the runtime's retained idle
+heap (`go_memstats_heap_idle_bytes − go_memstats_heap_released_bytes`) is
+below the heap in use and the RSS gauge has held within 2% across four
+readings 5 s apart, measured against the **first** reading of the run so a
+slow climb that stays under 2% per step is still a climb — all of it under
+the proof's own read workload (every asserted endpoint, round-robin, back
+to back), stopped before measurement. "Steady" means steady under reads: an
+idle process is not the state the objective describes — without allocation
+the pacer only cycles on the two-minute forced GC and RSS plateaus wherever
+the last cycle's goal left it, and the first collection under the
+measurement's reads moves it again (measured: 548 MiB idle, 465 MiB from the
+first read on) — and the memory outside the Go heap behind the wide-range
+reads only reaches its working size once those reads have run. Under the
+workload the cycles are allocation-driven and the pacer converges the way
+it will during measurement. If the budget runs out before that plateau,
+`rss.steady_reached` is false, `steady_reason` says where the gauge stood,
+and the assertion **fails**: an under-sampled p95 is not evidence. Why the second: the GC pacer sets each cycle's heap goal
+from the live heap of the cycle before, so the first collection after the
+prune runs against a goal computed while the transient was still live and
+the scavenger stops at a ceiling that still includes it (measured: RSS flat
+at 617 MiB for 70 s with `heap_released` unchanged, then the next collection
+released another 160 MiB). The scavenger's pace is a runtime property that
+differs by an order of magnitude between hosts (seconds here, minutes on a
+hosted 4-vCPU runner), so the harness never caps that wait with a number of
+its own; the only bound is the CI budget remainder (8 min), and reaching it
+is recorded in `steady_rule` and leaves the window to fail honestly. The
+measurement phase (the reads) runs inside that window, so the p95 covers the
+server answering the asserted endpoints.
+
+With about eight samples the nearest-rank p95 is the maximum, which is the
+strict reading and the intended one.
+
+Where the memory went at the 144-window depth, measured while sizing the
+fix (`memory_accounting.mappings_before_reads` / `mappings_after_reads`
+carry the same breakdown for every run, from `/proc/<pid>/smaps`): the
+pure-Go SQLite page cache is **not** Go heap (modernc's libc allocates it
+outside the heap, invisible to `GOMEMLIMIT`) and its allocator holds about
+twice the configured cache as anonymous RSS — 277 MiB at the former 256 MB
+ceiling, 249 MiB at 128 MB, 125 MiB at 64 MB, flat before and after the
+reads; the former 1 GB `mmap_size` window kept every page a full-range scan
+touched resident (124–155 MiB for the 173 MB legacy file, growing with the
+file); the Go heap holds ~65–130 MiB live after the transient and its arena
+grows toward the GC goal (2× live) under sustained reads, which is the
+climb a hosted runner shows during the read phase. The fix (#292) is at the
+SQLite owner: the page cache is fixed at 64 MB and mmap is opt-in via
+`SQLITE_MMAP_SIZE_BYTES` — re-proven against the latency objectives above
+(legacy steady p95 344 MiB locally, all latency assertions green).
+`OTELCONTEXT_READPROOF_PPROF_ADDR=127.0.0.1:6060` opens the measured
+server's pprof listener so a future exceedance can be attributed the same
+way.
 
 ## Shapes and objectives (from #281)
 
@@ -86,4 +166,6 @@ The test fails when any assertion fails and still writes the JSON.
 CI runs both shapes on every pull request as `read latency proof · legacy`
 and `read latency proof · aggregate` (`.github/workflows/ci.yml`) and uploads
 `read-latency-<shape>-<sha>` for 14 days. The untagged helpers (percentiles,
-evaluation, JSON, RSS parsing) are covered by the normal `go test ./...`.
+evaluation, JSON, exposition parsing, memory accounting) are covered by the
+normal `go test ./...`. Each shape now spends up to five minutes settling
+after seeding before it measures, so a run is three to eight minutes.

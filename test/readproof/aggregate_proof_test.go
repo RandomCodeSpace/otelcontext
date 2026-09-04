@@ -45,7 +45,9 @@ func TestReadLatencyAggregate(t *testing.T) {
 	}
 
 	started := time.Now()
-	objectives := Objectives{Requests: 200, WarmP99MS: 500, ColdMS: 2000}
+	// Latency from #281; RSS steady p95 from #283 (aggregate, 120 services:
+	// 2 GiB, inside the gate's 4 GiB confinement).
+	objectives := Objectives{Requests: 200, WarmP99MS: 500, ColdMS: 2000, RSSSteadyP95Bytes: 2048 * MiB}
 	proof := newProof(t, "aggregate", binary, objectives)
 	proof.Prefill = Prefill{RequestedWindows: sevenDayWindows, Windows: windows, Series: aggprefillSeries, Services: aggprefillServices}
 	if windows != sevenDayWindows {
@@ -108,10 +110,15 @@ func TestReadLatencyAggregate(t *testing.T) {
 	proof.ReadySeconds = round3(time.Since(app.started).Seconds())
 	t.Logf("ready after %.1f s", proof.ReadySeconds)
 
+	sampler.settle(time.Now(), workload(plan))
 	measureFrom := time.Since(app.started).Seconds()
+	before := app.mappings()
 	sampler.sample()
 	for _, ep := range plan {
 		measure(t, ep.m, ep.fn, objectives)
 	}
+	proof.Memory = app.account()
+	proof.Memory.MappingsBefore, proof.Memory.MappingsAfter = before, app.mappings()
 	proof.RSS = sampler.finish(measureFrom)
+	logMemory(t, proof)
 }

@@ -1386,6 +1386,7 @@ func main() {
 				ent.WithLabelValues("tenants").Set(float64(c.Tenants))
 				ent.WithLabelValues("services").Set(float64(c.Services))
 				ent.WithLabelValues("operations").Set(float64(c.Operations))
+				ent.WithLabelValues("latency_sketches").Set(float64(c.LatencySketches))
 				ent.WithLabelValues("traces").Set(float64(c.Traces))
 				ent.WithLabelValues("spans").Set(float64(c.Spans))
 				ent.WithLabelValues("log_clusters").Set(float64(c.LogClusters))

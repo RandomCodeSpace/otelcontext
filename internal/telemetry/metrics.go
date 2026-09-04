@@ -375,6 +375,9 @@ type Metrics struct {
 	dbLatencyObserved uint64
 	dbLatencyLastMs   float64
 	startTime         time.Time
+	// readCaches publishes otelcontext_read_cache_entries{cache} for the
+	// read caches registered through RegisterReadCache (#292 accounting).
+	readCaches *readCacheCollector
 }
 
 // New creates and registers all OtelContext internal metrics.
@@ -571,7 +574,7 @@ func New() *Metrics {
 		}),
 		GraphRAGStoreEntities: promauto.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "otelcontext_graphrag_store_entities",
-			Help: "Live GraphRAG node counts across tenants, by entity kind (tenants|services|operations|traces|spans|log_clusters|metrics|anomalies).",
+			Help: "Live GraphRAG node counts across tenants, by entity kind (tenants|services|operations|latency_sketches|traces|spans|log_clusters|metrics|anomalies).",
 		}, []string{"entity"}),
 		GraphRAGStoreEdges: promauto.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "otelcontext_graphrag_store_edges",
@@ -856,6 +859,11 @@ func New() *Metrics {
 		Help:    "Wall time of one exemplar-tier purge pass.",
 		Buckets: prometheus.DefBuckets,
 	})
+	// RSS witness (#283/#292): otelcontext_process_resident_memory_bytes on
+	// Linux only, otelcontext_go_heap_inuse_bytes everywhere, both sampled on
+	// scrape; plus the read-cache entry counts the memory accounting reads.
+	m.readCaches = newReadCacheCollector()
+	prometheus.MustRegister(newProcessMemoryCollector(processRSSReader), m.readCaches)
 	return m
 }
 
