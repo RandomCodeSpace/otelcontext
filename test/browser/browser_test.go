@@ -1374,13 +1374,20 @@ func TestProtectedBrowserWorkflow(t *testing.T) {
 		!document.querySelector("#inspector-tabs").hidden &&
 		document.querySelectorAll("#inspector-body .host-chip").length === 2
 	`, 5*time.Second)
-	if err := chromedp.Run(ctx, chromedp.Evaluate(`document.querySelector('#inspector-body .host-chip[data-host="node-b"]').focus()`, nil)); err != nil {
-		t.Fatalf("focus host chip: %v", err)
-	}
-	requireJS(t, ctx, `document.activeElement && document.activeElement.dataset.host === "node-b"`, 5*time.Second)
-	if err := chromedp.Run(ctx, chromedp.Evaluate(`document.activeElement.click()`, nil)); err != nil {
-		t.Fatalf("activate host chip: %v", err)
-	}
+	// Focus and activate the chip in one evaluation. A live snapshot can
+	// re-render the inspector body between two round-trips; the replaced
+	// chip then no longer holds focus and a click on document.activeElement
+	// lands on <body>.
+	requireJS(t, ctx, `
+		(() => {
+			const chip = document.querySelector('#inspector-body .host-chip[data-host="node-b"]');
+			if (!chip) return false;
+			chip.focus();
+			if (document.activeElement !== chip) return false;
+			chip.click();
+			return true;
+		})()
+	`, 5*time.Second)
 	requireJS(t, ctx, `
 		document.querySelector("#inspector-title").textContent.trim() === "node-b" &&
 		!!document.querySelector('#inspector-body .dependency-row[data-service="checkout"]')
