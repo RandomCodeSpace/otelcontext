@@ -3,10 +3,9 @@
 All notable changes to **otelcontext** are documented in this file.
 
 The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/),
-and this project follows [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html)
-once a stable release line exists. While otelcontext remains pre-1.0, every
-commit on `main` is the canonical version identifier (`git rev-parse HEAD`).
-Per-tag pre-release notes are published on
+and this project follows [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
+While otelcontext remains pre-1.0, every commit on `main` is the canonical
+version identifier (`git rev-parse HEAD`). Per-tag release notes are published on
 [GitHub Releases](https://github.com/RandomCodeSpace/otelcontext/releases).
 This file's `Unreleased` section tracks what has landed on `main` since the
 most recently published tag.
@@ -57,8 +56,8 @@ most recently published tag.
   matching with BM25 ranking, while `trace_id` remains an exact filter. Set
   `LOG_FTS_ENABLED=false` to keep the LIKE path. FTS tables are installed only
   when `DB_AUTOMIGRATE=true`; an existing database without the index continues
-  to use LIKE until an operator provisions it. Expect the index to add roughly
-  30–40% to log-heavy SQLite database size.
+  to use LIKE until an operator provisions it. The index adds
+  workload-dependent disk and write overhead.
 - SQLite applies its managed PRAGMAs to every physical connection in the pool.
   The default idle pool now matches the runtime default: 25 connections for
   non-SQLite databases and one for SQLite.
