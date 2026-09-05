@@ -1,6 +1,7 @@
 package aggregate
 
 import (
+	"context"
 	"errors"
 	"sync"
 	"sync/atomic"
@@ -342,7 +343,7 @@ func seedTraceWindow(t *testing.T, f *cumulativeFixture, spans int) int64 {
 // the request/span basis, so the span counter is the honest assertion here.
 func dashboardSpans(t *testing.T, e *Engine, from, to time.Time) int64 {
 	t.Helper()
-	res, err := e.QueryDashboard(Query{Tenant: "acme", Start: from, End: to})
+	res, err := e.QueryDashboard(context.Background(), Query{Tenant: "acme", Start: from, End: to})
 	if err != nil {
 		t.Fatalf("QueryDashboard: %v", err)
 	}

@@ -5,10 +5,9 @@ import (
 	"fmt"
 	"log"
 	"log/slog"
-	"os"
-	"strconv"
 	"strings"
 
+	"github.com/RandomCodeSpace/otelcontext/internal/config"
 	"gorm.io/gorm"
 )
 
@@ -118,32 +117,14 @@ func fts5MatchExpr(input string) string {
 // fts5Available reports whether the given driver should use the FTS5 path.
 // FTS5 is only enabled when (a) the driver is SQLite (Postgres has its own
 // pg_trgm GIN path; MySQL/SQL Server are out of scope) and (b) LOG_FTS_ENABLED
-// is truthy. Default off — FTS5's inverted index typically consumes 30-40% of
+// is enabled. Default on; FTS5's inverted index typically consumes 30-40% of
 // SQLite DB disk for log-heavy workloads, and the LIKE fallback at
 // log_repo.go:105 keeps search_logs functional without it.
 func fts5Available(driver string) bool {
 	if !strings.EqualFold(driver, "sqlite") {
 		return false
 	}
-	return logFTSEnabledFromEnv()
-}
-
-// logFTSEnabledFromEnv reads LOG_FTS_ENABLED and reports whether the FTS5
-// virtual table + triggers should be installed and queried. Defaults to
-// false; opt in with LOG_FTS_ENABLED=true (also accepts yes/on/1).
-func logFTSEnabledFromEnv() bool {
-	v, ok := os.LookupEnv("LOG_FTS_ENABLED")
-	if !ok {
-		return false
-	}
-	if b, err := strconv.ParseBool(strings.TrimSpace(v)); err == nil {
-		return b
-	}
-	switch strings.ToLower(strings.TrimSpace(v)) {
-	case "yes", "y", "on":
-		return true
-	}
-	return false
+	return config.LogFTSEnabledFromEnv()
 }
 
 // DropLogsFTS removes the FTS5 virtual table and its sync triggers, then runs

@@ -13,6 +13,8 @@ most recently published tag.
 
 ## [Unreleased]
 
+## [v0.5.0] - 2026-09-05
+
 ### Added — aggregate metrics engine (production-readiness epic #194)
 
 - **Aggregate engine** (`internal/aggregate/`, opt-in via
@@ -51,6 +53,25 @@ most recently published tag.
 
 ### Changed
 
+- SQLite log search now enables FTS5 by default. It uses stemmed token-prefix
+  matching with BM25 ranking, while `trace_id` remains an exact filter. Set
+  `LOG_FTS_ENABLED=false` to keep the LIKE path. FTS tables are installed only
+  when `DB_AUTOMIGRATE=true`; an existing database without the index continues
+  to use LIKE until an operator provisions it. Expect the index to add roughly
+  30–40% to log-heavy SQLite database size.
+- SQLite applies its managed PRAGMAs to every physical connection in the pool.
+  The default idle pool now matches the runtime default: 25 connections for
+  non-SQLite databases and one for SQLite.
+- Production mode accepts SQLite without a waiver and treats API
+  authentication and TLS as independent opt-ins. The former
+  `OTELCONTEXT_ALLOW_SQLITE_PROD` and
+  `OTELCONTEXT_ALLOW_INSECURE_GRPC` flags remain accepted as deprecated no-ops.
+  Configured authentication and TLS still take effect.
+- API render caches are capped at 256 entries and 16 MiB each. Cache keys use
+  canonical request parameters and preserve ETag behavior.
+- The unused legacy in-memory metric ring is no longer allocated. Metric
+  queries still use their existing storage paths, and the compatibility ring
+  gauges remain exported at zero.
 - Host-only telemetry has a home (#280, #287): a resource carrying `host.name`
   or `host.id` and no `service.name` is identified as `host/<host.name>`
   (`host/<host.id>` without a name) in legacy and aggregate modes, so
@@ -87,6 +108,14 @@ most recently published tag.
 
 ### Fixed
 
+- Aggregate HTTP, MCP, and realtime reads now propagate request cancellation
+  through their query fan-out.
+- The DLQ refuses a single envelope that exceeds its disk budget before it
+  evicts recoverable entries, and aborts an enqueue when an old entry cannot be
+  removed.
+- FTS log searches with a service filter now qualify `logs.service_name`,
+  avoiding the ambiguous-column error that forced an unnecessary LIKE
+  fallback.
 - **realtime**: WebSocket hub shutdown deadlock and WaitGroup misuse —
   graceful shutdown could hang forever against connection churn.
 - **api**: aggregate reads whose range exceeds the read-range cap are
@@ -405,7 +434,8 @@ committed the built UI to `main`.)
 - bestpractices.dev project [12646](https://www.bestpractices.dev/projects/12646)
   declared at `level: passing` via canonical autofill schema. ([#47])
 
-[Unreleased]: https://github.com/RandomCodeSpace/otelcontext/compare/v0.3.0-beta.1...HEAD
+[Unreleased]: https://github.com/RandomCodeSpace/otelcontext/compare/v0.5.0...HEAD
+[v0.5.0]: https://github.com/RandomCodeSpace/otelcontext/compare/v0.4.0-beta.1...v0.5.0
 [v0.3.0-beta.1]: https://github.com/RandomCodeSpace/otelcontext/compare/v0.2.0-beta.6...v0.3.0-beta.1
 [v0.2.0-beta.6]: https://github.com/RandomCodeSpace/otelcontext/compare/v0.0.11-beta.15...v0.2.0-beta.6
 [#24]: https://github.com/RandomCodeSpace/otelcontext/pull/24

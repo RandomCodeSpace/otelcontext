@@ -11,8 +11,8 @@ import (
 // newTestRepo builds a Repository backed by an in-memory SQLite DB with all models migrated.
 // Tests live in the same package so they can poke unexported fields.
 //
-// FTS5 is force-enabled here so the existing FTS5 + BM25 + trigger tests
-// keep working after LOG_FTS_ENABLED defaulted to false in production.
+// FTS5 is explicitly enabled here so tests are isolated from the host
+// environment even though LOG_FTS_ENABLED defaults to true.
 // t.Setenv applies for the lifetime of the test that called this helper.
 func newTestRepo(t *testing.T) *Repository {
 	t.Helper()

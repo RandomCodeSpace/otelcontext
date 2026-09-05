@@ -54,6 +54,7 @@ type DeadLetterQueue struct {
 	evicted      atomic.Int64
 	evictedBytes atomic.Int64
 	metricsTel   *telemetry.Metrics // nil-safe; enables otelcontext_dlq_evicted_* counters
+	removeFile   func(string) error
 }
 
 // NewDLQ creates a new Dead Letter Queue.
@@ -79,6 +80,7 @@ func NewDLQWithLimits(dir string, interval time.Duration, replayFn func(data []b
 		maxDiskMB:  maxDiskMB,
 		maxRetries: maxRetries,
 		retries:    make(map[string]int),
+		removeFile: os.Remove,
 	}
 
 	dlq.wg.Add(1)
@@ -158,7 +160,9 @@ func (d *DeadLetterQueue) Enqueue(batch any) error {
 	}
 
 	// Enforce limits before writing a new file.
-	d.enforceLimits(int64(len(data)))
+	if err := d.enforceLimits(int64(len(data))); err != nil {
+		return fmt.Errorf("DLQ: cannot enforce limits: %w", err)
+	}
 
 	// batch_<nanos>_*.json — CreateTemp replaces `*` with a unique suffix so
 	// two goroutines in the same nanosecond still get distinct files.
@@ -206,14 +210,23 @@ func (d *DeadLetterQueue) Enqueue(batch any) error {
 
 // enforceLimits removes oldest files to stay within maxFiles and maxDiskMB.
 // Must be called with d.mu held.
-func (d *DeadLetterQueue) enforceLimits(incomingBytes int64) {
+func (d *DeadLetterQueue) enforceLimits(incomingBytes int64) error {
 	if d.maxFiles == 0 && d.maxDiskMB == 0 {
-		return
+		return nil
+	}
+
+	const bytesPerMiB int64 = 1024 * 1024
+	if d.maxDiskMB > math.MaxInt64/bytesPerMiB {
+		return fmt.Errorf("disk limit exceeds supported range")
+	}
+	maxBytes := d.maxDiskMB * bytesPerMiB
+	if maxBytes > 0 && incomingBytes > maxBytes {
+		return fmt.Errorf("incoming envelope is %d bytes, exceeds %d-byte disk limit", incomingBytes, maxBytes)
 	}
 
 	entries, err := os.ReadDir(d.dir)
 	if err != nil {
-		return
+		return fmt.Errorf("read DLQ directory: %w", err)
 	}
 
 	// Collect JSON files sorted by name (timestamp-prefixed → chronological).
@@ -227,13 +240,17 @@ func (d *DeadLetterQueue) enforceLimits(incomingBytes int64) {
 		if e.IsDir() || filepath.Ext(e.Name()) != ".json" {
 			continue
 		}
-		if info, err := e.Info(); err == nil {
-			files = append(files, fileInfo{e.Name(), info.Size()})
-			totalBytes += info.Size()
+		info, err := e.Info()
+		if err != nil {
+			return fmt.Errorf("stat DLQ file %s: %w", e.Name(), err)
 		}
+		if info.Size() > math.MaxInt64-totalBytes {
+			return fmt.Errorf("DLQ file sizes exceed supported range")
+		}
+		files = append(files, fileInfo{e.Name(), info.Size()})
+		totalBytes += info.Size()
 	}
 
-	maxBytes := d.maxDiskMB * 1024 * 1024
 	var evictedThisCall int
 	var evictedBytesThisCall int64
 	i := 0
@@ -247,8 +264,10 @@ func (d *DeadLetterQueue) enforceLimits(incomingBytes int64) {
 
 		// Evict oldest file.
 		path := filepath.Join(d.dir, files[i].name)
+		if err := d.removeFile(path); err != nil {
+			return fmt.Errorf("remove DLQ file %s: %w", files[i].name, err)
+		}
 		totalBytes -= files[i].size
-		_ = os.Remove(path)
 		delete(d.retries, files[i].name)
 		slog.Warn("🗑️  DLQ FIFO eviction", "file", files[i].name)
 		d.evicted.Add(1)
@@ -274,6 +293,7 @@ func (d *DeadLetterQueue) enforceLimits(incomingBytes int64) {
 			"max_disk_mb", d.maxDiskMB,
 		)
 	}
+	return nil
 }
 
 // Size returns the number of files currently in the DLQ directory.

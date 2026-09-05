@@ -2,6 +2,7 @@ package telemetry
 
 import (
 	"database/sql"
+	"strings"
 	"testing"
 	"time"
 
@@ -86,6 +87,33 @@ func TestSampleDBPoolStats(t *testing.T) {
 		// telemetry.Metrics through to the OTLP servers.
 		var m2 *Metrics
 		m2.ObserveIngestDuration("traces", time.Millisecond)
+	})
+
+	t.Run("DisabledRingMetricsRemainCompatibleAndZero", func(t *testing.T) {
+		activeDesc := m.TSDBRingSeriesActive.Desc().String()
+		if !strings.Contains(activeDesc, `fqName: "otelcontext_tsdb_ring_series_active"`) ||
+			!strings.Contains(activeDesc, "always zero") {
+			t.Fatalf("active ring metric descriptor = %s", activeDesc)
+		}
+		rejectedDesc := m.TSDBRingSeriesRejected.Desc().String()
+		if !strings.Contains(rejectedDesc, `fqName: "otelcontext_tsdb_ring_series_rejected_total"`) ||
+			!strings.Contains(rejectedDesc, "always zero") {
+			t.Fatalf("rejected ring metric descriptor = %s", rejectedDesc)
+		}
+
+		var active, rejected dto.Metric
+		if err := m.TSDBRingSeriesActive.Write(&active); err != nil {
+			t.Fatalf("active ring gauge write: %v", err)
+		}
+		if err := m.TSDBRingSeriesRejected.Write(&rejected); err != nil {
+			t.Fatalf("rejected ring counter write: %v", err)
+		}
+		if got := active.GetGauge().GetValue(); got != 0 {
+			t.Fatalf("active ring series = %v, want 0", got)
+		}
+		if got := rejected.GetCounter().GetValue(); got != 0 {
+			t.Fatalf("rejected ring series = %v, want 0", got)
+		}
 	})
 }
 

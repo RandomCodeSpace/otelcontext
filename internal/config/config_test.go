@@ -35,7 +35,7 @@ func baseValid() *Config {
 		SamplingRate:             1.0,
 		APIRateLimitRPS:          100,
 		DBMaxOpenConns:           50,
-		DBMaxIdleConns:           10,
+		DBMaxIdleConns:           25,
 		CompressionLevel:         "default",
 		GRPCMaxRecvMB:            16,
 		GRPCMaxConcurrentStreams: 1000,
@@ -324,24 +324,15 @@ func TestTLSAutoSelfsigned_IgnoredWhenCertFilesSet(t *testing.T) {
 	}
 }
 
-func TestValidateDBForEnv_RefusesSQLiteInProduction(t *testing.T) {
-	c := baseValid()
-	c.DBDriver = "sqlite"
-	c.Env = "production"
-	c.AllowSqliteProd = false
-	err := c.ValidateDBForEnv()
-	if err == nil || !strings.Contains(err.Error(), "SQLite is unsuitable") {
-		t.Fatalf("expected SQLite-in-prod rejection, got %v", err)
-	}
-}
-
-func TestValidateDBForEnv_AllowsSQLiteWhenOptIn(t *testing.T) {
-	c := baseValid()
-	c.DBDriver = "sqlite"
-	c.Env = "production"
-	c.AllowSqliteProd = true
-	if err := c.ValidateDBForEnv(); err != nil {
-		t.Fatalf("opt-in should allow SQLite in prod, got %v", err)
+func TestValidateDBForEnv_AllowsSQLiteInProductionRegardlessOfDeprecatedFlag(t *testing.T) {
+	for _, allow := range []bool{false, true} {
+		c := baseValid()
+		c.DBDriver = "sqlite"
+		c.Env = "production"
+		c.AllowSqliteProd = allow
+		if err := c.ValidateDBForEnv(); err != nil {
+			t.Fatalf("AllowSqliteProd=%t: SQLite in production must pass, got %v", allow, err)
+		}
 	}
 }
 

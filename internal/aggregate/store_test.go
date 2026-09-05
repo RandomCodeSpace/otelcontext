@@ -1,6 +1,7 @@
 package aggregate
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -297,7 +298,7 @@ func TestFinalizeWindowMaterializesAndDeletes(t *testing.T) {
 	assertCount(t, store, "aggregate_delta_log", 0)
 	assertCount(t, store, "aggregate_buckets", 2)
 
-	page, err := store.ReadBuckets(Selector{TenantID: 1, Start: 300, End: 900})
+	page, err := store.ReadBuckets(context.Background(), Selector{TenantID: 1, Start: 300, End: 900})
 	if err != nil {
 		t.Fatalf("ReadBuckets: %v", err)
 	}
@@ -344,7 +345,7 @@ func TestFinalizeWindowMergesIntoExistingBucket(t *testing.T) {
 	if _, err := store.FinalizeWindow(600); err != nil {
 		t.Fatalf("second finalize: %v", err)
 	}
-	page, err := store.ReadBuckets(Selector{TenantID: 1, Start: 600, End: 900})
+	page, err := store.ReadBuckets(context.Background(), Selector{TenantID: 1, Start: 600, End: 900})
 	if err != nil {
 		t.Fatalf("ReadBuckets: %v", err)
 	}
@@ -392,7 +393,7 @@ func TestReadBucketsEnforcesBounds(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := store.ReadBuckets(tc.sel); !errors.Is(err, ErrSelectorUnbounded) {
+			if _, err := store.ReadBuckets(context.Background(), tc.sel); !errors.Is(err, ErrSelectorUnbounded) {
 				t.Fatalf("ReadBuckets(%+v) = %v, want ErrSelectorUnbounded", tc.sel, err)
 			}
 		})
@@ -417,7 +418,7 @@ func TestReadBucketsClampsLimitAndScopesTenant(t *testing.T) {
 		t.Fatalf("FinalizeWindow: %v", err)
 	}
 
-	got, err := store.ReadBuckets(Selector{TenantID: 1, Start: 600, End: 900})
+	got, err := store.ReadBuckets(context.Background(), Selector{TenantID: 1, Start: 600, End: 900})
 	if err != nil {
 		t.Fatalf("ReadBuckets: %v", err)
 	}
@@ -428,7 +429,7 @@ func TestReadBucketsClampsLimitAndScopesTenant(t *testing.T) {
 		t.Fatal("an unlimited read of 3 rows reported truncation")
 	}
 
-	limited, err := store.ReadBuckets(Selector{TenantID: 1, Start: 600, End: 900, Limit: 2})
+	limited, err := store.ReadBuckets(context.Background(), Selector{TenantID: 1, Start: 600, End: 900, Limit: 2})
 	if err != nil {
 		t.Fatalf("ReadBuckets(limit): %v", err)
 	}
@@ -444,7 +445,7 @@ func TestReadBucketsClampsLimitAndScopesTenant(t *testing.T) {
 		t.Fatalf("resume cursor %+v does not point at the last returned row %+v", limited.Next, last)
 	}
 
-	signalScoped, err := store.ReadBuckets(Selector{TenantID: 1, Start: 600, End: 900, Signal: SignalLog})
+	signalScoped, err := store.ReadBuckets(context.Background(), Selector{TenantID: 1, Start: 600, End: 900, Signal: SignalLog})
 	if err != nil {
 		t.Fatalf("ReadBuckets(signal): %v", err)
 	}
@@ -608,7 +609,7 @@ func TestSumBucketsGroupsByNameWithinASignal(t *testing.T) {
 		t.Fatalf("CommitGroup: %v", err)
 	}
 
-	sums, err := store.SumBuckets(Selector{
+	sums, err := store.SumBuckets(context.Background(), Selector{
 		TenantID: 1,
 		Start:    window,
 		End:      window + 4*int64(WindowSize/time.Second),

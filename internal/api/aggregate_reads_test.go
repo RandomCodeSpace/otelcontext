@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -15,6 +16,17 @@ import (
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 	"gorm.io/gorm"
 )
+
+var errAPIAggregateReadLostContext = errors.New("aggregate API read lost request context")
+
+type apiReadContextStore struct{ aggregate.Store }
+
+func (apiReadContextStore) SumBuckets(ctx context.Context, _ aggregate.Selector, _ aggregate.GroupBy) ([]aggregate.SumRow, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return nil, errAPIAggregateReadLostContext
+}
 
 // rawTableCounter counts GORM reads that touch the raw telemetry tables. It is
 // how "no raw trace/log table scans behind the dashboard in aggregate mode"
@@ -78,6 +90,20 @@ func aggregateTestServer(t *testing.T, withEngine bool) (*Server, *rawTableCount
 	counter := &rawTableCounter{}
 	counter.install(t, db)
 	return s, counter, engine
+}
+
+func TestDashboardViewPropagatesRequestCancellation(t *testing.T) {
+	server, _, engine := aggregateTestServer(t, true)
+	engine.SetStore(apiReadContextStore{})
+
+	ctx := storage.WithTenantContext(context.Background(), "default")
+	ctx, cancel := context.WithCancel(ctx)
+	cancel()
+	req := httptest.NewRequest(http.MethodGet, "/api/metrics/dashboard", nil).WithContext(ctx)
+	_, err := server.dashboardView(req, time.Now().Add(-time.Hour), time.Now(), nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("dashboardView error = %v, want context.Canceled", err)
+	}
 }
 
 // seedAggregate folds one service's worth of spans and logs into the engine's

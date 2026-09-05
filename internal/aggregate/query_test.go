@@ -1,6 +1,7 @@
 package aggregate
 
 import (
+	"context"
 	"math"
 	"slices"
 	"sort"
@@ -81,7 +82,10 @@ func (s *stubStore) matching(sel Selector) []Bucket {
 	return out
 }
 
-func (s *stubStore) ReadBuckets(sel Selector) (BucketPage, error) {
+func (s *stubStore) ReadBuckets(ctx context.Context, sel Selector) (BucketPage, error) {
+	if err := ctx.Err(); err != nil {
+		return BucketPage{}, err
+	}
 	limit, err := sel.Validate()
 	if err != nil {
 		return BucketPage{}, err
@@ -100,14 +104,20 @@ func (s *stubStore) ReadBuckets(sel Selector) (BucketPage, error) {
 	return page, nil
 }
 
-func (s *stubStore) VisitSketches(sel Selector, visit func(uint32, *Sketch) error) error {
+func (s *stubStore) VisitSketches(ctx context.Context, sel Selector, visit func(uint32, *Sketch) error) error {
 	if _, err := sel.Validate(); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	s.reads++
 	s.readRanges = append(s.readRanges, [2]int64{sel.Start, sel.End})
 	sel.SketchOnly = true
 	for _, b := range s.matching(sel) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if err := visit(s.infos[b.SeriesID].ServiceID, b.Delta.Sketch); err != nil {
 			return err
 		}
@@ -115,8 +125,11 @@ func (s *stubStore) VisitSketches(sel Selector, visit func(uint32, *Sketch) erro
 	return nil
 }
 
-func (s *stubStore) SumBuckets(sel Selector, by GroupBy) ([]SumRow, error) {
+func (s *stubStore) SumBuckets(ctx context.Context, sel Selector, by GroupBy) ([]SumRow, error) {
 	if _, err := sel.Validate(); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	groups := make(map[SumRow]*SumRow)
@@ -291,7 +304,7 @@ func TestQueryDashboardFromMutableMemory(t *testing.T) {
 	logs.ObserveLog(f.now, false)
 	f.apply(f.logKey("checkout", "payment failed <*>"), f.window(), logs)
 
-	res, err := f.engine.QueryDashboard(f.rangeQuery())
+	res, err := f.engine.QueryDashboard(context.Background(), f.rangeQuery())
 	if err != nil {
 		t.Fatalf("QueryDashboard: %v", err)
 	}
@@ -340,7 +353,7 @@ func TestQueryDashboardPercentileWithinReportedBound(t *testing.T) {
 	}
 	f.apply(f.traceKey("checkout", "POST /pay"), f.window(), d)
 
-	res, err := f.engine.QueryDashboard(f.rangeQuery())
+	res, err := f.engine.QueryDashboard(context.Background(), f.rangeQuery())
 	if err != nil {
 		t.Fatalf("QueryDashboard: %v", err)
 	}
@@ -386,7 +399,7 @@ func TestAccuracyMetadataTracksDownscaledMerge(t *testing.T) {
 	f.apply(f.traceKey("a", "op"), f.window(), fine)
 	f.apply(f.traceKey("b", "op"), f.window(), coarse)
 
-	res, err := f.engine.QueryDashboard(f.rangeQuery())
+	res, err := f.engine.QueryDashboard(context.Background(), f.rangeQuery())
 	if err != nil {
 		t.Fatalf("QueryDashboard: %v", err)
 	}
@@ -425,7 +438,7 @@ func TestQueryBucketsOnePointPerWindow(t *testing.T) {
 	f.apply(f.traceKey("checkout", "op"), prev, spanDelta(3, 1000))
 	f.apply(f.traceKey("checkout", "op"), cur, spanDelta(6, 1000))
 
-	res, err := f.engine.QueryBuckets(f.rangeQuery())
+	res, err := f.engine.QueryBuckets(context.Background(), f.rangeQuery())
 	if err != nil {
 		t.Fatalf("QueryBuckets: %v", err)
 	}
@@ -452,7 +465,7 @@ func TestQueryTopologyNodesFromAggregates(t *testing.T) {
 	f.apply(f.traceKey("cart", "op"), f.window(), spanDelta(3, 2000))
 	f.apply(f.traceKey("checkout", "op"), f.window(), spanDelta(6, 1000))
 
-	res, err := f.engine.QueryTopology(f.rangeQuery())
+	res, err := f.engine.QueryTopology(context.Background(), f.rangeQuery())
 	if err != nil {
 		t.Fatalf("QueryTopology: %v", err)
 	}
@@ -486,7 +499,7 @@ func TestOwnershipIsExclusivePerWindow(t *testing.T) {
 	// must not add a second count.
 	st.put(1, key, w, spanDelta(10, 1000))
 
-	res, err := f.engine.QueryDashboard(f.rangeQuery())
+	res, err := f.engine.QueryDashboard(context.Background(), f.rangeQuery())
 	if err != nil {
 		t.Fatalf("QueryDashboard: %v", err)
 	}
@@ -515,7 +528,7 @@ func TestOwnershipIsExclusivePerWindow(t *testing.T) {
 		t.Errorf("FinalizedWatermark = %d, want %d", own.FinalizedWatermark, w)
 	}
 
-	res, err = f.engine.QueryDashboard(f.rangeQuery())
+	res, err = f.engine.QueryDashboard(context.Background(), f.rangeQuery())
 	if err != nil {
 		t.Fatalf("QueryDashboard after finalize: %v", err)
 	}
@@ -528,10 +541,10 @@ func TestOwnershipIsExclusivePerWindow(t *testing.T) {
 // facade: a query without a forward range is refused, not clamped silently.
 func TestQueryRejectsUnboundedRange(t *testing.T) {
 	f := newQueryFixture(t)
-	if _, err := f.engine.QueryDashboard(Query{Tenant: "default"}); err == nil {
+	if _, err := f.engine.QueryDashboard(context.Background(), Query{Tenant: "default"}); err == nil {
 		t.Fatal("QueryDashboard accepted an empty range")
 	}
-	if _, err := f.engine.QueryDashboard(Query{Start: f.now.Add(-time.Hour), End: f.now}); err == nil {
+	if _, err := f.engine.QueryDashboard(context.Background(), Query{Start: f.now.Add(-time.Hour), End: f.now}); err == nil {
 		t.Fatal("QueryDashboard accepted a query with no tenant")
 	}
 }
@@ -598,7 +611,7 @@ func TestQueryTopologyEdgesShareTheNodeQuery(t *testing.T) {
 		Signal:    SignalServiceEdge,
 	}, old, spanDelta(30, 1000))
 
-	res, err := f.engine.QueryTopology(f.rangeQuery())
+	res, err := f.engine.QueryTopology(context.Background(), f.rangeQuery())
 	if err != nil {
 		t.Fatalf("QueryTopology: %v", err)
 	}
@@ -641,7 +654,7 @@ func TestQueryTopologyServiceFilterKeepsTheGraphClosed(t *testing.T) {
 
 	q := f.rangeQuery()
 	q.Services = []string{"checkout"}
-	res, err := f.engine.QueryTopology(q)
+	res, err := f.engine.QueryTopology(context.Background(), q)
 	if err != nil {
 		t.Fatalf("QueryTopology: %v", err)
 	}

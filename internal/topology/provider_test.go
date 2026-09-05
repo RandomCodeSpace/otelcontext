@@ -2,6 +2,8 @@ package topology
 
 import (
 	"context"
+	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -9,6 +11,42 @@ import (
 	"github.com/RandomCodeSpace/otelcontext/internal/latency"
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 )
+
+type topologyReadContextStore struct {
+	aggregate.Store
+	calls atomic.Int32
+}
+
+func (s *topologyReadContextStore) SumBuckets(ctx context.Context, _ aggregate.Selector, _ aggregate.GroupBy) ([]aggregate.SumRow, error) {
+	s.calls.Add(1)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return nil, errors.New("aggregate topology read lost caller context")
+}
+
+func TestAggregateProviderPropagatesCallerCancellation(t *testing.T) {
+	engine, err := aggregate.NewEngine(aggregate.EngineConfig{Mode: aggregate.ModeAggregate})
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	store := &topologyReadContextStore{}
+	engine.SetStore(store)
+	provider, err := NewAggregateProvider(engine)
+	if err != nil {
+		t.Fatalf("NewAggregateProvider: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(storage.WithTenantContext(context.Background(), "default"))
+	cancel()
+	_, err = provider.Snapshot(ctx, Query{Start: time.Now().Add(-time.Hour), End: time.Now()})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Snapshot error = %v, want context.Canceled", err)
+	}
+	if got := store.calls.Load(); got != 0 {
+		t.Fatalf("store calls = %d, want 0", got)
+	}
+}
 
 type fakeLegacyRepository struct {
 	result *storage.ServiceMapMetrics

@@ -23,7 +23,7 @@ func newCachedTestServer(t *testing.T) *Server {
 		t.Fatalf("AutoMigrateModels: %v", err)
 	}
 	repo := storage.NewRepositoryFromDB(db, "sqlite")
-	c := cache.New()
+	c := cache.NewBounded(apiCacheEntries, apiCacheByteLimit)
 	t.Cleanup(func() {
 		c.Stop()
 		_ = repo.Close()
@@ -101,9 +101,7 @@ func TestHandleGetSystemGraph_CacheAndETag(t *testing.T) {
 	pollCacheFlow(t, s.handleGetSystemGraph, "/api/system/graph")
 }
 
-// TestHandleGetDashboardStats_QueryScopedKey proves distinct query strings
-// never share a cache entry.
-func TestHandleGetDashboardStats_QueryScopedKey(t *testing.T) {
+func TestHandleGetDashboardStats_CanonicalKey(t *testing.T) {
 	s := newCachedTestServer(t)
 
 	do := func(path string) *httptest.ResponseRecorder {
@@ -113,14 +111,84 @@ func TestHandleGetDashboardStats_QueryScopedKey(t *testing.T) {
 		return rec
 	}
 
-	if got := do("/api/metrics/dashboard?service_name=a").Header().Get("X-Cache"); got != "MISS" {
-		t.Errorf("first ?service_name=a: X-Cache = %q, want MISS", got)
+	first := "/api/metrics/dashboard?start=2026-06-11T00:00:00Z&end=2026-06-11T01:00:00Z&service_name=b&service_name=a&ignored=one"
+	if got := do(first).Header().Get("X-Cache"); got != "MISS" {
+		t.Fatalf("first request X-Cache = %q, want MISS", got)
 	}
-	if got := do("/api/metrics/dashboard?service_name=b").Header().Get("X-Cache"); got != "MISS" {
-		t.Errorf("first ?service_name=b: X-Cache = %q, want MISS (different query must not share entry)", got)
+
+	equivalent := "/api/metrics/dashboard?service_name=%61&ignored=two&end=2026-06-11T02:00:00%2B01:00&service_name=b&service_name=b&start=2026-06-11T01:00:00%2B01:00"
+	if got := do(equivalent).Header().Get("X-Cache"); got != "HIT" {
+		t.Errorf("equivalent request X-Cache = %q, want HIT", got)
 	}
-	if got := do("/api/metrics/dashboard?service_name=a").Header().Get("X-Cache"); got != "HIT" {
-		t.Errorf("second ?service_name=a: X-Cache = %q, want HIT", got)
+}
+
+func TestHandleGetDashboardStats_CacheKeyPreservesEmptyFilterAndPartialRanges(t *testing.T) {
+	s := newCachedTestServer(t)
+	do := func(path string) string {
+		rec := httptest.NewRecorder()
+		s.handleGetDashboardStats(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		return rec.Header().Get("X-Cache")
+	}
+
+	if got := do("/api/metrics/dashboard"); got != "MISS" {
+		t.Fatalf("unfiltered X-Cache = %q, want MISS", got)
+	}
+	if got := do("/api/metrics/dashboard?service_name="); got != "MISS" {
+		t.Errorf("explicit empty service filter X-Cache = %q, want MISS", got)
+	}
+
+	stamp := "2026-06-11T00:00:00Z"
+	if got := do("/api/metrics/dashboard?start=" + stamp); got != "MISS" {
+		t.Fatalf("explicit start X-Cache = %q, want MISS", got)
+	}
+	if got := do("/api/metrics/dashboard?end=" + stamp); got != "MISS" {
+		t.Errorf("explicit end collided with explicit start: X-Cache = %q, want MISS", got)
+	}
+}
+
+func TestHandleGetDashboardStats_CacheKeySeparatesSemantics(t *testing.T) {
+	s := newCachedTestServer(t)
+	do := func(path, tenant string) string {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req = req.WithContext(storage.WithTenantContext(req.Context(), tenant))
+		rec := httptest.NewRecorder()
+		s.handleGetDashboardStats(rec, req)
+		return rec.Header().Get("X-Cache")
+	}
+
+	base := "/api/metrics/dashboard?start=2026-06-11T00:00:00Z&end=2026-06-11T01:00:00Z&service_name=a"
+	if got := do(base, "tenant-a"); got != "MISS" {
+		t.Fatalf("base X-Cache = %q, want MISS", got)
+	}
+	for name, request := range map[string]struct {
+		path   string
+		tenant string
+	}{
+		"tenant":  {base, "tenant-b"},
+		"range":   {"/api/metrics/dashboard?start=2026-06-11T00:00:00Z&end=2026-06-11T02:00:00Z&service_name=a", "tenant-a"},
+		"service": {"/api/metrics/dashboard?start=2026-06-11T00:00:00Z&end=2026-06-11T01:00:00Z&service_name=b", "tenant-a"},
+	} {
+		if got := do(request.path, request.tenant); got != "MISS" {
+			t.Errorf("different %s X-Cache = %q, want MISS", name, got)
+		}
+	}
+}
+
+func TestHandleGetDashboardStats_RollingAndIgnoredParametersReuseKey(t *testing.T) {
+	s := newCachedTestServer(t)
+	do := func(path string) string {
+		rec := httptest.NewRecorder()
+		s.handleGetDashboardStats(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		return rec.Header().Get("X-Cache")
+	}
+	if got := do("/api/metrics/dashboard"); got != "MISS" {
+		t.Fatalf("first rolling request X-Cache = %q, want MISS", got)
+	}
+	if got := do("/api/metrics/dashboard?ignored=" + strings.Repeat("x", 300)); got != "HIT" {
+		t.Errorf("ignored parameter changed rolling key: X-Cache = %q, want HIT", got)
+	}
+	if got := do("/api/metrics/dashboard?start=invalid"); got != "HIT" {
+		t.Errorf("ignored invalid start changed effective rolling key: X-Cache = %q, want HIT", got)
 	}
 }
 
@@ -140,6 +208,24 @@ func TestHandleGetDashboardStats_LongQueryBypassesCache(t *testing.T) {
 		}
 		if got := rec.Header().Get("X-Cache"); got == "HIT" {
 			t.Errorf("request %d: oversized query must bypass the cache, got X-Cache HIT", i)
+		}
+	}
+}
+
+func TestHandleGetDashboardStats_OversizedPayloadBypassesCache(t *testing.T) {
+	s := newCachedTestServer(t)
+	tiny := cache.NewBounded(1, 1)
+	t.Cleanup(tiny.Stop)
+	s.cache = tiny
+
+	for i := range 2 {
+		rec := httptest.NewRecorder()
+		s.handleGetDashboardStats(rec, httptest.NewRequest(http.MethodGet, "/api/metrics/dashboard", nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("request %d: status = %d body=%q", i, rec.Code, rec.Body.String())
+		}
+		if got := rec.Header().Get("X-Cache"); got != "MISS" {
+			t.Errorf("request %d: X-Cache = %q, want MISS", i, got)
 		}
 	}
 }

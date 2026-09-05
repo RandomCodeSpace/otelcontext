@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -11,6 +12,21 @@ import (
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 	"github.com/RandomCodeSpace/otelcontext/internal/topology"
 )
+
+type realtimeReadContextStore struct {
+	aggregate.Store
+	calls atomic.Int32
+}
+
+func (s *realtimeReadContextStore) SumBuckets(context.Context, aggregate.Selector, aggregate.GroupBy) ([]aggregate.SumRow, error) {
+	s.calls.Add(1)
+	return nil, nil
+}
+
+func (s *realtimeReadContextStore) VisitSketches(context.Context, aggregate.Selector, func(uint32, *aggregate.Sketch) error) error {
+	s.calls.Add(1)
+	return nil
+}
 
 // hostsProvider is a provider whose host projection a test fixes by hand.
 type hostsProvider struct {
@@ -101,5 +117,30 @@ func TestAggregateSnapshotCarriesProviderHosts(t *testing.T) {
 	}
 	if n := snap.ServiceMap.Nodes[0]; n.Kind != "service" || fmt.Sprint(n.Hosts) != "[node-a node-b]" {
 		t.Fatalf("service node = %+v", n)
+	}
+}
+
+func TestEnginePublisherPropagatesSnapshotCancellation(t *testing.T) {
+	engine, err := aggregate.NewEngine(aggregate.EngineConfig{Mode: aggregate.ModeAggregate})
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	store := &realtimeReadContextStore{}
+	engine.SetStore(store)
+	provider := &hostsProvider{source: topology.SourceAggregate}
+	pub := NewEnginePublisher(EnginePublisherConfig{Engine: engine, Topology: provider})
+	if pub == nil {
+		t.Fatal("publisher refused an aggregate provider")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	hub := NewEventHub(nil, nil, nil)
+	hub.SetAggregatePublisher(pub, time.Second)
+	if snap := hub.snapshotFor(ctx, scopeKey{}); snap == nil {
+		t.Fatal("Snapshot returned nil after the topology provider completed")
+	}
+	if got := store.calls.Load(); got != 0 {
+		t.Fatalf("store calls = %d, want 0", got)
 	}
 }

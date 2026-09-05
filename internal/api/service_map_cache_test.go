@@ -23,7 +23,7 @@ func newServiceMapTestServer(t *testing.T) *Server {
 		t.Fatalf("AutoMigrateModels: %v", err)
 	}
 	repo := storage.NewRepositoryFromDB(db, "sqlite")
-	c := cache.New()
+	c := cache.NewBounded(apiCacheEntries, apiCacheByteLimit)
 	t.Cleanup(func() {
 		c.Stop()
 		_ = repo.Close()

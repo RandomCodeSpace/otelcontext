@@ -249,7 +249,7 @@ func (h *EventHub) Start(ctx context.Context, snapshotInterval, batchInterval ti
 			slog.Info("🌐 EventHub stopping via signal...")
 			return
 		case <-snapshotTicker.C:
-			h.flushSnapshots()
+			h.flushSnapshots(ctx)
 		case <-batchTicker.C:
 			h.flushBatches()
 		case entry := <-h.logsCh:
@@ -382,7 +382,7 @@ func (h *EventHub) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// Send immediate FULL snapshot so the client has data right away. In
 	// aggregate mode it carries {epoch, revision} and reset=true: a fresh
 	// client has nothing to merge into and must adopt the snapshot whole.
-	if !h.sendSnapshotTo(cf) && h.aggregatePublisher() != nil {
+	if !h.sendSnapshotTo(r.Context(), cf) && h.aggregatePublisher() != nil {
 		// A failed reconnect seed must remain retryable even when the revision
 		// was observed earlier while no clients were connected.
 		h.mu.Lock()
@@ -466,7 +466,7 @@ func (h *EventHub) updateClientFilter(c *websocket.Conn, service string) {
 // matching clients. A scope is (tenant, service filter): two clients on
 // different tenants never share a computed snapshot, so a snapshot cannot
 // carry another tenant's rows.
-func (h *EventHub) flushSnapshots() {
+func (h *EventHub) flushSnapshots(ctx context.Context) {
 	h.mu.Lock()
 	if !h.pending {
 		h.mu.Unlock()
@@ -482,13 +482,13 @@ func (h *EventHub) flushSnapshots() {
 	h.mu.Unlock()
 
 	// Compute snapshots in parallel using errgroup
-	g, _ := errgroup.WithContext(context.Background())
+	g, groupCtx := errgroup.WithContext(ctx)
 	snapshotMap := make(map[scopeKey]*LiveSnapshot)
 	var snapMu sync.Mutex
 
 	for scope := range groups {
 		g.Go(func() error {
-			snap := h.snapshotFor(scope)
+			snap := h.snapshotFor(groupCtx, scope)
 			if snap != nil {
 				snapMu.Lock()
 				snapshotMap[scope] = snap
@@ -589,8 +589,8 @@ func (h *EventHub) sendBatch(cf *clientFilter, batchType string, data any) {
 
 // sendSnapshotTo sends a snapshot to a single client and reports whether a
 // full replacement was queued.
-func (h *EventHub) sendSnapshotTo(cf *clientFilter) bool {
-	snapshot := h.snapshotFor(scopeKey{tenant: cf.tenant, service: cf.service})
+func (h *EventHub) sendSnapshotTo(ctx context.Context, cf *clientFilter) bool {
+	snapshot := h.snapshotFor(ctx, scopeKey{tenant: cf.tenant, service: cf.service})
 	if snapshot == nil {
 		return false
 	}
@@ -619,8 +619,7 @@ func (h *EventHub) sendSnapshotTo(cf *clientFilter) bool {
 // snapshotFor produces the payload for one scope from whichever source owns
 // the numbers in this mode. The tenant travels on the context, which is what
 // scopes both the repository queries and the aggregate publisher.
-func (h *EventHub) snapshotFor(scope scopeKey) *LiveSnapshot {
-	ctx := context.Background()
+func (h *EventHub) snapshotFor(ctx context.Context, scope scopeKey) *LiveSnapshot {
 	if scope.tenant != "" {
 		ctx = storage.WithTenantContext(ctx, scope.tenant)
 	}
@@ -654,7 +653,7 @@ func (h *EventHub) runAggregate(ctx context.Context) {
 			slog.Info("🌐 EventHub stopping via signal...")
 			return
 		case <-tick.C:
-			h.publishIfChanged()
+			h.publishIfChanged(ctx)
 		}
 	}
 }
@@ -663,7 +662,7 @@ func (h *EventHub) runAggregate(ctx context.Context) {
 // the engine's {epoch, revision} identity has moved since the last
 // publication. It is exported behaviour only through the loop; tests drive it
 // directly so the 2 s floor does not become a 2 s test.
-func (h *EventHub) publishIfChanged() {
+func (h *EventHub) publishIfChanged(ctx context.Context) {
 	pub := h.aggregatePublisher()
 	if pub == nil {
 		return
@@ -691,7 +690,7 @@ func (h *EventHub) publishIfChanged() {
 
 	messages := make(map[scopeKey][]byte, len(groups))
 	for scope := range groups {
-		snap := h.snapshotFor(scope)
+		snap := h.snapshotFor(ctx, scope)
 		if snap == nil {
 			// A provider error is not an empty topology. Keep the last good
 			// identity so the same revision is retried on the next tick.

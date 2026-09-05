@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -76,22 +77,37 @@ func TestHandleDropFTS_Reclaims(t *testing.T) {
 // endpoint refuses (405) if LOG_FTS_ENABLED is currently truthy, because
 // dropping the triggers mid-operation would silently break FTS5 sync.
 func TestHandleDropFTS_RefusesWhenEnabled(t *testing.T) {
-	t.Setenv("LOG_FTS_ENABLED", "true")
-	repo := newAPITestRepoWithFTS(t)
-
-	srv := &Server{repo: repo}
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /api/admin/drop_fts", srv.handleDropFTS)
-
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/api/admin/drop_fts", nil)
-	mux.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusMethodNotAllowed {
-		t.Fatalf("want 405 with LOG_FTS_ENABLED=true, got %d body=%q", rec.Code, rec.Body.String())
-	}
-	// FTS5 table must still be present.
-	if err := repo.DB().Exec("SELECT 1 FROM logs_fts LIMIT 1").Error; err != nil {
-		t.Fatalf("logs_fts should remain queryable when refused: %v", err)
+	for _, tc := range []struct {
+		name  string
+		value *string
+	}{
+		{name: "unset defaults on"},
+		{name: "explicit true", value: stringPtrAPI("true")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("LOG_FTS_ENABLED", "")
+			if tc.value == nil {
+				if err := os.Unsetenv("LOG_FTS_ENABLED"); err != nil {
+					t.Fatalf("unset LOG_FTS_ENABLED: %v", err)
+				}
+			} else {
+				t.Setenv("LOG_FTS_ENABLED", *tc.value)
+			}
+			repo := newAPITestRepoWithFTS(t)
+			srv := &Server{repo: repo}
+			mux := http.NewServeMux()
+			mux.HandleFunc("POST /api/admin/drop_fts", srv.handleDropFTS)
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/api/admin/drop_fts", nil)
+			mux.ServeHTTP(rec, req)
+			if rec.Code != http.StatusMethodNotAllowed {
+				t.Fatalf("want 405 with FTS enabled, got %d body=%q", rec.Code, rec.Body.String())
+			}
+			if err := repo.DB().Exec("SELECT 1 FROM logs_fts LIMIT 1").Error; err != nil {
+				t.Fatalf("logs_fts should remain queryable when refused: %v", err)
+			}
+		})
 	}
 }
+
+func stringPtrAPI(v string) *string { return &v }

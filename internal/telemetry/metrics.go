@@ -112,13 +112,14 @@ type Metrics struct {
 	// GraphRAGStoreEntities — live node counts per entity kind across tenants
 	// (tenants|services|operations|traces|spans|log_clusters|metrics|anomalies).
 	// GraphRAGStoreEdges — live edge counts per store (service|trace|signal|anomaly).
-	// Together with the ring/drain gauges these attribute RSS growth to a
+	// Together with the Drain gauge these attribute RSS growth to a
 	// specific structure before a heap profile is needed.
 	GraphRAGStoreEntities *prometheus.GaugeVec
 	GraphRAGStoreEdges    *prometheus.GaugeVec
+	// TSDBRingSeriesActive and TSDBRingSeriesRejected remain registered for
+	// metric-name compatibility. Production does not instantiate the legacy
+	// ring, so both collectors remain zero.
 	TSDBRingSeriesActive  prometheus.Gauge
-	// TSDBRingSeriesRejected — points refused a NEW ring series at the
-	// tenant-scoped series cap (existing series keep recording).
 	TSDBRingSeriesRejected prometheus.Counter
 	DrainTemplatesActive   prometheus.Gauge
 
@@ -582,11 +583,11 @@ func New() *Metrics {
 		}, []string{"store"}),
 		TSDBRingSeriesActive: promauto.NewGauge(prometheus.GaugeOpts{
 			Name: "otelcontext_tsdb_ring_series_active",
-			Help: "Distinct metric series currently held in TSDB ring buffers.",
+			Help: "Legacy compatibility metric; always zero because the unused TSDB ring buffer is disabled.",
 		}),
 		TSDBRingSeriesRejected: promauto.NewCounter(prometheus.CounterOpts{
 			Name: "otelcontext_tsdb_ring_series_rejected_total",
-			Help: "Metric points refused a new TSDB ring series at the cardinality cap (existing series keep recording).",
+			Help: "Legacy compatibility metric; always zero because the unused TSDB ring buffer is disabled.",
 		}),
 		DrainTemplatesActive: promauto.NewGauge(prometheus.GaugeOpts{
 			Name: "otelcontext_drain_templates_active",

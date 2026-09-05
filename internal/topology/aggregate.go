@@ -60,7 +60,7 @@ func (p *AggregateProvider) snapshot(ctx context.Context, q Query) (Snapshot, er
 	}
 	meta.Start, meta.End = q.Start, q.End
 
-	result, err := p.engine.QueryTopology(aggregate.Query{
+	result, err := p.engine.QueryTopology(ctx, aggregate.Query{
 		Tenant:   tenant,
 		Start:    q.Start,
 		End:      q.End,

@@ -59,6 +59,18 @@ func TestOverCapRangeClampsInsteadOfFailing(t *testing.T) {
 			if got := rr.Header().Get(EffectiveStartHeader); got != wantEffective {
 				t.Errorf("%s = %q, want %q", EffectiveStartHeader, got, wantEffective)
 			}
+			if name == "dashboard" || name == "service-map" {
+				hit := doClampGet(t, h, "/api/metrics/"+name+q)
+				if got := hit.Header().Get("X-Cache"); got != "HIT" {
+					t.Errorf("cached response X-Cache = %q, want HIT", got)
+				}
+				if got, want := hit.Header().Get(RequestedStartHeader), start.Format(time.RFC3339); got != want {
+					t.Errorf("cached %s = %q, want %q", RequestedStartHeader, got, want)
+				}
+				if got := hit.Header().Get(EffectiveStartHeader); got != wantEffective {
+					t.Errorf("cached %s = %q, want %q", EffectiveStartHeader, got, wantEffective)
+				}
+			}
 		})
 	}
 }

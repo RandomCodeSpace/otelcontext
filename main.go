@@ -385,19 +385,16 @@ func main() {
 	// needs the publisher wired before the first tick.
 	ctxEvents, cancelEvents := context.WithCancel(context.Background())
 
-	// 4c. Initialize TSDB Aggregator + Ring Buffer.
+	// 4c. Initialize the legacy TSDB aggregator.
 	//
 	// Retired outright in AGGREGATE_MODE=aggregate (#194 finding 10). There the
-	// aggregate engine owns every metric read, so the ring buffer, the 30s
-	// flush into metric_buckets, the per-point RawMetric allocation and the
-	// metric callback are all pure waste on the hot path. Legacy keeps the path
-	// because it IS the metric store; shadow keeps it because shadow's whole
-	// job is running both paths side by side.
+	// aggregate engine owns every metric read, so the 30s flush into
+	// metric_buckets, the per-point RawMetric allocation and the metric callback
+	// are all pure waste on the hot path. Legacy keeps the path because it IS the
+	// metric store; shadow keeps it because shadow's whole job is running both
+	// paths side by side.
 	legacyTSDB := legacyMetricPath(cfg.AggregateMode)
-	var (
-		tsdbAgg *tsdb.Aggregator
-		ringBuf *tsdb.RingBuffer
-	)
+	var tsdbAgg *tsdb.Aggregator
 	ctxTSDB, cancelTSDB := context.WithCancel(context.Background())
 	if legacyTSDB {
 		tsdbAgg = tsdb.NewAggregator(repo, 30*time.Second)
@@ -419,9 +416,9 @@ func main() {
 			func() { metrics.TSDBIngestTotal.Inc() },
 			func() { metrics.TSDBBatchesDropped.Inc() },
 		)
-		ringBuf = tsdb.NewRingBuffer(120, 30*time.Second, cfg.MetricMaxCardinality, metrics.TSDBRingSeriesRejected.Inc)
-		tsdbAgg.SetRingBuffer(ringBuf)
-		slog.Info("📈 TSDB ring buffer attached (120 slots × 30s = 1h retention)")
+		slog.Info("📈 TSDB ring buffer disabled",
+			"note", "no runtime query consumes the legacy ring; compatibility metrics remain zero",
+		)
 
 		go tsdbAgg.Start(ctxTSDB)
 		slog.Info("📈 TSDB Aggregator started (30s window)")
@@ -490,7 +487,7 @@ func main() {
 	if idle, err := time.ParseDuration(cfg.GraphRAGTenantIdleTTL); err == nil && idle > 0 {
 		graphRAGCfg.TenantIdleTTL = idle
 	}
-	graphRAG := graphrag.New(repo, tsdbAgg, ringBuf, graphRAGCfg)
+	graphRAG := graphrag.New(repo, tsdbAgg, nil, graphRAGCfg)
 	graphRAG.SetMetrics(metrics)
 	ctxGraphRAG, cancelGraphRAG := context.WithCancel(context.Background())
 
@@ -1169,7 +1166,7 @@ func main() {
 		),
 	}
 	// OTLP gRPC authentication. Installed only when a credential source is
-	// configured, so an unauthenticated development deployment is untouched.
+	// configured. Without one, the interceptors remain disabled.
 	// Auth runs AFTER the metrics interceptor so rejected calls still show up
 	// in the request counters.
 	if authUnary, authStream := ingest.NewGRPCAuthInterceptors(ingest.GRPCAuthOptions{
@@ -1188,7 +1185,7 @@ func main() {
 			"operator_key", cfg.APIKey != "",
 			"trust_external", cfg.AuthTrustExternal)
 	} else {
-		slog.Warn("🔓 gRPC OTLP unauthenticated — tenant identity is client-controlled; set API_KEY or API_TENANT_KEYS_FILE")
+		slog.Info("gRPC OTLP authentication disabled", "tenant_identity", "client-controlled")
 	}
 	slog.Info("📡 gRPC server tuned",
 		"max_recv_mb", recvBytes,
@@ -1210,7 +1207,7 @@ func main() {
 		grpcOpts = append(grpcOpts, grpc.Creds(creds))
 		slog.Info("🔒 gRPC TLS enabled", "mode", tlsModeSelfSigned, "cache_dir", cfg.TLSCacheDir)
 	default:
-		slog.Info("🔓 gRPC plaintext — not for production; set TLS_CERT_FILE/TLS_KEY_FILE or TLS_AUTO_SELFSIGNED=true")
+		slog.Info("gRPC transport security disabled", "mode", "plaintext")
 	}
 	grpcServer := grpc.NewServer(grpcOpts...)
 	coltracepb.RegisterTraceServiceServer(grpcServer, traceServer)
@@ -1312,7 +1309,7 @@ func main() {
 		slog.Warn("🔑 Authentication delegated to the front proxy (AUTH_TRUST_EXTERNAL=true) — the deployment contract in CLAUDE.md is mandatory",
 			"identity_header", cfg.AuthExternalTenantHeader)
 	default:
-		slog.Warn("API authentication disabled — set API_KEY or API_TENANT_KEYS_FILE for production")
+		slog.Info("API authentication disabled", "tenant_identity", "client-controlled")
 	}
 	if cfg.EnforceWSOrigin() {
 		slog.Info("🔒 WebSocket origin policy enforced",
@@ -1397,9 +1394,6 @@ func main() {
 				edg.WithLabelValues("trace").Set(float64(c.TraceEdges))
 				edg.WithLabelValues("signal").Set(float64(c.SignalEdges))
 				edg.WithLabelValues("anomaly").Set(float64(c.AnomalyEdges))
-				if ringBuf != nil {
-					metrics.TSDBRingSeriesActive.Set(float64(ringBuf.MetricCount()))
-				}
 				metrics.DrainTemplatesActive.Set(float64(graphRAG.DrainTemplateCount()))
 			}
 		}
@@ -1461,7 +1455,7 @@ func main() {
 				fatal("HTTPS server failed", err)
 			}
 		} else {
-			slog.Info("🌐 HTTP server started (plaintext — not for production)", "port", cfg.HTTPPort)
+			slog.Info("HTTP server started", "port", cfg.HTTPPort, "mode", "plaintext")
 			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 				fatal("HTTP server failed", err)
 			}
@@ -1773,8 +1767,8 @@ func sqliteMainDBPath(cfg *config.Config) string {
 }
 
 // legacyMetricPath reports whether the legacy metric path — the TSDB
-// aggregator, its ring buffer, the 30s flush into metric_buckets and the
-// per-point metric callback — is constructed for a given AGGREGATE_MODE.
+// aggregator, its 30s flush into metric_buckets and the per-point metric
+// callback — is constructed for a given AGGREGATE_MODE.
 //
 // Only AGGREGATE_MODE=aggregate retires it (#194 finding 10). Legacy has no
 // other metric store, and shadow's entire purpose is running both paths at

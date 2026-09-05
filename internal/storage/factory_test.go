@@ -1,10 +1,15 @@
 package storage
 
 import (
+	"context"
+	"database/sql"
+	"database/sql/driver"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
 )
 
@@ -200,6 +205,131 @@ func TestNewDatabase_SQLiteAutoVacuumIncremental(t *testing.T) {
 
 	if got := pragmaInt64(t, db, "auto_vacuum"); got != 2 {
 		t.Fatalf("auto_vacuum=%d want 2 (INCREMENTAL) on a fresh database", got)
+	}
+}
+
+func TestNewDatabase_SQLitePragmasSurviveConnectionReplacement(t *testing.T) {
+	tests := []struct {
+		name      string
+		cacheKB   string
+		mmapBytes string
+		wantCache int64
+		wantMmap  int64
+	}{
+		{name: "defaults", wantCache: -65536},
+		{name: "overrides", cacheKB: "12345", mmapBytes: "33554432", wantCache: -12345, wantMmap: 33554432},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("SQLITE_CACHE_SIZE_KB", tt.cacheKB)
+			t.Setenv("SQLITE_MMAP_SIZE_BYTES", tt.mmapBytes)
+
+			db, err := NewDatabase("sqlite", filepath.Join(t.TempDir(), "replacement.db"))
+			if err != nil {
+				t.Fatalf("sqlite: %v", err)
+			}
+			defer closeDB(db)
+			sqlDB, err := db.DB()
+			if err != nil {
+				t.Fatalf("database handle: %v", err)
+			}
+
+			assertSQLiteConnectionPragmas(t, sqlDB, tt.wantCache, tt.wantMmap)
+			conn, err := sqlDB.Conn(context.Background())
+			if err != nil {
+				t.Fatalf("acquire initial connection: %v", err)
+			}
+			if err := conn.Raw(func(any) error { return driver.ErrBadConn }); err != driver.ErrBadConn {
+				t.Fatalf("retire initial connection: %v", err)
+			}
+			_ = conn.Close()
+			assertSQLiteConnectionPragmas(t, sqlDB, tt.wantCache, tt.wantMmap)
+		})
+	}
+}
+
+func assertSQLiteConnectionPragmas(t *testing.T, db *sql.DB, wantCache, wantMmap int64) {
+	t.Helper()
+	for pragma, want := range map[string]int64{
+		"cache_size": wantCache, "mmap_size": wantMmap, "synchronous": 1,
+		"temp_store": 2, "wal_autocheckpoint": 10000,
+		"journal_size_limit": 67108864, "busy_timeout": 5000,
+	} {
+		var got int64
+		if err := db.QueryRow("PRAGMA " + pragma).Scan(&got); err != nil || got != want {
+			t.Fatalf("PRAGMA %s=%d err=%v want %d", pragma, got, err, want)
+		}
+	}
+	var mode string
+	if err := db.QueryRow("PRAGMA journal_mode").Scan(&mode); err != nil || !strings.EqualFold(mode, "wal") {
+		t.Fatalf("journal_mode=%q err=%v want wal", mode, err)
+	}
+}
+
+func TestSQLiteTunedDSN_PreservesSupportedFormsAndParameters(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "escaped # name.db")
+	tests := []string{
+		base,
+		(&url.URL{Scheme: "file", Path: base, RawQuery: "mode=rwc&cache=shared&custom=value"}).String(),
+		":memory:",
+		"file::memory:?cache=shared",
+		"file:named-memory?mode=memory&cache=shared",
+	}
+	for _, input := range tests {
+		t.Run(input, func(t *testing.T) {
+			dsn, err := sqliteTunedDSN(input, 12345, 0)
+			if err != nil {
+				t.Fatalf("sqliteTunedDSN: %v", err)
+			}
+			if strings.Contains(input, "custom=value") && !strings.Contains(dsn, "custom=value") {
+				t.Fatalf("existing parameter lost: %q", dsn)
+			}
+			db, err := sql.Open(sqlite.DriverName, dsn)
+			if err != nil {
+				t.Fatalf("open %q: %v", dsn, err)
+			}
+			defer db.Close()
+			if err := db.Ping(); err != nil {
+				t.Fatalf("ping %q: %v", dsn, err)
+			}
+		})
+	}
+}
+
+func TestSQLiteTunedDSN_ReplacesOnlyManagedPragmas(t *testing.T) {
+	dsn, err := sqliteTunedDSN("test.db?custom=value&_pragma=foreign_keys(ON)&_pragma=cache_size(-1)", 12345, 0)
+	if err != nil {
+		t.Fatalf("sqliteTunedDSN: %v", err)
+	}
+	_, rawQuery, _ := strings.Cut(dsn, "?")
+	q, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		t.Fatalf("parse tuned query: %v", err)
+	}
+	if q.Get("custom") != "value" {
+		t.Fatalf("custom parameter lost: %q", dsn)
+	}
+	var foreignKeys, cacheSizes []string
+	for _, pragma := range q["_pragma"] {
+		switch {
+		case strings.HasPrefix(pragma, "foreign_keys"):
+			foreignKeys = append(foreignKeys, pragma)
+		case strings.HasPrefix(pragma, "cache_size"):
+			cacheSizes = append(cacheSizes, pragma)
+		}
+	}
+	if len(foreignKeys) != 1 || foreignKeys[0] != "foreign_keys(ON)" {
+		t.Fatalf("unmanaged PRAGMA changed: %v", foreignKeys)
+	}
+	if len(cacheSizes) != 1 || cacheSizes[0] != "cache_size(-12345)" {
+		t.Fatalf("managed PRAGMA conflict remains: %v", cacheSizes)
+	}
+}
+
+func TestNewDatabase_SQLiteInvalidInitializationFails(t *testing.T) {
+	_, err := NewDatabase("sqlite", filepath.Join(t.TempDir(), "invalid.db")+"?_pragma=definitely_not_a_pragma(")
+	if err == nil {
+		t.Fatal("invalid required connection initialization must fail")
 	}
 }
 

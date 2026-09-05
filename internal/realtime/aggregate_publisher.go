@@ -124,7 +124,7 @@ func (p *EnginePublisher) Snapshot(ctx context.Context, service string) *LiveSna
 		snap.CoverageNote = coverage.Note()
 	}
 
-	if dash, err := p.engine.QueryDashboard(q); err == nil {
+	if dash, err := p.engine.QueryDashboard(ctx, q); err == nil {
 		provenance := dash.LatencyProvenance
 		snap.Dashboard = &storage.DashboardStats{
 			// Headline trio on the REQUEST basis, restated by name alongside
@@ -156,7 +156,7 @@ func (p *EnginePublisher) Snapshot(ctx context.Context, service string) *LiveSna
 		slog.Debug("aggregate snapshot: dashboard query failed", "error", err)
 	}
 
-	if traffic, err := p.engine.QueryBuckets(q); err == nil {
+	if traffic, err := p.engine.QueryBuckets(ctx, q); err == nil {
 		points := make([]storage.TrafficPoint, 0, len(traffic.Points))
 		for _, pt := range traffic.Points {
 			points = append(points, trafficPointFromAggregate(pt))

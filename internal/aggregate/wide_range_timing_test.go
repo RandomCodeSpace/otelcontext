@@ -1,6 +1,7 @@
 package aggregate
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -76,7 +77,7 @@ func TestManualWideRangeTiming(t *testing.T) {
 	newStart := time.Now()
 	var newMerged *Sketch
 	newRows := 0
-	if err := e.mergeStoreSketches(sel, nil, func(sk *Sketch) {
+	if err := e.mergeStoreSketches(context.Background(), sel, nil, func(sk *Sketch) {
 		newRows++
 		if newMerged == nil {
 			newMerged = NewSketchAtScaleUnchecked(sk.Scale())
@@ -95,7 +96,7 @@ func TestManualWideRangeTiming(t *testing.T) {
 	var oldMerged *Sketch
 	oldRows := 0
 	for {
-		page, err := store.ReadBuckets(pagedSel)
+		page, err := store.ReadBuckets(context.Background(), pagedSel)
 		if err != nil {
 			t.Fatalf("ReadBuckets: %v", err)
 		}
@@ -182,7 +183,7 @@ func BenchmarkQueryDashboardSevenDay(b *testing.B) {
 	b.ReportMetric(float64(seriesN*windowsN), "rows/query")
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		result, err := e.QueryDashboard(q)
+		result, err := e.QueryDashboard(context.Background(), q)
 		if err != nil {
 			b.Fatalf("QueryDashboard: %v", err)
 		}

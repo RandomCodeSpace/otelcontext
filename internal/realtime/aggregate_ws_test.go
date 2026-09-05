@@ -22,6 +22,44 @@ type fakePublisher struct {
 	fail  atomic.Bool
 }
 
+type cancellationPublisher struct{ started chan struct{} }
+
+func (p *cancellationPublisher) Epoch() string    { return "epoch-1" }
+func (p *cancellationPublisher) Revision() uint64 { return 1 }
+func (p *cancellationPublisher) Snapshot(ctx context.Context, _ string) *LiveSnapshot {
+	close(p.started)
+	<-ctx.Done()
+	return nil
+}
+
+func TestRunAggregatePropagatesShutdownContextToSnapshot(t *testing.T) {
+	hub := NewEventHub(nil, nil, nil)
+	pub := &cancellationPublisher{started: make(chan struct{})}
+	hub.SetAggregatePublisher(pub, time.Millisecond)
+	client := &clientFilter{send: make(chan []byte, 1)}
+	client.seeded.Store(true)
+	hub.clients[nil] = client
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		hub.runAggregate(ctx)
+		close(done)
+	}()
+
+	select {
+	case <-pub.started:
+	case <-time.After(time.Second):
+		t.Fatal("aggregate loop did not start a snapshot")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("aggregate loop did not stop its in-flight snapshot")
+	}
+}
+
 func newFakePublisher(epoch string) *fakePublisher {
 	p := &fakePublisher{}
 	p.epoch.Store(epoch)
@@ -139,7 +177,7 @@ func TestAggregateWSSameEpochRevisionNeverDecreases(t *testing.T) {
 	hub.lastEpoch = "epoch-1"
 	hub.lastRev = 7
 
-	hub.publishIfChanged()
+	hub.publishIfChanged(context.Background())
 
 	if hub.lastRev != 7 {
 		t.Fatalf("published revision regressed to %d", hub.lastRev)
@@ -157,17 +195,17 @@ func TestAggregateWSPublishesOnlyOnRevisionChange(t *testing.T) {
 	hub.SetAggregatePublisher(pub, time.Hour)
 
 	pub.rev.Store(3)
-	hub.publishIfChanged()
+	hub.publishIfChanged(context.Background())
 	first := pub.calls.Load()
 
-	hub.publishIfChanged()
-	hub.publishIfChanged()
+	hub.publishIfChanged(context.Background())
+	hub.publishIfChanged(context.Background())
 	if got := pub.calls.Load(); got != first {
 		t.Fatalf("snapshot built %d times for an unchanged revision, want %d", got, first)
 	}
 
 	pub.rev.Store(4)
-	hub.publishIfChanged()
+	hub.publishIfChanged(context.Background())
 	if hub.lastRev != 4 {
 		t.Fatalf("lastRev = %d after a change, want 4", hub.lastRev)
 	}
@@ -186,7 +224,7 @@ func TestAggregateWSProviderErrorRetainsLastGoodIdentity(t *testing.T) {
 	client.seeded.Store(true)
 	hub.clients[nil] = client
 
-	hub.publishIfChanged()
+	hub.publishIfChanged(context.Background())
 	if hub.lastRev != 1 {
 		t.Fatalf("provider error advanced last good revision to %d", hub.lastRev)
 	}
@@ -202,7 +240,7 @@ func TestAggregateWSReconnectRetriesObservedRevisionAfterProviderRecovery(t *tes
 	pub.fail.Store(true)
 	hub.SetAggregatePublisher(pub, 20*time.Millisecond)
 	// Observe the revision while idle, without rendering it.
-	hub.publishIfChanged()
+	hub.publishIfChanged(context.Background())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go hub.Start(ctx, time.Hour, time.Hour)
@@ -352,9 +390,9 @@ func TestAggregateWSConnectSeedIsNotRepublished(t *testing.T) {
 
 	// A tick at the seeded revision publishes nothing; the next revision is
 	// therefore the very next message on the wire.
-	f.hub.publishIfChanged()
+	f.hub.publishIfChanged(context.Background())
 	f.pub.rev.Store(seed.Revision + 1)
-	f.hub.publishIfChanged()
+	f.hub.publishIfChanged(context.Background())
 	next := f.read(t, 2*time.Second)
 	if next.Revision != seed.Revision+1 || next.Reset {
 		t.Fatalf("next snapshot = rev %d reset %v, want rev %d reset false (a duplicate seed revision would arrive first)", next.Revision, next.Reset, seed.Revision+1)
