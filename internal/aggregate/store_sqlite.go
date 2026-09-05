@@ -1298,7 +1298,9 @@ func (s *SQLiteStore) ReadBuckets(ctx context.Context, sel Selector) (BucketPage
 	sb.WriteString(` ORDER BY window_start, series_id, src LIMIT ?`)
 	args = append(args, limit+1)
 
-	rows, err := s.reader.QueryContext(ctx, sb.String(), args...)
+	// The query structure comes only from bucketSources and fixed clauses in
+	// appendBucketUnion. Selector values and the limit stay bound in args.
+	rows, err := s.reader.QueryContext(ctx, sb.String(), args...) // NOSONAR
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return BucketPage{}, ctxErr
@@ -1435,7 +1437,9 @@ func (s *SQLiteStore) SumBuckets(ctx context.Context, sel Selector, by GroupBy) 
 		sb.WriteString(` GROUP BY ` + strings.Join(group, ", "))
 	}
 
-	rows, err := s.reader.QueryContext(ctx, sb.String(), args...)
+	// Group columns come from the fixed GroupBy table above, bucketSources owns
+	// both table names, and appendBucketFilter binds every selector value.
+	rows, err := s.reader.QueryContext(ctx, sb.String(), args...) // NOSONAR
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
@@ -1511,7 +1515,9 @@ func (s *SQLiteStore) visitTableSketches(ctx context.Context, table string, sel 
 		JOIN aggregate_series s ON s.id = t.series_id WHERE `, table)
 	sel.SketchOnly = true
 	args = appendBucketFilter(&sb, sel, args)
-	rows, err := s.reader.QueryContext(ctx, sb.String(), args...)
+	// table is one of the bucketSources literals and appendBucketFilter binds
+	// every selector value. No caller input becomes SQL structure.
+	rows, err := s.reader.QueryContext(ctx, sb.String(), args...) // NOSONAR
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
