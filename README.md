@@ -180,19 +180,25 @@ Restore starts the same candidate briefly, waits for `/ready`, and shuts it down
 
 ## Secure a deployment
 
-Set at least one authentication method before exposing OtelContext:
+With no authentication or TLS settings configured, production mode starts without either:
+
+```bash
+APP_ENV=production ./otelcontext
+```
+
+Authentication is optional. Enable it when the deployment boundary requires a credential:
 
 - `API_KEY` for a shared operator credential.
 - `AUTH_TRUST_EXTERNAL=true` when a trusted reverse proxy owns authentication and tenant identity.
 
-Example:
+Authenticated example:
 
 ```bash
 export API_KEY="$(openssl rand -hex 32)"
 ./otelcontext
 ```
 
-Clients then send `Authorization: Bearer <key>`. Production mode also requires protected, authenticated gRPC unless you set an explicit waiver.
+Clients then send `Authorization: Bearer <key>`. Authentication and TLS are independently optional at runtime; configure each one when the deployment boundary requires it.
 
 The browser UI does not currently store an API key. For an authenticated browser deployment, put OtelContext behind a same-origin proxy that authenticates the user and injects the credential for REST, MCP, and WebSocket traffic.
 

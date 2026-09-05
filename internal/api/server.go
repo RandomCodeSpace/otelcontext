@@ -148,7 +148,7 @@ func NewServer(repo *storage.Repository, hub *realtime.Hub, eventHub *realtime.E
 		hub:      hub,
 		eventHub: eventHub,
 		metrics:  metrics,
-		cache:    cache.New(),
+		cache:    cache.NewBounded(apiCacheEntries, apiCacheByteLimit),
 	}
 	metrics.RegisterReadCache("api_ttl", s.cache.Len)
 	return s

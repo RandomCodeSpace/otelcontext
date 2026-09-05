@@ -18,8 +18,8 @@ What happens:
 - `.env` is loaded if present; otherwise defaults apply.
 - GORM `AutoMigrate` creates tables in `otelcontext.db` in the working directory.
 - `DEFAULT_TENANT=default` is assigned to all rows ingested without an explicit tenant header.
-- `API_KEY` is empty → auth middleware is a **pass-through** (every request allowed). A warning is logged.
-- No TLS is configured → HTTP and gRPC listen in **plaintext**. Dev only.
+- No authentication source is configured → auth middleware is a **pass-through** (every request allowed). A status line is logged.
+- No TLS is configured → HTTP and gRPC listen in **plaintext**.
 - Listeners: HTTP `:8080`, gRPC `:4317`, Prometheus `/metrics`, liveness `/live`, readiness `/ready`.
 
 ### Postgres
@@ -39,7 +39,7 @@ Set `DB_AUTOMIGRATE=false` in production after `otelcontext migrate status` repo
 | Database | Support tier | Intended use |
 |---|---|---|
 | PostgreSQL 16 | Primary | Production deployments |
-| SQLite | Bounded opt-in | One process, at most five services, and a low write rate |
+| SQLite | Bounded | One process, at most five services, and a low write rate |
 | MySQL 8.4 | Preview | Evaluation with weekly lifecycle proof; keep a tested rollback |
 | SQL Server 2022 | Experimental | Evaluation only; keep a tested rollback |
 
@@ -134,12 +134,13 @@ A proxy is optional. When one already fronts the browser, give OtelContext a ded
 
 ## Production Checklist
 
-### Must set
-- `API_KEY` — long random string. Without it, anyone on the network can query or ingest.
-- `DB_DRIVER=postgres` with PostgreSQL 16 for the primary production path. Alternatives retain the support tiers above.
-- `DB_DSN` — with strict TLS when crossing a network boundary.
-- `TLS_CERT_FILE` + `TLS_KEY_FILE` (or `TLS_AUTO_SELFSIGNED=true` for internal-only deployments).
+### Set for the deployment
 - `HOT_RETENTION_DAYS` — pick a value you can defend. Default 7 is reasonable; range is 1..36500.
+- Choose the database and `DB_DSN` from the support tiers above. Use strict database TLS when the connection crosses a network boundary.
+- Configure `API_KEY`, per-tenant keys, or trusted proxy authentication when network access alone is not the intended access control.
+- Configure `TLS_CERT_FILE` + `TLS_KEY_FILE` or `TLS_AUTO_SELFSIGNED=true` when the listener needs transport security.
+
+Older environment files may contain `OTELCONTEXT_ALLOW_SQLITE_PROD`, `OTELCONTEXT_ALLOW_INSECURE_GRPC`, or `TSDB_RING_BUFFER_DURATION`. They remain accepted for compatibility but no longer change runtime behavior.
 
 ### Should set
 - `DB_MAX_OPEN_CONNS` — size to match your Postgres pool and expected ingest concurrency.
@@ -160,7 +161,7 @@ A proxy is optional. When one already fronts the browser, give OtelContext a ded
 - `MCP_MAX_CONCURRENT=32`, `MCP_CALL_TIMEOUT_MS=30000`, `MCP_CACHE_TTL_MS=5000` — MCP HTTP streamable robustness. Concurrent `tools/call` invocations are gated by a counting semaphore (returns JSON-RPC `-32000` "server overloaded" past the cap). Per-call deadlines abort runaway tool handlers (returns JSON-RPC `-32001` "call timeout"). Cheap GraphRAG tools (`get_service_map`, `impact_analysis`, `root_cause_analysis`, `get_anomaly_timeline`, `get_service_health`) are memoized for the TTL window, keyed by `(tenant, tool, args)`. Setting any of these to `0` disables that protection.
 
 ### SQLite in production
-SQLite is rejected at startup when `APP_ENV=production` unless you explicitly opt in with `OTELCONTEXT_ALLOW_SQLITE_PROD=true`. The guard exists because SQLite uses a single writer lock. Keep it to one process, at most five services, and a low write rate. Use PostgreSQL 16 beyond that bound.
+SQLite starts without a production waiver. It uses a single writer lock, so keep it to one process, at most five services, and a low write rate. Use PostgreSQL 16 beyond that bound.
 
 ---
 
@@ -208,7 +209,7 @@ Telemetry:
 
 The FTS5 path uses `tokenize='porter unicode61 remove_diacritics 2'` — case-insensitive, accent-insensitive, English-stemmed (so `panic` matches `panicked`). User input is escaped and prefix-suffixed (`*`) so partial words like `conn` still match `connection`. If FTS5 errors at query time, the repository transparently falls back to LIKE so a misbehaving index does not surface as a 500 to the API.
 
-The FTS5 table is provisioned automatically by `AutoMigrateModels` on every SQLite boot; setup is idempotent. To rebuild after corruption or a manual schema change:
+SQLite FTS5 defaults on. Set `LOG_FTS_ENABLED=false` to opt out and use LIKE. `AutoMigrateModels` provisions the table and triggers when `DB_AUTOMIGRATE=true`, then rebuilds the index from existing log rows. With `DB_AUTOMIGRATE=false`, an existing database without `logs_fts` keeps using the LIKE fallback until an automatic migration runs. To rebuild after corruption or a manual schema change:
 
 ```sql
 INSERT INTO logs_fts(logs_fts) VALUES('rebuild');
@@ -220,7 +221,7 @@ The Postgres `pg_trgm` path requires the extension; if missing, AutoMigrate logs
 CREATE EXTENSION pg_trgm;
 ```
 
-Phase 3b will add Postgres declarative partitioning as an opt-in adapter; at that point the GIN indexes will be created per-partition. There is no migration required to use FTS5 — existing SQLite databases are backfilled the first time the upgraded binary boots.
+Phase 3b will add Postgres declarative partitioning as an opt-in adapter; at that point the GIN indexes will be created per-partition. Existing SQLite databases are backfilled the first time `AutoMigrateModels` runs with FTS enabled.
 
 ---
 

@@ -6,7 +6,7 @@ import (
 )
 
 // sqliteEnvKeys is the set of env vars whose defaults applyDriverDefaults
-// flips when the driver is SQLite. Cleared via t.Setenv before each test so a
+// changes when the driver is SQLite. Cleared via t.Setenv before each test so a
 // stray host-env value doesn't leak in.
 var sqliteEnvKeys = []string{
 	"DB_MAX_OPEN_CONNS",
@@ -17,7 +17,6 @@ var sqliteEnvKeys = []string{
 	"METRIC_MAX_CARDINALITY",
 	"SAMPLING_RATE",
 	"GRPC_MAX_CONCURRENT_STREAMS",
-	"LOG_FTS_ENABLED",
 	"GRAPHRAG_EVENT_QUEUE_SIZE",
 	"GRAPHRAG_TRACE_TTL",
 }
@@ -49,7 +48,7 @@ func postgresDefaultsConfig(driver string) *Config {
 	return &Config{
 		DBDriver:                 driver,
 		DBMaxOpenConns:           50,        // Postgres default
-		DBMaxIdleConns:           10,        // Postgres default
+		DBMaxIdleConns:           25,        // Postgres default
 		IngestPipelineWorkers:    8,         // Postgres default
 		IngestPipelineQueueSize:  50000,     // Postgres default
 		IngestPipelineMaxBytes:   512 << 20, // Postgres default
@@ -58,15 +57,15 @@ func postgresDefaultsConfig(driver string) *Config {
 		SamplingRate:             1.0,       // keep-all default
 		GRPCMaxConcurrentStreams: 1000,      // Postgres default
 		GraphRAGEventQueueSize:   100000,    // Postgres default
-		LogFTSEnabled:            false,     // FTS5 opt-in default
+		LogFTSEnabled:            true,      // global default; only meaningful for SQLite
 		GraphRAGTraceTTL:         "1h",      // Postgres default
 	}
 }
 
-// TestApplyDriverDefaults_SQLite_FlipsAllWhenNoEnv proves the post-Load()
+// TestApplyDriverDefaults_SQLite_AppliesWhenNoEnv proves the post-Load()
 // override fires when the driver is SQLite and the operator did not set
 // any of the overridable env vars.
-func TestApplyDriverDefaults_SQLite_FlipsAllWhenNoEnv(t *testing.T) {
+func TestApplyDriverDefaults_SQLite_AppliesWhenNoEnv(t *testing.T) {
 	clearSQLiteEnv(t)
 	cfg := postgresDefaultsConfig("sqlite")
 	applyDriverDefaults(cfg)
@@ -92,6 +91,62 @@ func TestApplyDriverDefaults_SQLite_FlipsAllWhenNoEnv(t *testing.T) {
 		if c.got != c.want {
 			t.Errorf("%s: SQLite override = %v, want %v", c.name, c.got, c.want)
 		}
+	}
+}
+
+func TestLoad_SQLiteLogFTSDefaultsOnAndRespectsOverride(t *testing.T) {
+	t.Setenv("DB_DRIVER", "sqlite")
+	for _, tc := range []struct {
+		name  string
+		value *string
+		want  bool
+	}{
+		{name: "unset", want: true},
+		{name: "explicit empty", value: stringPtr(""), want: false},
+		{name: "explicit false", value: stringPtr("false"), want: false},
+		{name: "explicit zero", value: stringPtr("0"), want: false},
+		{name: "invalid", value: stringPtr("sometimes"), want: false},
+		{name: "explicit true", value: stringPtr("true"), want: true},
+		{name: "explicit one", value: stringPtr("1"), want: true},
+		{name: "yes", value: stringPtr("yes"), want: true},
+		{name: "y", value: stringPtr("Y"), want: true},
+		{name: "on", value: stringPtr("ON"), want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("LOG_FTS_ENABLED", "")
+			if tc.value == nil {
+				if err := os.Unsetenv("LOG_FTS_ENABLED"); err != nil {
+					t.Fatalf("unset LOG_FTS_ENABLED: %v", err)
+				}
+			} else {
+				t.Setenv("LOG_FTS_ENABLED", *tc.value)
+			}
+			cfg, err := Load("__no_such_env_file__")
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.LogFTSEnabled != tc.want {
+				t.Fatalf("LogFTSEnabled = %t, want %t", cfg.LogFTSEnabled, tc.want)
+			}
+		})
+	}
+}
+
+func stringPtr(v string) *string { return &v }
+
+func TestLoad_PostgresIdlePoolDefaultMatchesStorage(t *testing.T) {
+	t.Setenv("DB_DRIVER", "postgres")
+	t.Setenv("DB_MAX_IDLE_CONNS", "")
+	if err := os.Unsetenv("DB_MAX_IDLE_CONNS"); err != nil {
+		t.Fatalf("unset DB_MAX_IDLE_CONNS: %v", err)
+	}
+
+	cfg, err := Load("__no_such_env_file__")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.DBMaxIdleConns != 25 {
+		t.Fatalf("DBMaxIdleConns = %d, want storage default 25", cfg.DBMaxIdleConns)
 	}
 }
 

@@ -72,13 +72,15 @@ func TestFTS5Available_FlagGate(t *testing.T) {
 		flag string
 		want bool
 	}{
-		{"", false},      // empty value present = unparsable = false
+		{"", false}, // empty value present = unparsable = false
+		{"invalid", false},
 		{"false", false}, // explicit off
 		{"0", false},
 		{"no", false},
 		{"true", true},
 		{"1", true},
 		{"yes", true},
+		{"y", true},
 		{"on", true},
 		{"YES", true},
 		{"TRUE", true},
@@ -93,11 +95,11 @@ func TestFTS5Available_FlagGate(t *testing.T) {
 	}
 }
 
-// TestFTS5Available_DefaultOff verifies the absence of LOG_FTS_ENABLED yields
-// false. Uses os.Unsetenv directly because t.Setenv only sets values, never
+// TestFTS5Available_DefaultOn verifies the absence of LOG_FTS_ENABLED yields
+// true. Uses os.Unsetenv directly because t.Setenv only sets values, never
 // unsets — and the test's whole point is to assert behavior when the env var
 // is unset.
-func TestFTS5Available_DefaultOff(t *testing.T) {
+func TestFTS5Available_DefaultOn(t *testing.T) {
 	prev, hadPrev := os.LookupEnv("LOG_FTS_ENABLED")
 	if err := os.Unsetenv("LOG_FTS_ENABLED"); err != nil {
 		t.Fatalf("unsetenv: %v", err)
@@ -109,8 +111,8 @@ func TestFTS5Available_DefaultOff(t *testing.T) {
 			_ = os.Unsetenv("LOG_FTS_ENABLED")
 		}
 	})
-	if fts5Available("sqlite") {
-		t.Fatal("FTS5 must default off when LOG_FTS_ENABLED is unset")
+	if !fts5Available("sqlite") {
+		t.Fatal("FTS5 must default on when LOG_FTS_ENABLED is unset")
 	}
 }
 

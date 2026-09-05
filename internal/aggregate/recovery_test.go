@@ -1,6 +1,7 @@
 package aggregate
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -120,7 +121,7 @@ func TestRecoveryFinalizesDowntimeExpiredWindows(t *testing.T) {
 	if stats.FinalizedWindows != 1 || stats.ReplayedRows != 0 {
 		t.Fatalf("recovery stats = %+v, want 1 finalized / 0 replayed", stats)
 	}
-	page, err := store.ReadBuckets(Selector{
+	page, err := store.ReadBuckets(context.Background(), Selector{
 		TenantID: 1,
 		Start:    WindowStart(clock.Now()) - int64(4*(WindowSize+AllowedLateness)/time.Second),
 		End:      WindowStart(clock.Now()) + 1,

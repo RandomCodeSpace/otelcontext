@@ -1,6 +1,7 @@
 package aggregate
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -318,7 +319,7 @@ func TestReadsAreCompleteBeyondTheRowCap(t *testing.T) {
 	}
 
 	t.Run("dashboard totals match the reference", func(t *testing.T) {
-		res, err := f.engine.QueryDashboard(f.query())
+		res, err := f.engine.QueryDashboard(context.Background(), f.query())
 		if err != nil {
 			t.Fatalf("QueryDashboard: %v", err)
 		}
@@ -332,7 +333,7 @@ func TestReadsAreCompleteBeyondTheRowCap(t *testing.T) {
 			names = append(names, n)
 		}
 		ref := buildReference(func(s string) bool { _, ok := keep[s]; return ok })
-		res, err := f.engine.QueryDashboard(f.query(names...))
+		res, err := f.engine.QueryDashboard(context.Background(), f.query(names...))
 		if err != nil {
 			t.Fatalf("QueryDashboard(filtered): %v", err)
 		}
@@ -340,7 +341,7 @@ func TestReadsAreCompleteBeyondTheRowCap(t *testing.T) {
 
 		// A filter matching nothing must produce zeros, not the unfiltered
 		// answer — the cheapest way for a pushed-down filter to be wrong.
-		empty, err := f.engine.QueryDashboard(f.query("no-such-service"))
+		empty, err := f.engine.QueryDashboard(context.Background(), f.query("no-such-service"))
 		if err != nil {
 			t.Fatalf("QueryDashboard(empty filter): %v", err)
 		}
@@ -350,7 +351,7 @@ func TestReadsAreCompleteBeyondTheRowCap(t *testing.T) {
 	})
 
 	t.Run("traffic totals match the reference per window", func(t *testing.T) {
-		res, err := f.engine.QueryBuckets(f.query())
+		res, err := f.engine.QueryBuckets(context.Background(), f.query())
 		if err != nil {
 			t.Fatalf("QueryBuckets: %v", err)
 		}
@@ -371,7 +372,7 @@ func TestReadsAreCompleteBeyondTheRowCap(t *testing.T) {
 	})
 
 	t.Run("topology nodes match the reference", func(t *testing.T) {
-		res, err := f.engine.QueryTopology(f.query())
+		res, err := f.engine.QueryTopology(context.Background(), f.query())
 		if err != nil {
 			t.Fatalf("QueryTopology: %v", err)
 		}
@@ -391,7 +392,7 @@ func TestReadsAreCompleteBeyondTheRowCap(t *testing.T) {
 
 	t.Run("generic reads page to completion and say when they do not", func(t *testing.T) {
 		sel := f.selector()
-		first, err := f.store.ReadBuckets(sel)
+		first, err := f.store.ReadBuckets(context.Background(), sel)
 		if err != nil {
 			t.Fatalf("ReadBuckets: %v", err)
 		}
@@ -417,7 +418,7 @@ func TestReadsAreCompleteBeyondTheRowCap(t *testing.T) {
 				break
 			}
 			sel.After = page.Next
-			if page, err = f.store.ReadBuckets(sel); err != nil {
+			if page, err = f.store.ReadBuckets(context.Background(), sel); err != nil {
 				t.Fatalf("ReadBuckets(page %d): %v", pages, err)
 			}
 			pages++
@@ -508,7 +509,7 @@ func TestPercentilePathReadsEverySketchBearingRow(t *testing.T) {
 	var merged *Sketch
 	visited := 0
 	sel := Selector{TenantID: tenantID, Start: base, End: base + 3*windowSecs}
-	if err := e.mergeStoreSketches(sel, nil, func(sk *Sketch) {
+	if err := e.mergeStoreSketches(context.Background(), sel, nil, func(sk *Sketch) {
 		visited++
 		if sk == nil {
 			t.Error("sketch stream delivered a nil sketch")
@@ -535,14 +536,14 @@ func TestPercentilePathReadsEverySketchBearingRow(t *testing.T) {
 	// filter naming the seeded service must observe everything; a filter
 	// naming an absent service must observe nothing.
 	var kept uint64
-	if err := e.mergeStoreSketches(sel, map[string]struct{}{"svc": {}}, func(sk *Sketch) { kept += sk.Count() }); err != nil {
+	if err := e.mergeStoreSketches(context.Background(), sel, map[string]struct{}{"svc": {}}, func(sk *Sketch) { kept += sk.Count() }); err != nil {
 		t.Fatalf("mergeStoreSketches(filter=svc): %v", err)
 	}
 	if kept != want {
 		t.Fatalf("filter for the seeded service observed %d of %d observations", kept, want)
 	}
 	dropped := 0
-	if err := e.mergeStoreSketches(sel, map[string]struct{}{"absent": {}}, func(*Sketch) { dropped++ }); err != nil {
+	if err := e.mergeStoreSketches(context.Background(), sel, map[string]struct{}{"absent": {}}, func(*Sketch) { dropped++ }); err != nil {
 		t.Fatalf("mergeStoreSketches(filter=absent): %v", err)
 	}
 	if dropped != 0 {
@@ -700,7 +701,7 @@ func TestStoreRefusesAV2FileAndRebuildsOnDemand(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("commit into rebuilt store: %v", err)
 	}
-	sums, err := rebuilt.SumBuckets(Selector{TenantID: 1, Start: 600, End: 900}, 0)
+	sums, err := rebuilt.SumBuckets(context.Background(), Selector{TenantID: 1, Start: 600, End: 900}, 0)
 	if err != nil {
 		t.Fatalf("SumBuckets: %v", err)
 	}

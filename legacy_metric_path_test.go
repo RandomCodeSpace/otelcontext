@@ -7,10 +7,9 @@ import (
 )
 
 // TestLegacyMetricPathByMode pins the wiring decision behind #194 finding 10:
-// aggregate mode constructs no TSDB aggregator, no ring buffer and no metric
-// callback, while legacy and shadow keep all three. Shadow especially — it runs
-// both paths side by side, and dropping the legacy one would leave nothing to
-// shadow.
+// aggregate mode constructs no TSDB aggregator or metric callback, while legacy
+// and shadow keep both. Shadow especially — it runs both paths side by side,
+// and dropping the legacy one would leave nothing to shadow.
 func TestLegacyMetricPathByMode(t *testing.T) {
 	for _, tc := range []struct {
 		mode string

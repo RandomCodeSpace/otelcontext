@@ -4,11 +4,10 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
-	"os"
 	"strconv"
-	"strings"
 	"time"
 
+	"github.com/RandomCodeSpace/otelcontext/internal/config"
 	"github.com/RandomCodeSpace/otelcontext/internal/httpconst"
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 )
@@ -99,16 +98,9 @@ func (s *Server) handleVacuum(w http.ResponseWriter, _ *http.Request) {
 // VACUUM blocks writes for ~10-60 minutes on a multi-GB DB. Run this during
 // a maintenance window.
 func (s *Server) handleDropFTS(w http.ResponseWriter, r *http.Request) {
-	if v, ok := os.LookupEnv("LOG_FTS_ENABLED"); ok {
-		if b, err := strconv.ParseBool(strings.TrimSpace(v)); err == nil && b {
-			http.Error(w, "drop_fts refused: LOG_FTS_ENABLED is currently true; set it to false and restart before dropping", http.StatusMethodNotAllowed)
-			return
-		}
-		switch strings.ToLower(strings.TrimSpace(v)) {
-		case "yes", "y", "on":
-			http.Error(w, "drop_fts refused: LOG_FTS_ENABLED is currently true; set it to false and restart before dropping", http.StatusMethodNotAllowed)
-			return
-		}
+	if config.LogFTSEnabledFromEnv() {
+		http.Error(w, "drop_fts refused: LOG_FTS_ENABLED is currently true; set it to false and restart before dropping", http.StatusMethodNotAllowed)
+		return
 	}
 
 	started := time.Now()

@@ -81,7 +81,7 @@ var toolDefs = []Tool{
 		param("trace_id", "string", "The trace ID to visualize."),
 	),
 	mkTool("search_logs", "Searches log entries by severity, service, body text, trace ID, and time range. Returns id, timestamp, severity, service_name, body, trace_id. **Limited to the last 24 hours** — windows entirely outside the 24h cap are rejected. Strongly recommend setting `service` and/or `severity` to scope the search; unscoped keyword queries scan large row counts when FTS5 is disabled. Use severity=ERROR to find errors, query= for full-text search, trace_id= to correlate with a trace. Use page= for pagination.",
-		param("query", "string", "Full-text search in log body."),
+		param("query", "string", "Full-text search in log body. SQLite uses stemmed token-prefix matching and BM25 ranking when FTS5 is enabled; use trace_id for exact trace lookup."),
 		param("severity", "string", "Filter by severity level: ERROR, WARN, INFO, DEBUG."),
 		param("service", "string", "Filter by service name (exact match)."),
 		param("trace_id", "string", "Filter logs belonging to a specific trace ID."),

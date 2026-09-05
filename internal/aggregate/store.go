@@ -1,6 +1,7 @@
 package aggregate
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"time"
@@ -581,13 +582,13 @@ type Store interface {
 	// store-side. The read asks the database for limit+1 rows and reports
 	// Truncated rather than trimming in silence; a caller that needs every row
 	// pages with Selector.After until Truncated is false.
-	ReadBuckets(sel Selector) (BucketPage, error)
+	ReadBuckets(ctx context.Context, sel Selector) (BucketPage, error)
 
 	// SumBuckets aggregates the same row set as ReadBuckets in SQL, grouped by
 	// by. NO row cap applies: the result is bounded by the grouping — windows,
 	// services, signals — not by the number of rows scanned, which is what
 	// makes a scalar dashboard total structurally impossible to truncate.
-	SumBuckets(sel Selector, by GroupBy) ([]SumRow, error)
+	SumBuckets(ctx context.Context, sel Selector, by GroupBy) ([]SumRow, error)
 
 	// VisitSketches streams every sketch-bearing row matching sel — from
 	// BOTH durable tables, like ReadBuckets — to visit, in no particular
@@ -606,7 +607,7 @@ type Store interface {
 	// The visited sketch is valid only for the duration of the call: the
 	// store decodes every row into one scratch value, so a visitor must
 	// merge or copy it, never retain the pointer.
-	VisitSketches(sel Selector, visit func(serviceID uint32, sk *Sketch) error) error
+	VisitSketches(ctx context.Context, sel Selector, visit func(serviceID uint32, sk *Sketch) error) error
 
 	// ReplayMutable returns the delta-log rows for windows at or after since —
 	// the mutable set only. Finalized history never hydrates into RAM (#160).

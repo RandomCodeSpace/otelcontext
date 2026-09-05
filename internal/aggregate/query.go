@@ -1,13 +1,14 @@
 package aggregate
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"sort"
-	"sync"
 	"time"
 
 	"github.com/RandomCodeSpace/otelcontext/internal/latency"
+	"golang.org/x/sync/errgroup"
 )
 
 // The engine's query facade (#164, #175).
@@ -325,11 +326,14 @@ type visitFunc func(windowStart int64, key SeriesKey, d *AggregateDelta)
 //	generic rows   -> ReadBuckets: keeps its row cap and says so.
 //
 // hasStore is false when memory owns the whole range or no store is attached.
-func (e *Engine) plan(q Query, visit visitFunc) (Ownership, Selector, bool, error) {
+func (e *Engine) plan(ctx context.Context, q Query, visit visitFunc) (Ownership, Selector, bool, error) {
 	var (
 		own Ownership
 		sel Selector
 	)
+	if err := ctx.Err(); err != nil {
+		return own, sel, false, err
+	}
 	if q.Tenant == "" {
 		return own, sel, false, fmt.Errorf("%w: tenant is required", ErrSelectorUnbounded)
 	}
@@ -352,7 +356,10 @@ func (e *Engine) plan(q Query, visit visitFunc) (Ownership, Selector, bool, erro
 
 	// Memory first, under the ownership read lock, so the shard contents and
 	// the snapshot describe the same instant.
-	own = e.readMutable(tenantID, start, end, q.Signal, visit)
+	own, err := e.readMutable(ctx, tenantID, start, end, q.Signal, visit)
+	if err != nil {
+		return own, sel, false, err
+	}
 
 	// Everything below the oldest memory-owned window in range belongs to the
 	// store. The mutable set is a contiguous suffix by construction, so this
@@ -371,18 +378,28 @@ func (e *Engine) plan(q Query, visit visitFunc) (Ownership, Selector, bool, erro
 
 // readMutable visits the memory-owned windows in [start, end) and returns the
 // ownership snapshot it read under.
-func (e *Engine) readMutable(tenantID uint32, start, end int64, signal Signal, visit visitFunc) Ownership {
+func (e *Engine) readMutable(ctx context.Context, tenantID uint32, start, end int64, signal Signal, visit visitFunc) (Ownership, error) {
 	e.own.mu.RLock()
 	defer e.own.mu.RUnlock()
 	own := e.ownershipLocked()
 	for _, w := range own.Mutable {
+		if err := ctx.Err(); err != nil {
+			return own, err
+		}
 		if w < start || w >= end {
 			continue
 		}
 		for i := range e.shards {
+			if err := ctx.Err(); err != nil {
+				return own, err
+			}
 			sh := &e.shards[i]
 			sh.mu.Lock()
 			for key, d := range sh.windows[w] {
+				if err := ctx.Err(); err != nil {
+					sh.mu.Unlock()
+					return own, err
+				}
 				if key.TenantID != tenantID {
 					continue
 				}
@@ -394,7 +411,7 @@ func (e *Engine) readMutable(tenantID uint32, start, end int64, signal Signal, v
 			sh.mu.Unlock()
 		}
 	}
-	return own
+	return own, nil
 }
 
 // Store reads over a wide range fan out across the read pool (#290). A
@@ -439,30 +456,33 @@ func splitSelector(sel Selector) []Selector {
 
 // sumStore runs the SQL aggregation over the store-owned sub-range, one
 // chunk per connection, and re-sums the grouped rows the chunks return.
-func (e *Engine) sumStore(sel Selector, by GroupBy) ([]SumRow, error) {
+func (e *Engine) sumStore(ctx context.Context, sel Selector, by GroupBy) ([]SumRow, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	st := e.Store()
 	if st == nil {
 		return nil, nil
 	}
 	chunks := splitSelector(sel)
 	if len(chunks) == 1 {
-		return st.SumBuckets(sel, by)
+		return st.SumBuckets(ctx, sel, by)
 	}
 	results := make([][]SumRow, len(chunks))
-	errs := make([]error, len(chunks))
-	var wg sync.WaitGroup
+	g, groupCtx := errgroup.WithContext(ctx)
 	for i, chunk := range chunks {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			results[i], errs[i] = st.SumBuckets(chunk, by)
-		}()
+		i, chunk := i, chunk
+		g.Go(func() error {
+			rows, err := st.SumBuckets(groupCtx, chunk, by)
+			results[i] = rows
+			return err
+		})
 	}
-	wg.Wait()
-	for _, err := range errs {
-		if err != nil {
-			return nil, err
-		}
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	type groupKey struct {
 		window        int64
@@ -473,6 +493,9 @@ func (e *Engine) sumStore(sel Selector, by GroupBy) ([]SumRow, error) {
 	var out []SumRow
 	for _, rows := range results {
 		for _, r := range rows {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			key := groupKey{r.WindowStart, r.ServiceID, r.NameID, r.Signal}
 			i, ok := merged[key]
 			if !ok {
@@ -508,7 +531,10 @@ func (e *Engine) sumStore(sel Selector, by GroupBy) ([]SumRow, error) {
 // are merged across chunks and handed to visit once per service, so the
 // visitor runs on the calling goroutine and sees one sketch per service
 // instead of one per stored row.
-func (e *Engine) visitStoreSketches(sel Selector, filter map[string]struct{}, visit func(uint32, *Sketch)) error {
+func (e *Engine) visitStoreSketches(ctx context.Context, sel Selector, filter map[string]struct{}, visit func(uint32, *Sketch)) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	st := e.Store()
 	if st == nil {
 		return nil
@@ -517,25 +543,28 @@ func (e *Engine) visitStoreSketches(sel Selector, filter map[string]struct{}, vi
 	sel.SketchOnly = true
 	chunks := splitSelector(sel)
 	perChunk := make([]map[uint32]*Sketch, len(chunks))
-	errs := make([]error, len(chunks))
-	var wg sync.WaitGroup
+	g, groupCtx := errgroup.WithContext(ctx)
 	for i, chunk := range chunks {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			perChunk[i], errs[i] = e.collectStoreSketches(st, chunk, filter)
-		}()
-	}
-	wg.Wait()
-	for _, err := range errs {
-		if err != nil {
+		i, chunk := i, chunk
+		g.Go(func() error {
+			rows, err := e.collectStoreSketches(groupCtx, st, chunk, filter)
+			perChunk[i] = rows
 			return err
-		}
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	byService := make(map[uint32]*Sketch)
 	var order []uint32
 	for _, m := range perChunk {
 		for serviceID, sk := range m {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			acc := byService[serviceID]
 			if acc == nil {
 				byService[serviceID] = sk
@@ -546,6 +575,9 @@ func (e *Engine) visitStoreSketches(sel Selector, filter map[string]struct{}, vi
 		}
 	}
 	for _, serviceID := range order {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		visit(serviceID, byService[serviceID])
 	}
 	return nil
@@ -554,13 +586,16 @@ func (e *Engine) visitStoreSketches(sel Selector, filter map[string]struct{}, vi
 // collectStoreSketches streams one chunk's sketch rows and folds them into one
 // sketch per service, applying the service filter with one memoized
 // dictionary lookup per distinct service ID.
-func (e *Engine) collectStoreSketches(st Store, sel Selector, filter map[string]struct{}) (map[uint32]*Sketch, error) {
+func (e *Engine) collectStoreSketches(ctx context.Context, st Store, sel Selector, filter map[string]struct{}) (map[uint32]*Sketch, error) {
 	var verdict map[uint32]bool
 	if filter != nil {
 		verdict = make(map[uint32]bool, len(filter))
 	}
 	out := make(map[uint32]*Sketch)
-	err := st.VisitSketches(sel, func(serviceID uint32, sk *Sketch) error {
+	err := st.VisitSketches(ctx, sel, func(serviceID uint32, sk *Sketch) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if filter != nil {
 			ok, seen := verdict[serviceID]
 			if !seen {
@@ -582,8 +617,8 @@ func (e *Engine) collectStoreSketches(st Store, sel Selector, filter map[string]
 	return out, err
 }
 
-func (e *Engine) mergeStoreSketches(sel Selector, filter map[string]struct{}, merge func(*Sketch)) error {
-	return e.visitStoreSketches(sel, filter, func(_ uint32, sk *Sketch) { merge(sk) })
+func (e *Engine) mergeStoreSketches(ctx context.Context, sel Selector, filter map[string]struct{}, merge func(*Sketch)) error {
+	return e.visitStoreSketches(ctx, sel, filter, func(_ uint32, sk *Sketch) { merge(sk) })
 }
 
 // serviceName resolves a series' service through the dictionary. An
@@ -657,7 +692,7 @@ func (c *trafficCounters) addSum(r SumRow) {
 // The store half is a SQL GROUP BY: the result is one row per window (per
 // service when a service filter forces it), so the 20,000-row read cap cannot
 // reach it. That is #194 blocker 4 for this query class.
-func (e *Engine) QueryBuckets(q Query) (*BucketsResult, error) {
+func (e *Engine) QueryBuckets(ctx context.Context, q Query) (*BucketsResult, error) {
 	if q.Signal == SignalUnspecified {
 		q.Signal = SignalTraceOp
 	}
@@ -672,7 +707,7 @@ func (e *Engine) QueryBuckets(q Query) (*BucketsResult, error) {
 		return c
 	}
 
-	own, sel, hasStore, err := e.plan(q, func(windowStart int64, key SeriesKey, d *AggregateDelta) {
+	own, sel, hasStore, err := e.plan(ctx, q, func(windowStart int64, key SeriesKey, d *AggregateDelta) {
 		if filter != nil {
 			if _, ok := filter[e.serviceName(key)]; !ok {
 				return
@@ -690,7 +725,7 @@ func (e *Engine) QueryBuckets(q Query) (*BucketsResult, error) {
 		if filter != nil {
 			by |= GroupByService
 		}
-		sums, err := e.sumStore(sel, by)
+		sums, err := e.sumStore(ctx, sel, by)
 		if err != nil {
 			return nil, err
 		}
@@ -774,7 +809,7 @@ func (a *dashAccum) addSum(r SumRow) {
 // quantile sketch is not SUMmable, so the sketch-bearing rows are streamed
 // once and merged in Go (#219). Doing both through one capped read is exactly
 // what made the old dashboard quietly wrong past 20,000 rows.
-func (e *Engine) QueryDashboard(q Query) (*DashboardResult, error) {
+func (e *Engine) QueryDashboard(ctx context.Context, q Query) (*DashboardResult, error) {
 	q.Signal = SignalUnspecified // the scan covers traces and logs in one pass
 	filter := serviceFilter(q.Services)
 
@@ -808,7 +843,7 @@ func (e *Engine) QueryDashboard(q Query) (*DashboardResult, error) {
 		acc.addSum(r)
 	}
 
-	own, sel, hasStore, err := e.plan(q, func(_ int64, key SeriesKey, d *AggregateDelta) {
+	own, sel, hasStore, err := e.plan(ctx, q, func(_ int64, key SeriesKey, d *AggregateDelta) {
 		name := e.serviceName(key)
 		if filter != nil {
 			if _, ok := filter[name]; !ok {
@@ -839,7 +874,7 @@ func (e *Engine) QueryDashboard(q Query) (*DashboardResult, error) {
 		// sorted by the GROUP BY just to be discarded here (#290).
 		sumSel := sel
 		sumSel.Signals = []Signal{SignalTraceOp, SignalLog}
-		sums, err := e.sumStore(sumSel, GroupByService|GroupBySignal)
+		sums, err := e.sumStore(ctx, sumSel, GroupByService|GroupBySignal)
 		if err != nil {
 			return nil, err
 		}
@@ -858,7 +893,7 @@ func (e *Engine) QueryDashboard(q Query) (*DashboardResult, error) {
 			}
 		}
 
-		if err := e.mergeStoreSketches(sel, filter, mergeSketch); err != nil {
+		if err := e.mergeStoreSketches(ctx, sel, filter, mergeSketch); err != nil {
 			return nil, err
 		}
 	}
@@ -935,7 +970,7 @@ func topFailing(perSvc map[string]*dashAccum, limit int) []ServiceStat {
 // A Services filter selects a SUBGRAPH: an edge survives only when both of its
 // ends survive, so the result is never a graph with edges hanging off nodes it
 // does not contain.
-func (e *Engine) QueryTopology(q Query) (*TopologyResult, error) {
+func (e *Engine) QueryTopology(ctx context.Context, q Query) (*TopologyResult, error) {
 	// No signal filter: the trace-op series carry the nodes and the
 	// service-edge series carry the edges, and both must be read through the
 	// one plan that pins tenant, range and ownership.
@@ -971,7 +1006,7 @@ func (e *Engine) QueryTopology(q Query) (*TopologyResult, error) {
 		return acc
 	}
 
-	own, sel, hasStore, err := e.plan(q, func(_ int64, key SeriesKey, d *AggregateDelta) {
+	own, sel, hasStore, err := e.plan(ctx, q, func(_ int64, key SeriesKey, d *AggregateDelta) {
 		switch key.Signal {
 		case SignalTraceOp:
 			name := e.serviceName(key)
@@ -993,7 +1028,7 @@ func (e *Engine) QueryTopology(q Query) (*TopologyResult, error) {
 	if hasStore {
 		nodeSel := sel
 		nodeSel.Signal = SignalTraceOp
-		sums, err := e.sumStore(nodeSel, GroupByService)
+		sums, err := e.sumStore(ctx, nodeSel, GroupByService)
 		if err != nil {
 			return nil, err
 		}
@@ -1004,7 +1039,7 @@ func (e *Engine) QueryTopology(q Query) (*TopologyResult, error) {
 			}
 			at(name).addSum(r)
 		}
-		if err := e.visitStoreSketches(sel, filter, func(serviceID uint32, sk *Sketch) {
+		if err := e.visitStoreSketches(ctx, sel, filter, func(serviceID uint32, sk *Sketch) {
 			name := e.serviceNameByID(serviceID)
 			if keep(name) {
 				at(name).mergeSketch(sk)
@@ -1018,7 +1053,7 @@ func (e *Engine) QueryTopology(q Query) (*TopologyResult, error) {
 		// selector — the only shape in which a NameID means one namespace.
 		edgeSel := sel
 		edgeSel.Signal = SignalServiceEdge
-		edgeSums, err := e.sumStore(edgeSel, GroupByService|GroupByName)
+		edgeSums, err := e.sumStore(ctx, edgeSel, GroupByService|GroupByName)
 		if err != nil {
 			return nil, err
 		}

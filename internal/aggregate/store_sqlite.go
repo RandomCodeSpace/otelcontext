@@ -1266,9 +1266,12 @@ func (s *SQLiteStore) Analyze() error {
 // resume cursor. A caller that needs completeness pages with Selector.After
 // until Truncated is false; a caller that wants a scalar total should not be
 // here at all and should call SumBuckets.
-func (s *SQLiteStore) ReadBuckets(sel Selector) (BucketPage, error) {
+func (s *SQLiteStore) ReadBuckets(ctx context.Context, sel Selector) (BucketPage, error) {
 	limit, err := sel.Validate()
 	if err != nil {
+		return BucketPage{}, err
+	}
+	if err := ctx.Err(); err != nil {
 		return BucketPage{}, err
 	}
 	page := BucketPage{Limit: limit}
@@ -1295,13 +1298,21 @@ func (s *SQLiteStore) ReadBuckets(sel Selector) (BucketPage, error) {
 	sb.WriteString(` ORDER BY window_start, series_id, src LIMIT ?`)
 	args = append(args, limit+1)
 
-	rows, err := s.reader.Query(sb.String(), args...)
+	// The query structure comes only from bucketSources and fixed clauses in
+	// appendBucketUnion. Selector values and the limit stay bound in args.
+	rows, err := s.reader.QueryContext(ctx, sb.String(), args...) // NOSONAR
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return BucketPage{}, ctxErr
+		}
 		return BucketPage{}, fmt.Errorf("aggregate store: read buckets: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 	out := make([]Bucket, 0, 64)
 	for rows.Next() {
+		if err := ctx.Err(); err != nil {
+			return BucketPage{}, err
+		}
 		var window, id, src int64
 		d, err := scanDelta(func(dst ...any) error {
 			return rows.Scan(append([]any{&window, &id, &src}, dst...)...)
@@ -1323,6 +1334,9 @@ func (s *SQLiteStore) ReadBuckets(sel Selector) (BucketPage, error) {
 			Delta:       d,
 			Source:      BucketSource(src), // #nosec G115 -- src is a literal 0/1 in the query
 		})
+	}
+	if err := ctx.Err(); err != nil {
+		return BucketPage{}, err
 	}
 	if err := rows.Err(); err != nil {
 		return BucketPage{}, fmt.Errorf("aggregate store: read buckets: %w", err)
@@ -1346,8 +1360,11 @@ const sumColumnList = `point_count, error_count, request_count, error_request_co
 // the cardinality limiter — and never by the number of rows scanned. That is
 // the structural difference from ReadBuckets, whose result size IS the row
 // count.
-func (s *SQLiteStore) SumBuckets(sel Selector, by GroupBy) ([]SumRow, error) {
+func (s *SQLiteStore) SumBuckets(ctx context.Context, sel Selector, by GroupBy) ([]SumRow, error) {
 	if _, err := sel.Validate(); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	var (
@@ -1420,13 +1437,21 @@ func (s *SQLiteStore) SumBuckets(sel Selector, by GroupBy) ([]SumRow, error) {
 		sb.WriteString(` GROUP BY ` + strings.Join(group, ", "))
 	}
 
-	rows, err := s.reader.Query(sb.String(), args...)
+	// Group columns come from the fixed GroupBy table above, bucketSources owns
+	// both table names, and appendBucketFilter binds every selector value.
+	rows, err := s.reader.QueryContext(ctx, sb.String(), args...) // NOSONAR
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		return nil, fmt.Errorf("aggregate store: sum buckets: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 	var out []SumRow
 	for rows.Next() {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		var (
 			r                              SumRow
 			window, service, name, signal  int64
@@ -1451,6 +1476,9 @@ func (s *SQLiteStore) SumBuckets(sel Selector, by GroupBy) ([]SumRow, error) {
 		r.DurationSum = durSum
 		out = append(out, r)
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	return out, rows.Err()
 }
 
@@ -1461,12 +1489,15 @@ func (s *SQLiteStore) SumBuckets(sel Selector, by GroupBy) ([]SumRow, error) {
 // per page and a re-scan per keyset resume; a wide dashboard range paid that
 // price hundreds of times over (#219). A sketch merge is order-independent,
 // so this path pays it zero times.
-func (s *SQLiteStore) VisitSketches(sel Selector, visit func(serviceID uint32, sk *Sketch) error) error {
+func (s *SQLiteStore) VisitSketches(ctx context.Context, sel Selector, visit func(serviceID uint32, sk *Sketch) error) error {
 	if _, err := sel.Validate(); err != nil {
 		return err
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	for _, src := range bucketSources {
-		if err := s.visitTableSketches(src.table, sel, visit); err != nil {
+		if err := s.visitTableSketches(ctx, src.table, sel, visit); err != nil {
 			return err
 		}
 	}
@@ -1474,7 +1505,7 @@ func (s *SQLiteStore) VisitSketches(sel Selector, visit func(serviceID uint32, s
 }
 
 // visitTableSketches streams one table's sketch-bearing rows to visit.
-func (s *SQLiteStore) visitTableSketches(table string, sel Selector, visit func(uint32, *Sketch) error) error {
+func (s *SQLiteStore) visitTableSketches(ctx context.Context, table string, sel Selector, visit func(uint32, *Sketch) error) error {
 	var (
 		sb   strings.Builder
 		args []any
@@ -1484,8 +1515,13 @@ func (s *SQLiteStore) visitTableSketches(table string, sel Selector, visit func(
 		JOIN aggregate_series s ON s.id = t.series_id WHERE `, table)
 	sel.SketchOnly = true
 	args = appendBucketFilter(&sb, sel, args)
-	rows, err := s.reader.Query(sb.String(), args...)
+	// table is one of the bucketSources literals and appendBucketFilter binds
+	// every selector value. No caller input becomes SQL structure.
+	rows, err := s.reader.QueryContext(ctx, sb.String(), args...) // NOSONAR
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		return fmt.Errorf("aggregate store: visit sketches: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
@@ -1499,6 +1535,9 @@ func (s *SQLiteStore) visitTableSketches(table string, sel Selector, visit func(
 		blob    sql.RawBytes
 	)
 	for rows.Next() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if err := rows.Scan(&service, &blob); err != nil {
 			return fmt.Errorf("aggregate store: visit sketches: %w", err)
 		}
@@ -1508,6 +1547,9 @@ func (s *SQLiteStore) visitTableSketches(table string, sel Selector, visit func(
 		if err := visit(uint32(service), &scratch); err != nil { // #nosec G115 -- dictionary IDs are uint32
 			return err
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("aggregate store: visit sketches: %w", err)

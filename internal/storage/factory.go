@@ -2,14 +2,17 @@ package storage
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/RandomCodeSpace/otelcontext/internal/config"
 	"github.com/glebarez/sqlite"
 	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
@@ -25,6 +28,7 @@ import (
 // Applies per-driver optimizations (WAL for SQLite, connection pooling for others).
 func NewDatabase(driver, dsn string) (*gorm.DB, error) {
 	var dialector gorm.Dialector
+	var sqliteDB *sql.DB
 
 	switch strings.ToLower(driver) {
 	case "postgres", "postgresql":
@@ -62,7 +66,16 @@ func NewDatabase(driver, dsn string) (*gorm.DB, error) {
 			driver = "sqlite"
 			log.Println("DB_DRIVER not set, defaulting to sqlite (OtelContext.db)")
 		}
-		dialector = sqlite.Open(dsn)
+		cacheKB, mmapBytes := sqliteMemorySizes()
+		dsn, err := sqliteTunedDSN(dsn, cacheKB, mmapBytes)
+		if err != nil {
+			return nil, fmt.Errorf("sqlite DSN: %w", err)
+		}
+		sqliteDB, err = sql.Open(sqlite.DriverName, dsn)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open sqlite database: %w", err)
+		}
+		dialector = &sqlite.Dialector{DSN: dsn, Conn: sqliteDB}
 
 	default:
 		return nil, fmt.Errorf("unsupported database driver: %s", driver)
@@ -91,17 +104,18 @@ func NewDatabase(driver, dsn string) (*gorm.DB, error) {
 		DisableForeignKeyConstraintWhenMigrating: true,
 	})
 	if err != nil {
+		if sqliteDB != nil {
+			_ = sqliteDB.Close()
+		}
 		// Never surface the DSN in error wraps — pgx occasionally embeds connection
 		// string fragments (user:password@host) in its errors. Sanitize before returning.
 		return nil, fmt.Errorf("failed to connect to database (%s): %s", driver, scrubDSN(err.Error()))
 	}
 
-	// SQLite pragmas — set via Exec because glebarez/sqlite doesn't honour
-	// _pragma DSN params. Applied fail-closed: any PRAGMA failure aborts
-	// startup with a wrapped error so an unexpected SQLite build that doesn't
-	// support, e.g. mmap_size cannot silently regress the platform to
-	// default-tuned behaviour. The set was hardened on 2026-05-24 to make
-	// the platform survivable at 120 services on SQLite.
+	// The SQLite driver applies the PRAGMA parameters in sqliteTunedDSN to every
+	// physical connection and rejects a connection if initialization fails.
+	// The set was hardened on 2026-05-24 to make the platform survivable at 120
+	// services on SQLite.
 	//
 	// cache_size is fixed to the memory objective and mmap is opt-in — see
 	// sqliteMemorySizes for the rationale and the override rules.
@@ -109,31 +123,6 @@ func NewDatabase(driver, dsn string) (*gorm.DB, error) {
 	// journal_size_limit=67108864 = hard-cap the WAL file at 64 MB.
 	if strings.ToLower(driver) == "sqlite" || driver == "" {
 		cacheKB, mmapBytes := sqliteMemorySizes()
-		// Best-effort, deliberately NOT fail-closed, and ordered BEFORE the
-		// stanza below: auto_vacuum only takes effect on databases this
-		// process creates, and the journal_mode=WAL switch initializes the
-		// file header — after which the stored auto_vacuum mode is frozen
-		// (pre-existing files keep theirs either way). INCREMENTAL lets the
-		// retention scheduler reclaim pages via PRAGMA incremental_vacuum
-		// instead of a full daily VACUUM.
-		if err := db.Exec("PRAGMA auto_vacuum=INCREMENTAL").Error; err != nil {
-			log.Printf("⚠️  PRAGMA auto_vacuum=INCREMENTAL failed (best-effort, continuing): %v", err)
-		}
-		pragmas := []string{
-			"PRAGMA journal_mode=WAL",
-			"PRAGMA synchronous=NORMAL",
-			fmt.Sprintf("PRAGMA cache_size=-%d", cacheKB),
-			"PRAGMA temp_store=MEMORY",
-			fmt.Sprintf("PRAGMA mmap_size=%d", mmapBytes),
-			"PRAGMA wal_autocheckpoint=10000",
-			"PRAGMA journal_size_limit=67108864",
-			"PRAGMA busy_timeout=5000",
-		}
-		for _, p := range pragmas {
-			if err := db.Exec(p).Error; err != nil {
-				return nil, fmt.Errorf("sqlite pragma %q failed: %w", p, err)
-			}
-		}
 		log.Printf("📊 SQLite memory tuning: cache=%d KB, mmap=%d MB", cacheKB, mmapBytes/(1<<20))
 	}
 
@@ -179,6 +168,51 @@ func NewDatabase(driver, dsn string) (*gorm.DB, error) {
 	}
 
 	return db, nil
+}
+
+var sqliteManagedPragmas = map[string]struct{}{
+	"auto_vacuum":        {},
+	"busy_timeout":       {},
+	"cache_size":         {},
+	"journal_mode":       {},
+	"journal_size_limit": {},
+	"mmap_size":          {},
+	"synchronous":        {},
+	"temp_store":         {},
+	"wal_autocheckpoint": {},
+}
+
+func sqliteTunedDSN(dsn string, cacheKB, mmapBytes int64) (string, error) {
+	path, rawQuery, _ := strings.Cut(dsn, "?")
+	q, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return "", err
+	}
+
+	kept := q["_pragma"][:0]
+	for _, pragma := range q["_pragma"] {
+		name := strings.TrimSpace(pragma)
+		if end := strings.IndexAny(name, " (=\t"); end >= 0 {
+			name = name[:end]
+		}
+		if _, managed := sqliteManagedPragmas[strings.ToLower(name)]; !managed {
+			kept = append(kept, pragma)
+		}
+	}
+
+	q["_pragma"] = append([]string{
+		"auto_vacuum(INCREMENTAL)",
+		"journal_mode(WAL)",
+		"synchronous(NORMAL)",
+		fmt.Sprintf("cache_size(-%d)", cacheKB),
+		"temp_store(MEMORY)",
+		fmt.Sprintf("mmap_size(%d)", mmapBytes),
+		"wal_autocheckpoint(10000)",
+		"journal_size_limit(67108864)",
+		"busy_timeout(5000)",
+	}, kept...)
+
+	return path + "?" + q.Encode(), nil
 }
 
 func getEnvPoolInt(key string, fallback int) int {
@@ -389,12 +423,12 @@ func AutoMigrateModelsWithOptions(db *gorm.DB, driver string, opts MigrateOption
 	// Search routes through bm25() ranking on this driver; LIKE remains the fallback
 	// if FTS5 is unavailable (older SQLite builds without FTS5 compiled in).
 	//
-	// Gated on LOG_FTS_ENABLED (default false) — FTS5's inverted index typically
+	// Gated on LOG_FTS_ENABLED (default true) — FTS5's inverted index typically
 	// consumes 30-40% of SQLite DB disk for log-heavy workloads. When disabled,
 	// search_logs falls back transparently to LIKE via the existing branch in
 	// log_repo.go:105.
 	if driver == "sqlite" || driver == "" {
-		if logFTSEnabledFromEnv() {
+		if config.LogFTSEnabledFromEnv() {
 			if err := setupSQLiteFTS5(db); err != nil {
 				log.Printf("⚠️  SQLite FTS5 setup failed (%v) — log search will fall back to LIKE", err)
 			}

@@ -76,8 +76,9 @@ type Config struct {
 	// POST /api/admin/vacuum. Ignored on non-SQLite drivers.
 	RetentionFullVacuum bool
 
-	// TSDB
-	TSDBRingBufferDuration string // e.g. "1h"
+	// TSDBRingBufferDuration is retained for configuration compatibility.
+	// Deprecated: the runtime no longer creates the legacy metric ring buffer.
+	TSDBRingBufferDuration string
 
 	// Smart Observability — Adaptive Sampling
 	SamplingRate               float64
@@ -133,8 +134,8 @@ type Config struct {
 	// LogFTSEnabled toggles SQLite FTS5 provisioning + querying. The FTS5
 	// inverted index typically consumes 30-40% of SQLite DB disk for
 	// log-heavy workloads, while the LIKE fallback (log_repo.go:105) keeps
-	// search_logs functional without it. Default false; opt in with
-	// LOG_FTS_ENABLED=true. Only meaningful on SQLite; Postgres uses pg_trgm
+	// search_logs functional without it. Default true; opt out with
+	// LOG_FTS_ENABLED=false. Only meaningful on SQLite; Postgres uses pg_trgm
 	// independently of this flag.
 	LogFTSEnabled bool
 
@@ -259,9 +260,8 @@ type Config struct {
 	// and message type to an unauthenticated peer.
 	GRPCReflection bool
 
-	// AllowInsecureGRPC waives the production requirement for TLS and
-	// authentication on the OTLP gRPC listener. Explicit acknowledgement that
-	// telemetry crosses the network unprotected and unauthenticated.
+	// AllowInsecureGRPC is retained for configuration compatibility.
+	// Deprecated: TLS and authentication are independently opt-in in every environment.
 	AllowInsecureGRPC bool
 
 	// DevMode disables origin checks for WebSocket and enables dev-friendly defaults.
@@ -272,9 +272,8 @@ type Config struct {
 	GRPCMaxRecvMB            int
 	GRPCMaxConcurrentStreams int
 
-	// AllowSqliteProd lets operators explicitly acknowledge that SQLite is
-	// being used outside dev/test. Without it, a production Env + SQLite
-	// combination refuses to start.
+	// AllowSqliteProd is retained for configuration compatibility.
+	// Deprecated: SQLite is allowed in every environment.
 	AllowSqliteProd bool
 
 	// WSMaxClients caps simultaneous WebSocket connections to /ws*
@@ -522,7 +521,7 @@ func Load(customPath string) (*Config, error) {
 
 		// DB Connection Pool
 		DBMaxOpenConns:    getEnvInt("DB_MAX_OPEN_CONNS", 50),
-		DBMaxIdleConns:    getEnvInt("DB_MAX_IDLE_CONNS", 10),
+		DBMaxIdleConns:    getEnvInt("DB_MAX_IDLE_CONNS", 25),
 		DBConnMaxLifetime: getEnv("DB_CONN_MAX_LIFETIME", "1h"),
 
 		// Postgres partitioning (opt-in). Default empty = legacy unpartitioned.
@@ -535,7 +534,7 @@ func Load(customPath string) (*Config, error) {
 		RetentionBatchSleepMs: getEnvInt("RETENTION_BATCH_SLEEP_MS", 1),
 		RetentionFullVacuum:   getEnvBool("RETENTION_FULL_VACUUM", false),
 
-		// TSDB
+		// Deprecated compatibility input; the runtime no longer creates the ring.
 		TSDBRingBufferDuration: getEnv("TSDB_RING_BUFFER_DURATION", "1h"),
 
 		// Adaptive Sampling
@@ -567,8 +566,8 @@ func Load(customPath string) (*Config, error) {
 		// Compression
 		CompressionLevel: getEnv("COMPRESSION_LEVEL", "default"),
 
-		// Log search FTS5 toggle (SQLite only). Default off — see field comment.
-		LogFTSEnabled: parseTruthy(getEnv("LOG_FTS_ENABLED", "")),
+		// Log search FTS5 toggle (SQLite only). Default on; explicit values win.
+		LogFTSEnabled: LogFTSEnabledFromEnv(),
 
 		// GraphRAG
 		GraphRAGWorkerCount:       getEnvInt("GRAPHRAG_WORKER_COUNT", 16),
@@ -615,7 +614,7 @@ func Load(customPath string) (*Config, error) {
 		GRPCMaxRecvMB:            getEnvInt("GRPC_MAX_RECV_MB", 16),
 		GRPCMaxConcurrentStreams: getEnvInt("GRPC_MAX_CONCURRENT_STREAMS", 1000),
 
-		// Production safety guard for SQLite
+		// Deprecated compatibility input; SQLite no longer requires a waiver.
 		AllowSqliteProd: parseTruthy(getEnv("OTELCONTEXT_ALLOW_SQLITE_PROD", "")),
 
 		// Aggregate Engine Configuration
@@ -766,7 +765,6 @@ var sqliteOverrides = []struct {
 	{"METRIC_MAX_CARDINALITY", func(c *Config) { c.MetricMaxCardinality = 3000 }},
 	{"SAMPLING_RATE", func(c *Config) { c.SamplingRate = 0.05 }},
 	{"GRPC_MAX_CONCURRENT_STREAMS", func(c *Config) { c.GRPCMaxConcurrentStreams = 240 }},
-	{"LOG_FTS_ENABLED", func(c *Config) { c.LogFTSEnabled = true }},
 	// Each queued event embeds a storage.Span/Log by value (~0.5–2 KB); the
 	// 100k Postgres default is ~100 MB+ of standing buffer. On SQLite the
 	// single writer starves the workers anyway — drop sooner (metered via
@@ -788,6 +786,25 @@ func applyDriverDefaults(cfg *Config) {
 			ov.apply(cfg)
 		}
 	}
+}
+
+// LogFTSEnabledFromEnv is the authoritative LOG_FTS_ENABLED resolver used by
+// configuration, SQLite migration, queries, and the administrative drop gate.
+// An unset variable enables FTS5. Explicit empty, false, and invalid values
+// disable it; strconv boolean values plus yes/y/on enable it.
+func LogFTSEnabledFromEnv() bool {
+	v, ok := os.LookupEnv("LOG_FTS_ENABLED")
+	if !ok {
+		return true
+	}
+	if b, err := strconv.ParseBool(strings.TrimSpace(v)); err == nil {
+		return b
+	}
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "yes", "y", "on":
+		return true
+	}
+	return false
 }
 
 func getEnv(key, fallback string) string {
@@ -994,18 +1011,6 @@ func (c *Config) Validate() error {
 		}
 		if strings.EqualFold(c.AuthExternalTenantHeader, "X-Tenant-ID") {
 			return fmt.Errorf("AUTH_EXTERNAL_TENANT_HEADER must not be X-Tenant-ID — that header stays client-controlled; use a dedicated header your proxy strips and re-injects")
-		}
-	}
-
-	// Production fail-closed: the OTLP gRPC listener must be both protected in
-	// transport and authenticated. Two waivers, each named in the refusal so
-	// the operator knows exactly which acknowledgement they are making.
-	if c.IsProduction() && !c.AuthTrustExternal && !c.AllowInsecureGRPC {
-		if !c.TLSEnabled() {
-			return fmt.Errorf("APP_ENV=production requires transport protection on the OTLP gRPC listener: set TLS_CERT_FILE/TLS_KEY_FILE, or TLS_AUTO_SELFSIGNED=true, or waive with AUTH_TRUST_EXTERNAL=true (proxy-terminated TLS) or OTELCONTEXT_ALLOW_INSECURE_GRPC=true")
-		}
-		if !c.AuthEnabled() {
-			return fmt.Errorf("APP_ENV=production requires authentication on the OTLP gRPC listener: set API_KEY or API_TENANT_KEYS_FILE, or waive with AUTH_TRUST_EXTERNAL=true (proxy-authenticated identity) or OTELCONTEXT_ALLOW_INSECURE_GRPC=true")
 		}
 	}
 
@@ -1270,21 +1275,10 @@ func checkReadable(path string) error {
 	return f.Close()
 }
 
-// ValidateDBForEnv refuses the combination of SQLite driver + production
-// environment unless AllowSqliteProd is explicitly set. SQLite's single-writer
-// lock caps sustained throughput to ~5 services; using it in production will
-// silently throttle ingestion.
-//
-// Call once during startup after Load + Validate.
+// ValidateDBForEnv is retained for callers that perform a separate environment
+// compatibility check after Validate. All supported drivers are valid in every
+// environment; operators choose a driver based on their workload.
 func (c *Config) ValidateDBForEnv() error {
-	if !strings.EqualFold(c.DBDriver, "sqlite") {
-		return nil
-	}
-	if strings.EqualFold(c.Env, "production") && !c.AllowSqliteProd {
-		return fmt.Errorf("SQLite is unsuitable for APP_ENV=production " +
-			"(single-writer lock caps throughput at ~5 services). " +
-			"Use DB_DRIVER=postgres, or set OTELCONTEXT_ALLOW_SQLITE_PROD=true to acknowledge")
-	}
 	return nil
 }
 

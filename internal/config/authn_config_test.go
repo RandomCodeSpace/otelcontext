@@ -1,6 +1,7 @@
 package config
 
 import (
+	"os"
 	"strings"
 	"testing"
 )
@@ -15,31 +16,34 @@ func productionConfig(t *testing.T) *Config {
 	return c
 }
 
-// The production startup matrix from the #198 resolution: plaintext OR
-// unauthenticated gRPC is refused, and each waiver flag admits it with a
-// message that names the flag.
-func TestValidate_ProductionRequiresTransportAndAuth(t *testing.T) {
+// Production does not implicitly enable or require transport protection or
+// authentication. Each remains independently opt-in.
+func TestValidate_ProductionAllowsOptionalTransportAndAuth(t *testing.T) {
 	certFile, keyFile := writeTLSPair(t)
 
 	cases := []struct {
-		name    string
-		mutate  func(*Config)
-		wantErr string
+		name   string
+		mutate func(*Config)
 	}{
 		{
-			name:    "plaintext and unauthenticated refused",
-			mutate:  func(*Config) {},
-			wantErr: "transport protection",
+			name:   "plaintext and unauthenticated",
+			mutate: func(*Config) {},
 		},
 		{
-			name:    "TLS without authentication refused",
-			mutate:  func(c *Config) { c.TLSCertFile, c.TLSKeyFile = certFile, keyFile },
-			wantErr: "requires authentication",
+			name:   "TLS without authentication",
+			mutate: func(c *Config) { c.TLSCertFile, c.TLSKeyFile = certFile, keyFile },
 		},
 		{
-			name:    "self-signed TLS counts as transport protection",
-			mutate:  func(c *Config) { c.TLSAutoSelfsigned = true },
-			wantErr: "requires authentication",
+			name:   "self-signed TLS without authentication",
+			mutate: func(c *Config) { c.TLSAutoSelfsigned = true },
+		},
+		{
+			name:   "API key without TLS",
+			mutate: func(c *Config) { c.APIKey = "secret" },
+		},
+		{
+			name:   "tenant keys without TLS",
+			mutate: func(c *Config) { c.APITenantKeysFile = "/etc/otelcontext/keys.json" },
 		},
 		{
 			name: "TLS plus API_KEY admitted",
@@ -56,39 +60,75 @@ func TestValidate_ProductionRequiresTransportAndAuth(t *testing.T) {
 			},
 		},
 		{
-			name:   "AUTH_TRUST_EXTERNAL waives both",
+			name:   "external trusted authentication",
 			mutate: func(c *Config) { c.AuthTrustExternal = true; c.AuthExternalTenantHeader = "X-OtelContext-Tenant" },
 		},
 		{
-			name:   "OTELCONTEXT_ALLOW_INSECURE_GRPC waives both",
+			name:   "deprecated insecure flag true",
 			mutate: func(c *Config) { c.AllowInsecureGRPC = true },
+		},
+		{
+			name:   "deprecated insecure flag false",
+			mutate: func(c *Config) { c.AllowInsecureGRPC = false },
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			c := productionConfig(t)
 			tc.mutate(c)
-			err := c.Validate()
-			if tc.wantErr == "" {
-				if err != nil {
-					t.Fatalf("want admitted, got %v", err)
-				}
-				return
-			}
-			if err == nil {
-				t.Fatal("want refusal, got nil")
-			}
-			if !strings.Contains(err.Error(), tc.wantErr) {
-				t.Fatalf("error %q should mention %q", err, tc.wantErr)
-			}
-			// Every refusal names both waivers so the operator can see the
-			// acknowledgement they would be making.
-			for _, flag := range []string{"AUTH_TRUST_EXTERNAL", "OTELCONTEXT_ALLOW_INSECURE_GRPC"} {
-				if !strings.Contains(err.Error(), flag) {
-					t.Errorf("refusal %q does not name %s", err, flag)
-				}
+			if err := c.Validate(); err != nil {
+				t.Fatalf("production opt-in combination refused: %v", err)
 			}
 		})
+	}
+}
+
+func TestValidate_ProductionRejectsInvalidExplicitTLS(t *testing.T) {
+	c := productionConfig(t)
+	c.TLSCertFile = "/tmp/cert-without-key.crt"
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "TLS_CERT_FILE and TLS_KEY_FILE") {
+		t.Fatalf("invalid explicit TLS pair must be rejected, got %v", err)
+	}
+}
+
+func TestLoad_ProductionDefaultsAllowSQLiteWithoutAuthOrTLS(t *testing.T) {
+	for _, key := range []string{
+		"API_KEY",
+		"API_TENANT_KEYS_FILE",
+		"AUTH_TRUST_EXTERNAL",
+		"TLS_CERT_FILE",
+		"TLS_KEY_FILE",
+		"TLS_AUTO_SELFSIGNED",
+		"OTELCONTEXT_ALLOW_INSECURE_GRPC",
+		"OTELCONTEXT_ALLOW_SQLITE_PROD",
+		"LOG_FTS_ENABLED",
+	} {
+		t.Setenv(key, "")
+		if err := os.Unsetenv(key); err != nil {
+			t.Fatalf("unset %s: %v", key, err)
+		}
+	}
+	t.Setenv("APP_ENV", "production")
+	t.Setenv("DB_DRIVER", "sqlite")
+
+	c, err := Load("__no_such_env_file__")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.AuthEnabled() || c.TLSEnabled() {
+		t.Fatalf("production defaults unexpectedly enabled auth or TLS: auth=%t tls=%t", c.AuthEnabled(), c.TLSEnabled())
+	}
+	if c.AllowInsecureGRPC || c.AllowSqliteProd {
+		t.Fatalf("deprecated compatibility flags unexpectedly enabled: grpc=%t sqlite=%t", c.AllowInsecureGRPC, c.AllowSqliteProd)
+	}
+	if !c.LogFTSEnabled {
+		t.Fatal("SQLite FTS must default on")
+	}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if err := c.ValidateDBForEnv(); err != nil {
+		t.Fatalf("ValidateDBForEnv: %v", err)
 	}
 }
 

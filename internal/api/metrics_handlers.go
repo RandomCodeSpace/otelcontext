@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
+	"net/url"
 	"sort"
 	"time"
 
@@ -39,7 +40,7 @@ func (s *Server) handleGetTrafficMetrics(w http.ResponseWriter, r *http.Request)
 	// travels in the response header instead (#164).
 	if s.aggregateReads() {
 		start = clampAggregateRange(w, start, end)
-		res, err := s.aggregateEngine.QueryBuckets(aggregate.Query{
+		res, err := s.aggregateEngine.QueryBuckets(r.Context(), aggregate.Query{
 			Tenant:   storage.TenantFromContext(r.Context()),
 			Start:    start,
 			End:      end,
@@ -127,27 +128,30 @@ func (s *Server) handleGetLatencyHeatmap(w http.ResponseWriter, r *http.Request)
 }
 
 // handleGetDashboardStats handles GET /api/metrics/dashboard.
-// The rendered JSON is cached for 10s per (tenant, query) with an ETag —
+// The rendered JSON is cached for 10s per normalized request with an ETag —
 // same pattern as handleGetSystemGraph — so steady-state dashboard polling
 // becomes a hash compare instead of a SQLite aggregate + JSON encode. The
-// key includes the raw query string so explicit start/end/service_name
-// windows never share an entry; oversized queries skip the cache (see
-// maxCacheKeyQueryLen).
+// keys retain only the supported tenant, time-range, and service semantics.
 func (s *Server) handleGetDashboardStats(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query()
 	// Default to last 30 minutes if not specified
 	end := time.Now()
 	start := end.Add(-30 * time.Minute)
 
-	if startStr := r.URL.Query().Get("start"); startStr != "" {
+	var explicitStart, explicitEnd *time.Time
+	if startStr := query.Get("start"); startStr != "" {
 		if t, err := time.Parse(time.RFC3339, startStr); err == nil {
 			start = t
+			explicitStart = &t
 		}
 	}
-	if endStr := r.URL.Query().Get("end"); endStr != "" {
+	if endStr := query.Get("end"); endStr != "" {
 		if t, err := time.Parse(time.RFC3339, endStr); err == nil {
 			end = t
+			explicitEnd = &t
 		}
 	}
+	serviceNames := query["service_name"]
 	// Clamp BEFORE the cache lookup so the clamp headers are stamped on
 	// cache hits too — the cached payload was produced from the clamped
 	// range, and the headers must say so every time it is served (#217).
@@ -155,16 +159,13 @@ func (s *Server) handleGetDashboardStats(w http.ResponseWriter, r *http.Request)
 		start = clampAggregateRange(w, start, end)
 	}
 
-	var cacheKey string
-	if len(r.URL.RawQuery) <= maxCacheKeyQueryLen {
-		cacheKey = "dashboard_stats:" + storage.TenantFromContext(r.Context()) + "?" + r.URL.RawQuery
+	cacheKey := dashboardCacheKey(storage.TenantFromContext(r.Context()), explicitStart, explicitEnd, serviceNames)
+	if cacheKey != "" {
 		if cached, ok := s.cache.Get(cacheKey); ok {
 			cached.(*cachedJSON).write(w, r, "HIT")
 			return
 		}
 	}
-
-	serviceNames := r.URL.Query()["service_name"]
 
 	view, err := s.dashboardView(r, start, end, serviceNames)
 	if err != nil {
@@ -184,6 +185,32 @@ func (s *Server) handleGetDashboardStats(w http.ResponseWriter, r *http.Request)
 	cj.write(w, r, "MISS")
 }
 
+func dashboardCacheKey(tenant string, start, end *time.Time, services []string) string {
+	values := make(url.Values, 4)
+	values.Set("tenant", tenant)
+	values.Set("start", "rolling")
+	if start != nil {
+		values.Set("start", start.UTC().Format(time.RFC3339Nano))
+	}
+	values.Set("end", "rolling")
+	if end != nil {
+		values.Set("end", end.UTC().Format(time.RFC3339Nano))
+	}
+
+	canonicalServices := append([]string(nil), services...)
+	sort.Strings(canonicalServices)
+	for i, service := range canonicalServices {
+		if i == 0 || service != canonicalServices[i-1] {
+			values.Add("service_name", service)
+		}
+	}
+	key := "dashboard_stats?" + values.Encode()
+	if len(key) > maxCacheKeyLen {
+		return ""
+	}
+	return key
+}
+
 // dashboardView produces the dashboard payload from whichever source owns the
 // numbers in this mode. In aggregate mode every figure comes from engine
 // queries — no COUNT/AVG/DISTINCT scan of the trace or log tables, and no
@@ -191,7 +218,7 @@ func (s *Server) handleGetDashboardStats(w http.ResponseWriter, r *http.Request)
 // bound that sketch justifies.
 func (s *Server) dashboardView(r *http.Request, start, end time.Time, serviceNames []string) (views.DashboardStats, error) {
 	if s.aggregateReads() {
-		res, err := s.aggregateEngine.QueryDashboard(aggregate.Query{
+		res, err := s.aggregateEngine.QueryDashboard(r.Context(), aggregate.Query{
 			Tenant:   storage.TenantFromContext(r.Context()),
 			Start:    start,
 			End:      end,
@@ -244,9 +271,7 @@ func (s *Server) handleGetServiceMapMetrics(w http.ResponseWriter, r *http.Reque
 	}
 
 	if cached, ok := s.cache.Get(cacheKey); ok {
-		w.Header().Set(httpconst.HeaderContentType, httpconst.ContentTypeJSON)
-		w.Header().Set("X-Cache", "HIT")
-		_ = json.NewEncoder(w).Encode(cached)
+		cached.(*cachedBody).write(w, "HIT")
 		return
 	}
 
@@ -256,10 +281,13 @@ func (s *Server) handleGetServiceMapMetrics(w http.ResponseWriter, r *http.Reque
 		http.Error(w, err.Error(), aggregateReadStatus(err))
 		return
 	}
-	s.cache.Set(cacheKey, resp, cacheTTL)
-	w.Header().Set(httpconst.HeaderContentType, httpconst.ContentTypeJSON)
-	w.Header().Set("X-Cache", "MISS")
-	_ = json.NewEncoder(w).Encode(resp)
+	body, err := newCachedBody(resp)
+	if err != nil {
+		http.Error(w, "failed to encode service map metrics", http.StatusInternalServerError)
+		return
+	}
+	s.cache.Set(cacheKey, body, cacheTTL)
+	body.write(w, "MISS")
 }
 
 // serviceMapView produces the topology payload.
@@ -285,7 +313,7 @@ func (s *Server) serviceMapView(r *http.Request, start, end time.Time) (views.Se
 		}
 		return views.ServiceMapMetricsFromModel(metrics), nil
 	}
-	res, err := s.aggregateEngine.QueryTopology(aggregate.Query{
+	res, err := s.aggregateEngine.QueryTopology(r.Context(), aggregate.Query{
 		Tenant: storage.TenantFromContext(r.Context()),
 		Start:  start,
 		End:    end,

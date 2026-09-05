@@ -130,7 +130,7 @@ func (r *Repository) GetLogsV2(ctx context.Context, filter LogFilter) ([]Log, in
 // applied here — the two callers handle it differently (FTS5 MATCH vs LIKE).
 func applyLogFilterCriteria(base *gorm.DB, filter LogFilter) *gorm.DB {
 	if filter.ServiceName != "" {
-		base = base.Where("service_name = ?", filter.ServiceName)
+		base = base.Where("logs.service_name = ?", filter.ServiceName)
 	}
 	if filter.Severity != "" {
 		base = base.Where(sqlWhereSeverity, filter.Severity)
