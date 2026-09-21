@@ -78,7 +78,8 @@ jobs:
       - name: Install semgrep
         # Pinned: a scanner that silently changes version changes the
         # merge gate under everyone without a commit saying so.
-        run: python -m pip install --quiet "pip==26.2.1" "semgrep==1.174.0"
+        run: |
+          python -m pip install --quiet --only-binary=:all: "pip==26.2.1" "semgrep==1.174.0"
       - name: Run semgrep (security-audit + owasp-top-ten + golang)
         run: |
           semgrep scan \

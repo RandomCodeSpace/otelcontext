@@ -3,6 +3,7 @@ package gatecore
 import (
 	"encoding/json"
 	"fmt"
+	"net/netip"
 	"os"
 	"strings"
 )
@@ -403,6 +404,11 @@ func LoadConfigFile(path string) (Config, error) {
 // Validate refuses a configuration that cannot produce a scoreable run.
 func (c Config) Validate() error {
 	var problems []string
+	// The gate starts and measures a local server; HTTP control traffic must stay local.
+	addr, err := netip.ParseAddrPort(c.HTTPAddr)
+	if err != nil || !addr.Addr().IsLoopback() || addr.Addr().Zone() != "" || addr.Port() == 0 {
+		problems = append(problems, "http_addr must use a literal loopback IP address and port")
+	}
 	if c.Binaries.Server == "" {
 		problems = append(problems, "binaries.server is empty")
 	}

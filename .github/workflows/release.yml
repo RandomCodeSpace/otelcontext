@@ -18,6 +18,10 @@ on:
         type: string
         default: ''
 
+# Keep the exact go.mod toolchain; do not download a newer toolchain implicitly.
+env:
+  GOTOOLCHAIN: local
+
 jobs:
   source-identity:
     name: source identity
