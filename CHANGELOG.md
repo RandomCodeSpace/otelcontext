@@ -12,7 +12,7 @@ most recently published tag.
 
 ## [Unreleased]
 
-## [v0.6.0] - 2026-09-21
+## [v0.6.1] - 2026-09-21
 
 ### Changed
 
@@ -33,6 +33,14 @@ most recently published tag.
   geometry, stable refresh, and boundary navigation.
 - Pinned, locally embedded Dagre layout assets with MIT notices and provenance.
   Builds and runtime operation require no Node.js, frontend build, or CDN.
+
+### Fixed
+
+- Release browser checks now use native Enter events across inspector focus changes,
+  preventing the test driver from opening and immediately closing the inspector.
+- Scanner installation accepts binary packages only. The manual gate restricts HTTP
+  destinations to loopback. Go workflows disable automatic toolchain upgrades, and
+  the release script enforces the Go 1.26.5 maximum while retaining Go 1.25.13 builds.
 
 ## [v0.5.0] - 2026-09-05
 
@@ -455,8 +463,8 @@ committed the built UI to `main`.)
 - bestpractices.dev project [12646](https://www.bestpractices.dev/projects/12646)
   declared at `level: passing` via canonical autofill schema. ([#47])
 
-[Unreleased]: https://github.com/RandomCodeSpace/otelcontext/compare/v0.6.0...HEAD
-[v0.6.0]: https://github.com/RandomCodeSpace/otelcontext/compare/v0.5.0...v0.6.0
+[Unreleased]: https://github.com/RandomCodeSpace/otelcontext/compare/v0.6.1...HEAD
+[v0.6.1]: https://github.com/RandomCodeSpace/otelcontext/compare/v0.5.0...v0.6.1
 [v0.5.0]: https://github.com/RandomCodeSpace/otelcontext/compare/v0.4.0-beta.1...v0.5.0
 [v0.3.0-beta.1]: https://github.com/RandomCodeSpace/otelcontext/compare/v0.2.0-beta.6...v0.3.0-beta.1
 [v0.2.0-beta.6]: https://github.com/RandomCodeSpace/otelcontext/compare/v0.0.11-beta.15...v0.2.0-beta.6

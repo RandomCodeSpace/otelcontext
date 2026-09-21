@@ -13,11 +13,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/chromedp/cdproto/input"
 	cdplog "github.com/chromedp/cdproto/log"
 	"github.com/chromedp/cdproto/network"
 	cdpruntime "github.com/chromedp/cdproto/runtime"
 	"github.com/chromedp/chromedp"
-	"github.com/chromedp/chromedp/kb"
 )
 
 type applicationMapPage struct {
@@ -150,6 +150,20 @@ func mapThemesAndMobile(t *testing.T, page applicationMapPage) {
 	}
 }
 
+// mapEnterKey sends native key events so preventDefault on keydown suppresses
+// the character event. chromedp.KeyEvent sends a separate character regardless;
+// after the inspector takes focus, that character can activate its Close button.
+func mapEnterKey() chromedp.Tasks {
+	return chromedp.Tasks{
+		input.DispatchKeyEvent(input.KeyDown).WithKey("Enter").WithCode("Enter").
+			WithWindowsVirtualKeyCode(13).WithText("\r").WithUnmodifiedText("\r"),
+		// Hold Enter across the inspector's focus handoff to exercise the regression.
+		chromedp.Sleep(100 * time.Millisecond),
+		input.DispatchKeyEvent(input.KeyUp).WithKey("Enter").WithCode("Enter").
+			WithWindowsVirtualKeyCode(13),
+	}
+}
+
 func TestApplicationMap150(t *testing.T) {
 	if strings.TrimSpace(os.Getenv("OTELCONTEXT_BROWSER_CASE")) != "application-map" {
 		t.Skip("set OTELCONTEXT_BROWSER_CASE=application-map")
@@ -257,13 +271,13 @@ func verifyConnectedApplicationMap(t *testing.T, page applicationMapPage) {
 	// Keyboard activation selects a real measured connection and exposes its evidence.
 	source := evaluateString(t, ctx, `document.querySelector("#graph-edges .graph-edge").dataset.source`)
 	target := evaluateString(t, ctx, `document.querySelector("#graph-edges .graph-edge").dataset.target`)
-	if err := chromedp.Run(ctx, chromedp.Focus("#graph-edges .graph-edge", chromedp.ByQuery), chromedp.KeyEvent(kb.Enter)); err != nil {
+	if err := chromedp.Run(ctx, chromedp.Focus("#graph-edges .graph-edge", chromedp.ByQuery), mapEnterKey()); err != nil {
 		t.Fatal(err)
 	}
 	requireJS(t, ctx, fmt.Sprintf(`!document.querySelector("#inspector").inert && (() => { const text = document.querySelector("#inspector").textContent; return text.includes(%q) && text.includes(%q) && /calls/i.test(text) && /latency/i.test(text) && /error/i.test(text); })()`, source, target), 5*time.Second)
 	page.smoke.screenshot("connection-evidence")
 	mapClick(t, ctx, "#close-inspector-button")
-	if err := chromedp.Run(ctx, chromedp.Focus("#graph-nodes .service-node", chromedp.ByQuery), chromedp.KeyEvent(kb.Enter)); err != nil {
+	if err := chromedp.Run(ctx, chromedp.Focus("#graph-nodes .service-node", chromedp.ByQuery), mapEnterKey()); err != nil {
 		t.Fatal(err)
 	}
 	selected := evaluateString(t, ctx, `document.querySelector("#inspector-title").textContent.trim()`)
