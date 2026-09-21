@@ -283,7 +283,9 @@ func (g *gate) abs(p string) string {
 	return filepath.Join(g.cfg.RepoRoot, p)
 }
 
-func (g *gate) baseURL() string { return "http://" + g.cfg.HTTPAddr }
+func (g *gate) baseURL() string {
+	return "http://" + g.cfg.HTTPAddr // NOSONAR: Config.Validate restricts HTTP to the local test server on a literal loopback IP.
+}
 
 func (g *gate) recordCommand(phase string, argv []string, dir string, started time.Time, dur float64, exit int, logPath, errMsg string) {
 	g.mu.Lock()

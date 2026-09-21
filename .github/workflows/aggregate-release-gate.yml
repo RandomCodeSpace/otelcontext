@@ -15,6 +15,10 @@ on:
 permissions:
   contents: read
 
+# Keep the exact go.mod toolchain; do not download a newer toolchain implicitly.
+env:
+  GOTOOLCHAIN: local
+
 jobs:
   aggregate:
     name: aggregate gate · linux-amd64 · 2 CPU · 4 GiB

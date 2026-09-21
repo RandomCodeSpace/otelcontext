@@ -199,3 +199,37 @@ func TestConfigRoundTripsThroughJSON(t *testing.T) {
 		t.Error("thresholds did not survive the round trip")
 	}
 }
+
+func TestValidateHTTPAddress(t *testing.T) {
+	for _, tc := range []struct {
+		addr  string
+		valid bool
+	}{
+		{"127.0.0.1:8080", true},
+		{"127.0.0.2:8080", true},
+		{"[::1]:8080", true},
+		{"192.0.2.1:8080", false},
+		{"0.0.0.0:8080", false},
+		{"[::]:8080", false},
+		{"localhost:8080", false},
+		{"127.0.0.1", false},
+		{"127.0.0.1:80@example.com", false},
+		{"127.0.0.1:", false},
+		{"127.0.0.1:http", false},
+		{"127.0.0.1:0", false},
+		{"127.0.0.1:65536", false},
+		{"[::1%lo]:8080", false},
+	} {
+		t.Run(tc.addr, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.HTTPAddr = tc.addr
+			err := cfg.Validate()
+			if tc.valid && err != nil {
+				t.Fatalf("loopback address rejected: %v", err)
+			}
+			if !tc.valid && (err == nil || !strings.Contains(err.Error(), "http_addr")) {
+				t.Fatalf("want http_addr rejection, got %v", err)
+			}
+		})
+	}
+}

@@ -10,6 +10,10 @@ on:
 permissions:
   contents: read
 
+# Keep the exact go.mod toolchain; do not download a newer toolchain implicitly.
+env:
+  GOTOOLCHAIN: local
+
 jobs:
   build-and-test:
     name: build · vet · test
