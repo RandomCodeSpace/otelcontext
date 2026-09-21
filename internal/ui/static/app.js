@@ -1,5 +1,6 @@
+import { CARD_WIDTH, CARD_HEIGHT, layoutGraph, partitionNeighborhoods, boundedNeighborhood, topologyKey } from "./map-layout.js";
+
 const SVG_NS = "http://www.w3.org/2000/svg";
-const GOLDEN_ANGLE = 2.399963229728653;
 const POLL_INTERVAL_MS = 30000;
 const TOOL_CACHE_MS = 300000;
 const HOST_PREFIX = "host/";
@@ -56,6 +57,25 @@ const dom = {
   mapView: byId("map-view-button"),
   listView: byId("list-view-button"),
   hostGroup: byId("host-group-button"),
+  mapSummary: byId("map-summary"),
+  componentSelect: byId("component-select"),
+  scopeSelect: byId("scope-select"),
+  resetScope: byId("reset-scope-button"),
+  disconnectedButton: byId("disconnected-button"),
+  disconnectedInventory: byId("disconnected-inventory"),
+  disconnectedList: byId("disconnected-list"),
+  overview: byId("system-overview"),
+  overviewButton: byId("system-overview-button"),
+  overviewSummary: byId("overview-summary"),
+  overviewGrid: byId("overview-grid"),
+  mapBack: byId("map-back-button"),
+  neighborhoodList: byId("neighborhood-list"),
+  neighborhoodIndex: byId("neighborhood-index-button"),
+  serviceIndex: byId("service-index-button"),
+  mapEvidence: byId("map-evidence"),
+  mapEvidenceSummary: byId("map-evidence-summary"),
+  mapMembers: byId("map-member-list"),
+  mapConnections: byId("map-connection-list"),
   map: byId("service-map"),
   graphDescription: byId("graph-description"),
   rings: byId("graph-rings"),
@@ -98,6 +118,21 @@ const state = {
   refreshing: false,
   selected: null,
   selectedHost: null,
+  selectedEdge: null,
+  component: null,
+  scope: "neighbors",
+  focusRoot: null,
+  inventory: false,
+  overview: false,
+  indexMode: "neighborhoods",
+  mapHistory: [],
+  initializedComponents: new Set(),
+  explicitFullScope: false,
+  partition: null,
+  layout: null,
+  layoutKey: "",
+  viewportScope: "",
+  pendingFit: true,
   groupBy: "service",
   hosts: null,
   hostsError: "",
@@ -375,6 +410,14 @@ function readURL() {
   const tab = params.get("tab");
   state.activeTab = ["overview", "why", "impact", "dependencies"].includes(tab) ? tab : "overview";
   state.impactRoot = params.get("impact");
+  state.component = params.get("component");
+  state.scope = ["all", "neighbors", "callers", "dependencies"].includes(params.get("scope")) ? params.get("scope") : "neighbors";
+  state.explicitFullScope = params.get("scope") === "all";
+  state.focusRoot = params.get("focus") || state.selected;
+  state.inventory = params.get("view") === "unconnected";
+  state.overview = state.groupBy !== "host" && (params.get("view") === "overview" || state.component === "all");
+  state.selectedEdge = null;
+  state.pendingFit = true;
 }
 
 function setTheme(theme, persist) {
@@ -684,8 +727,13 @@ function renderStates() {
   dom.loading.hidden = !state.loading;
   dom.error.hidden = state.loading || !state.error;
   dom.empty.hidden = state.loading || Boolean(state.error) || nodeCount > 0;
-  dom.canvas.hidden = state.loading || Boolean(state.error) || nodeCount === 0 || (isMobile() && state.mobileMode === "list");
-  dom.mobileList.hidden = state.loading || Boolean(state.error) || nodeCount === 0 || !isMobile() || state.mobileMode !== "list";
+  dom.canvas.hidden = state.loading || Boolean(state.error) || nodeCount === 0 || state.inventory || state.overview || (isMobile() && state.mobileMode === "list");
+  dom.mobileList.hidden = state.loading || Boolean(state.error) || nodeCount === 0 || state.overview || !isMobile() || state.mobileMode !== "list";
+  dom.disconnectedInventory.hidden = state.loading || Boolean(state.error) || nodeCount === 0 || !state.inventory || (isMobile() && state.mobileMode === "list");
+  dom.overview.hidden = state.loading || Boolean(state.error) || nodeCount === 0 || !state.overview;
+  dom.mapEvidence.hidden = dom.canvas.hidden || state.groupBy === "host";
+  document.body.classList.toggle("is-system-overview", state.overview);
+  document.body.classList.toggle("is-host-map", state.groupBy === "host");
   dom.errorMessage.textContent = state.error;
 }
 
@@ -693,11 +741,11 @@ function renderPulse() {
   const summary = state.graph && state.graph.system ? state.graph.system : {};
   const dashboard = state.dashboard || {};
   const stats = state.stats || {};
-  dom.pulseHealth.textContent = formatRatio(summary.overall_health_score, 0);
-  dom.pulseHealth.style.color = statusColor(normalizeStatus({
-    status: summary.critical > 0 ? "critical" : summary.degraded > 0 ? "degraded" : "healthy",
-    health_score: summary.overall_health_score,
-  }));
+  const services = sortedNodes();
+  const healthy = services.filter((node) => normalizeStatus(node) === "healthy").length;
+  dom.pulseHealth.textContent = state.graph ? healthy + " / " + services.length : "—";
+  dom.pulseHealth.style.color = "var(--text)";
+  dom.pulseHealth.setAttribute("aria-label", healthy + " of " + services.length + " services healthy");
   dom.pulseErrors.textContent = Number.isFinite(Number(dashboard.error_rate))
     ? formatPercent(dashboard.error_rate, 1)
     : formatRatio(summary.total_error_rate, 1);
@@ -849,6 +897,12 @@ function renderServiceLists() {
   dom.railEyebrow.textContent = hostMode ? "By host" : "Worst first";
   dom.serviceCount.textContent = String(all.length);
   dom.searchCount.textContent = state.query ? String(filtered.length) + " found" : "";
+  const services = hostMode || state.indexMode === "services" || Boolean(state.query.trim()) || !state.partition?.components.length;
+  dom.serviceList.hidden = !services;
+  dom.neighborhoodList.hidden = services;
+  dom.neighborhoodIndex.setAttribute("aria-pressed", String(!services));
+  dom.serviceIndex.setAttribute("aria-pressed", String(services));
+  dom.railEyebrow.textContent = hostMode ? "By host" : services ? "Worst first" : "All " + all.length + " services";
 }
 
 function cleanEdges(nodes, edges) {
@@ -856,7 +910,7 @@ function cleanEdges(nodes, edges) {
   const seen = new Set();
   const output = [];
   for (const edge of edges) {
-    if (!ids.has(edge.source) || !ids.has(edge.target) || edge.source === edge.target) continue;
+    if (!ids.has(edge.source) || !ids.has(edge.target) || edge.kind === "runs_on") continue;
     const key = edge.source + ">" + edge.target;
     if (seen.has(key)) continue;
     seen.add(key);
@@ -864,47 +918,6 @@ function cleanEdges(nodes, edges) {
   }
   output.sort((a, b) => (a.source + ">" + a.target).localeCompare(b.source + ">" + b.target));
   return output;
-}
-
-function graphLayout(nodes, edges) {
-  const ids = nodes.map((node) => node.id).sort((a, b) => a.localeCompare(b));
-  const callers = new Map();
-  const degree = new Map();
-  for (const id of ids) {
-    callers.set(id, new Set());
-    degree.set(id, 0);
-  }
-  for (const edge of edges) {
-    callers.get(edge.target).add(edge.source);
-    degree.set(edge.source, degree.get(edge.source) + 1);
-    degree.set(edge.target, degree.get(edge.target) + 1);
-  }
-  let maxCallers = 0;
-  let maxLogDegree = 0;
-  for (const id of ids) {
-    maxCallers = Math.max(maxCallers, callers.get(id).size);
-    maxLogDegree = Math.max(maxLogDegree, Math.log1p(degree.get(id)));
-  }
-  const scores = new Map();
-  for (const id of ids) {
-    const callerScore = maxCallers ? callers.get(id).size / maxCallers : 0;
-    const volumeScore = maxLogDegree ? Math.log1p(degree.get(id)) / maxLogDegree : 0;
-    scores.set(id, 0.6 * callerScore + 0.4 * volumeScore);
-  }
-  ids.sort((a, b) => scores.get(b) - scores.get(a) || a.localeCompare(b));
-
-  const positions = new Map();
-  const count = Math.max(ids.length, 1);
-  const radius = ids.length === 1 ? 0 : 382;
-  ids.forEach((id, index) => {
-    const distance = radius * Math.sqrt((index + 0.4) / count);
-    const angle = index * GOLDEN_ANGLE;
-    positions.set(id, {
-      x: 500 + distance * Math.cos(angle),
-      y: 500 + distance * Math.sin(angle),
-    });
-  });
-  return positions;
 }
 
 // hostNodes synthesizes one host node per registry host the graph does not
@@ -940,24 +953,6 @@ function hostNodeLabel(name) {
   return name + ", " + count + (count === 1 ? " service" : " services");
 }
 
-function renderRunsOnEdges(placements, positions, fragment) {
-  for (const edge of placements) {
-    const source = positions.get(edge.source);
-    const target = positions.get(edge.target);
-    if (!source || !target) continue;
-    fragment.appendChild(svgElement("line", {
-      class: "runs-on-edge",
-      "data-kind": edge.kind,
-      "data-source": edge.source,
-      "data-target": edge.target,
-      x1: source.x,
-      y1: source.y,
-      x2: target.x,
-      y2: target.y,
-    }));
-  }
-}
-
 function downstreamDepths(root, edges, maxDepth) {
   const outgoing = new Map();
   for (const edge of edges) {
@@ -986,178 +981,414 @@ function graphSearchMatches() {
   return new Set(state.graph.nodes.filter((node) => node.id.toLowerCase().includes(query)).map((node) => node.id));
 }
 
+function connectionKey(edge) {
+  return edge.source + ">" + edge.target;
+}
+
+function scopeNeighbors(root, edges, scope) {
+  const ids = new Set([root]);
+  for (const edge of edges) {
+    if (edge.source === root && scope !== "callers") ids.add(edge.target);
+    if (edge.target === root && scope !== "dependencies") ids.add(edge.source);
+  }
+  return ids;
+}
+
+function initialFocus(nodes, edges) {
+  const degree = new Map(nodes.map((node) => [node.id, 0]));
+  for (const edge of edges) {
+    if (degree.has(edge.source)) degree.set(edge.source, degree.get(edge.source) + 1);
+    if (degree.has(edge.target)) degree.set(edge.target, degree.get(edge.target) + 1);
+  }
+  const bounded = nodes.filter((node) => degree.get(node.id) < 30);
+  return (bounded.length ? bounded : nodes).map((node) => node.id).sort((a, b) => degree.get(b) - degree.get(a) || a.localeCompare(b))[0];
+}
+
+function neighborhoodRoot(nodes, edges) {
+  const critical = nodes.filter((node) => normalizeStatus(node) === "critical");
+  return initialFocus(critical.length ? critical : nodes, edges);
+}
+
+function graphModel() {
+  const services = state.graph.nodes.filter((node) => !isHostNode(node));
+  const callEdges = cleanEdges(services, state.graph.edges);
+  const partition = partitionNeighborhoods(services, callEdges);
+  state.partition = partition;
+  const component = partition.components.find((item) => item.nodeIds.includes(state.selected))
+    || partition.components.find((item) => item.id === state.component)
+    || partition.components.find((item) => item.nodeIds.includes(state.focusRoot))
+    || partition.components.find((item) => item.nodeIds.includes(neighborhoodRoot(services, callEdges)))
+    || partition.components[0];
+  state.component = component ? component.id : null;
+  const members = new Set(component ? component.nodeIds : []);
+  const groupNodes = services.filter((node) => members.has(node.id));
+  if (!services.some((node) => node.id === state.focusRoot) || !members.has(state.focusRoot)) {
+    state.focusRoot = members.has(state.selected) ? state.selected : neighborhoodRoot(groupNodes, callEdges);
+  }
+  let nodes = groupNodes;
+  let edges = callEdges.filter((edge) => members.has(edge.source) && members.has(edge.target));
+  let remainingIds = [];
+  if (state.groupBy === "host") {
+    state.overview = false;
+    nodes = services.concat(state.graph.nodes.filter(isHostNode), hostNodes(state.graph.nodes));
+    edges = callEdges;
+  } else if (state.selectedEdge) {
+    const edge = callEdges.find((item) => connectionKey(item) === state.selectedEdge);
+    if (edge) {
+      nodes = services.filter((node) => node.id === edge.source || node.id === edge.target);
+      edges = [edge];
+    }
+  } else if (state.scope !== "all" && state.focusRoot) {
+    ({ nodes, edges, remainingIds } = boundedNeighborhood(services, callEdges, state.focusRoot, state.scope));
+  }
+  if (!partition.disconnected.length) state.inventory = false;
+  if (state.groupBy !== "host" && partition.disconnected.some((node) => node.id === state.selected)) {
+    state.inventory = true;
+    state.overview = false;
+  }
+  if (!partition.components.length && state.groupBy !== "host" && !state.overview) state.inventory = true;
+  return { nodes, edges, placements: state.groupBy === "host" ? runsOnEdges(nodes) : [], partition,
+    component, services, callEdges, remainingIds, totalConnected: services.length - partition.disconnected.length,
+    groupCount: groupNodes.length };
+}
+
+function updateMapURL() {
+  updateURL({ component: state.component, scope: state.scope,
+    focus: state.scope === "all" ? null : state.focusRoot,
+    view: state.overview ? "overview" : state.inventory ? "unconnected" : null });
+}
+
+function rememberMap() {
+  const saved = {};
+  for (const key of ["component", "scope", "focusRoot", "inventory", "overview", "selected", "selectedHost", "selectedEdge", "activeTab", "groupBy", "indexMode", "query", "viewportScope"]) saved[key] = state[key];
+  saved.viewBox = { ...state.viewBox };
+  state.mapHistory.push(saved);
+  if (state.mapHistory.length > 30) state.mapHistory.shift();
+}
+
+function openNeighborhood(id) {
+  const component = state.partition?.components.find((item) => item.id === id);
+  if (!component) return;
+  rememberMap();
+  state.component = id;
+  state.selected = state.selectedHost = state.selectedEdge = null;
+  state.focusRoot = neighborhoodRoot(state.graph.nodes.filter((node) => component.nodeIds.includes(node.id)), state.graph.edges);
+  state.scope = "neighbors";
+  state.overview = state.inventory = false;
+  state.pendingFit = true;
+  state.query = dom.search.value = "";
+  state.mobileMode = "map";
+  updateURL({ service: null, host: null, tab: null });
+  updateMapURL();
+  renderAll();
+}
+
+function showSystemOverview() {
+  rememberMap();
+  state.selected = state.selectedHost = state.selectedEdge = null;
+  state.groupBy = "service";
+  state.overview = true;
+  state.inventory = false;
+  updateURL({ service: null, host: null, tab: null, group: null });
+  updateMapURL();
+  renderAll();
+}
+
+function goBackOnMap() {
+  const saved = state.mapHistory.pop();
+  if (!saved) return;
+  Object.assign(state, saved);
+  state.pendingFit = false;
+  dom.search.value = state.query;
+  updateURL({ service: state.selected, host: state.selectedHost, tab: state.activeTab === "overview" ? null : state.activeTab,
+    group: state.groupBy === "host" ? "host" : null });
+  updateMapURL();
+  renderAll();
+  setViewBox(saved.viewBox);
+}
+
+function mapButton(label, className, action) {
+  const button = textElement("button", className, label);
+  button.type = "button";
+  button.addEventListener("click", action);
+  return button;
+}
+
+function groupHealth(group, byId) {
+  const counts = { critical: 0, degraded: 0, unknown: 0, healthy: 0 };
+  group.nodeIds.forEach((id) => { counts[normalizeStatus(byId.get(id))] += 1; });
+  return Object.entries(counts).filter((entry) => entry[1]).map(([status, count]) => count + " " + status).join(" · ");
+}
+
+function renderMapScope(model) {
+  const components = model.partition.components;
+  const byId = new Map(model.services.map((node) => [node.id, node]));
+  const signature = components.map((item) => item.id + ":" + item.nodeIds.length).join("|");
+  if (dom.componentSelect.dataset.signature !== signature) {
+    const options = components.map((item) => {
+      const option = textElement("option", "", item.label + " · " + item.nodeIds.length + " services");
+      option.value = item.id;
+      return option;
+    });
+    if (components.length) {
+      const all = textElement("option", "", "System overview · " + model.services.length + " services");
+      all.value = "all";
+      options.unshift(all);
+    }
+    dom.componentSelect.replaceChildren(...options);
+    dom.componentSelect.dataset.signature = signature;
+  }
+  dom.componentSelect.value = state.overview ? "all" : state.component || "";
+  dom.componentSelect.hidden = !components.length;
+  dom.componentSelect.disabled = !components.length || state.groupBy === "host";
+  dom.scopeSelect.value = state.scope;
+  dom.scopeSelect.hidden = !components.length || state.overview;
+  dom.scopeSelect.disabled = state.inventory || !model.nodes.length || state.groupBy === "host";
+  dom.resetScope.hidden = !components.length || state.overview || state.scope === "all" && !state.inventory;
+  dom.resetScope.disabled = state.groupBy === "host";
+  dom.disconnectedButton.hidden = model.partition.disconnected.length === 0;
+  dom.disconnectedButton.textContent = "No observed dependencies (" + model.partition.disconnected.length + ")";
+  dom.disconnectedButton.setAttribute("aria-pressed", state.inventory ? "true" : "false");
+  dom.disconnectedButton.disabled = model.partition.disconnected.length === 0;
+  dom.overviewButton.setAttribute("aria-pressed", String(state.overview));
+  dom.mapBack.disabled = state.mapHistory.length === 0;
+  const shown = state.inventory ? model.partition.disconnected.length : model.nodes.filter((node) => !isHostNode(node)).length;
+  dom.mapSummary.textContent = state.overview
+    ? model.services.length + " services · " + model.callEdges.length + " observed dependencies · System overview"
+    : state.inventory ? shown + " services with no observed dependencies · " + model.services.length + " services total"
+    : "Showing " + shown + " services · " + model.services.length + " services total · "
+      + (state.groupBy === "host" ? "By host" : state.selectedEdge ? "Selected connection" : (model.component?.label || "Service flow") + " · " + model.groupCount + " neighborhood members")
+      + (model.remainingIds.length ? " · " + model.remainingIds.length + " more neighbors in evidence list" : "");
+  dom.overviewSummary.textContent = model.services.length + " services · " + model.callEdges.length + " observed dependencies · "
+    + model.partition.componentCount + " connected components · Navigation groups do not imply ownership";
+  dom.overviewGrid.replaceChildren();
+  dom.neighborhoodList.replaceChildren();
+  for (const group of components) {
+    const health = groupHealth(group, byId);
+    const row = mapButton("", "neighborhood-row", () => openNeighborhood(group.id));
+    row.dataset.neighborhood = group.id;
+    row.setAttribute("aria-current", String(group.id === state.component));
+    row.append(textElement("strong", "", group.label), textElement("small", "", group.nodeIds.length + " services · " + health));
+    dom.neighborhoodList.append(row);
+    const card = document.createElement("article");
+    card.className = "overview-card";
+    card.dataset.neighborhood = group.id;
+    const heading = document.createElement("div");
+    heading.className = "overview-heading";
+    heading.append(textElement("h3", "overview-title", group.label), textElement("span", "overview-health", health));
+    const marks = document.createElement("div");
+    marks.className = "overview-members";
+    group.nodeIds.forEach((id) => {
+      const node = byId.get(id);
+      const mark = mapButton("", "overview-member " + normalizeStatus(node), () => openInspector(id));
+      mark.dataset.service = id;
+      mark.style.backgroundColor = statusColor(normalizeStatus(node));
+      mark.setAttribute("aria-label", id + ", " + normalizeStatus(node));
+      mark.title = id + ", " + normalizeStatus(node);
+      marks.append(mark);
+    });
+    card.append(heading, marks,
+      textElement("span", "overview-counts", group.nodeIds.length + " services · " + group.incomingEdges.length + " incoming · " + group.outgoingEdges.length + " outgoing"),
+      mapButton("Open map", "overview-open", () => openNeighborhood(group.id)));
+    dom.overviewGrid.append(card);
+  }
+  if (model.partition.disconnected.length) {
+    const card = document.createElement("article");
+    card.className = "overview-card";
+    card.append(textElement("h3", "overview-title", "No observed dependencies"),
+      textElement("p", "overview-counts", model.partition.disconnected.length + " searchable services"),
+      mapButton("Open services", "overview-open", () => dom.disconnectedButton.click()));
+    dom.overviewGrid.append(card);
+  }
+  const group = model.component;
+  const allEdges = group ? [...group.internalEdges, ...group.incomingEdges, ...group.outgoingEdges]
+    .sort((a, b) => connectionKey(a).localeCompare(connectionKey(b))) : [];
+  dom.mapMembers.replaceChildren(...(group ? group.nodeIds.map((id) => serviceButton(byId.get(id))) : []));
+  dom.mapConnections.replaceChildren(...allEdges.map((edge) => {
+    const row = mapButton("", "map-connection-row", () => openConnection(edge));
+    row.dataset.source = edge.source;
+    row.dataset.target = edge.target;
+    const crossing = !group.nodeIds.includes(edge.source) || !group.nodeIds.includes(edge.target);
+    row.append(textElement("strong", "", edge.source + " → " + edge.target),
+      textElement("span", "", edgeEvidence(edge) + (crossing ? " · Cross-neighborhood" : "")));
+    return row;
+  }));
+  dom.mapEvidenceSummary.textContent = (group?.nodeIds.length || 0) + " neighborhood members · " + allEdges.length + " observed dependencies"
+    + (group ? " · " + (group.incomingEdges.length + group.outgoingEdges.length) + " cross-neighborhood" : "");
+  const query = state.query.trim().toLowerCase();
+  const isolated = model.partition.disconnected.filter((node) => !query || node.id.toLowerCase().includes(query));
+  dom.disconnectedList.replaceChildren(...isolated.map(serviceButton));
+  if (!isolated.length) dom.disconnectedList.appendChild(textElement("p", "quiet", "No services match this search."));
+  renderServiceLists();
+}
+
+function routedPath(points) {
+  points = (points || []).filter((point, index, route) => !index || point.x !== route[index - 1].x || point.y !== route[index - 1].y);
+  if (points.length < 2) return "";
+  let path = "M" + points[0].x + "," + points[0].y;
+  for (let index = 1; index < points.length - 1; index += 1) {
+    const previous = points[index - 1];
+    const corner = points[index];
+    const next = points[index + 1];
+    const incoming = Math.hypot(corner.x - previous.x, corner.y - previous.y);
+    const outgoing = Math.hypot(next.x - corner.x, next.y - corner.y);
+    // Round within the existing route, keeping endpoints and arrow direction.
+    const radius = Math.min(48, incoming / 2, outgoing / 2);
+    if (!radius) continue;
+    const entryX = corner.x + (previous.x - corner.x) * radius / incoming;
+    const entryY = corner.y + (previous.y - corner.y) * radius / incoming;
+    const exitX = corner.x + (next.x - corner.x) * radius / outgoing;
+    const exitY = corner.y + (next.y - corner.y) * radius / outgoing;
+    path += " L" + entryX + "," + entryY + " Q" + corner.x + "," + corner.y + " " + exitX + "," + exitY;
+  }
+  const end = points[points.length - 1];
+  return path + " L" + end.x + "," + end.y;
+}
+
+function edgeEvidence(edge) {
+  if (!(Number(edge.call_count) > 0)) return formatCount(edge.call_count) + " calls · latency and errors not reported";
+  return formatCount(edge.call_count) + " calls · " + formatMs(edge.avg_latency_ms) + " average · " + formatRatio(edge.error_rate, 1) + " errors";
+}
+
+function activateWithKeyboard(element, activate) {
+  element.addEventListener("click", (event) => {
+    event.stopPropagation();
+    activate();
+  });
+  element.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      activate();
+    }
+  });
+}
+
+function appendCardText(group, className, x, y, text) {
+  const label = svgElement("text", { class: className, x, y });
+  label.textContent = text;
+  group.appendChild(label);
+  return label;
+}
+
 function renderGraph() {
+  const focus = document.activeElement;
+  const restoreNode = focus && focus.closest("#graph-nodes") ? focus.dataset.service : null;
+  const restoreEdge = focus && focus.closest("#graph-edges") ? focus.dataset.edge : null;
   dom.rings.replaceChildren();
   dom.edges.replaceChildren();
   dom.nodes.replaceChildren();
   dom.minimapEdges.replaceChildren();
   dom.minimapNodes.replaceChildren();
-  if (!state.graph || state.graph.nodes.length === 0) return;
-
-  const hostMode = state.groupBy === "host";
-  dom.graphDescription.textContent = hostMode
-    ? "Hosts share the map with services; a dashed edge links a service to each host it runs on. Select a service or a host to inspect it."
-    : "Services are arranged by dependency criticality. Select a service to inspect it.";
-  const nodes = hostMode ? state.graph.nodes.concat(hostNodes(state.graph.nodes)) : state.graph.nodes;
-  const edges = cleanEdges(state.graph.nodes, state.graph.edges);
-  // Placement edges enter the layout scoring only, so a host ranks with the
-  // services it carries; every traversal below reads the call edges alone.
-  const placements = hostMode ? runsOnEdges(nodes) : [];
-  const positions = graphLayout(nodes, edges.concat(placements));
-  for (const radius of [100, 200, 300, 400]) {
-    dom.rings.appendChild(svgElement("circle", { class: "graph-ring", cx: 500, cy: 500, r: radius }));
+  if (!state.graph || state.graph.nodes.length === 0) {
+    dom.disconnectedInventory.hidden = true;
+    dom.mapSummary.textContent = "Waiting for telemetry";
+    return;
   }
+  const model = graphModel();
+  renderMapScope(model);
+  renderStates();
+  if (state.inventory || state.overview) return;
+  const { nodes, edges, placements } = model;
+  const key = topologyKey(nodes, edges.concat(placements));
+  if (key !== state.layoutKey || !state.layout) {
+    state.layout = layoutGraph(nodes, edges.concat(placements));
+    state.layoutKey = key;
+    dom.map.dataset.layoutMs = String(state.layout.durationMs);
+  }
+  const { positions, routes, bounds } = state.layout;
+  const scopeKey = [state.groupBy, state.component, state.scope, state.selectedEdge || "", state.scope === "all" ? "" : state.focusRoot].join(":");
+  const fit = state.pendingFit || state.viewportScope !== scopeKey;
+  state.viewportScope = scopeKey;
+  state.pendingFit = false;
+  dom.graphDescription.textContent = "Application call flow from left to right. Arrowheads point to downstream dependencies. Select a named service or a connection to inspect it."
+    + (state.groupBy === "host" ? " Dashed lines show host placement, not application calls." : "");
+  dom.minimap.setAttribute("viewBox", [bounds.x, bounds.y, bounds.width, bounds.height].join(" "));
   const searchMatches = graphSearchMatches();
-  const impact = state.impactRoot ? downstreamDepths(state.impactRoot, edges, 5) : null;
-  const selectedNeighbors = new Set();
-  if (state.selected) {
-    selectedNeighbors.add(state.selected);
-    for (const edge of edges) {
-      if (edge.source === state.selected) selectedNeighbors.add(edge.target);
-      if (edge.target === state.selected) selectedNeighbors.add(edge.source);
-    }
+  const impact = state.impactRoot ? downstreamDepths(state.impactRoot, state.graph.edges, 5) : null;
+  const neighbors = state.selected ? scopeNeighbors(state.selected, state.graph.edges, "neighbors") : null;
+  for (const edge of placements) {
+    dom.edges.appendChild(svgElement("path", { class: "runs-on-edge", "data-kind": "runs_on",
+      "data-source": edge.source, "data-target": edge.target, d: routedPath(routes.get(connectionKey(edge))) }));
   }
-
-  const edgeFragment = document.createDocumentFragment();
-  renderRunsOnEdges(placements, positions, edgeFragment);
   for (const edge of edges) {
-    const source = positions.get(edge.source);
-    const target = positions.get(edge.target);
-    if (!source || !target) continue;
-    const line = svgElement("line", {
-      class: "graph-edge",
-      "data-source": edge.source,
-      "data-target": edge.target,
-      x1: source.x,
-      y1: source.y,
-      x2: target.x,
-      y2: target.y,
-    });
+    const points = routes.get(connectionKey(edge));
+    if (!points) continue;
+    const id = connectionKey(edge);
+    const selected = state.selectedEdge === id;
     const related = state.selected && (edge.source === state.selected || edge.target === state.selected);
-    const inImpact = impact && impact.has(edge.source) && impact.has(edge.target)
-      && impact.get(edge.target) === impact.get(edge.source) + 1;
+    const inImpact = impact && impact.has(edge.source) && impact.has(edge.target);
+    const line = svgElement("path", { class: "graph-edge", "data-source": edge.source,
+      "data-target": edge.target, "data-edge": id, d: routedPath(points),
+      "marker-end": "url(#edge-arrow)", role: "button", tabindex: "0",
+      "aria-label": edge.source + " to " + edge.target + ": " + edgeEvidence(edge), "aria-pressed": String(selected) });
+    if (selected) line.classList.add("is-selected");
     if (related) line.classList.add("is-related");
     if (inImpact) line.classList.add("is-impact");
-    if ((related || inImpact) && edges.length < 600) line.setAttribute("marker-end", "url(#edge-arrow)");
-    if (searchMatches && !searchMatches.has(edge.source) && !searchMatches.has(edge.target)) {
-      line.style.opacity = "0.1";
-    } else if (state.selected && !related) {
-      line.style.opacity = "0.12";
-    } else if (impact && !inImpact) {
-      line.style.opacity = "0.08";
+    if (Number(edge.error_rate) > 0.05 || edge.status === "critical") line.classList.add("is-critical");
+    if (searchMatches && !searchMatches.has(edge.source) && !searchMatches.has(edge.target)) line.classList.add("is-dim");
+    else if (state.selected && !related) line.classList.add("is-dim");
+    else if (impact && !inImpact) line.classList.add("is-dim");
+    const title = svgElement("title");
+    title.textContent = edge.source + " → " + edge.target + ": " + edgeEvidence(edge);
+    line.appendChild(title);
+    activateWithKeyboard(line, () => openConnection(edge));
+    const hit = svgElement("path", { class: "edge-hit", d: routedPath(points), "aria-hidden": "true" });
+    hit.addEventListener("click", (event) => { event.stopPropagation(); openConnection(edge); });
+    dom.edges.append(hit, line);
+    // Edge evidence stays accessible on every connection. Print labels only
+    // where the map's spacing can support them without covering other nodes.
+    if ((edges.length <= 20 || related || selected) && points.length > 1) {
+      const middle = points[Math.floor(points.length / 2)];
+      const label = svgElement("text", { class: "edge-label", x: middle.x, y: middle.y - 9, "text-anchor": "middle", "aria-hidden": "true" });
+      label.textContent = formatCount(edge.call_count) + " calls · " + (Number(edge.call_count) > 0 ? formatMs(edge.avg_latency_ms) : "latency not reported");
+      if (line.classList.contains("is-dim")) label.classList.add("is-dimmed");
+      dom.edges.appendChild(label);
     }
-    edgeFragment.appendChild(line);
-    dom.minimapEdges.appendChild(svgElement("line", {
-      class: "minimap-edge",
-      x1: source.x,
-      y1: source.y,
-      x2: target.x,
-      y2: target.y,
-    }));
+    dom.minimapEdges.appendChild(svgElement("path", { class: "minimap-edge", d: routedPath(points) }));
   }
-  dom.edges.appendChild(edgeFragment);
-
-  const count = nodes.length;
-  const nodeRadius = count > 140 ? 7 : count > 70 ? 9 : count > 30 ? 11 : 14;
-  const showAllLabels = count <= 42;
-  const nodeFragment = document.createDocumentFragment();
   for (const node of nodes) {
     const point = positions.get(node.id);
     if (!point) continue;
     const hostNode = isHostNode(node);
     const hostName = hostNode ? hostOfNode(node) : "";
     const status = hostNode ? "unknown" : normalizeStatus(node);
-    const group = svgElement("g", {
-      class: "service-node",
-      transform: "translate(" + point.x + " " + point.y + ")",
-      tabindex: "0",
-      role: "button",
-      "data-status": status,
-      "aria-label": hostNode
-        ? hostNodeLabel(hostName)
-        : node.id + ", " + status + ", health " + formatRatio(node.health_score, 0),
-    });
-    group.dataset.service = node.id;
-    if (hostNode) {
-      // A host is a diamond; activating it opens the host panel.
-      group.dataset.kind = "host";
-      group.dataset.host = hostName;
-      if (hostName === state.selectedHost) group.classList.add("is-selected");
-      const side = nodeRadius * 1.7;
-      group.appendChild(svgElement("rect", { class: "node-halo", x: -side / 2 - 7, y: -side / 2 - 7, width: side + 14, height: side + 14, transform: "rotate(45)" }));
-      group.appendChild(svgElement("rect", { class: "node-core", x: -side / 2, y: -side / 2, width: side, height: side, transform: "rotate(45)" }));
-      if (showAllLabels || searchMatches && searchMatches.has(node.id)) {
-        const label = svgElement("text", { class: "node-label", x: nodeRadius + 9, y: 6 });
-        label.textContent = hostName.length > 24 ? hostName.slice(0, 23) + "…" : hostName;
-        group.appendChild(label);
-      }
-      const title = svgElement("title");
-      title.textContent = hostName + " — host";
-      group.appendChild(title);
-      const open = () => openHost(hostName);
-      group.addEventListener("click", (event) => {
-        event.stopPropagation();
-        open();
-      });
-      group.addEventListener("keydown", (event) => {
-        if (event.key === "Enter" || event.key === " ") {
-          event.preventDefault();
-          open();
-        }
-      });
-      nodeFragment.appendChild(group);
-      continue;
-    }
-    if (node.id === state.selected) group.classList.add("is-selected");
+    const group = svgElement("g", { class: "service-node", transform: "translate(" + (point.x - CARD_WIDTH / 2) + " " + (point.y - CARD_HEIGHT / 2) + ")",
+      tabindex: "0", role: "button", "data-status": status, "data-service": node.id,
+      "aria-label": hostNode ? hostNodeLabel(hostName) : node.id + ", " + status + ", health " + formatRatio(node.health_score, 0) });
+    if (hostNode) { group.dataset.kind = "host"; group.dataset.host = hostName; }
+    if (node.id === state.selected || hostNode && hostName === state.selectedHost) group.classList.add("is-selected");
     if (searchMatches && searchMatches.has(node.id)) group.classList.add("is-search-match");
     if (impact && impact.has(node.id)) group.classList.add("is-impact");
-    const dimForSearch = searchMatches && !searchMatches.has(node.id);
-    const dimForSelection = state.selected && !selectedNeighbors.has(node.id);
-    const dimForImpact = impact && !impact.has(node.id);
-    if (dimForSearch || dimForSelection || dimForImpact) group.classList.add("is-dim");
-
-    group.appendChild(svgElement("circle", { class: "node-halo", r: nodeRadius + 8 }));
-    group.appendChild(svgElement("circle", { class: "node-core", r: nodeRadius }));
-    const showLabel = showAllLabels || node.id === state.selected || (searchMatches && searchMatches.has(node.id));
-    if (showLabel) {
-      const label = svgElement("text", {
-        class: "node-label",
-        x: nodeRadius + 9,
-        y: 6,
-      });
-      label.textContent = node.id.length > 24 ? node.id.slice(0, 23) + "…" : node.id;
-      group.appendChild(label);
-      if (hostMode && nodeHostCount(node) > 1) {
-        const sub = svgElement("text", { class: "node-sub", x: nodeRadius + 9, y: 22 });
-        sub.textContent = nodeHostCount(node) + " hosts";
-        group.appendChild(sub);
+    if (searchMatches && !searchMatches.has(node.id) || neighbors && !neighbors.has(node.id) && !hostNode || impact && !impact.has(node.id) && !hostNode) group.classList.add("is-dim");
+    group.appendChild(svgElement("rect", { class: "node-card", width: CARD_WIDTH, height: CARD_HEIGHT, rx: 6 }));
+    group.appendChild(svgElement("rect", { class: "node-status-bar", width: 4, height: CARD_HEIGHT, rx: 2 }));
+    appendCardText(group, "node-kind", 14, 18, hostNode ? "HOST" : status.toUpperCase());
+    const name = hostNode ? hostName : node.id;
+    const label = appendCardText(group, "node-label", 14, name.length > 24 ? 36 : 41, "");
+    if (name.length > 24) {
+      for (let row = 0; row < 2; row += 1) {
+        const part = svgElement("tspan", { x: 14, dy: row ? 15 : 0 });
+        part.textContent = name.slice(row * 24, (row + 1) * 24) + (row === 1 && name.length > 48 ? "…" : "");
+        label.appendChild(part);
       }
-    }
+    } else label.textContent = name;
+    const metrics = node.metrics || {};
+    const tail = formatP99(metrics.p99_latency_ms, metrics.latency_provenance);
+    appendCardText(group, "node-metrics", 14, 73, hostNode
+      ? (hostByName(hostName) ? hostByName(hostName).service_count + " services" : "Host metrics")
+      : formatMs(metrics.avg_latency_ms) + " avg · " + formatRatio(metrics.error_rate, 1) + " error");
     const title = svgElement("title");
-    const tail = formatP99(node.metrics.p99_latency_ms, node.metrics.latency_provenance);
-    title.textContent = node.id + " — " + status + ", " + tail.label + " " + tail.value + ". " + tail.explanation;
+    title.textContent = hostNode ? hostNodeLabel(hostName) : node.id + ", " + status + ", " + tail.label + " " + tail.value + ". " + tail.explanation;
     group.appendChild(title);
-    group.addEventListener("click", (event) => {
-      event.stopPropagation();
-      openInspector(node.id);
-    });
-    group.addEventListener("keydown", (event) => {
-      if (event.key === "Enter" || event.key === " ") {
-        event.preventDefault();
-        openInspector(node.id);
-      }
-    });
-    nodeFragment.appendChild(group);
-    dom.minimapNodes.appendChild(svgElement("circle", {
-      class: "minimap-node",
-      cx: point.x,
-      cy: point.y,
-      r: count > 70 ? 16 : 22,
-      "data-status": status,
-    }));
+    if (hostNode) group.appendChild(svgElement("path", { class: "host-symbol", d: "M178 10 L185 17 L178 24 L171 17 Z" }));
+    activateWithKeyboard(group, () => hostNode ? openHost(hostName) : openInspector(node.id));
+    dom.nodes.appendChild(group);
+    dom.minimapNodes.appendChild(svgElement("circle", { class: "minimap-node", cx: point.x, cy: point.y, r: 12, "data-status": status }));
   }
-  dom.nodes.appendChild(nodeFragment);
-  renderMinimapViewport();
+  if (fit) fitGraph();
+  else renderMinimapViewport();
+  if (restoreNode) dom.nodes.querySelector('[data-service="' + CSS.escape(restoreNode) + '"]')?.focus({ preventScroll: true });
+  if (restoreEdge) dom.edges.querySelector('[data-edge="' + CSS.escape(restoreEdge) + '"]')?.focus({ preventScroll: true });
 }
 
 function renderImpactBanner() {
@@ -1201,6 +1432,11 @@ async function setGroupBy(mode) {
     }
   }
   state.groupBy = mode;
+  state.overview = false;
+  if (mode === "host") state.scope = "all";
+  state.inventory = false;
+  state.pendingFit = true;
+  updateMapURL();
   updateURL({ group: mode === "host" ? "host" : null });
   if (mode === "host" && isMobile()) {
     state.mobileMode = "list";
@@ -1230,6 +1466,7 @@ function setMobileMode(mode) {
   updateURL({ flow: mode === "map" ? "1" : "0" });
   renderViewSwitch();
   renderStates();
+  if (mode === "map") { state.pendingFit = true; renderGraph(); }
 }
 
 function statCard(label, value, critical, explanation) {
@@ -1678,8 +1915,14 @@ function renderWhy(node) {
 
 function showImpactOnMap(service) {
   state.impactRoot = service;
+  const owner = state.partition && state.partition.components.find((item) => item.nodeIds.includes(service));
+  if (owner) state.component = owner.id;
+  state.scope = "all";
+  state.inventory = !owner;
+  state.pendingFit = true;
   state.mobileMode = "map";
   state.mobileModeChosen = true;
+  updateMapURL();
   updateURL({ impact: service, service: null, tab: null, flow: "1" });
   closeInspector();
   renderAll();
@@ -1735,9 +1978,50 @@ function renderImpact(node) {
   return frame;
 }
 
+function renderConnection(edge) {
+  const wrapper = document.createElement("div");
+  wrapper.className = "connection-details";
+  if (!edge) {
+    wrapper.appendChild(textElement("p", "quiet", "This connection is no longer in the current graph."));
+    return wrapper;
+  }
+  const endpoints = document.createElement("div");
+  endpoints.className = "section";
+  for (const [label, id] of [["Caller", edge.source], ["Dependency", edge.target]]) {
+    endpoints.appendChild(textElement("h3", "section-title", label));
+    const button = textElement("button", "dependency-row", id);
+    button.type = "button";
+    button.addEventListener("click", () => openInspector(id));
+    endpoints.appendChild(button);
+  }
+  const stats = document.createElement("div");
+  stats.className = "stat-grid";
+  const measured = Number(edge.call_count) > 0;
+  stats.append(statCard("Observed calls", formatCount(edge.call_count), false),
+    statCard("Average latency", measured ? formatMs(edge.avg_latency_ms) : "Not reported", false),
+    statCard("Errors", measured ? formatRatio(edge.error_rate, 1) : "Not reported", measured && Number(edge.error_rate) > 0.05));
+  wrapper.append(endpoints, stats, textElement("p", "quiet", "Observed call evidence from the current graph. Counts are not a request rate."));
+  return wrapper;
+}
+
+function openConnection(edge) {
+  rememberMap();
+  state.overview = state.inventory = false;
+  state.pendingFit = true;
+  state.selectedEdge = connectionKey(edge);
+  state.selected = null;
+  state.selectedHost = null;
+  updateURL({ service: null, host: null, tab: null });
+  renderInspector();
+  renderGraph();
+  renderServiceLists();
+  window.setTimeout(() => dom.closeInspector.focus(), 0);
+}
+
 function renderInspector() {
   const node = currentNode();
-  if (!state.selected && !state.selectedHost) {
+  document.body.classList.toggle("has-inspector", Boolean(state.selected || state.selectedHost || state.selectedEdge));
+  if (!state.selected && !state.selectedHost && !state.selectedEdge) {
     dom.inspector.setAttribute("aria-hidden", "true");
     dom.inspector.inert = true;
     dom.inspectorScrim.hidden = true;
@@ -1746,7 +2030,16 @@ function renderInspector() {
   dom.inspector.setAttribute("aria-hidden", "false");
   dom.inspector.inert = false;
   dom.inspectorScrim.hidden = !isMobile();
-  dom.inspectorTabs.hidden = Boolean(state.selectedHost);
+  dom.inspectorTabs.hidden = Boolean(state.selectedHost || state.selectedEdge);
+  if (state.selectedEdge) {
+    const edge = state.graph && state.graph.edges.find((item) => connectionKey(item) === state.selectedEdge);
+    dom.inspectorEyebrow.textContent = "Connection details";
+    dom.inspectorTitle.textContent = edge ? edge.source + " → " + edge.target : "Connection";
+    dom.inspectorStatus.className = "service-status " + (edge && Number(edge.error_rate) > 0.05 ? "critical" : "unknown");
+    dom.inspectorHealth.textContent = "";
+    dom.inspectorBody.replaceChildren(renderConnection(edge));
+    return;
+  }
   dom.inspectorEyebrow.textContent = state.selectedHost ? "Host inspector" : "Service inspector";
   if (state.selectedHost) {
     const host = hostByName(state.selectedHost);
@@ -1786,12 +2079,32 @@ function renderInspector() {
 }
 
 function openInspector(service) {
+  rememberMap();
+  state.overview = false;
+  const owner = state.partition && state.partition.components.find((item) => item.nodeIds.includes(service));
+  if (state.groupBy !== "host") {
+    if (owner) {
+      state.inventory = false;
+      if (state.component !== owner.id) {
+        state.component = owner.id;
+        state.pendingFit = true;
+      }
+      if (state.scope !== "all" && state.focusRoot !== service && (state.selectedEdge || !dom.nodes.querySelector('[data-service="' + CSS.escape(service) + '"]'))) {
+        state.focusRoot = service;
+        state.pendingFit = true;
+      }
+    } else if (state.partition && state.partition.disconnected.some((node) => node.id === service)) {
+      state.inventory = true;
+    }
+  }
   state.selected = service;
   state.selectedHost = null;
-  updateURL({ service: service, host: null, tab: state.activeTab === "overview" ? null : state.activeTab });
+  state.selectedEdge = null;
+  updateURL({ service, host: null, tab: state.activeTab === "overview" ? null : state.activeTab });
+  updateMapURL();
+  renderInspector();
   renderGraph();
   renderServiceLists();
-  renderInspector();
   window.setTimeout(() => dom.closeInspector.focus(), 0);
 }
 
@@ -1800,7 +2113,9 @@ function openHost(candidate) {
   if (!host) return;
   state.selected = null;
   state.selectedHost = host;
+  state.selectedEdge = null;
   updateURL({ host: host, service: null, tab: null });
+  renderInspector();
   renderGraph();
   renderServiceLists();
   renderInspector();
@@ -1812,13 +2127,16 @@ function openHost(candidate) {
 function closeInspector() {
   const selected = state.selected;
   const selectedHost = state.selectedHost;
+  const selectedEdge = state.selectedEdge;
+  state.selectedEdge = null;
   state.selected = null;
   state.selectedHost = null;
   updateURL({ service: null, host: null, tab: null });
+  renderInspector();
   renderGraph();
   renderServiceLists();
   renderInspector();
-  const selector = selected ? "[data-service=" + CSS.escape(selected) + "]" : selectedHost ? "[data-host=" + CSS.escape(selectedHost) + "]" : "";
+  const selector = selected ? "[data-service=" + CSS.escape(selected) + "]" : selectedHost ? "[data-host=" + CSS.escape(selectedHost) + "]" : selectedEdge ? '[data-edge="' + CSS.escape(selectedEdge) + '"]' : "";
   const source = selector ? document.querySelector(selector) : null;
   if (source) source.focus();
 }
@@ -1834,6 +2152,11 @@ function selectTab(tabName, focus) {
 }
 
 function renderAll() {
+  const focused = document.activeElement;
+  const focusList = focused?.closest("#neighborhood-list, #overview-grid, #map-member-list, #map-connection-list, #service-list, #disconnected-list, #mobile-list");
+  const focusAttributes = focusList ? ["data-service", "data-neighborhood", "data-source", "data-target"]
+    .filter((name) => focused.hasAttribute(name))
+    .map((name) => "[" + name + "=\"" + CSS.escape(focused.getAttribute(name)) + "\"]").join("") : "";
   // Host mode cannot outlive its data: once the host list is known to be
   // empty or unreachable, fall back to the service view and say why.
   if (state.groupBy === "host" && !hostsAvailable() && (state.hosts !== null || state.hostsError)) {
@@ -1845,20 +2168,46 @@ function renderAll() {
   renderPulse();
   renderSeverity();
   renderServiceLists();
+  renderInspector();
   renderGraph();
   renderImpactBanner();
   renderViewSwitch();
   renderInspector();
+  if (focusList && focusAttributes && !focused.isConnected) {
+    const replacement = document.querySelector("#" + focusList.id + " " + focusAttributes);
+    if (replacement?.getClientRects().length) replacement.focus({ preventScroll: true });
+  }
 }
 
 function setViewBox(next) {
-  const minSize = 260;
-  const maxSize = 1400;
-  const width = Math.max(minSize, Math.min(maxSize, next.width));
-  const height = Math.max(minSize, Math.min(maxSize, next.height));
-  state.viewBox = { x: next.x, y: next.y, width: width, height: height };
-  dom.map.setAttribute("viewBox", [state.viewBox.x, state.viewBox.y, width, height].join(" "));
+  const rect = dom.map.getBoundingClientRect();
+  const aspect = rect.width && rect.height ? rect.width / rect.height : next.width / next.height;
+  const bounds = state.layout ? state.layout.bounds : { width: 1000, height: 1000 };
+  const maxWidth = state.groupBy === "host" ? Math.max(1400, bounds.width * 2, bounds.height * aspect * 2) : rect.width;
+  const width = Math.max(260, Math.min(maxWidth, next.width));
+  const height = width / aspect;
+  state.viewBox = { x: next.x, y: next.y, width, height };
+  dom.map.setAttribute("viewBox", [next.x, next.y, width, height].join(" "));
   renderMinimapViewport();
+}
+
+function fitGraph() {
+  if (!state.layout) return;
+  const rect = dom.map.getBoundingClientRect();
+  if (!rect.width || !rect.height) { state.pendingFit = true; return; }
+  const bounds = state.layout.bounds;
+  const aspect = rect.width / rect.height;
+  const fittedWidth = Math.max(bounds.width, bounds.height * aspect) * 1.06;
+  // Full-system coverage belongs to the atlas. Keep names and edge evidence
+  // at their CSS size; pan a larger neighborhood instead of shrinking text.
+  const width = Math.min(fittedWidth, rect.width);
+  const height = width / aspect;
+  const center = !state.selectedEdge && state.layout.positions.get(state.selected || state.focusRoot);
+  const origin = (start, size, viewport, focus) => size <= viewport || !center
+    ? start + (size - viewport) / 2
+    : Math.max(start, Math.min(start + size - viewport, focus - viewport / 2));
+  setViewBox({ x: origin(bounds.x, bounds.width, width, center?.x),
+    y: origin(bounds.y, bounds.height, height, center?.y), width, height });
 }
 
 function renderMinimapViewport() {
@@ -1868,29 +2217,27 @@ function renderMinimapViewport() {
   dom.minimapViewport.setAttribute("height", String(state.viewBox.height));
 }
 
+function svgPoint(svg, clientX, clientY) {
+  const transform = svg.getScreenCTM();
+  return transform ? new DOMPoint(clientX, clientY).matrixTransform(transform.inverse()) : null;
+}
+
 function zoomAt(factor, clientX, clientY) {
   const rect = dom.map.getBoundingClientRect();
   if (!rect.width || !rect.height) return;
   const view = state.viewBox;
-  const px = clientX === undefined ? rect.left + rect.width / 2 : clientX;
-  const py = clientY === undefined ? rect.top + rect.height / 2 : clientY;
-  const focusX = view.x + (px - rect.left) / rect.width * view.width;
-  const focusY = view.y + (py - rect.top) / rect.height * view.height;
-  const width = Math.max(260, Math.min(1400, view.width * factor));
-  const height = Math.max(260, Math.min(1400, view.height * factor));
-  const ratioX = (focusX - view.x) / view.width;
-  const ratioY = (focusY - view.y) / view.height;
-  setViewBox({
-    x: focusX - ratioX * width,
-    y: focusY - ratioY * height,
-    width: width,
-    height: height,
-  });
+  const point = svgPoint(dom.map, clientX === undefined ? rect.left + rect.width / 2 : clientX,
+    clientY === undefined ? rect.top + rect.height / 2 : clientY);
+  if (!point) return;
+  const width = Math.max(260, view.width * factor);
+  const ratio = width / view.width;
+  setViewBox({ x: point.x - (point.x - view.x) * ratio,
+    y: point.y - (point.y - view.y) * ratio, width, height: view.height * ratio });
 }
 
 let pointerPan = null;
 dom.map.addEventListener("pointerdown", (event) => {
-  if (event.button !== 0 || event.target.closest(".service-node")) return;
+  if (event.button !== 0 || event.target.closest(".service-node, .graph-edge, .edge-hit")) return;
   pointerPan = {
     id: event.pointerId,
     x: event.clientX,
@@ -2016,6 +2363,14 @@ function isEditableTarget(target) {
 }
 
 function bindEvents() {
+  dom.overviewButton.addEventListener("click", showSystemOverview);
+  dom.mapBack.addEventListener("click", goBackOnMap);
+  dom.neighborhoodIndex.addEventListener("click", () => {
+    state.indexMode = "neighborhoods";
+    state.query = dom.search.value = "";
+    renderServiceLists();
+  });
+  dom.serviceIndex.addEventListener("click", () => { state.indexMode = "services"; renderServiceLists(); });
   dom.commandButton.addEventListener("click", openCommandMenu);
   dom.closeCommand.addEventListener("click", () => dom.commandDialog.close());
   dom.closeShortcuts.addEventListener("click", () => dom.shortcutDialog.close());
@@ -2070,21 +2425,49 @@ function bindEvents() {
   dom.hostGroup.addEventListener("click", () => setGroupBy(state.groupBy === "host" ? "service" : "host"));
   dom.zoomIn.addEventListener("click", () => zoomAt(0.8));
   dom.zoomOut.addEventListener("click", () => zoomAt(1.25));
-  dom.fit.addEventListener("click", () => setViewBox({ x: 0, y: 0, width: 1000, height: 1000 }));
+  dom.fit.addEventListener("click", () => fitGraph(true));
   dom.minimapButton.addEventListener("click", (event) => {
-    if (!event.detail) {
-      setViewBox({ x: 0, y: 0, width: 1000, height: 1000 });
-      return;
-    }
-    const rect = dom.minimap.getBoundingClientRect();
-    const centerX = (event.clientX - rect.left) / rect.width * 1000;
-    const centerY = (event.clientY - rect.top) / rect.height * 1000;
-    setViewBox({
-      x: centerX - state.viewBox.width / 2,
-      y: centerY - state.viewBox.height / 2,
-      width: state.viewBox.width,
-      height: state.viewBox.height,
-    });
+    if (!event.detail) { fitGraph(true); return; }
+    const center = svgPoint(dom.minimap, event.clientX, event.clientY);
+    if (!center) return;
+    setViewBox({ x: center.x - state.viewBox.width / 2, y: center.y - state.viewBox.height / 2,
+      width: state.viewBox.width, height: state.viewBox.height });
+  });
+  dom.componentSelect.addEventListener("change", () => {
+    if (dom.componentSelect.value === "all") showSystemOverview();
+    else openNeighborhood(dom.componentSelect.value);
+  });
+  dom.scopeSelect.addEventListener("change", () => {
+    rememberMap();
+    state.selectedEdge = null;
+    state.scope = dom.scopeSelect.value;
+    state.initializedComponents.add(state.groupBy + ":" + state.component);
+    state.focusRoot = state.selected || state.focusRoot;
+    state.inventory = false;
+    state.pendingFit = true;
+    renderInspector();
+    renderGraph();
+    updateMapURL();
+  });
+  dom.resetScope.addEventListener("click", () => {
+    rememberMap();
+    state.selectedEdge = null;
+    state.scope = "all";
+    state.initializedComponents.add(state.groupBy + ":" + state.component);
+    state.inventory = false;
+    state.pendingFit = true;
+    renderInspector();
+    renderGraph();
+    updateMapURL();
+  });
+  dom.disconnectedButton.addEventListener("click", () => {
+    rememberMap();
+    state.overview = false;
+    state.inventory = !state.inventory;
+    state.pendingFit = true;
+    closeInspector();
+    updateMapURL();
+    renderGraph();
   });
   dom.clearImpact.addEventListener("click", () => {
     state.impactRoot = null;
@@ -2123,7 +2506,7 @@ function bindEvents() {
     }
     if (event.key.toLowerCase() === "f" && !editable && !event.ctrlKey && !event.metaKey && !event.altKey) {
       event.preventDefault();
-      setViewBox({ x: 0, y: 0, width: 1000, height: 1000 });
+      fitGraph(true);
       return;
     }
     if (event.key.toLowerCase() === "h" && !editable && !event.ctrlKey && !event.metaKey && !event.altKey) {
@@ -2131,7 +2514,7 @@ function bindEvents() {
       setGroupBy(state.groupBy === "host" ? "service" : "host");
       return;
     }
-    if (event.key === "Escape" && (state.selected || state.selectedHost)) {
+    if (event.key === "Escape" && (state.selected || state.selectedHost || state.selectedEdge)) {
       event.preventDefault();
       closeInspector();
     }
@@ -2145,10 +2528,41 @@ function bindEvents() {
     renderAll();
     if (state.selectedHost) loadHostMetrics(state.selectedHost);
   });
+  let resizeFit = false;
+  let resizeTimer;
+  const queueResizeFit = () => {
+    if (!resizeFit) return;
+    window.clearTimeout(resizeTimer);
+    // Media queries can change the grid in a second layout notification.
+    // Fit once those notifications settle, without refitting on selection.
+    resizeTimer = window.setTimeout(() => { resizeFit = false; fitGraph(); }, 50);
+  };
+  const mapResize = new ResizeObserver(() => {
+    if (resizeFit) { queueResizeFit(); return; }
+    if (!state.layout || dom.canvas.hidden || state.groupBy === "host") return;
+    const rect = dom.map.getBoundingClientRect();
+    if (!rect.width || !rect.height) return;
+    const view = state.viewBox;
+    const width = Math.min(view.width, rect.width);
+    const height = width * rect.height / rect.width;
+    let x = view.x + (view.width - width) / 2;
+    let y = view.y + (view.height - height) / 2;
+    const selected = state.layout.positions.get(state.selected);
+    if (selected) {
+      x = Math.min(selected.x - CARD_WIDTH / 2 - 16, Math.max(x, selected.x + CARD_WIDTH / 2 + 16 - width));
+      y = Math.min(selected.y - CARD_HEIGHT / 2 - 16, Math.max(y, selected.y + CARD_HEIGHT / 2 + 16 - height));
+    }
+    // Docking an inspector or expanding evidence resizes the canvas without
+    // resizing the window. Update both viewBox dimensions to keep text readable.
+    setViewBox({ x, y, width, height });
+  });
+  mapResize.observe(dom.canvas);
   window.addEventListener("resize", () => {
+    resizeFit = true;
     renderStates();
     renderViewSwitch();
     renderInspector();
+    queueResizeFit();
   });
   window.addEventListener("online", connectWebSocket);
   document.addEventListener("visibilitychange", () => {

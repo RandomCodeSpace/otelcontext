@@ -1121,7 +1121,10 @@ func TestProtectedBrowserWorkflow(t *testing.T) {
 	if err := chromedp.Run(ctx, chromedp.Click("#close-inspector-button", chromedp.ByQuery)); err != nil {
 		t.Fatalf("close checkout inspector: %v", err)
 	}
-	if err := chromedp.Run(ctx, chromedp.Click(`#service-list [data-service="gateway"]`, chromedp.ByQuery)); err != nil {
+	if err := chromedp.Run(ctx,
+		chromedp.Click("#service-index-button", chromedp.ByQuery),
+		chromedp.Click(`#service-list [data-service="gateway"]`, chromedp.ByQuery),
+	); err != nil {
 		t.Fatalf("select gateway: %v", err)
 	}
 	requireJS(t, ctx, `document.querySelector("#inspector-title").textContent.trim() === "gateway"`, 5*time.Second)

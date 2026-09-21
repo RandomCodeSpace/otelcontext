@@ -14,7 +14,8 @@ import (
 )
 
 // The browser-native UI is committed with the Go source and embedded in every
-// build. It has no generated bundle and no external runtime assets.
+// build. The application has no build step or external runtime assets; its
+// pinned Dagre layout library is vendored alongside the handwritten client.
 //
 //go:embed static/*
 var content embed.FS

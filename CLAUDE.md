@@ -10,7 +10,7 @@ OtelContext is a self-hosted OTLP observability platform. Single Go binary with 
 ## Strict Rules
 
 - NO Express.js/Gin/Echo — use native Go `net/http`
-- Keep the frontend dependency-free. Use semantic HTML, token-based CSS in `internal/ui/static/app.css`, and native browser APIs in `internal/ui/static/app.js`. Go tests own asset-serving contracts; rendered interaction checks own browser behavior.
+- Keep the frontend browser-native. Use semantic HTML, token-based CSS in `internal/ui/static/app.css`, and native browser APIs in `internal/ui/static/app.js`. The pinned, embedded Dagre layout dependency is documented in `docs/dependencies/dagre.md`; no frontend build or runtime CDN is required. Go tests own asset-serving contracts; rendered interaction checks own browser behavior.
 - Single-service architecture (no microservices split)
 - All internal DBs must be **embedded** (no external processes)
 - Relational DB (SQLite/MySQL/PostgreSQL/MSSQL) is the **single source of truth**

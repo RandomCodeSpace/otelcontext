@@ -81,6 +81,14 @@ jobs:
           BROWSER_SMOKE_ARTIFACTS: ${{ runner.temp }}/browser-smoke/artifacts
         run: go test -tags=browser -count=1 -timeout 150s -run '^TestLatencyLabels$' ./test/browser
 
+      - name: verify the 150-service application map
+        env:
+          OTELCONTEXT_BINARY: ${{ runner.temp }}/browser-smoke/otelcontext
+          OTELCONTEXT_BROWSER_CASE: application-map
+          CHROME_BIN: google-chrome
+          BROWSER_SMOKE_ARTIFACTS: ${{ runner.temp }}/browser-smoke/artifacts/application-map
+        run: go test -tags=browser -count=1 -timeout 150s -run '^TestApplicationMap150$' ./test/browser
+
       - name: upload browser diagnostics
         if: ${{ always() }}
         uses: actions/upload-artifact@v7

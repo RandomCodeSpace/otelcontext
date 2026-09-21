@@ -85,13 +85,13 @@
       "id": "host-grouping-and-panel",
       "proof": "browser",
       "phase": "host-group",
-      "contract": "Host mode draws every host from /api/hosts as a diamond node in the service layout with one dashed runs-on edge per service placement, excluded from call traversals so the blast radius is unchanged; the list groups by host, host entities stay out of the service ranking, and the host panel reads CPU, memory and disk through /api/metrics or says not reported; toggle, host nodes and host chips are keyboard reachable and the grouped list stays readable on mobile."
+      "contract": "Host mode draws every host from /api/hosts as a named card with a diamond symbol in the service layout with one dashed runs-on edge per service placement, excluded from call traversals so the blast radius is unchanged; the list groups by host, host entities stay out of the service ranking, and the host panel reads CPU, memory and disk through /api/metrics or says not reported; toggle, host nodes and host chips are keyboard reachable and the grouped list stays readable on mobile."
     },
     {
       "id": "node-free-client-source",
       "proof": "source",
       "phase": "source-contract",
-      "contract": "The tracked client has no Node manifest, lockfile, frontend build, generated bundle, remote font, CDN import, or external design-system package."
+      "contract": "The handwritten client has no Node manifest, lockfile, frontend build, generated application bundle, remote font, CDN import, or external design-system package. The pinned Dagre layout distribution and its license are embedded locally."
     },
     {
       "id": "user-readme",
