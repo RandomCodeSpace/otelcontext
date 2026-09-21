@@ -463,8 +463,8 @@ committed the built UI to `main`.)
 - bestpractices.dev project [12646](https://www.bestpractices.dev/projects/12646)
   declared at `level: passing` via canonical autofill schema. ([#47])
 
-[Unreleased]: https://github.com/RandomCodeSpace/otelcontext/compare/v0.6.0...HEAD
-[v0.6.0]: https://github.com/RandomCodeSpace/otelcontext/compare/v0.5.0...v0.6.0
+[Unreleased]: https://github.com/RandomCodeSpace/otelcontext/compare/v0.6.1...HEAD
+[v0.6.1]: https://github.com/RandomCodeSpace/otelcontext/compare/v0.5.0...v0.6.1
 [v0.5.0]: https://github.com/RandomCodeSpace/otelcontext/compare/v0.4.0-beta.1...v0.5.0
 [v0.3.0-beta.1]: https://github.com/RandomCodeSpace/otelcontext/compare/v0.2.0-beta.6...v0.3.0-beta.1
 [v0.2.0-beta.6]: https://github.com/RandomCodeSpace/otelcontext/compare/v0.0.11-beta.15...v0.2.0-beta.6
