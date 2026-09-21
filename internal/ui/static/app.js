@@ -2425,9 +2425,9 @@ function bindEvents() {
   dom.hostGroup.addEventListener("click", () => setGroupBy(state.groupBy === "host" ? "service" : "host"));
   dom.zoomIn.addEventListener("click", () => zoomAt(0.8));
   dom.zoomOut.addEventListener("click", () => zoomAt(1.25));
-  dom.fit.addEventListener("click", () => fitGraph(true));
+  dom.fit.addEventListener("click", () => fitGraph());
   dom.minimapButton.addEventListener("click", (event) => {
-    if (!event.detail) { fitGraph(true); return; }
+    if (!event.detail) { fitGraph(); return; }
     const center = svgPoint(dom.minimap, event.clientX, event.clientY);
     if (!center) return;
     setViewBox({ x: center.x - state.viewBox.width / 2, y: center.y - state.viewBox.height / 2,
@@ -2506,7 +2506,7 @@ function bindEvents() {
     }
     if (event.key.toLowerCase() === "f" && !editable && !event.ctrlKey && !event.metaKey && !event.altKey) {
       event.preventDefault();
-      fitGraph(true);
+      fitGraph();
       return;
     }
     if (event.key.toLowerCase() === "h" && !editable && !event.ctrlKey && !event.metaKey && !event.altKey) {

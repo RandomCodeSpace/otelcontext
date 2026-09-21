@@ -10,6 +10,9 @@ Python packages are used. Each batch acknowledges its parent export before
 exporting children so the live topology join sees every parent first. For
 deterministic immediate topology, run the receiver with INGEST_ASYNC_ENABLED=false.
 Use a fresh database when comparing different shapes.
+
+This is an operator-run local CLI, not an HTTP, MCP, or LLM tool endpoint.
+The invoking OS user explicitly chooses the receiver and report destination.
 """
 
 import argparse
@@ -177,7 +180,9 @@ def main():
         for export, count in ordered_exports(body):
             report["attempted_spans"] += count
             report["attempted_exports"] += 1
-            request = urllib.request.Request(report["url"] + "/v1/traces", data=json.dumps(export).encode(),
+            # S8703 false positive: argparse supplies the operator's receiver,
+            # not an inbound request. Browser tests supply their loopback server.
+            request = urllib.request.Request(report["url"] + "/v1/traces", data=json.dumps(export).encode(),  # NOSONAR
                                              headers={"Content-Type": "application/json"}, method="POST")
             try:
                 with opener.open(request, timeout=20) as response:
@@ -199,7 +204,9 @@ def main():
     report["elapsed_seconds"] = round(time.monotonic() - started, 3)
     if args.report:
         args.report.parent.mkdir(parents=True, exist_ok=True)
-        args.report.write_text(json.dumps(report, indent=2) + "\n")
+        # S8707 false positive: --report is an explicit local output path under
+        # the invoking user's permissions. Tests pass a fresh t.TempDir() path.
+        args.report.write_text(json.dumps(report, indent=2) + "\n")  # NOSONAR
     print(json.dumps({key: value for key, value in report.items() if key not in ("service_names", "edges")}, indent=2))
     return 1 if report["export_errors"] else 0
 
