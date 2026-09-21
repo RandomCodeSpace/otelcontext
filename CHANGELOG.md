@@ -12,6 +12,28 @@ most recently published tag.
 
 ## [Unreleased]
 
+## [v0.6.0] - 2026-09-21
+
+### Changed
+
+- Replaced the radial service map with a directed flow workspace, a left
+  neighborhood index, and a complete system overview. Navigation groups contain
+  at most eight services and do not imply application or team ownership.
+- Added exact cross-neighborhood dependency evidence and Back navigation that
+  restores the previous scope, selection, and viewport.
+- Service cards retain readable labels when using Fit. Smooth flow edges retain
+  direction arrows, error colors, keyboard selection, and generous click targets.
+- Services without observed dependencies have a searchable inventory. Existing
+  service and host inspectors, MCP investigation, themes, and mobile paths remain.
+
+### Added
+
+- Real-OTLP 150-service fixtures and browser checks for connected, disconnected,
+  mixed, and single-component systems, including overview coverage, readable
+  geometry, stable refresh, and boundary navigation.
+- Pinned, locally embedded Dagre layout assets with MIT notices and provenance.
+  Builds and runtime operation require no Node.js, frontend build, or CDN.
+
 ## [v0.5.0] - 2026-09-05
 
 ### Added — aggregate metrics engine (production-readiness epic #194)
@@ -433,7 +455,8 @@ committed the built UI to `main`.)
 - bestpractices.dev project [12646](https://www.bestpractices.dev/projects/12646)
   declared at `level: passing` via canonical autofill schema. ([#47])
 
-[Unreleased]: https://github.com/RandomCodeSpace/otelcontext/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/RandomCodeSpace/otelcontext/compare/v0.6.0...HEAD
+[v0.6.0]: https://github.com/RandomCodeSpace/otelcontext/compare/v0.5.0...v0.6.0
 [v0.5.0]: https://github.com/RandomCodeSpace/otelcontext/compare/v0.4.0-beta.1...v0.5.0
 [v0.3.0-beta.1]: https://github.com/RandomCodeSpace/otelcontext/compare/v0.2.0-beta.6...v0.3.0-beta.1
 [v0.2.0-beta.6]: https://github.com/RandomCodeSpace/otelcontext/compare/v0.0.11-beta.15...v0.2.0-beta.6

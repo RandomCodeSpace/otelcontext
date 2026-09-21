@@ -45,7 +45,7 @@ See [`CLAUDE.md`](CLAUDE.md) for the architecture overview, key directory map, i
 Hard rules from `CLAUDE.md` worth repeating here:
 
 - Use native Go `net/http` (no Express/Gin/Echo).
-- Keep the UI dependency-free: semantic HTML, token-based CSS, and native browser JavaScript under `internal/ui/static/`.
+- Keep the UI browser-native: semantic HTML, token-based CSS, and native JavaScript under `internal/ui/static/`. The pinned, embedded Dagre layout dependency is documented in `docs/dependencies/dagre.md`; no frontend build or runtime CDN is required.
 - Single-service architecture; embedded internal DBs only.
 - Relational DB (SQLite/Postgres/MySQL/MSSQL) is the source of truth.
 - New graph work goes in `internal/graphrag/`, not the legacy `internal/graph/`.

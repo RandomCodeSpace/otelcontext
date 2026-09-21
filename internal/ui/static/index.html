@@ -8,6 +8,7 @@
     <title>OtelContext</title>
     <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
     <link rel="stylesheet" href="/static/app.css">
+    <script src="/static/dagre.min.js"></script>
     <script type="module" src="/static/app.js"></script>
   </head>
   <body>
@@ -27,7 +28,7 @@
 
         <dl class="pulse-metrics" aria-label="Current system metrics">
           <div>
-            <dt>Health</dt>
+            <dt>Healthy services</dt>
             <dd id="pulse-health">—</dd>
           </div>
           <div>
@@ -75,11 +76,30 @@
       </header>
 
       <main id="workspace" class="workspace">
+        <aside class="service-rail" aria-labelledby="services-heading">
+          <div class="rail-heading">
+            <div>
+              <p class="eyebrow" id="rail-eyebrow">Worst first</p>
+              <h2 id="services-heading">System index</h2>
+            </div>
+            <span id="service-count">0</span>
+          </div>
+          <div class="severity-summary" id="severity-summary" aria-label="Service health breakdown"></div>
+          <div class="index-switch" aria-label="System index">
+            <button id="neighborhood-index-button" type="button" aria-pressed="true">Neighborhoods</button>
+            <button id="service-index-button" type="button" aria-pressed="false">Services</button>
+          </div>
+          <div class="neighborhood-list" id="neighborhood-list"></div>
+          <div class="service-list" id="service-list"></div>
+        </aside>
         <section class="map-panel" aria-labelledby="map-heading">
           <div class="map-toolbar">
-            <div>
-              <p class="eyebrow">Live topology</p>
-              <h1 id="map-heading">Service constellation</h1>
+            <div class="map-heading-group">
+              <h1 id="map-heading">Application map</h1>
+              <div class="map-navigation" aria-label="Map navigation">
+                <button class="scope-action" id="map-back-button" type="button" disabled>Back</button>
+                <button class="scope-action" id="system-overview-button" type="button">System overview</button>
+              </div>
             </div>
             <div class="view-controls">
               <div class="view-switch" aria-label="View">
@@ -98,12 +118,38 @@
             </label>
           </div>
 
+          <div class="map-scope" aria-label="Map scope">
+            <p id="map-summary" class="map-summary" role="status">Loading service relationships…</p>
+            <label class="scope-field" for="component-select">
+              <span>Service group</span>
+              <select id="component-select" aria-label="Service group"></select>
+            </label>
+            <label class="scope-field" for="scope-select">
+              <span>Show</span>
+              <select id="scope-select">
+                <option value="all">Full group</option>
+                <option value="neighbors">Callers and dependencies</option>
+                <option value="callers">Callers</option>
+                <option value="dependencies">Dependencies</option>
+              </select>
+            </label>
+            <button class="scope-action" id="reset-scope-button" type="button" hidden>Show full group</button>
+            <button class="scope-action inventory-action" id="disconnected-button" type="button" hidden>No observed dependencies (0)</button>
+          </div>
+
           <div class="impact-banner" id="impact-banner" role="status" hidden>
             <span id="impact-label"></span>
             <button id="clear-impact-button" type="button" aria-label="Clear blast radius">Clear</button>
           </div>
 
           <div class="map-stage" id="map-stage">
+            <section class="system-overview" id="system-overview" aria-labelledby="overview-heading" hidden>
+              <header class="overview-header">
+                <h2 id="overview-heading">System overview</h2>
+                <p id="overview-summary"></p>
+              </header>
+              <div class="overview-grid" id="overview-grid"></div>
+            </section>
             <div class="loading-state" id="loading-state" aria-live="polite">
               <span class="spinner" aria-hidden="true"></span>
               <p>Building the live service map…</p>
@@ -125,9 +171,9 @@
             </div>
 
             <div class="canvas-wrap" id="canvas-wrap" hidden>
-              <svg id="service-map" viewBox="0 0 1000 1000" role="img" aria-labelledby="graph-title graph-description">
+              <svg id="service-map" viewBox="0 0 1000 1000" role="group" aria-labelledby="graph-title graph-description">
                 <title id="graph-title">Service dependency map</title>
-                <desc id="graph-description">Services are arranged by dependency criticality. Select a service to inspect it.</desc>
+                <desc id="graph-description">Observed calls flow from callers to dependencies. Select a service or connection to inspect its telemetry.</desc>
                 <defs>
                   <marker id="edge-arrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto" markerUnits="strokeWidth">
                     <path d="M0,0 L0,6 L7,3 z" class="edge-arrow"></path>
@@ -135,7 +181,7 @@
                 </defs>
                 <g id="graph-viewport">
                   <g id="graph-rings" aria-hidden="true"></g>
-                  <g id="graph-edges" aria-hidden="true"></g>
+                  <g id="graph-edges"></g>
                   <g id="graph-nodes"></g>
                 </g>
               </svg>
@@ -159,21 +205,27 @@
               </div>
             </div>
 
+            <details class="map-evidence" id="map-evidence" hidden>
+              <summary id="map-evidence-summary">Neighborhood members and observed dependencies</summary>
+              <div class="map-evidence-body">
+                <div id="map-member-list" aria-label="Neighborhood members"></div>
+                <div id="map-connection-list" aria-label="Observed dependencies"></div>
+              </div>
+            </details>
+
+            <section class="disconnected-inventory" id="disconnected-inventory" aria-labelledby="disconnected-heading" hidden>
+              <header class="inventory-header">
+                <h2 id="disconnected-heading">No observed dependencies</h2>
+                <p>These services have no observed call relationships in the available telemetry.</p>
+              </header>
+              <div class="disconnected-list" id="disconnected-list"></div>
+            </section>
+
             <div class="mobile-list" id="mobile-list" hidden></div>
           </div>
         </section>
 
-        <aside class="service-rail" aria-labelledby="services-heading">
-          <div class="rail-heading">
-            <div>
-              <p class="eyebrow" id="rail-eyebrow">Worst first</p>
-              <h2 id="services-heading">Services</h2>
-            </div>
-            <span id="service-count">0</span>
-          </div>
-          <div class="severity-summary" id="severity-summary" aria-label="Service health breakdown"></div>
-          <div class="service-list" id="service-list"></div>
-        </aside>
+
       </main>
     </div>
 

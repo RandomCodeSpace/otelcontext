@@ -163,8 +163,8 @@ func TestRegisterRoutesUsesCommittedAssets(t *testing.T) {
 	}
 
 	index := request(t, mux, http.MethodGet, "/", nil)
-	if index.Code != http.StatusOK || !strings.Contains(index.Body.String(), "Service constellation") {
-		t.Fatalf("index = %d, contains screen heading = %v", index.Code, strings.Contains(index.Body.String(), "Service constellation"))
+	if index.Code != http.StatusOK || !strings.Contains(index.Body.String(), "Application map") {
+		t.Fatalf("index = %d, contains screen heading = %v", index.Code, strings.Contains(index.Body.String(), "Application map"))
 	}
 	for _, marker := range []string{
 		"type=\"module\" src=\"/static/app.js\"",
@@ -177,7 +177,7 @@ func TestRegisterRoutesUsesCommittedAssets(t *testing.T) {
 			t.Errorf("index is missing %q", marker)
 		}
 	}
-	for _, target := range []string{"/static/app.css", "/static/app.js", "/static/favicon.svg"} {
+	for _, target := range []string{"/static/app.css", "/static/app.js", "/static/favicon.svg", "/static/map-layout.js", "/static/dagre.min.js", "/static/dagre.min.js.LEGAL.txt"} {
 		rec := request(t, mux, http.MethodGet, target, nil)
 		if rec.Code != http.StatusOK || rec.Body.Len() == 0 {
 			t.Errorf("%s: status = %d, bytes = %d", target, rec.Code, rec.Body.Len())
@@ -191,10 +191,13 @@ func TestCommittedUIHasNoFrontendBuildContract(t *testing.T) {
 		t.Fatalf("read embedded UI: %v", err)
 	}
 	wantAssets := map[string]bool{
-		"app.css":     true,
-		"app.js":      true,
-		"favicon.svg": true,
-		"index.html":  true,
+		"app.css":                true,
+		"app.js":                 true,
+		"favicon.svg":            true,
+		"index.html":             true,
+		"map-layout.js":          true,
+		"dagre.min.js":           true,
+		"dagre.min.js.LEGAL.txt": true,
 	}
 	for _, entry := range entries {
 		if entry.IsDir() || !wantAssets[entry.Name()] {
@@ -206,7 +209,7 @@ func TestCommittedUIHasNoFrontendBuildContract(t *testing.T) {
 		t.Errorf("embedded UI is missing source asset %q", name)
 	}
 
-	for _, name := range []string{"index.html", "app.css", "app.js"} {
+	for _, name := range []string{"index.html", "app.css", "app.js", "map-layout.js"} {
 		body, readErr := fs.ReadFile(content, "static/"+name)
 		if readErr != nil {
 			t.Fatalf("read %s: %v", name, readErr)
