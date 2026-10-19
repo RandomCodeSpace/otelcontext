@@ -177,6 +177,8 @@ func (a *appProcess) environment() []string {
 		"INGEST_MIN_SEVERITY":        "INFO",
 		"LOG_LEVEL":                  "INFO",
 		"PPROF_ADDR":                 "",
+		"PROMETHEUS_URL":             "",
+		"PROMETHEUS_REQUIRED":        "false",
 		"RETENTION_BATCH_SIZE":       "100",
 		"RETENTION_BATCH_SLEEP_MS":   "0",
 		"SAMPLING_RATE":              "1.0",

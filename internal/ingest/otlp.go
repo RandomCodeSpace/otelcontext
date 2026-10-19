@@ -450,6 +450,7 @@ func (s *MetricsServer) exportMetrics(ctx context.Context, req *colmetricspb.Exp
 	// OTLP partial-success response (#199 Q5).
 	var rejected metricRejections
 	var projectionRejected metricRejections
+	var localPending uint64
 
 	for _, resourceMetrics := range req.ResourceMetrics {
 		resourceAttrs := resourceMetrics.GetResource().GetAttributes()
@@ -468,8 +469,10 @@ func (s *MetricsServer) exportMetrics(ctx context.Context, req *colmetricspb.Exp
 		registerResource(s.resourceRegistry, tenantID, serviceName, slots, topology.SignalMetrics, start)
 
 		var producerIdentity aggregate.ResourceIdentity
+		var acceptedBefore uint64
 		if reducer != nil {
 			producerIdentity = slots.identity()
+			acceptedBefore = reducer.Stats().Accepted[aggregate.SignalMetric]
 		}
 
 		for _, scopeMetrics := range resourceMetrics.ScopeMetrics {
@@ -524,17 +527,28 @@ func (s *MetricsServer) exportMetrics(ctx context.Context, req *colmetricspb.Exp
 				}
 			}
 		}
+		if reducer != nil && !acknowledged[resourceMetrics] {
+			// Count only points awaiting a local commit. The reducer excludes
+			// ignored points; unsupported points are already in rejected.
+			localPending += reducer.Stats().Accepted[aggregate.SignalMetric] - acceptedBefore
+		}
 	}
 
 	// Apply the request's aggregate deltas. Under durable ACK this blocks
 	// until the group commit lands, and a refusal is the client's answer.
+	var localFailure error
 	if err := applyAggregate(s.aggregateEngine, reducer); err != nil {
 		if backendOwnsACK {
 			return &colmetricspb.ExportMetricsServiceResponse{PartialSuccess: &colmetricspb.ExportMetricsPartialSuccess{
 				ErrorMessage: "Prometheus accepted metrics; local aggregate projection failed",
 			}}, nil
 		}
-		return nil, err
+		if len(acknowledged) == 0 {
+			return nil, err
+		}
+		// Some resources already reached Prometheus. Retrying the whole
+		// request would replay them; report uncommitted local points instead.
+		localFailure = err
 	}
 
 	if s.metrics != nil {
@@ -559,6 +573,13 @@ func (s *MetricsServer) exportMetrics(ctx context.Context, req *colmetricspb.Exp
 			resp.PartialSuccess = &colmetricspb.ExportMetricsPartialSuccess{}
 		}
 		resp.PartialSuccess.ErrorMessage = strings.TrimSpace(resp.PartialSuccess.ErrorMessage + " Prometheus accepted metrics not representable in the local aggregate projection: " + projectionRejected.message())
+	}
+	if localFailure != nil {
+		if resp.PartialSuccess == nil {
+			resp.PartialSuccess = &colmetricspb.ExportMetricsPartialSuccess{}
+		}
+		resp.PartialSuccess.RejectedDataPoints += int64(localPending) // #nosec G115 -- bounded by the request's point count
+		resp.PartialSuccess.ErrorMessage = strings.TrimSpace(resp.PartialSuccess.ErrorMessage + " Local aggregate write failed: " + grpcstatus.Convert(localFailure).Message())
 	}
 	return resp, nil
 }

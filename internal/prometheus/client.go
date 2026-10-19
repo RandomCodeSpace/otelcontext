@@ -104,6 +104,11 @@ func NewClient(cfg Config) (*Client, error) {
 	if cfg.MaxSeries == 0 {
 		cfg.MaxSeries = 1000
 	}
+	// Enforce the operator-facing bounds here too: callers can construct a
+	// client without passing through the application's configuration validator.
+	if cfg.MaxConcurrent > 64 || cfg.MaxIngestConcurrent > 256 || cfg.MaxIngestWaiters > 4096 {
+		return nil, errors.New("Prometheus admission limits exceed maxima: 64 queries, 256 active exports, 4096 waiting exports")
+	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.MaxConnsPerHost = cfg.MaxConcurrent + cfg.MaxIngestConcurrent + 1
 	transport.MaxIdleConnsPerHost = transport.MaxConnsPerHost

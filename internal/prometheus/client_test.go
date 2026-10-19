@@ -183,6 +183,34 @@ func TestClientConfigValidation(t *testing.T) {
 	}
 }
 
+func TestClientAdmissionBounds(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		max  int
+		set  func(*Config, int)
+	}{
+		{"queries", 64, func(c *Config, n int) { c.MaxConcurrent = n }},
+		{"active exports", 256, func(c *Config, n int) { c.MaxIngestConcurrent = n }},
+		{"waiting exports", 4096, func(c *Config, n int) { c.MaxIngestWaiters = n }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Config{URL: "http://localhost"}
+			tc.set(&cfg, tc.max)
+			c, err := NewClient(cfg)
+			if err != nil {
+				t.Fatalf("documented maximum refused: %v", err)
+			}
+			c.Close()
+			tc.set(&cfg, tc.max+1)
+			c, err = NewClient(cfg)
+			if err == nil {
+				c.Close()
+				t.Fatal("accepted admission limit above documented maximum")
+			}
+		})
+	}
+}
+
 func TestErrorResponseIsStructured(t *testing.T) {
 	status, body := ErrorResponse(NewError(413, "bad_data", "oversized"))
 	var envelope map[string]any

@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/RandomCodeSpace/otelcontext/internal/aggregate"
 	"github.com/RandomCodeSpace/otelcontext/internal/authn"
 	"github.com/RandomCodeSpace/otelcontext/internal/prometheus"
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
@@ -213,5 +214,186 @@ func TestPrometheusRequiredFailureHTTPIsRetryable(t *testing.T) {
 	NewHTTPHandler(nil, nil, s).handleMetrics(w, r)
 	if w.Code != 429 || w.Header().Get("Retry-After") == "" {
 		t.Fatalf("non-retryable HTTP failure: %d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestPrometheusMixedTenantPreservesBackendPartialOnLocalSaturation(t *testing.T) {
+	cfg := aggTestConfig()
+	cfg.OTLPTrustResourceTenant = true
+	s := NewMetricsServer(nil, nil, nil, cfg)
+	s.SetAggregateEngine(engineWithApplier(t, aggregate.ModeAggregate,
+		&aggregate.SaturationError{Bound: "waiters", Current: 1, Limit: 1}))
+	calls := 0
+	attachPrometheus(t, s, "default", true, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		b, _ := proto.Marshal(&colmetricspb.ExportMetricsServiceResponse{
+			PartialSuccess: &colmetricspb.ExportMetricsPartialSuccess{
+				RejectedDataPoints: 1, ErrorMessage: "backend rejected one point",
+			},
+		})
+		_, _ = w.Write(b)
+	})
+	now := time.Now()
+	req := metricsRequest(gaugeMetricPoints("bound.cpu", 2, now))
+	req.ResourceMetrics[0].Resource.Attributes = append(req.ResourceMetrics[0].Resource.Attributes, stringAttr("tenant.id", "default"))
+	local := metricsRequest(gaugeMetricPoints("local.cpu", 1, now)).ResourceMetrics[0]
+	local.Resource.Attributes = append(local.Resource.Attributes, stringAttr("tenant.id", "other"))
+	req.ResourceMetrics = append(req.ResourceMetrics, local)
+	resp, err := s.Export(context.Background(), req)
+	t.Logf("backendCalls=%d code=%s retryable429=%t response=%v error=%v", calls, status.Code(err), isQueueFull(err), resp, err)
+	if calls != 1 {
+		t.Fatalf("backend calls=%d", calls)
+	}
+	if err != nil {
+		t.Fatalf("lost upstream partial success to local refusal: %v", err)
+	}
+	p := resp.GetPartialSuccess()
+	if p.GetRejectedDataPoints() != 2 || !strings.Contains(p.GetErrorMessage(), "backend rejected one point") || !strings.Contains(p.GetErrorMessage(), "aggregate store at capacity") {
+		t.Fatalf("combined failure details missing: %v", resp)
+	}
+}
+
+func TestPrometheusMixedTenantLocalSaturationCounts(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		rejected int64
+		http     bool
+	}{
+		{"partial upstream", 1, false},
+		{"full upstream", 0, false},
+		{"partial upstream HTTP", 1, true},
+		{"full upstream HTTP", 0, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := aggTestConfig()
+			cfg.OTLPTrustResourceTenant = true
+			cfg.IngestExcludedServices = "filtered"
+			s := NewMetricsServer(nil, nil, nil, cfg)
+			s.SetAggregateEngine(engineWithApplier(t, aggregate.ModeAggregate,
+				&aggregate.SaturationError{Bound: "waiters", Current: 1, Limit: 1}))
+			now := time.Now()
+			req := metricsRequest(gaugeMetricPoints("bound.cpu", 2, now),
+				histogramMetric("bound.hist", metricspb.AggregationTemporality_AGGREGATION_TEMPORALITY_CUMULATIVE, now, []uint64{1, 2, 3, 4}))
+			req.ResourceMetrics[0].Resource.Attributes = append(req.ResourceMetrics[0].Resource.Attributes, stringAttr("tenant.id", "default"))
+			forwarded := proto.Clone(req).(*colmetricspb.ExportMetricsServiceRequest)
+			var calls atomic.Int64
+			attachPrometheus(t, s, "default", true, func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				body, err := io.ReadAll(r.Body)
+				var got colmetricspb.ExportMetricsServiceRequest
+				if err != nil || proto.Unmarshal(body, &got) != nil || !proto.Equal(forwarded, &got) {
+					t.Errorf("unexpected forwarded subset: %v err=%v", &got, err)
+				}
+				body, err = proto.Marshal(&colmetricspb.ExportMetricsServiceResponse{PartialSuccess: &colmetricspb.ExportMetricsPartialSuccess{
+					RejectedDataPoints: tc.rejected, ErrorMessage: "backend detail",
+				}})
+				if err != nil {
+					t.Error(err)
+				}
+				_, _ = w.Write(body)
+			})
+
+			// Five pending local points, plus four already rejected points.
+			sum := &metricspb.Metric{Name: "local.sum", Data: &metricspb.Metric_Sum{Sum: &metricspb.Sum{
+				AggregationTemporality: metricspb.AggregationTemporality_AGGREGATION_TEMPORALITY_CUMULATIVE,
+				DataPoints:             gaugeMetricPoints("", 1, now).GetGauge().DataPoints,
+			}}}
+			malformed := expHistogramMetric("bad.exp", 2, now, []uint64{1, 2})
+			malformed.GetExponentialHistogram().DataPoints[0].Count = 99
+			noHistogram := histogramMetric("gap.hist", metricspb.AggregationTemporality_AGGREGATION_TEMPORALITY_DELTA, now, []uint64{0, 0, 0, 0})
+			noHistogram.GetHistogram().DataPoints[0].Flags = otlpDataPointNoRecordedValue
+			noExp := expHistogramMetric("gap.exp", 2, now, []uint64{0})
+			noExp.GetExponentialHistogram().DataPoints[0].Flags = otlpDataPointNoRecordedValue
+			local := metricsRequest(
+				gaugeMetricPoints("local.cpu", 2, now), sum,
+				histogramMetric("local.hist", metricspb.AggregationTemporality_AGGREGATION_TEMPORALITY_DELTA, now, []uint64{1, 2, 3, 4}),
+				expHistogramMetric("local.exp", 2, now, []uint64{1, 2}),
+				histogramMetric("unsupported.hist", metricspb.AggregationTemporality_AGGREGATION_TEMPORALITY_CUMULATIVE, now, []uint64{1, 2, 3, 4}),
+				malformed, summaryMetric("unsupported.summary", now, 2),
+				noHistogram, noExp, gaugeMetricPoints("late", 2, now.Add(-24*time.Hour)),
+			).ResourceMetrics[0]
+			local.Resource.Attributes = append(local.Resource.Attributes, stringAttr("tenant.id", "other"))
+			another := metricsRequest(gaugeMetricPoints("another.cpu", 1, now)).ResourceMetrics[0]
+			another.Resource.Attributes = append(another.Resource.Attributes, stringAttr("tenant.id", "another"))
+			filtered := metricsRequest(gaugeMetricPoints("filtered.cpu", 7, now)).ResourceMetrics[0]
+			filtered.Resource.Attributes = []*commonpb.KeyValue{stringAttr("service.name", "filtered"), stringAttr("tenant.id", "default")}
+			req.ResourceMetrics = append(req.ResourceMetrics, local, another, filtered)
+
+			var resp *colmetricspb.ExportMetricsServiceResponse
+			if tc.http {
+				// Resource order must not change rejection accounting.
+				req.ResourceMetrics[0], req.ResourceMetrics[1] = req.ResourceMetrics[1], req.ResourceMetrics[0]
+				body, err := proto.Marshal(req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				r := httptest.NewRequest(http.MethodPost, "/v1/metrics", bytes.NewReader(body))
+				r.Header.Set("Content-Type", "application/x-protobuf")
+				w := httptest.NewRecorder()
+				NewHTTPHandler(nil, nil, s).handleMetrics(w, r)
+				if w.Code != http.StatusOK || w.Header().Get("Retry-After") != "" {
+					t.Fatalf("HTTP status=%d retry-after=%q body=%s", w.Code, w.Header().Get("Retry-After"), w.Body.String())
+				}
+				resp = new(colmetricspb.ExportMetricsServiceResponse)
+				if err := proto.Unmarshal(w.Body.Bytes(), resp); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				var err error
+				resp, err = s.Export(context.Background(), req)
+				if err != nil {
+					t.Fatalf("retryable local failure after upstream success: %v", err)
+				}
+			}
+			partial := resp.GetPartialSuccess()
+			// Six pending points across two local tenants plus four unsupported
+			// points. Filtered, no-recorded-value and late points add nothing.
+			if calls.Load() != 1 || partial.GetRejectedDataPoints() != 10+tc.rejected {
+				t.Fatalf("backend calls=%d response=%v", calls.Load(), resp)
+			}
+			for _, want := range []string{"backend detail", "aggregate store at capacity", "summary/" + aggregate.ReasonUnsupportedType,
+				"histogram/" + aggregate.ReasonCumulativeTemporality, "exponential_histogram/" + aggregate.ReasonMalformedPoint} {
+				if !strings.Contains(partial.GetErrorMessage(), want) {
+					t.Errorf("response lost %q: %v", want, resp)
+				}
+			}
+			if tc.rejected == 0 && !strings.Contains(partial.GetErrorMessage(), "local aggregate projection") {
+				t.Fatalf("lost warning for upstream-accepted histogram: %v", resp)
+			}
+		})
+	}
+}
+
+func TestPrometheusLocalSaturationWithoutUpstreamSuccessRemainsRetryable(t *testing.T) {
+	for _, mode := range []string{"disabled", "optional failure", "unmatched tenant"} {
+		t.Run(mode, func(t *testing.T) {
+			cfg := aggTestConfig()
+			cfg.OTLPTrustResourceTenant = true
+			s := NewMetricsServer(nil, nil, nil, cfg)
+			s.SetAggregateEngine(engineWithApplier(t, aggregate.ModeAggregate,
+				&aggregate.SaturationError{Bound: "waiters", Current: 1, Limit: 1}))
+			var calls atomic.Int64
+			if mode != "disabled" {
+				attachPrometheus(t, s, "default", false, func(w http.ResponseWriter, r *http.Request) {
+					calls.Add(1)
+					w.WriteHeader(http.StatusServiceUnavailable)
+				})
+			}
+			req := metricsRequest(gaugeMetricPoints("local.cpu", 1, time.Now()))
+			if mode == "unmatched tenant" {
+				req.ResourceMetrics[0].Resource.Attributes = append(req.ResourceMetrics[0].Resource.Attributes, stringAttr("tenant.id", "other"))
+			}
+			resp, err := s.Export(context.Background(), req)
+			if resp != nil || status.Code(err) != codes.ResourceExhausted || !isQueueFull(err) {
+				t.Fatalf("local refusal lost retry semantics: response=%v error=%v", resp, err)
+			}
+			var wantCalls int64
+			if mode == "optional failure" {
+				wantCalls = 1
+			}
+			if calls.Load() != wantCalls {
+				t.Fatalf("backend calls=%d, want %d", calls.Load(), wantCalls)
+			}
+		})
 	}
 }
