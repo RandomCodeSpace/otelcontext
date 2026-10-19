@@ -121,8 +121,8 @@ func trySurfaceFingerprint(app *appProcess) (surfaceFingerprint, error) {
 		return surfaceFingerprint{}, err
 	}
 	fingerprint.MCPTools = tools
-	if len(tools) != 7 {
-		return surfaceFingerprint{}, fmt.Errorf("MCP tools=%v, want seven", tools)
+	if len(tools) != 9 {
+		return surfaceFingerprint{}, fmt.Errorf("MCP tools=%v, want nine", tools)
 	}
 	calls := []struct {
 		name string
@@ -148,6 +148,26 @@ func trySurfaceFingerprint(app *appProcess) (surfaceFingerprint, error) {
 			Succeeded:       true,
 			MentionsFixture: strings.Contains(text, "shutdown-proof") || strings.Contains(text, traceFixtureID) || strings.Contains(text, logFixtureBody),
 		}
+	}
+	// The optional backend is deliberately absent in this database proof.
+	for _, tool := range []string{"promql_query", "promql_query_range"} {
+		args := map[string]any{"query": "up"}
+		if tool == "promql_query_range" {
+			args["start"], args["end"], args["step"] = "0", "60", "60"
+		}
+		text, succeeded, err := callMCPTool(baseURL+"/mcp", tool, args)
+		if err != nil {
+			return surfaceFingerprint{}, err
+		}
+		var envelope struct {
+			Status    string `json:"status"`
+			ErrorType string `json:"errorType"`
+			Error     string `json:"error"`
+		}
+		if succeeded || json.Unmarshal([]byte(text), &envelope) != nil || envelope.Status != "error" || envelope.ErrorType != "unavailable" || envelope.Error != "PromQL backend is not configured" {
+			return surfaceFingerprint{}, fmt.Errorf("MCP %s must report its unconfigured backend: %s", tool, text)
+		}
+		fingerprint.MCPCalls[tool] = mcpSurface{Succeeded: false}
 	}
 	webSocketBody, err := readWebSocketSnapshot(baseURL + "/ws/events")
 	if err != nil {
@@ -452,7 +472,7 @@ func TestBackupRestoreModeProof(t *testing.T) {
 			{Name: "main_and_mode_owned_state_equal", Passed: mainEqual},
 			{Name: "dlq_inventory_equal", Passed: dlqEqual},
 			{Name: "rest_surfaces_equal", Passed: reflect.DeepEqual(sourceSurfaces.REST, targetSurfaces.REST)},
-			{Name: "seven_mcp_tools_callable", Passed: len(targetSurfaces.MCPTools) == 7 && len(targetSurfaces.MCPCalls) == 7},
+			{Name: "nine_mcp_tools_have_expected_responses", Passed: len(targetSurfaces.MCPTools) == 9 && len(targetSurfaces.MCPCalls) == 9},
 			{Name: "websocket_surface_equal", Passed: sourceSurfaces.WebSocket == targetSurfaces.WebSocket},
 			{Name: "all_surfaces_equal", Passed: surfacesEqual},
 			{Name: "lifecycle_fingerprint_equal", Passed: createReport.BackupID == restoreReport.BackupID && restoreReport.LifecycleFingerprint == manifest.LifecycleFingerprint},

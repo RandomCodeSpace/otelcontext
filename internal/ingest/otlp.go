@@ -14,6 +14,7 @@ import (
 	"github.com/RandomCodeSpace/otelcontext/internal/aggregate"
 	"github.com/RandomCodeSpace/otelcontext/internal/authn"
 	"github.com/RandomCodeSpace/otelcontext/internal/config"
+	"github.com/RandomCodeSpace/otelcontext/internal/prometheus"
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 	"github.com/RandomCodeSpace/otelcontext/internal/telemetry"
 	"github.com/RandomCodeSpace/otelcontext/internal/topology"
@@ -170,10 +171,12 @@ type LogsServer struct {
 }
 
 type MetricsServer struct {
-	repo           *storage.Repository
-	metrics        *telemetry.Metrics
-	aggregator     *tsdb.Aggregator
-	metricCallback func(tsdb.RawMetric)
+	repo               *storage.Repository
+	metrics            *telemetry.Metrics
+	aggregator         *tsdb.Aggregator
+	metricCallback     func(tsdb.RawMetric)
+	prometheusClient   *prometheus.Client
+	prometheusRequired bool
 	// aggregateEngine — see TraceServer.aggregateEngine.
 	aggregateEngine *aggregate.Engine
 	// resourceRegistry — see TraceServer.resourceRegistry.
@@ -352,7 +355,90 @@ func (s *MetricsServer) SetMetricCallback(cb func(tsdb.RawMetric)) {
 func (s *MetricsServer) Export(ctx context.Context, req *colmetricspb.ExportMetricsServiceRequest) (*colmetricspb.ExportMetricsServiceResponse, error) {
 	start := time.Now()
 	defer func() { s.metrics.ObserveIngestDuration("metrics", time.Since(start)) }()
+	if s.prometheusClient == nil {
+		return s.exportMetrics(ctx, req, nil, false, start)
+	}
 
+	// Resolve each resource with the same precedence as the local path. Never
+	// send a mixed-tenant batch to the single-tenant Prometheus backend.
+	forward := &colmetricspb.ExportMetricsServiceRequest{}
+	acknowledged := make(map[*metricspb.ResourceMetrics]bool)
+	allForwarded := true
+	for _, rm := range req.GetResourceMetrics() {
+		attrs := rm.GetResource().GetAttributes()
+		service := resolveServiceIdentity(scanResourceSlots(attrs), nil, "metrics")
+		if !shouldIngestService(service, s.allowedServices, s.excludedServices) {
+			continue
+		}
+		if resolveTenant(ctx, attrs, s.defaultTenant, s.trustResourceTenant) == s.prometheusClient.TenantID() {
+			forward.ResourceMetrics = append(forward.ResourceMetrics, rm)
+			acknowledged[rm] = true
+		} else {
+			allForwarded = false
+		}
+	}
+	if len(forward.ResourceMetrics) == 0 {
+		return s.exportMetrics(ctx, req, nil, false, start)
+	}
+	forwardCtx := storage.WithTenantContext(ctx, s.prometheusClient.TenantID())
+	upstream, err := s.prometheusClient.Export(forwardCtx, forward)
+	warning := ""
+	if err != nil {
+		if s.prometheusRequired {
+			// The existing OTLP HTTP adapter maps ResourceExhausted to 429,
+			// which both HTTP and gRPC exporters retry. No local side effect
+			// has happened, so backend failure cannot double local accounting.
+			var apiErr *prometheus.APIError
+			if errors.As(err, &apiErr) && apiErr.StatusCode >= 400 && apiErr.StatusCode < 500 && apiErr.StatusCode != 429 {
+				return nil, grpcstatus.Error(codes.InvalidArgument, err.Error())
+			}
+			return nil, grpcstatus.Error(codes.ResourceExhausted, err.Error())
+		}
+		acknowledged, allForwarded = nil, false
+		warning = "Prometheus forwarding failed: " + err.Error() + "; local path only"
+	}
+	localReq := req
+	if upstream.GetPartialSuccess().GetRejectedDataPoints() > 0 {
+		// OTLP partial success does not identify rejected points. Do not claim
+		// local accounting for an unknown subset or ask clients to replay it.
+		localReq = &colmetricspb.ExportMetricsServiceRequest{}
+		for _, rm := range req.GetResourceMetrics() {
+			if !acknowledged[rm] {
+				localReq.ResourceMetrics = append(localReq.ResourceMetrics, rm)
+			}
+		}
+	}
+	resp, err := s.exportMetrics(ctx, localReq, acknowledged, allForwarded, start)
+	if err != nil {
+		return nil, err
+	}
+	if partial := upstream.GetPartialSuccess(); partial != nil {
+		if resp.PartialSuccess == nil {
+			resp.PartialSuccess = &colmetricspb.ExportMetricsPartialSuccess{}
+		}
+		resp.PartialSuccess.RejectedDataPoints += partial.RejectedDataPoints
+		resp.PartialSuccess.ErrorMessage = strings.TrimSpace(resp.PartialSuccess.ErrorMessage + " " + partial.ErrorMessage)
+	}
+	if warning != "" {
+		if resp.PartialSuccess == nil {
+			resp.PartialSuccess = &colmetricspb.ExportMetricsPartialSuccess{}
+		}
+		resp.PartialSuccess.ErrorMessage = strings.TrimSpace(resp.PartialSuccess.ErrorMessage + " " + warning)
+	}
+	return resp, nil
+}
+
+// SetPrometheusClient must run before serving requests. Required mode fails
+// closed when its backend cannot accept metrics; nil preserves legacy behavior.
+func (s *MetricsServer) SetPrometheusClient(client *prometheus.Client, required bool) error {
+	if required && client == nil {
+		return errors.New("required Prometheus backend is not configured")
+	}
+	s.prometheusClient, s.prometheusRequired = client, required
+	return nil
+}
+
+func (s *MetricsServer) exportMetrics(ctx context.Context, req *colmetricspb.ExportMetricsServiceRequest, acknowledged map[*metricspb.ResourceMetrics]bool, backendOwnsACK bool, start time.Time) (*colmetricspb.ExportMetricsServiceResponse, error) {
 	// Aggregate accounting. One reducer, one arrival time for the whole
 	// request (#160): lateness must not depend on a point's position in the
 	// batch. nil engine = AGGREGATE_MODE=legacy = nothing below runs.
@@ -363,9 +449,14 @@ func (s *MetricsServer) Export(ctx context.Context, req *colmetricspb.ExportMetr
 	// rejected accumulates the points aggregate accounting refused, for the
 	// OTLP partial-success response (#199 Q5).
 	var rejected metricRejections
+	var projectionRejected metricRejections
 
 	for _, resourceMetrics := range req.ResourceMetrics {
-		resourceAttrs := resourceMetrics.Resource.Attributes
+		resourceAttrs := resourceMetrics.GetResource().GetAttributes()
+		pointRejections := &rejected
+		if acknowledged[resourceMetrics] {
+			pointRejections = &projectionRejected
+		}
 		slots := scanResourceSlots(resourceAttrs)
 		serviceName := resolveServiceIdentity(slots, s.metrics, "metrics")
 
@@ -404,7 +495,7 @@ func (s *MetricsServer) Export(ctx context.Context, req *colmetricspb.ExportMetr
 						}
 						res := reducer.ReduceHistogramPoint(aggregateHistogramInput(
 							tenantID, serviceName, m.Name, producerIdentity, resourceAttrs, temporality, p))
-						rejected.record(s.metrics, pointTypeHistogram, res)
+						pointRejections.record(s.metrics, pointTypeHistogram, res)
 					}
 				case *metricspb.Metric_ExponentialHistogram:
 					if reducer == nil {
@@ -417,7 +508,7 @@ func (s *MetricsServer) Export(ctx context.Context, req *colmetricspb.ExportMetr
 						}
 						res := reducer.ReduceExponentialHistogramPoint(aggregateExpHistogramInput(
 							tenantID, serviceName, m.Name, producerIdentity, resourceAttrs, temporality, p))
-						rejected.record(s.metrics, pointTypeExpHistogram, res)
+						pointRejections.record(s.metrics, pointTypeExpHistogram, res)
 					}
 				case *metricspb.Metric_Summary:
 					// Summary is wholly unsupported (#199 Q5). It carries
@@ -428,7 +519,7 @@ func (s *MetricsServer) Export(ctx context.Context, req *colmetricspb.ExportMetr
 						continue
 					}
 					n := uint64(len(data.Summary.GetDataPoints()))
-					rejected.add(pointTypeSummary, aggregate.ReasonUnsupportedType, n)
+					pointRejections.add(pointTypeSummary, aggregate.ReasonUnsupportedType, n)
 					s.metrics.RecordMetricUnsupported(pointTypeSummary, aggregate.ReasonUnsupportedType, len(data.Summary.GetDataPoints()))
 				}
 			}
@@ -438,6 +529,11 @@ func (s *MetricsServer) Export(ctx context.Context, req *colmetricspb.ExportMetr
 	// Apply the request's aggregate deltas. Under durable ACK this blocks
 	// until the group commit lands, and a refusal is the client's answer.
 	if err := applyAggregate(s.aggregateEngine, reducer); err != nil {
+		if backendOwnsACK {
+			return &colmetricspb.ExportMetricsServiceResponse{PartialSuccess: &colmetricspb.ExportMetricsPartialSuccess{
+				ErrorMessage: "Prometheus accepted metrics; local aggregate projection failed",
+			}}, nil
+		}
 		return nil, err
 	}
 
@@ -457,6 +553,12 @@ func (s *MetricsServer) Export(ctx context.Context, req *colmetricspb.ExportMetr
 			RejectedDataPoints: int64(rejected.total), // #nosec G115 -- bounded by the request's point count
 			ErrorMessage:       rejected.message(),
 		}
+	}
+	if projectionRejected.total > 0 {
+		if resp.PartialSuccess == nil {
+			resp.PartialSuccess = &colmetricspb.ExportMetricsPartialSuccess{}
+		}
+		resp.PartialSuccess.ErrorMessage = strings.TrimSpace(resp.PartialSuccess.ErrorMessage + " Prometheus accepted metrics not representable in the local aggregate projection: " + projectionRejected.message())
 	}
 	return resp, nil
 }

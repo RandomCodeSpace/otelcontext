@@ -90,6 +90,18 @@ var toolDefs = []Tool{
 		param("limit", "number", "Max results per page (default 50, max 200)."),
 		param("page", "number", "Page number for pagination (default 0)."),
 	),
+	mkTool("promql_query", "Evaluate PromQL over ingested application and host metrics. Returns the unmodified Prometheus JSON envelope, including labels, timestamps, result type, warnings and errors. This is separate from the internal self-monitoring scrape.",
+		required("query"), param("query", "string", `PromQL expression, maximum 16384 bytes. Native OTLP NoTranslation preserves dots: {__name__="system.cpu.utilization","host.name"="host-a"}. Standard PromQL operators and functions apply.`),
+		param("time", "string", "Optional evaluation time, RFC3339 or Unix seconds. Defaults to now."),
+		param("timeout", "string", "Optional query timeout, maximum 30s."),
+		param("limit", "number", "Maximum returned series, 1 to 1000."),
+	),
+	mkTool("promql_query_range", "Evaluate PromQL over ingested metrics for a bounded range up to seven days. Preserves the Prometheus JSON envelope and warnings. At most 11000 evaluation points per series; backend limits also apply.",
+		required("query", "start", "end", "step"), param("query", "string", `PromQL expression, maximum 16384 bytes. Native OTLP NoTranslation preserves dots: {__name__="system.cpu.utilization","host.name"="host-a"}. Standard PromQL operators and functions apply.`),
+		param("start", "string", "RFC3339 or Unix seconds, inclusive."), param("end", "string", "RFC3339 or Unix seconds, inclusive."),
+		param("step", "string", "Positive duration such as 5m, or seconds."),
+		param("timeout", "string", "Optional timeout, maximum 30s."), param("limit", "number", "Maximum returned series, 1 to 1000."),
+	),
 }
 
 // mcpCtx returns a tenant-scoped context for repository calls. If the caller's
@@ -135,6 +147,8 @@ func (s *Server) toolHandler(ctx context.Context, name string, args map[string]a
 		"impact_analysis":      s.toolImpactAnalysis,
 		"trace_graph":          s.toolTraceGraph,
 		"search_logs":          s.toolSearchLogs,
+		"promql_query":         s.toolPromQLQuery,
+		"promql_query_range":   s.toolPromQLRange,
 	}
 	if fn, ok := dispatch[name]; ok {
 		result := fn(ctx, args)
@@ -160,6 +174,8 @@ var toolCoverage = map[string]aggregate.Coverage{
 	"impact_analysis":      aggregate.CoverageSampled,
 	"trace_graph":          aggregate.CoverageExemplar,
 	"search_logs":          aggregate.CoverageExemplar,
+	"promql_query":         "", // Backend envelope owns metric coverage and warnings.
+	"promql_query_range":   "",
 }
 
 // coverageMeta is the body metadata appended to every successful tool result

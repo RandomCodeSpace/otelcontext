@@ -5,6 +5,8 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"gorm.io/gorm"
 )
 
 // Retention's share of the durable aggregate store (#173): an hourly purge on
@@ -72,4 +74,39 @@ func TestRetentionScheduler_NoAggregateHooksIsANoop(t *testing.T) {
 	r := NewRetentionScheduler(repo, 7, 10_000, 0)
 	r.runPurge(context.Background())
 	r.runMaintenance(context.Background())
+}
+
+func TestRetentionScheduler_CancelledExemplarDoesNotStartAggregatePurge(t *testing.T) {
+	repo := newFileTestRepo(t)
+	seedTrace(t, repo.db, "old", time.Now().UTC().Add(-8*24*time.Hour), nil)
+	r := NewRetentionScheduler(repo, 7, 2, 0)
+	r.SetExemplarRetention(7)
+	calls := 0
+	r.SetAggregateRetention(func(time.Time) (int64, error) { calls++; return 0, nil }, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	const callback = "test:cancel-exemplar"
+	if err := repo.db.Callback().Raw().After("gorm:raw").Register(callback, func(*gorm.DB) { cancel() }); err != nil {
+		t.Fatal(err)
+	}
+	r.runPurge(ctx)
+	if err := repo.db.Callback().Raw().Remove(callback); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 0 {
+		t.Errorf("started %d aggregate purges after cancellation", calls)
+	}
+	if r.running.Load() {
+		t.Fatal("cancelled pass retained overlap guard")
+	}
+	if n := mustCount(t, repo.db, &Trace{}); n != 1 {
+		t.Fatalf("cancelled transaction retained %d traces, want 1", n)
+	}
+	r.runPurge(context.Background())
+	if n := mustCount(t, repo.db, &Trace{}); n != 0 {
+		t.Fatalf("recovery pass retained %d traces, want 0", n)
+	}
+	if calls != 1 {
+		t.Fatalf("recovery pass called aggregate purge %d times, want 1", calls)
+	}
 }

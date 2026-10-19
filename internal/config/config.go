@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -110,6 +111,16 @@ type Config struct {
 
 	// API Protection
 	APIRateLimitRPS int
+
+	// Prometheus is an optional tenant-bound metric store and PromQL backend.
+	// Required mode makes backend availability part of ingest ACKs and readiness.
+	PrometheusURL                 string
+	PrometheusRequired            bool
+	PrometheusTenantID            string
+	PrometheusTimeoutMs           int
+	PrometheusMaxConcurrent       int
+	PrometheusMaxIngestConcurrent int
+	PrometheusMaxIngestWaiters    int
 
 	// MCP Server
 	MCPEnabled bool
@@ -554,7 +565,14 @@ func Load(customPath string) (*Config, error) {
 		DLQMaxReplayPerTick: getEnvInt("DLQ_MAX_REPLAY_PER_TICK", 100),
 
 		// API
-		APIRateLimitRPS: getEnvInt("API_RATE_LIMIT_RPS", 100),
+		APIRateLimitRPS:               getEnvInt("API_RATE_LIMIT_RPS", 100),
+		PrometheusURL:                 strings.TrimSpace(getEnv("PROMETHEUS_URL", "")),
+		PrometheusRequired:            getEnvBool("PROMETHEUS_REQUIRED", false),
+		PrometheusTenantID:            getEnv("PROMETHEUS_TENANT_ID", getEnv("DEFAULT_TENANT", "default")),
+		PrometheusTimeoutMs:           getEnvInt("PROMETHEUS_TIMEOUT_MS", 10000),
+		PrometheusMaxConcurrent:       getEnvInt("PROMETHEUS_MAX_CONCURRENT", 8),
+		PrometheusMaxIngestConcurrent: getEnvInt("PROMETHEUS_MAX_INGEST_CONCURRENT", 16),
+		PrometheusMaxIngestWaiters:    getEnvInt("PROMETHEUS_MAX_INGEST_WAITERS", 256),
 
 		// MCP
 		MCPEnabled:       getEnvBool("MCP_ENABLED", true),
@@ -964,6 +982,21 @@ func (c *Config) Validate() error {
 	}
 	if c.APIRateLimitRPS < 0 {
 		return fmt.Errorf("API_RATE_LIMIT_RPS must be >= 0, got %d", c.APIRateLimitRPS)
+	}
+	if c.PrometheusRequired && c.PrometheusURL == "" {
+		return fmt.Errorf("PROMETHEUS_REQUIRED requires PROMETHEUS_URL")
+	}
+	if c.PrometheusURL != "" {
+		u, err := url.Parse(c.PrometheusURL)
+		if err != nil || u == nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Opaque != "" {
+			return fmt.Errorf("PROMETHEUS_URL must be an absolute HTTP(S) base URL without credentials, query or fragment")
+		}
+		if c.PrometheusTimeoutMs < 1 || c.PrometheusTimeoutMs > 30000 {
+			return fmt.Errorf("PROMETHEUS_TIMEOUT_MS must be between 1 and 30000")
+		}
+		if c.PrometheusMaxConcurrent < 1 || c.PrometheusMaxConcurrent > 64 || c.PrometheusMaxIngestConcurrent < 1 || c.PrometheusMaxIngestConcurrent > 256 || c.PrometheusMaxIngestWaiters < 1 || c.PrometheusMaxIngestWaiters > 4096 {
+			return fmt.Errorf("Prometheus concurrency must be bounded: queries 1..64, ingest 1..256, ingest waiters 1..4096")
+		}
 	}
 	// gRPC receive cap: must be positive, and capped to prevent per-message OOM
 	// from a bad env value (the limit pre-allocates a buffer of this size on

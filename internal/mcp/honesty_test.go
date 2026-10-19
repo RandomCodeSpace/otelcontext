@@ -130,18 +130,20 @@ func TestTraceGraphReportsPartialWhenParentMissing(t *testing.T) {
 }
 
 // TestToolDescriptionsStateTheirCoverageLimits proves the descriptions the
-// 7-tool surface advertises actually carry the contract, so a client is told
+// tool surface advertises actually carry the contract, so a client is told
 // the limits before it calls anything.
 func TestToolDescriptionsStateTheirCoverageLimits(t *testing.T) {
 	byName := map[string]string{}
 	for _, tool := range toolDefs {
 		byName[tool.Name] = tool.Description
 	}
-	if len(byName) != 7 {
-		t.Fatalf("tool surface has %d tools, want 7", len(byName))
+	if len(byName) != 9 {
+		t.Fatalf("tool surface has %d tools, want 9", len(byName))
 	}
 	for name, want := range map[string]string{
 		"trace_graph":          "not_retained_or_not_found",
+		"promql_query":         "Prometheus JSON envelope",
+		"promql_query_range":   "Prometheus JSON envelope",
 		"root_cause_analysis":  "partial_exemplar",
 		"get_service_map":      "aggregate retention",
 		"impact_analysis":      "aggregate retention",

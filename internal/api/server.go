@@ -11,6 +11,7 @@ import (
 	"github.com/RandomCodeSpace/otelcontext/internal/cache"
 	"github.com/RandomCodeSpace/otelcontext/internal/graph"
 	"github.com/RandomCodeSpace/otelcontext/internal/graphrag"
+	"github.com/RandomCodeSpace/otelcontext/internal/prometheus"
 	"github.com/RandomCodeSpace/otelcontext/internal/realtime"
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 	"github.com/RandomCodeSpace/otelcontext/internal/telemetry"
@@ -42,7 +43,9 @@ type Server struct {
 	// serve them, and legacy mode has no engine at all. Every read migrated
 	// to the engine branches on aggregateReads(), so legacy responses stay
 	// byte-for-byte what they were.
-	aggregateEngine *aggregate.Engine
+	aggregateEngine  *aggregate.Engine
+	prometheusClient *prometheus.Client
+	prometheusReady  func(context.Context) error
 
 	// aggregateRecovered reports whether the durable aggregate store has
 	// finished startup recovery. /ready stays 503 until it returns true, so
@@ -159,6 +162,12 @@ func (s *Server) SetGraph(g *graph.Graph) {
 	s.graph = g
 }
 
+// SetPrometheusClient enables retained metrics and PromQL for its bound tenant.
+// Call before serving requests. Other tenants retain their existing read path.
+func (s *Server) SetPrometheusClient(client *prometheus.Client) {
+	s.prometheusClient = client
+}
+
 // SetGraphRAG wires the GraphRAG instance for advanced queries.
 func (s *Server) SetGraphRAG(g *graphrag.GraphRAG) {
 	s.graphRAG = g
@@ -230,6 +239,12 @@ func (s *Server) SetAggregateDBProbe(fn func(context.Context) error) {
 	s.aggregateDBPing = fn
 }
 
+// SetPrometheusReadinessProbe makes a required metric backend part of /ready.
+// A nil probe keeps standalone and optional-backend deployments independent.
+func (s *Server) SetPrometheusReadinessProbe(fn func(context.Context) error) {
+	s.prometheusReady = fn
+}
+
 // SetReadinessThresholds overrides the runtime-probe limits. A zero value in
 // any field disables that probe.
 func (s *Server) SetReadinessThresholds(t ReadinessThresholds) {
@@ -250,6 +265,10 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 
 	// Metrics & Dashboard
 	mux.HandleFunc("GET /api/metrics", s.handleGetMetricBuckets)
+	mux.HandleFunc("GET /api/v1/query", s.handlePrometheusQuery)
+	mux.HandleFunc("POST /api/v1/query", s.handlePrometheusQuery)
+	mux.HandleFunc("GET /api/v1/query_range", s.handlePrometheusRangeQuery)
+	mux.HandleFunc("POST /api/v1/query_range", s.handlePrometheusRangeQuery)
 	mux.HandleFunc("GET /api/metrics/traffic", s.handleGetTrafficMetrics)
 	mux.HandleFunc("GET /api/metrics/latency_heatmap", s.handleGetLatencyHeatmap)
 	mux.HandleFunc("GET /api/metrics/dashboard", s.handleGetDashboardStats)
