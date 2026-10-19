@@ -148,7 +148,7 @@ type Span struct {
 	SpanID        string    `gorm:"size:16;not null;uniqueIndex:idx_spans_tenant_trace_span,priority:3" json:"span_id"`
 	ParentSpanID  string    `gorm:"size:16" json:"parent_span_id"`
 	OperationName string    `gorm:"size:255;index" json:"operation_name"`
-	StartTime     time.Time `gorm:"index:idx_spans_tenant_service_start,priority:3;index:idx_spans_tenant_status_start,priority:3" json:"start_time"`
+	StartTime     time.Time `gorm:"index:idx_spans_start_time;index:idx_spans_tenant_service_start,priority:3;index:idx_spans_tenant_status_start,priority:3" json:"start_time"`
 	EndTime       time.Time `json:"end_time"`
 	Duration      int64     `json:"duration"`                                                                     // Microseconds
 	ServiceName   string    `gorm:"size:255;index:idx_spans_tenant_service_start,priority:2" json:"service_name"` // Originating service

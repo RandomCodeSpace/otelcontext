@@ -140,6 +140,18 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 	if !s.aggregateRuntimeChecks(r.Context(), checks) {
 		ready = false
 	}
+	if s.prometheusReady != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), time.Second)
+		err := s.prometheusReady(ctx)
+		cancel()
+		checks["prometheus"] = "ok"
+		if err != nil {
+			checks["prometheus"] = "unavailable: " + err.Error()
+			ready = false
+		}
+	} else {
+		checks["prometheus"] = "not_required"
+	}
 
 	status := http.StatusOK
 	if !ready {

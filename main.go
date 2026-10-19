@@ -25,6 +25,7 @@ import (
 	"github.com/RandomCodeSpace/otelcontext/internal/graphrag"
 	"github.com/RandomCodeSpace/otelcontext/internal/ingest"
 	"github.com/RandomCodeSpace/otelcontext/internal/mcp"
+	"github.com/RandomCodeSpace/otelcontext/internal/prometheus"
 	"github.com/RandomCodeSpace/otelcontext/internal/queue"
 	"github.com/RandomCodeSpace/otelcontext/internal/realtime"
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
@@ -56,9 +57,15 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// Version is detected from build info at startup.
-// Returns the real tag when installed via `go install`, "local" otherwise.
-var Version = detectVersion()
+// Version is set by release builds with -X main.Version=<tag>.
+// Unstamped builds use module build info, falling back to "local".
+var Version string
+
+func init() {
+	if Version == "" {
+		Version = detectVersion()
+	}
+}
 
 // detectVersion reads runtime/debug.BuildInfo to return the module version
 // that go install or go build stamped into the binary. Falls back to "local"
@@ -156,6 +163,20 @@ func main() {
 	}
 	if err := cfg.Validate(); err != nil {
 		fatal("invalid configuration", err)
+	}
+	var prometheusClient *prometheus.Client
+	if cfg.PrometheusURL != "" {
+		prometheusClient, err = prometheus.NewClient(prometheus.Config{
+			URL: cfg.PrometheusURL, TenantID: cfg.PrometheusTenantID,
+			Timeout:             time.Duration(cfg.PrometheusTimeoutMs) * time.Millisecond,
+			MaxConcurrent:       cfg.PrometheusMaxConcurrent,
+			MaxIngestConcurrent: cfg.PrometheusMaxIngestConcurrent,
+			MaxIngestWaiters:    cfg.PrometheusMaxIngestWaiters,
+		})
+		if err != nil {
+			fatal("invalid Prometheus configuration", err)
+		}
+		defer prometheusClient.Close()
 	}
 	// Auto-exclude own service when self-instrumentation points to a loopback
 	// address (otherwise every span emitted re-enters Export and amplifies).
@@ -506,6 +527,9 @@ func main() {
 	// tsdbAgg is nil in aggregate mode: MetricsServer then skips the RawMetric
 	// build entirely (see exportNumberPoints).
 	metricsServer := ingest.NewMetricsServer(repo, metrics, tsdbAgg, cfg)
+	if err := metricsServer.SetPrometheusClient(prometheusClient, cfg.PrometheusRequired); err != nil {
+		fatal("configure metric backend", err)
+	}
 
 	// Bounded resource registry (#279): one owner for every mode. Reloaded
 	// BEFORE any listener starts so a restart keeps last_seen; flushed on a
@@ -755,6 +779,10 @@ func main() {
 	apiServer.SetGraph(svcGraph)
 	apiServer.SetGraphRAG(graphRAG)
 	apiServer.SetTopologyProvider(topologyProvider)
+	apiServer.SetPrometheusClient(prometheusClient)
+	if cfg.PrometheusRequired {
+		apiServer.SetPrometheusReadinessProbe(prometheusClient.Ready)
+	}
 
 	// 6b. Initialize MCP Server (HTTP Streamable, JSON-RPC 2.0 + SSE)
 	mcpServer := mcp.New(cfg.DefaultTenant, repo, metrics, topologyProvider)
@@ -762,6 +790,9 @@ func main() {
 	mcpServer.SetCallLimit(cfg.MCPMaxConcurrent)
 	mcpServer.SetCallTimeout(time.Duration(cfg.MCPCallTimeoutMs) * time.Millisecond)
 	mcpServer.SetCacheTTL(time.Duration(cfg.MCPCacheTTLMs) * time.Millisecond)
+	if prometheusClient != nil {
+		mcpServer.SetPromQLQuerier(prometheusClient, prometheusClient.TenantID())
+	}
 	slog.Info("🤖 MCP server initialized",
 		"path", cfg.MCPPath,
 		"enabled", cfg.MCPEnabled,

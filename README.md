@@ -27,7 +27,7 @@ It starts with SQLite and no external services. When you need more, the main tel
 
 - **A live service map** that shows dependencies, health, latency, and active anomalies.
 - **Incident context in one place** with related traces, logs, metrics, and impact analysis.
-- **Seven MCP tools** for investigating your system from an AI client or coding agent.
+- **Nine MCP tools** for investigating your system from an AI client or coding agent.
 - **Standard OTLP input** over gRPC and HTTP, so existing SDKs and Collectors can send data directly.
 - **A simple first run** with one binary and a local SQLite database.
 - **Self-hosted data** with retention controls, health probes, and Prometheus metrics.
@@ -128,6 +128,109 @@ service:
 For an authenticated deployment, add an `authorization` bearer header and, if needed, `x-tenant-id` under the exporter.
 
 </details>
+
+## Query ingested metrics with PromQL
+
+Set `PROMETHEUS_URL` to enable an optional Prometheus backend. With it unset,
+existing ingestion and metric reads keep their local paths. The `/metrics`
+scrape still reports OtelContext's own health and counters; PromQL queries the
+application and host metrics sent through OTLP.
+
+Configure Prometheus with its native OTLP receiver enabled and this configuration:
+
+```yaml
+global:
+  scrape_interval: 1m
+otlp:
+  translation_strategy: NoTranslation
+  promote_resource_attributes:
+    - service.name
+    - service.instance.id
+    - host.id
+    - host.name
+```
+
+Start Prometheus with `--web.enable-otlp-receiver`, set its retention explicitly
+with `--storage.tsdb.retention.time=7d`, and bound query work with
+`--query.max-samples=100000 --query.timeout=10s`. The reference integration test
+uses Prometheus 3.15.0. Prometheus owns metric retention and storage; OtelContext's
+local retention settings do not control that backend.
+
+Then configure OtelContext:
+
+```dotenv
+PROMETHEUS_URL=http://127.0.0.1:9090
+PROMETHEUS_TENANT_ID=default
+PROMETHEUS_REQUIRED=false
+```
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `PROMETHEUS_URL` | empty | HTTP(S) base URL; no embedded credentials, query, or fragment |
+| `PROMETHEUS_TENANT_ID` | `DEFAULT_TENANT` | The only tenant allowed to write or query this backend |
+| `PROMETHEUS_REQUIRED` | `false` | Require backend acceptance before local metric processing and include the backend in `/ready` |
+| `PROMETHEUS_TIMEOUT_MS` | `10000` | Request deadline, including ingest admission; range 1..30000 |
+| `PROMETHEUS_MAX_CONCURRENT` | `8` | Active queries and metadata reads; range 1..64 |
+| `PROMETHEUS_MAX_INGEST_CONCURRENT` | `16` | Separate active metric forwarding slots; range 1..256 |
+| `PROMETHEUS_MAX_INGEST_WAITERS` | `256` | Exporters waiting for an ingest slot; range 1..4096 |
+
+Use a dedicated backend for the configured tenant. Tenant binding gates access
+to the entire backend; it does not add tenant label filters to PromQL. Existing
+tenant precedence applies. Other tenants keep local ingestion and metric reads,
+and their PromQL requests are refused before reaching the backend.
+
+Forwarding preserves the original OTLP metric names, resource and point
+attributes, timestamps, units, histogram payloads, and exemplars before local
+projection. **Send cumulative sums and histograms.** Delta sums and histograms
+are refused by this backend contract. No delta conversion or metric renaming
+runs in OtelContext. With `NoTranslation`, dotted names and label keys need
+quoted selectors, for example `{__name__="system.cpu.utilization","host.name"="node-a"}`.
+Promote additional resource attributes in Prometheus if queries need them as labels.
+
+In optional mode, forwarding failures leave local ingestion running and return
+an OTLP partial-success warning; missing backend data is not queued for replay.
+In required mode, backend outages return retryable gRPC `RESOURCE_EXHAUSTED` or
+HTTP 429 before local accounting. Invalid backend input returns gRPC
+`INVALID_ARGUMENT` or HTTP 400. A successful backend write followed by a local
+projection failure returns a warning when the backend accepted all resources.
+Backend partial-success rejections are preserved and must not be retried. Local
+projection skips the forwarded resources in that case because the backend does
+not identify individual rejected points. `/ready` probes backend availability
+only when required; it does not validate retention, OTLP enablement, or translation.
+
+HTTP query endpoints accept GET parameters or POST form data:
+
+```bash
+curl -fsSG http://localhost:8080/api/v1/query \
+  --data-urlencode 'query={__name__="system.cpu.utilization","host.name"="node-a"}'
+curl -fsSG http://localhost:8080/api/v1/query_range \
+  --data-urlencode 'query={__name__="system.cpu.utilization"}' \
+  --data-urlencode 'start=2026-10-18T00:00:00Z' \
+  --data-urlencode 'end=2026-10-19T00:00:00Z' \
+  --data-urlencode 'step=5m'
+```
+
+Responses preserve Prometheus envelopes, labels, timestamps, result types,
+warnings, and backend errors. `GET /api/metadata/metrics` discovers retained
+metric names, with optional `service_name`, `start`, and `end` filters. The
+existing `GET /api/metrics?name=...` view returns evaluated scalar samples for
+the bound tenant, marked `sampled` with `OtelContext-Metric-Source: prometheus`.
+It cannot flatten native histograms; use PromQL for those. Host service names
+keep the existing `host/<host.name>` convention, falling back to `host.id`.
+
+MCP advertises `promql_query` and `promql_query_range` through `tools/list`.
+They return uncached Prometheus envelopes and share MCP's concurrency, timeout,
+and response-size bounds. `resources/list` advertises the readable
+`OtelContext://system/graph` resource; the internal scrape is not an MCP resource.
+
+The client caps query parameters at 64 KiB, query ranges at seven days, returned
+series at 1,000, and backend responses at 8 MiB. Each forwarded request is capped
+at 64 MiB; active and waiting exports share a 128 MiB protobuf wire-size budget.
+Encoding happens after admission. This budget does not cover incoming network
+decoding or total process memory. Readiness has its own slot. MCP further caps
+query text at 16 KiB, evaluation points at 11,000 per series, and results at its
+existing 4 MiB response limit. Prometheus must also enforce its own query and storage
+limits. This optional feature does not certify 200-service production capacity.
 
 ## Investigate with MCP
 

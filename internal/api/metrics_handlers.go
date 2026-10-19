@@ -326,6 +326,10 @@ func (s *Server) serviceMapView(r *http.Request, start, end time.Time) (views.Se
 
 // handleGetMetricBuckets handles GET /api/metrics
 func (s *Server) handleGetMetricBuckets(w http.ResponseWriter, r *http.Request) {
+	if s.prometheusClient != nil && s.prometheusClient.SupportsTenant(r.Context()) {
+		s.handlePrometheusMetricBuckets(w, r)
+		return
+	}
 	start, end, err := parseTimeRange(r)
 	if err != nil {
 		http.Error(w, "invalid time range", http.StatusBadRequest)
@@ -450,6 +454,10 @@ func clampToInt64(v uint64) int64 {
 
 // handleGetMetricNames handles GET /api/metadata/metrics
 func (s *Server) handleGetMetricNames(w http.ResponseWriter, r *http.Request) {
+	if s.prometheusClient != nil && s.prometheusClient.SupportsTenant(r.Context()) {
+		s.handlePrometheusMetricNames(w, r)
+		return
+	}
 	serviceName := r.URL.Query().Get("service_name")
 
 	// Aggregate mode: metric_buckets is not written, so the DISTINCT scan has

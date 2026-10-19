@@ -307,6 +307,12 @@ func (r *RetentionScheduler) runPurge(ctx context.Context) {
 	// pass means the long pass runs against a smaller table.
 	r.runExemplarPurge(ctx)
 
+	// The aggregate callback has no context. Do not start it after shutdown
+	// has already canceled the raw purge.
+	if ctx.Err() != nil {
+		return
+	}
+
 	// The aggregate store is a separate database file with its own writer, so
 	// its purge never contends with the relational one (ADR 0003).
 	r.purgeAggregate(cutoff)

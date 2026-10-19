@@ -12,6 +12,42 @@ most recently published tag.
 
 ## [Unreleased]
 
+## [v0.6.2] - 2026-10-19
+
+### Added
+
+- Optional tenant-bound Prometheus backend for ingested metrics, with native
+  OTLP forwarding before local projection and a cumulative `NoTranslation`
+  contract. Leaving `PROMETHEUS_URL` unset preserves local ingestion and reads.
+- HTTP instant and range PromQL queries, retained metric-name discovery, and
+  MCP `promql_query` and `promql_query_range` tools. Backend envelopes retain
+  labels, timestamps, warnings, and errors; PromQL results are not cached.
+- Separate bounded query and ingest admission, request/response byte limits,
+  and optional required-backend readiness and metric acknowledgments.
+- Readable MCP system-graph resource using the tool execution bounds.
+
+### Changed
+
+- Release preflight requires the exact Go version in `go.mod`.
+- Storage schema 4 adds the span timestamp index used by retention cleanup.
+  Follow the [upgrade and rollback instructions](docs/release-notes/v0.6.2-retention.md)
+  before starting this version on an existing database.
+- This release adds an optional metrics backend. It does not grant 200-service
+  production approval or certify aggregate capacity.
+
+### Fixed
+
+- SQLite retention deletes use timestamp indexes and tenant-correlated orphan
+  checks, avoiding full retained-table scans when no records have expired.
+- Cancelled exemplar cleanup no longer starts the aggregate retention callback.
+- Preserve the release tag supplied by `-X main.Version` so `--version`
+  reports the signed artifact version; unstamped builds retain their fallback.
+
+### Security
+
+- Carry the verified Go 1.26.9 and `golang.org/x/net` v0.60.0 security pins,
+  with compatible `x/crypto`, `x/sync`, `x/sys`, and `x/text` versions.
+
 ## [v0.6.1] - 2026-09-21
 
 ### Changed

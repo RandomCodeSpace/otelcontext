@@ -73,6 +73,8 @@ type Server struct {
 	topology      topology.Provider
 	graphRAG      *graphrag.GraphRAG
 	defaultTenant string
+	promQL        PromQLQuerier
+	promQLTenant  string
 
 	// aggregateMode makes every successful tool result carry coverage body
 	// metadata. Set only in AGGREGATE_MODE=aggregate; legacy and shadow
@@ -293,61 +295,7 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request) {
 			rpcErr = &RPCError{Code: ErrInvalidParams, Message: "invalid tools/call params"}
 			break
 		}
-		// Downstream tool handlers pull the tenant off ctx via mcpCtx(r.Context()).
-		tenant := s.requestTenant(r)
-		cacheTenant := s.topologyCacheScope(r.Context(), tenant, params.Name)
-
-		// Cache fast-path: cheap, idempotent GraphRAG tools are memoized
-		// for a few seconds so polling agent clients don't cripple the
-		// in-memory store under load.
-		if cached, hit := s.cache.Get(cacheTenant, params.Name, params.Arguments); hit {
-			s.cacheHits.Add(1)
-			result = cached
-			break
-		}
-
-		// Concurrency gate: non-blocking acquire. Use an `acquired` flag
-		// rather than a `break` inside `select{default}` (which only breaks
-		// the select, not the surrounding switch — refactor footgun).
-		acquired := s.callSlots == nil
-		if !acquired {
-			select {
-			case s.callSlots <- struct{}{}:
-				acquired = true
-			default:
-				s.overloaded.Add(1)
-				rpcErr = &RPCError{Code: ErrServerOverloaded, Message: "MCP server at capacity, retry shortly"}
-			}
-		}
-		if !acquired {
-			break
-		}
-
-		s.inFlight.Add(1)
-		callCtx, cancel := s.deriveCallCtx(r.Context())
-		callCtx = storage.WithTenantContext(callCtx, tenant)
-		// release fires when the inner goroutine finishes — not when the
-		// HTTP request returns. On timeout the request returns immediately
-		// with ErrCallTimeout but the slot stays held until the runaway
-		// tool actually completes, which is what defends the concurrency
-		// cap from being defeated by slow handlers.
-		release := func() {
-			if s.callSlots != nil {
-				<-s.callSlots
-			}
-			s.inFlight.Add(-1)
-		}
-		toolResult, timedOut := s.runWithTimeout(callCtx, cancel, params.Name, params.Arguments, release)
-		if timedOut {
-			s.timedOut.Add(1)
-			rpcErr = &RPCError{Code: ErrCallTimeout, Message: fmt.Sprintf("tool %q exceeded %s deadline", params.Name, s.callTimeout)}
-			break
-		}
-		s.callsServiced.Add(1)
-		if !toolResult.IsError {
-			s.cache.Set(cacheTenant, params.Name, params.Arguments, toolResult)
-		}
-		result = toolResult
+		result, rpcErr = s.callTool(r.Context(), s.requestTenant(r), params)
 
 	case "ping":
 		result = map[string]string{"status": "ok", "ts": time.Now().UTC().Format(time.RFC3339)}
@@ -355,10 +303,37 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request) {
 	case "resources/list":
 		result = map[string]any{
 			"resources": []map[string]any{
-				{"uri": "OtelContext://system/graph", "name": "System Graph", "mimeType": httpconst.ContentTypeJSON},
-				{"uri": "OtelContext://metrics/prometheus", "name": "Prometheus Metrics", "mimeType": "text/plain"},
+				{"uri": "OtelContext://system/graph", "name": "System Graph", "mimeType": httpconst.ContentTypeJSON, "description": "Current tenant service map with coverage. Ingested metrics use promql_query and promql_query_range; the internal self-monitoring scrape is not an MCP resource."},
 			},
 		}
+
+	case "resources/read":
+		params, ok := req.Params.(map[string]any)
+		uri, _ := params["uri"].(string)
+		if !ok || uri != resourceURIPrefix+"system/graph" {
+			rpcErr = &RPCError{Code: ErrInvalidParams, Message: "unknown resource URI"}
+			break
+		}
+		var toolResult ToolCallResult
+		toolResult, rpcErr = s.callTool(r.Context(), s.requestTenant(r), ToolCallParams{Name: "get_service_map"})
+		if rpcErr != nil {
+			break
+		}
+		if toolResult.IsError {
+			rpcErr = &RPCError{Code: ErrInternalError, Message: toolResult.Content[0].Text}
+			break
+		}
+		// Include coverage alongside the map in the resource document.
+		resourceBody := map[string]any{"services": json.RawMessage(toolResult.Content[0].Text)}
+		if len(toolResult.Content) > 1 {
+			resourceBody["metadata"] = json.RawMessage(toolResult.Content[1].Text)
+		}
+		data, err := json.Marshal(resourceBody)
+		if err != nil || len(data) > MaxToolResponseBytes {
+			rpcErr = &RPCError{Code: ErrInternalError, Message: "resource response exceeds bounds"}
+			break
+		}
+		result = map[string]any{"contents": []Resource{{URI: uri, MimeType: httpconst.ContentTypeJSON, Text: string(data)}}}
 
 	default:
 		rpcErr = &RPCError{Code: ErrMethodNotFound, Message: fmt.Sprintf("method not found: %s", req.Method)}
@@ -647,4 +622,59 @@ func parseToolCallParams(raw any) (ToolCallParams, bool) {
 		return ToolCallParams{}, false
 	}
 	return p, true
+}
+
+// callTool shares tenant scoping, concurrency, timeout and response bounds with resource reads.
+func (s *Server) callTool(ctx context.Context, tenant string, params ToolCallParams) (ToolCallResult, *RPCError) {
+	var rpcErr *RPCError
+	cacheTenant := s.topologyCacheScope(ctx, tenant, params.Name)
+
+	// Cache fast-path: cheap, idempotent GraphRAG tools are memoized
+	// for a few seconds so polling agent clients don't cripple the
+	// in-memory store under load.
+	if cached, hit := s.cache.Get(cacheTenant, params.Name, params.Arguments); hit {
+		s.cacheHits.Add(1)
+		return cached, nil
+	}
+
+	// Concurrency gate: non-blocking acquire.
+	acquired := s.callSlots == nil
+	if !acquired {
+		select {
+		case s.callSlots <- struct{}{}:
+			acquired = true
+		default:
+			s.overloaded.Add(1)
+			rpcErr = &RPCError{Code: ErrServerOverloaded, Message: "MCP server at capacity, retry shortly"}
+		}
+	}
+	if !acquired {
+		return ToolCallResult{}, rpcErr
+	}
+
+	s.inFlight.Add(1)
+	callCtx, cancel := s.deriveCallCtx(ctx)
+	callCtx = storage.WithTenantContext(callCtx, tenant)
+	// release fires when the inner goroutine finishes — not when the
+	// HTTP request returns. On timeout the request returns immediately
+	// with ErrCallTimeout but the slot stays held until the runaway
+	// tool actually completes, which is what defends the concurrency
+	// cap from being defeated by slow handlers.
+	release := func() {
+		if s.callSlots != nil {
+			<-s.callSlots
+		}
+		s.inFlight.Add(-1)
+	}
+	toolResult, timedOut := s.runWithTimeout(callCtx, cancel, params.Name, params.Arguments, release)
+	if timedOut {
+		s.timedOut.Add(1)
+		rpcErr = &RPCError{Code: ErrCallTimeout, Message: fmt.Sprintf("tool %q exceeded %s deadline", params.Name, s.callTimeout)}
+		return ToolCallResult{}, rpcErr
+	}
+	s.callsServiced.Add(1)
+	if !toolResult.IsError {
+		s.cache.Set(cacheTenant, params.Name, params.Arguments, toolResult)
+	}
+	return toolResult, nil
 }

@@ -2,8 +2,12 @@ package storage
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 	"time"
+
+	"gorm.io/gorm"
 )
 
 // Exemplar-tier retention (#201 Q2). The exemplar tier keeps two days while
@@ -220,5 +224,117 @@ func TestPurgeExemplarsNow_RunsOffTick(t *testing.T) {
 	s.PurgeExemplarsNow(context.Background())
 	if got := mustCount(t, repo.db, &Log{}); got != 0 {
 		t.Fatalf("%d logs after the on-demand purge, want 0", got)
+	}
+}
+
+func TestPurgeTraceRetention_TenantAndTimestampBoundaries(t *testing.T) {
+	for _, exemplar := range []bool{false, true} {
+		name := "hot"
+		if exemplar {
+			name = "exemplar"
+		}
+		t.Run(name, func(t *testing.T) {
+			repo := newTestRepo(t)
+			cutoff := time.Date(2026, 10, 12, 0, 0, 0, 123456789, time.UTC)
+			before, after := cutoff.Add(-time.Nanosecond), cutoff.Add(time.Nanosecond)
+			traces := []Trace{
+				{TenantID: "a", TraceID: "shared", Timestamp: before},
+				{TenantID: "b", TraceID: "shared", Timestamp: after},
+				{TenantID: "a", TraceID: "zero-spans", Timestamp: before},
+				{TenantID: "a", TraceID: "boundary", Timestamp: cutoff},
+				{TenantID: "a", TraceID: "before", Timestamp: before},
+			}
+			if err := repo.db.Create(&traces).Error; err != nil {
+				t.Fatal(err)
+			}
+			spans := []Span{
+				{TenantID: "a", TraceID: "shared", SpanID: "old", StartTime: before},
+				{TenantID: "b", TraceID: "shared", SpanID: "skew", StartTime: before},
+				{TenantID: "a", TraceID: "boundary", SpanID: "boundary", StartTime: cutoff},
+				{TenantID: "a", TraceID: "before", SpanID: "old", StartTime: before},
+				{TenantID: "a", TraceID: "missing", SpanID: "orphan", StartTime: before},
+				{TenantID: "a", TraceID: "missing", SpanID: "in-flight", StartTime: after},
+			}
+			if err := repo.db.Create(&spans).Error; err != nil {
+				t.Fatal(err)
+			}
+			if exemplar {
+				stats, err := repo.PurgeExemplarsBatched(context.Background(), cutoff, 1, 0)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if stats.Traces != 3 || stats.Spans+stats.OrphanSpans != 3 {
+					t.Fatalf("wrong totals: %+v", stats)
+				}
+			} else {
+				n, err := repo.PurgeTracesBatched(context.Background(), cutoff, 1, 0)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if n != 3 {
+					t.Fatalf("deleted %d traces, want 3", n)
+				}
+			}
+			if n := mustCount(t, repo.db, &Trace{}); n != 2 {
+				t.Errorf("%d traces remain, want live and exact-cutoff headers", n)
+			}
+			var remaining []Span
+			if err := repo.db.Order("id").Find(&remaining).Error; err != nil {
+				t.Fatal(err)
+			}
+			if len(remaining) != 3 || remaining[0].TenantID != "b" || remaining[0].SpanID != "skew" || remaining[1].SpanID != "boundary" || remaining[2].SpanID != "in-flight" {
+				t.Fatalf("wrong surviving spans: %+v", remaining)
+			}
+		})
+	}
+}
+
+func TestPurgeExemplars_CancelBetweenBatchesThenResume(t *testing.T) {
+	// database/sql may discard a canceled connection; use a file so reopening
+	// it exercises restart recovery instead of losing an in-memory fixture.
+	repo := newFileTestRepo(t)
+	cutoff := time.Date(2026, 10, 12, 0, 0, 0, 123456789, time.UTC)
+	for _, id := range []string{"one", "two", "three"} {
+		seedTrace(t, repo.db, id, cutoff.Add(-time.Hour), []time.Time{cutoff.Add(-time.Hour)})
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	traceBatches := 0
+	const callback = "test:cancel-second-batch"
+	if err := repo.db.Callback().Raw().After("gorm:raw").Register(callback, func(tx *gorm.DB) {
+		if strings.HasPrefix(tx.Statement.SQL.String(), "DELETE FROM traces") {
+			traceBatches++
+			if traceBatches == 2 {
+				cancel()
+			}
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stats, err := repo.PurgeExemplarsBatched(ctx, cutoff, 1, 0)
+	if removeErr := repo.db.Callback().Raw().Remove(callback); removeErr != nil {
+		t.Fatal(removeErr)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled purge: %v", err)
+	}
+	if stats.Traces != 1 || stats.Spans != 1 {
+		t.Fatalf("only first transaction should commit: %+v", stats)
+	}
+	if n := mustCount(t, repo.db, &Trace{}); n != 2 {
+		t.Fatalf("%d traces remain after cancellation, want 2", n)
+	}
+	stats, err = repo.PurgeExemplarsBatched(context.Background(), cutoff, 1, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Traces != 2 || stats.Spans != 2 {
+		t.Fatalf("resume did not finish remainder: %+v", stats)
+	}
+	if n := mustCount(t, repo.db, &Trace{}); n != 0 {
+		t.Fatalf("%d traces remain after resume", n)
+	}
+	if n := mustCount(t, repo.db, &Span{}); n != 0 {
+		t.Fatalf("%d spans remain after resume", n)
 	}
 }

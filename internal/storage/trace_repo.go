@@ -632,15 +632,14 @@ func (r *Repository) PurgeTracesBatched(ctx context.Context, olderThan time.Time
 		}
 	}
 
-	// Sweep orphaned spans in batches. The NOT IN subquery is evaluated per batch, which is
-	// O(spans × traces) worst case — acceptable because we bound the scan with LIMIT and the
-	// trace set shrinks on each pass.
+	// Sweep expired orphaned spans in batches, probing the tenant-scoped
+	// trace identity index instead of materializing every trace ID per batch.
 	for {
 		if err := ctx.Err(); err != nil {
 			return total, err
 		}
 		result := r.db.WithContext(ctx).Exec(
-			batchedDeleteSQL(r.driver, "spans", "start_time < ? AND trace_id NOT IN (SELECT trace_id FROM traces)"),
+			batchedDeleteSQL(r.driver, "spans", expiredOrphanSpansPredicate),
 			olderThan, batchSize,
 		)
 		if result.Error != nil {

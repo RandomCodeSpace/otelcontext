@@ -233,6 +233,10 @@ func (h *HTTPHandler) handleMetrics(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := h.metrics.Export(withTenantFromHTTP(r), req)
 	if err != nil {
+		if grpcstatus.Code(err) == codes.InvalidArgument {
+			writeOTLPError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		if isQueueFull(err) {
 			h.writeThrottled(w, "metrics")
 			return

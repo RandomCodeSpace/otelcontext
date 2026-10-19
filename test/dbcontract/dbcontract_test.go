@@ -177,6 +177,8 @@ func (a *appProcess) environment() []string {
 		"INGEST_MIN_SEVERITY":        "INFO",
 		"LOG_LEVEL":                  "INFO",
 		"PPROF_ADDR":                 "",
+		"PROMETHEUS_URL":             "",
+		"PROMETHEUS_REQUIRED":        "false",
 		"RETENTION_BATCH_SIZE":       "100",
 		"RETENTION_BATCH_SLEEP_MS":   "0",
 		"SAMPLING_RATE":              "1.0",
@@ -715,7 +717,7 @@ func trySurfaces(app *appProcess, value fixture) (surfaceProof, error) {
 	if err != nil {
 		return surfaceProof{}, err
 	}
-	wantTools := []string{"get_anomaly_timeline", "get_service_health", "get_service_map", "impact_analysis", "root_cause_analysis", "search_logs", "trace_graph"}
+	wantTools := []string{"get_anomaly_timeline", "get_service_health", "get_service_map", "impact_analysis", "promql_query", "promql_query_range", "root_cause_analysis", "search_logs", "trace_graph"}
 	if !reflect.DeepEqual(tools, wantTools) {
 		return surfaceProof{}, fmt.Errorf("MCP tools=%v want=%v", tools, wantTools)
 	}
@@ -741,6 +743,26 @@ func trySurfaces(app *appProcess, value fixture) (surfaceProof, error) {
 			return surfaceProof{}, fmt.Errorf("MCP %s failed: %s", call.name, text)
 		}
 		callProof[call.name] = mcpCallProof{Succeeded: true, HasBody: text != ""}
+	}
+	// The optional backend is deliberately absent in this database proof.
+	for _, tool := range []string{"promql_query", "promql_query_range"} {
+		args := map[string]any{"query": "up"}
+		if tool == "promql_query_range" {
+			args["start"], args["end"], args["step"] = "0", "60", "60"
+		}
+		text, succeeded, err := callMCPTool(app.baseURL()+"/mcp", tool, args)
+		if err != nil {
+			return surfaceProof{}, err
+		}
+		var envelope struct {
+			Status    string `json:"status"`
+			ErrorType string `json:"errorType"`
+			Error     string `json:"error"`
+		}
+		if succeeded || json.Unmarshal([]byte(text), &envelope) != nil || envelope.Status != "error" || envelope.ErrorType != "unavailable" || envelope.Error != "PromQL backend is not configured" {
+			return surfaceProof{}, fmt.Errorf("MCP %s must report its unconfigured backend: %s", tool, text)
+		}
+		callProof[tool] = mcpCallProof{Succeeded: false, HasBody: true}
 	}
 	webSockets := []string{"/ws", "/ws/events"}
 	if err := probeWebSocket(app.baseURL() + "/ws"); err != nil {
@@ -1224,7 +1246,7 @@ func proveRestore(t *testing.T, source *appProcess, value fixture, sourceRows ro
 	if exit, err := target.stop(); err != nil || exit != 0 {
 		t.Fatalf("restored shutdown exit=%d err=%v\n%s", exit, err, target.log.String())
 	}
-	if !reflect.DeepEqual(sourceRows, restoredRows) || !reflect.DeepEqual(sourceSurfaces.MCPTools, restoredSurfaces.MCPTools) || len(restoredSurfaces.MCPCalls) != 7 {
+	if !reflect.DeepEqual(sourceRows, restoredRows) || !reflect.DeepEqual(sourceSurfaces.MCPTools, restoredSurfaces.MCPTools) || len(restoredSurfaces.MCPCalls) != 9 {
 		t.Fatalf("restored contract mismatch: source=%#v target=%#v", sourceRows, restoredRows)
 	}
 	manifestData, err := os.ReadFile(filepath.Join(createReport.Bundle, "manifest.json"))
@@ -1334,7 +1356,7 @@ func TestDatabaseLifecycle(t *testing.T) {
 	if !reflect.DeepEqual(preRestart, postRestart) {
 		t.Fatalf("restart fingerprint changed: before=%#v after=%#v", preRestart, postRestart)
 	}
-	if !reflect.DeepEqual(surfaces.MCPTools, restartSurfaces.MCPTools) || len(restartSurfaces.MCPCalls) != 7 {
+	if !reflect.DeepEqual(surfaces.MCPTools, restartSurfaces.MCPTools) || len(restartSurfaces.MCPCalls) != 9 {
 		t.Fatalf("restart surface contract changed: %#v", restartSurfaces)
 	}
 	restore := proveRestore(t, app, value, postRestart, restartSurfaces, proofDir)
@@ -1349,7 +1371,7 @@ func TestDatabaseLifecycle(t *testing.T) {
 		{Name: "six_logs_six_metric_series", Passed: postRestart.Logs == 6 && postRestart.MetricBuckets == 6},
 		{Name: "representative_rest_complete", Passed: len(restartSurfaces.RESTPaths) >= 9},
 		{Name: "both_websockets_complete", Passed: len(restartSurfaces.WebSockets) == 2},
-		{Name: "seven_mcp_tools_listed_and_called", Passed: len(restartSurfaces.MCPTools) == 7 && len(restartSurfaces.MCPCalls) == 7},
+		{Name: "nine_mcp_tools_have_expected_responses", Passed: len(restartSurfaces.MCPTools) == 9 && len(restartSurfaces.MCPCalls) == 9},
 		{Name: "stale_rows_purged_live_rows_retained", Passed: reflect.DeepEqual(preRestart, postRestart)},
 		{Name: "graceful_restart_preserved_fingerprint", Passed: preRestart.Digest == postRestart.Digest},
 		{Name: "fresh_target_restore_preserved_fingerprint", Passed: restore.SourceFingerprint == restore.RestoredFingerprint},

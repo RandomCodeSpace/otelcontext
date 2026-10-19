@@ -81,7 +81,7 @@ func (r *Repository) PurgeExemplarsBatched(ctx context.Context, cutoff time.Time
 			// yet (Export writes traces and spans separately) is never a
 			// candidate.
 			res = tx.Exec(
-				batchedDeleteSQL(r.driver, "spans", "start_time < ? AND trace_id NOT IN (SELECT trace_id FROM traces)"),
+				batchedDeleteSQL(r.driver, "spans", expiredOrphanSpansPredicate),
 				cutoff, batchSize,
 			)
 			if res.Error != nil {
@@ -141,7 +141,7 @@ func (r *Repository) PurgeExemplarsBatched(ctx context.Context, cutoff time.Time
 			return stats, err
 		}
 		res := r.db.WithContext(ctx).Exec(
-			batchedDeleteSQL(r.driver, "spans", "start_time < ? AND trace_id NOT IN (SELECT trace_id FROM traces)"),
+			batchedDeleteSQL(r.driver, "spans", expiredOrphanSpansPredicate),
 			cutoff, batchSize,
 		)
 		if res.Error != nil {

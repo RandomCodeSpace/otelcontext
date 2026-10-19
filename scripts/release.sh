@@ -114,18 +114,14 @@ if [ "${#blocked[@]}" -gt 0 ]; then
 fi
 echo "✓ all ${#required[@]} required checks succeeded for $SHA"
 
-# The release must honor the Go 1.26.5 ceiling without auto-selecting a newer toolchain.
+# Release with the same patched toolchain used by CI, without auto-selection.
 export GOTOOLCHAIN=local
 go_version="$(go env GOVERSION)"
-if [[ ! "$go_version" =~ ^go1\.([0-9]+)\.([0-9]+)$ ]]; then
-  fail "unsupported release toolchain: $go_version (maximum go1.26.5)"
+required_go="go$(awk '$1 == "go" { print $2; exit }' go.mod)"
+if [[ "$go_version" != "$required_go" ]]; then
+  fail "unsupported release toolchain: $go_version (required $required_go from go.mod)"
 fi
-go_minor="${BASH_REMATCH[1]}"
-go_patch="${BASH_REMATCH[2]}"
-if (( go_minor > 26 || (go_minor == 26 && go_patch > 5) )); then
-  fail "release toolchain $go_version exceeds maximum go1.26.5"
-fi
-echo "✓ release toolchain $go_version is within the go1.26.5 ceiling"
+echo "✓ release toolchain $go_version matches go.mod"
 
 CHECK_BIN="$(mktemp "${TMPDIR:-/tmp}/otelcontext-release-check.XXXXXX")"
 trap 'rm -f "$CHECK_BIN"' EXIT

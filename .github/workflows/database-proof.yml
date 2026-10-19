@@ -156,8 +156,8 @@ jobs:
             .post_restart_fingerprint.spans == 6 and
             .post_restart_fingerprint.logs == 6 and
             .post_restart_fingerprint.metric_buckets == 6 and
-            (.surfaces.mcp_tools | length) == 7 and
-            (.surfaces.mcp_calls | length) == 7 and
+            (.surfaces.mcp_tools | length) == 9 and
+            (.surfaces.mcp_calls | length) == 9 and
             .restore.source_fingerprint == .restore.restored_fingerprint and
             all(.assertions[]; .passed == true)
           ' "${RUNNER_TEMP}/database-proof/database-proof-v1.json"
@@ -311,8 +311,8 @@ jobs:
             .post_restart_fingerprint.spans == 6 and
             .post_restart_fingerprint.logs == 6 and
             .post_restart_fingerprint.metric_buckets == 6 and
-            (.surfaces.mcp_tools | length) == 7 and
-            (.surfaces.mcp_calls | length) == 7 and
+            (.surfaces.mcp_tools | length) == 9 and
+            (.surfaces.mcp_calls | length) == 9 and
             .restore.source_fingerprint == .restore.restored_fingerprint and
             all(.assertions[]; .passed == true)
           ' "${RUNNER_TEMP}/database-proof/database-proof-v1.json"
@@ -345,23 +345,13 @@ jobs:
     timeout-minutes: 25
     env:
       CGO_ENABLED: '1'
-    services:
-      mysql:
-        image: mysql:8.4.11@sha256:b3b90af2a6552ae30c266fdb7d5dd55f3afb72404bb78d37fe8a23eb857fd3fb
-        env:
-          MYSQL_ROOT_PASSWORD: proof-${{ github.run_id }}
-          MYSQL_DATABASE: otelcontext
-        ports:
-          - 3306:3306
-        options: >-
-          --health-cmd "MYSQL_PWD=$MYSQL_ROOT_PASSWORD mysqladmin ping --host=127.0.0.1 --user=root"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 24
     steps:
       - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.candidate_ref || github.sha }}
+
+      - name: Start MySQL with an ephemeral credential
+        run: bash scripts/start-proof-database.sh mysql
 
       - uses: actions/setup-go@v7
         with:
@@ -410,7 +400,7 @@ jobs:
         env:
           OTELCONTEXT_TEST_BINARY: ${{ runner.temp }}/otelcontext
           OTELCONTEXT_TEST_DRIVER: mysql
-          OTELCONTEXT_TEST_DSN: root:proof-${{ github.run_id }}@tcp(127.0.0.1:3306)/otelcontext?charset=utf8mb4&parseTime=True&loc=UTC
+          OTELCONTEXT_TEST_DSN: root:${{ env.MYSQL_ROOT_PASSWORD }}@tcp(127.0.0.1:3306)/otelcontext?charset=utf8mb4&parseTime=True&loc=UTC
           OTELCONTEXT_TEST_REQUIRE_DB: '1'
           OTELCONTEXT_PROOF_DIR: ${{ runner.temp }}/database-proof
           OTELCONTEXT_TEST_NATIVE_RESTORE_PROOF: ${{ runner.temp }}/database-proof/native/mysql.json
@@ -425,12 +415,19 @@ jobs:
             .driver == "mysql" and
             .tier == "preview" and
             .migration.state == "unverified-preview" and
-            (.surfaces.mcp_tools | length) == 7 and
-            (.surfaces.mcp_calls | length) == 7 and
+            (.surfaces.mcp_tools | length) == 9 and
+            (.surfaces.mcp_calls | length) == 9 and
             .restore.kind == "native-fresh-target" and
             .restore.source_fingerprint == .restore.restored_fingerprint and
             all(.assertions[]; .passed == true)
           ' "${RUNNER_TEMP}/database-proof/database-proof-v1.json"
+
+      - name: Remove disposable database
+        if: ${{ always() }}
+        run: |
+          if docker inspect otelcontext-dbproof-mysql >/dev/null 2>&1; then
+            docker rm --force otelcontext-dbproof-mysql
+          fi
 
       - name: Upload MySQL 8.4 database proof
         if: ${{ always() }}
@@ -450,25 +447,13 @@ jobs:
     timeout-minutes: 35
     env:
       CGO_ENABLED: '1'
-    services:
-      sqlserver:
-        image: mcr.microsoft.com/mssql/server:2022-CU26-ubuntu-22.04@sha256:ba4c8329f48fb8f02e1416be6a930ebfd71268caee78aa985f3af4315e457c89
-        env:
-          ACCEPT_EULA: Y
-          MSSQL_SA_PASSWORD: Otc-${{ github.run_id }}-Proof!
-          MSSQL_PID: Developer
-          MSSQL_MEMORY_LIMIT_MB: '2048'
-        ports:
-          - 1433:1433
-        options: >-
-          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -S 127.0.0.1 -U sa -P 'Otc-${{ github.run_id }}-Proof!' -C -Q 'SELECT 1'"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 30
     steps:
       - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.candidate_ref || github.sha }}
+
+      - name: Start SQL Server with an ephemeral credential
+        run: bash scripts/start-proof-database.sh sqlserver
 
       - uses: actions/setup-go@v7
         with:
@@ -481,10 +466,12 @@ jobs:
 
       - name: Require SQL Server 2022 and create lifecycle database
         env:
-          SQLSERVER_ID: ${{ job.services.sqlserver.id }}
+          SQLSERVER_ID: otelcontext-dbproof-sqlserver
         run: |
-          docker exec "${SQLSERVER_ID}" /opt/mssql-tools18/bin/sqlcmd -S 127.0.0.1 -U sa -P 'Otc-${{ github.run_id }}-Proof!' -C -b -Q "SELECT CONVERT(varchar(128), SERVERPROPERTY('ProductVersion'))" | grep '16.0.4265.3'
-          docker exec "${SQLSERVER_ID}" /opt/mssql-tools18/bin/sqlcmd -S 127.0.0.1 -U sa -P 'Otc-${{ github.run_id }}-Proof!' -C -b -Q "CREATE DATABASE [otelcontext]"
+          set -euo pipefail
+          export SQLCMDPASSWORD="${MSSQL_SA_PASSWORD}"
+          docker exec --env SQLCMDPASSWORD "${SQLSERVER_ID}" /opt/mssql-tools18/bin/sqlcmd -S 127.0.0.1 -U sa -C -b -Q "SELECT CONVERT(varchar(128), SERVERPROPERTY('ProductVersion'))" | grep '16.0.4265.3'
+          docker exec --env SQLCMDPASSWORD "${SQLSERVER_ID}" /opt/mssql-tools18/bin/sqlcmd -S 127.0.0.1 -U sa -C -b -Q "CREATE DATABASE [otelcontext]"
 
       - name: Build candidate once
         if: ${{ inputs.candidate_artifact == '' }}
@@ -524,7 +511,7 @@ jobs:
         env:
           OTELCONTEXT_TEST_BINARY: ${{ runner.temp }}/otelcontext
           OTELCONTEXT_TEST_DRIVER: mssql
-          OTELCONTEXT_TEST_DSN: sqlserver://sa:Otc-${{ github.run_id }}-Proof%21@127.0.0.1:1433?database=otelcontext&encrypt=disable&TrustServerCertificate=true
+          OTELCONTEXT_TEST_DSN: sqlserver://sa:${{ env.MSSQL_SA_PASSWORD }}@127.0.0.1:1433?database=otelcontext&encrypt=disable&TrustServerCertificate=true
           OTELCONTEXT_TEST_REQUIRE_DB: '1'
           OTELCONTEXT_PROOF_DIR: ${{ runner.temp }}/database-proof
           OTELCONTEXT_TEST_NATIVE_RESTORE_PROOF: ${{ runner.temp }}/database-proof/native/mssql.json
@@ -539,12 +526,19 @@ jobs:
             .driver == "mssql" and
             .tier == "experimental" and
             .migration.state == "unverified-preview" and
-            (.surfaces.mcp_tools | length) == 7 and
-            (.surfaces.mcp_calls | length) == 7 and
+            (.surfaces.mcp_tools | length) == 9 and
+            (.surfaces.mcp_calls | length) == 9 and
             .restore.kind == "native-fresh-target" and
             .restore.source_fingerprint == .restore.restored_fingerprint and
             all(.assertions[]; .passed == true)
           ' "${RUNNER_TEMP}/database-proof/database-proof-v1.json"
+
+      - name: Remove disposable database
+        if: ${{ always() }}
+        run: |
+          if docker inspect otelcontext-dbproof-sqlserver >/dev/null 2>&1; then
+            docker rm --force otelcontext-dbproof-sqlserver
+          fi
 
       - name: Upload SQL Server 2022 database proof
         if: ${{ always() }}
