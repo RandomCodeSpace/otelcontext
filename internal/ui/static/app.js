@@ -561,7 +561,7 @@ function chooseCommandService(service) {
     const tab = mode === "root-cause" ? "why" : "impact";
     const tool = mode === "root-cause" ? "root_cause_analysis" : "impact_analysis";
     selectTab(tab, false);
-    runTool(tool, service);
+    void runTool(tool, service);
   }
 }
 
@@ -611,7 +611,7 @@ function renderCommandMenu() {
       }],
       ["Copy MCP URL", window.location.origin + "/mcp", "copy-mcp", () => {
         dom.commandDialog.close();
-        copyMCPURL();
+        void copyMCPURL();
       }],
     ].filter((item) => commandMatches(item[0], item[1])).map((item) =>
       commandItem(item[0], item[1], "command", item[2], item[3])
@@ -679,7 +679,7 @@ async function refresh(options) {
     // Silent refreshes arrive with every WebSocket snapshot; the panel's
     // five series follow the slower poll cadence unless asked explicitly.
     const loaded = state.hostMetrics.get(state.selectedHost);
-    if (!silent || !loaded || Date.now() - loaded.loadedAt > POLL_INTERVAL_MS) loadHostMetrics(state.selectedHost);
+    if (!silent || !loaded || Date.now() - loaded.loadedAt > POLL_INTERVAL_MS) void loadHostMetrics(state.selectedHost);
   }
 
   if (results[0].status === "fulfilled") {
@@ -2119,7 +2119,7 @@ function openHost(candidate) {
   renderGraph();
   renderServiceLists();
   renderInspector();
-  loadHostMetrics(host);
+  void loadHostMetrics(host);
   showToast("Host " + host + " opened.");
   window.setTimeout(() => dom.closeInspector.focus(), 0);
 }
@@ -2290,7 +2290,7 @@ function scheduleWebSocketRefresh() {
   if (document.visibilityState !== "visible" || wsRefreshTimer) return;
   wsRefreshTimer = window.setTimeout(() => {
     wsRefreshTimer = null;
-    refresh({ silent: true });
+    void refresh({ silent: true });
   }, 1200);
 }
 
@@ -2511,7 +2511,7 @@ function bindEvents() {
     }
     if (event.key.toLowerCase() === "h" && !editable && !event.ctrlKey && !event.metaKey && !event.altKey) {
       event.preventDefault();
-      setGroupBy(state.groupBy === "host" ? "service" : "host");
+      void setGroupBy(state.groupBy === "host" ? "service" : "host");
       return;
     }
     if (event.key === "Escape" && (state.selected || state.selectedHost || state.selectedEdge)) {
@@ -2526,7 +2526,7 @@ function bindEvents() {
   window.addEventListener("popstate", () => {
     readURL();
     renderAll();
-    if (state.selectedHost) loadHostMetrics(state.selectedHost);
+    if (state.selectedHost) void loadHostMetrics(state.selectedHost);
   });
   let resizeFit = false;
   let resizeTimer;
@@ -2567,7 +2567,7 @@ function bindEvents() {
   window.addEventListener("online", connectWebSocket);
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") {
-      refresh({ silent: true });
+      void refresh({ silent: true });
       connectWebSocket();
     }
   });
@@ -2576,10 +2576,10 @@ function bindEvents() {
 function startPolling() {
   window.setInterval(renderUptime, 1000);
   window.setInterval(() => {
-    if (document.visibilityState === "visible") refresh({ silent: true });
+    if (document.visibilityState === "visible") void refresh({ silent: true });
   }, POLL_INTERVAL_MS);
   window.setInterval(() => {
-    if (document.visibilityState === "visible") refreshAnomalies();
+    if (document.visibilityState === "visible") void refreshAnomalies();
   }, 60000);
 }
 
@@ -2589,8 +2589,8 @@ renderConnectionEndpoints();
 bindEvents();
 setViewBox(state.viewBox);
 renderAll();
-refresh({ silent: false });
-refreshAnomalies();
+void refresh({ silent: false });
+void refreshAnomalies();
 connectWebSocket();
 startPolling();
 
