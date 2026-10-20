@@ -4,6 +4,10 @@ These commands prepare synthetic history for root's integrated acceptance run.
 They do not start the three-hour load. Run from the repository root. No additional
 Python packages or Go modules are needed.
 
+Current production-200 durations and inclusive latency limits are documented in
+the [load profile](../loadsim/README.md#current-production-200-acceptance-targets).
+Fixture counts alone do not establish those acceptance results.
+
 ## Data and bounds
 
 | Fixture | Default shape | Written data |

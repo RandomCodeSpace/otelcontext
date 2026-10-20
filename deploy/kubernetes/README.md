@@ -92,7 +92,7 @@ suppressed. Reassess if enabling integrations or changing build inputs.
 
 ## Storage, capacity, and ownership
 
-This **test candidate** requests and limits OtelContext to **3 CPU and 6 GiB RAM**
+The configured stack requests and limits OtelContext to **3 CPU and 6 GiB RAM**
 and Prometheus to **1 CPU and 2 GiB RAM**. Together they request and limit **4 CPU
 and 8 GiB RAM**, with **48 GiB provisioned storage**. Shared Istio ingress,
 pod/runtime and node overhead are additional; this is not a total-node capacity
@@ -104,22 +104,23 @@ the largest init-container request or limit. The app pod's effective request and
 limit therefore remain 3 CPU/6 GiB, including initialization. See
 [init-container resource accounting](https://kubernetes.io/docs/concepts/workloads/pods/init-containers/#resource-sharing-within-containers).
 
-Keep `GOMEMLIMIT=3GiB` and `GOMAXPROCS=4` for the first partition test.
-`GOMAXPROCS` controls Go parallelism; it does not raise the 3 CPU quota.
-This split is unvalidated: observed low Prometheus CPU use does not establish
-1 CPU/2 GiB sufficiency, and the memory split changes cache headroom. A native
-profile with a shared 4 CPU/8 GiB parent that permits the app 4 CPU does not
-validate this partition. The next coordinated acceptance must enforce app
-3 CPU/6 GiB and Prometheus 1 CPU/2 GiB as children of the shared 4 CPU/8 GiB
-parent, with test TLS in that same parent. Include startup/migration, ingestion,
-rollups and concurrent queries; keep existing latency, ACK and storage gates.
+`GOMEMLIMIT=3GiB` and `GOMAXPROCS=4` remain unchanged. `GOMAXPROCS` controls
+Go parallelism; it does not raise the 3 CPU quota. The October 20 r4 local run
+enforced app 3 CPU/6 GiB and Prometheus 1 CPU/2 GiB beneath a shared 4 CPU/8 GiB
+parent, including test TLS in that parent. Its recorded measurements meet the
+[current production-200 targets](../../test/loadsim/README.md#current-production-200-acceptance-targets)
+after the sustained ACK p99 target changed to 600 ms. The historical 500 ms
+verdict remains FAIL; this reassessment adds no new performance measurement.
+The run used aged history with gaps. See the
+[release evidence](../../docs/release-notes/v0.6.3-readiness.md) for its limits.
 Actual Istio, CSI/PVC and node-overhead acceptance remains separate.
 
 The 16 GiB application PVC stores the main DB, aggregate DB, DLQ, and shutdown
 receipts under `/var/lib/otelcontext`. The measured sizing candidates are
 `READY_AGGREGATE_DISK_BUDGET_MB=6144` (6 GiB, aggregate DB only) and
-`DATA_DISK_BUDGET_MB=14336` (14 GiB, total application data). Combined runtime
-acceptance is still pending; these values are not a certified minimum.
+`DATA_DISK_BUDGET_MB=14336` (14 GiB, total application data). The bounded r4
+local run exercised these budgets; fresh dense combined history acceptance
+remains unverified. These values are not a certified minimum.
 
 The October 19 seven-day fixture contains 29,232,000 aggregate buckets across
 14,500 series. All 169 eligible hourly rollups completed. The checkpointed

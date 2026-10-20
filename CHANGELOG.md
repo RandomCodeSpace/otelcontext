@@ -12,6 +12,40 @@ most recently published tag.
 
 ## [Unreleased]
 
+## [v0.6.3] - 2026-10-20
+
+### Fixed
+
+- Retained dashboard, traffic and service-map reads use hourly rollups and
+  service summaries while preserving exact totals, snapshot consistency,
+  latency provenance and authoritative five-minute fallback. Dictionary value
+  lookup and retention cleanup avoid unnecessary retained-history scans.
+- MCP trace and investigation tools read persisted evidence after restart,
+  disclose partial history and identity loss, and bound trace/log reads before
+  materialization. Time-relative and PromQL results avoid stale cache reuse.
+- SQLite `migrate up` provisions and backfills configured log FTS even when
+  schema 4 is already exact. Production startup validates the configured index
+  without silently repairing it.
+- Ingestion admission accounts for queued bytes and bounded commit waiters.
+  Readiness uses an independent SQLite probe; disk pressure includes database
+  sidecars and external configured stores. Host-only telemetry retains host IDs,
+  and rate limits use the socket peer unless trusted proxies are configured.
+
+### Changed
+
+- Add singleton Kubernetes/Istio deployment manifests with a configured
+  4 CPU/8 GiB stack split: app 3 CPU/6 GiB, Prometheus 1 CPU/2 GiB. OS and
+  infrastructure overhead are additional. Go parallelism, heap and disk budgets
+  remain unchanged by this partition.
+- Set the bounded production-200 sustained all-signal ACK p99 target to an
+  inclusive 600 ms over 360 seconds. Burst remains an inclusive 1,000 ms over
+  the full 60 seconds; HTTP/MCP limits remain 15/5 seconds. Existing r4
+  measurements meet the revised local targets without a rerun; the historical
+  500 ms FAIL remains unchanged.
+- Read the [upgrade steps and readiness qualifications](docs/release-notes/v0.6.3-readiness.md)
+  before upgrading. Aged history and separate capacity fixtures do not establish
+  fresh dense combined history, a real seven-day soak, or deployment acceptance.
+
 ## [v0.6.2] - 2026-10-19
 
 ### Added

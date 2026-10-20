@@ -89,6 +89,29 @@ does not identify rejected timestamps. A warning with zero rejected points still
 counts as accepted. Host attributes are mocked specifications, not measurements
 of the test machine; capture actual server CPU, RAM and cgroup limits separately.
 
+## Current production-200 acceptance targets
+
+The bounded local profile uses 200 services and 20 hosts within a shared
+4 CPU/8 GiB stack budget: OtelContext 3 CPU/6 GiB and Prometheus 1 CPU/2 GiB.
+OS, Kubernetes and injected Istio overhead are additional.
+
+- Sustained load: 13,400 points/s for 360 seconds; combined all-signal ACK p99
+  must be **at most 600 ms**, inclusive.
+- Burst: 2x load for the full 60 seconds; combined all-signal ACK p99 must be
+  **at most 1,000 ms**, inclusive.
+- Seven-day HTTP reads must each complete within **15 seconds**, inclusive;
+  MCP reads within **5 seconds**, inclusive.
+- Exact acknowledged aggregate reconciliation, native sample accounting, no
+  unexpected drops or identity overflow, healthy readiness, no OOM, and cleanup
+  remain required.
+
+The sustained target changed from 500 ms by user decision on October 20, 2026.
+The simulator reports measurements; it does not enforce these production-200
+acceptance targets. The separate `test/gate` release profile keeps its existing
+criteria. Historical measurements and their original verdicts remain unchanged.
+See the [v0.6.3 evidence and qualifications](../../docs/release-notes/v0.6.3-readiness.md)
+for the existing r4 run's reassessment; no new load run accompanied this decision.
+
 ## Output
 
 Progress lines show per-signal counters, e.g.
