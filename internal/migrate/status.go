@@ -114,6 +114,10 @@ var ownedTableNames = []string{
 	"logs",
 	"investigations",
 	"drain_templates",
+	"promql_series",
+	"promql_samples",
+	"topology_entities",
+	"topology_buckets",
 }
 
 func schemaSpec(version int) map[string]tableSpec {
@@ -196,6 +200,26 @@ func schemaSpec(version int) map[string]tableSpec {
 				"idx_resource_registry_last_seen": {columns: []string{"last_seen"}},
 			},
 		}
+	}
+	if version >= 5 {
+		spec["promql_series"] = tableSpec{columns: []string{"id", "tenant_id", "name", "labels", "last_timestamp"}, primary: []string{"id"}, indexes: map[string]indexSpec{
+			"idx_promql_series_tenant_name":    {columns: []string{"tenant_id", "name"}},
+			"idx_promql_series_last_timestamp": {columns: []string{"last_timestamp"}},
+		}}
+		spec["promql_samples"] = tableSpec{columns: []string{"id", "series_id", "timestamp", "start_timestamp", "payload"}, primary: []string{"id"}, indexes: map[string]indexSpec{
+			"idx_promql_samples_series_time": {columns: []string{"series_id", "timestamp"}, unique: true},
+			"idx_promql_samples_timestamp":   {columns: []string{"timestamp"}},
+		}}
+	}
+
+	if version >= 6 {
+		spec["topology_entities"] = tableSpec{columns: []string{"id", "tenant_id", "environment", "namespace", "service", "instance", "host", "workload", "identity", "source", "target", "signals", "first_seen", "last_seen"}, primary: []string{"id"}, indexes: map[string]indexSpec{
+			"idx_topology_entities_tenant":    {columns: []string{"tenant_id", "environment"}},
+			"idx_topology_entities_last_seen": {columns: []string{"last_seen"}},
+		}}
+		spec["topology_buckets"] = tableSpec{columns: []string{"entity_id", "window_start", "spans", "requests", "errors", "duration_micros"}, primary: []string{"entity_id", "window_start"}, indexes: map[string]indexSpec{
+			"idx_topology_buckets_window": {columns: []string{"window_start"}},
+		}}
 	}
 	return spec
 }

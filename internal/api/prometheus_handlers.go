@@ -210,7 +210,7 @@ func (s *Server) handlePrometheusMetricBuckets(w http.ResponseWriter, r *http.Re
 	}
 	sort.SliceStable(buckets, func(i, j int) bool { return buckets[i].TimeBucket.Before(buckets[j].TimeBucket) })
 	setCoverage(w, aggregate.CoverageSampled)
-	w.Header().Set("OtelContext-Metric-Source", "prometheus")
+	w.Header().Set("OtelContext-Metric-Source", s.prometheusClient.Source())
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(buckets)
 }
@@ -244,7 +244,7 @@ func (s *Server) handlePrometheusMetricNames(w http.ResponseWriter, r *http.Requ
 	// Label discovery can include retained index entries outside sample
 	// availability; do not imply complete data coverage from a name alone.
 	setCoverage(w, aggregate.CoverageSampled)
-	w.Header().Set("OtelContext-Metric-Source", "prometheus")
+	w.Header().Set("OtelContext-Metric-Source", s.prometheusClient.Source())
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(envelope.Data)
 }

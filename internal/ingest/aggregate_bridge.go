@@ -337,6 +337,7 @@ type resourceSlots struct {
 	serviceInstanceID string
 	serviceNamespace  string
 	serviceName       string
+	environment       string
 	host              string
 	hostName          string
 	workload          string
@@ -382,6 +383,12 @@ func scanResourceSlots(attrs []*commonpb.KeyValue) resourceSlots {
 			id.serviceNamespace = kv.Value.GetStringValue()
 		case "service.name":
 			id.serviceName = kv.Value.GetStringValue()
+		case "deployment.environment.name":
+			id.environment = kv.Value.GetStringValue()
+		case "deployment.environment":
+			if id.environment == "" {
+				id.environment = kv.Value.GetStringValue()
+			}
 		case "host.id":
 			id.host = kv.Value.GetStringValue()
 		case "host.name":

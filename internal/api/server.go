@@ -28,8 +28,12 @@ type Server struct {
 	graph    *graph.Graph       // in-memory service dependency graph (may be nil before first build)
 	graphRAG *graphrag.GraphRAG // layered GraphRAG for advanced queries
 	// topology is selected once from AGGREGATE_MODE before listeners start.
-	// It owns every service-map and system-graph read.
-	topology topology.Provider
+	// It owns the existing service-map and system-graph reads; instanceGraph
+	// serves the separate environment/instance projection.
+	topology      topology.Provider
+	instanceGraph *topology.InstanceGraph
+	topologyReads chan struct{}
+	runtimeFiles  RuntimeFiles
 
 	// Saturation probes consulted by /ready. Each returns a fullness
 	// fraction in [0.0, 1.0]; nil disables the corresponding check.
@@ -44,7 +48,7 @@ type Server struct {
 	// to the engine branches on aggregateReads(), so legacy responses stay
 	// byte-for-byte what they were.
 	aggregateEngine  *aggregate.Engine
-	prometheusClient *prometheus.Client
+	prometheusClient prometheus.Backend
 	prometheusReady  func(context.Context) error
 
 	// aggregateRecovered reports whether the durable aggregate store has
@@ -147,11 +151,12 @@ func (s *Server) thresholds() ReadinessThresholds {
 // NewServer creates a new API server.
 func NewServer(repo *storage.Repository, hub *realtime.Hub, eventHub *realtime.EventHub, metrics *telemetry.Metrics) *Server {
 	s := &Server{
-		repo:     repo,
-		hub:      hub,
-		eventHub: eventHub,
-		metrics:  metrics,
-		cache:    cache.NewBounded(apiCacheEntries, apiCacheByteLimit),
+		repo:          repo,
+		hub:           hub,
+		eventHub:      eventHub,
+		metrics:       metrics,
+		cache:         cache.NewBounded(apiCacheEntries, apiCacheByteLimit),
+		topologyReads: make(chan struct{}, 4),
 	}
 	metrics.RegisterReadCache("api_ttl", s.cache.Len)
 	return s
@@ -164,7 +169,7 @@ func (s *Server) SetGraph(g *graph.Graph) {
 
 // SetPrometheusClient enables retained metrics and PromQL for its bound tenant.
 // Call before serving requests. Other tenants retain their existing read path.
-func (s *Server) SetPrometheusClient(client *prometheus.Client) {
+func (s *Server) SetPrometheusClient(client prometheus.Backend) {
 	s.prometheusClient = client
 }
 
@@ -276,6 +281,9 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 
 	// System Graph (AI-consumable topology + health)
 	mux.HandleFunc("GET /api/system/graph", s.handleGetSystemGraph)
+	mux.HandleFunc("GET /api/topology/catalog", s.handleTopologyCatalog)
+	mux.HandleFunc("GET /api/topology/graph", s.handleInstanceGraph)
+	mux.HandleFunc("GET /api/stats/runtime", s.handleRuntimeStats)
 
 	// Hosts (#288): the resource registry projected through the topology owner
 	mux.HandleFunc("GET /api/hosts", s.handleGetHosts)

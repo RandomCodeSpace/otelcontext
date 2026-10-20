@@ -129,12 +129,130 @@ For an authenticated deployment, add an `authorization` bearer header and, if ne
 
 </details>
 
+## Service and instance map
+
+Open **`/service-map`**, or use **Service & instance map** in the existing
+explorer. Choose an environment and time range, then apply the filters. Select
+a service to load its one- or two-hop neighborhood; **Inspect instances**
+expands the observed callers and dependencies into individual instances.
+Selecting a node or directed call edge opens its identity, traffic, average
+latency, and errors in the inspector. Refresh is manual.
+
+Send these **resource attributes** from each application:
+
+| Attribute | Purpose |
+|---|---|
+| `service.name` | Logical service, shared by its replicas |
+| `service.namespace` | Separates services with the same name in different applications |
+| `service.instance.id` | Distinguishes each running copy |
+| `deployment.environment.name` | Separates Dev, Test, and other environments |
+| `host.id` or `host.name` | Displays the latest reported host placement |
+
+The legacy `deployment.environment` attribute is also accepted. Missing
+environments appear under **Unknown**; host names never determine an environment.
+Calls require trace parent/child context propagated between applications.
+Sharing a host creates no call edge. Calls between two instances of the same
+service remain visible in the instance view.
+
+The map works with SQLite and PostgreSQL in both legacy and aggregate modes.
+Run `otelcontext migrate up` with the deployment's database configuration before
+starting the new binary: additive schema version **6** creates
+`topology_entities` and `topology_buckets`. Existing history is preserved, but
+old telemetry cannot supply instance identities that were never retained.
+MySQL and SQL Server retain the existing explorer; the new topology API reports
+that this projection is unavailable.
+
+Topology is a **best-effort visualization**, built from accepted traces before
+exemplar sampling. It stores five-minute summaries in the main database, with
+the configured `HOT_RETENTION_DAYS`. Summaries flush every five seconds and on
+graceful shutdown; a crash may lose the unflushed interval. Parent joins and
+retry deduplication last five minutes in memory and reset on restart.
+Host-only identities are marked unresolved; explicit instance IDs, or a host
+plus workload identity, distinguish copies. Metrics-only and logs-only
+resources can appear without invented call edges or trace rates.
+
+Reads are limited to 24 hours, 40 displayed nodes by default (100 maximum),
+200 edges, and 50,000 stored summary rows per request. Environment and
+neighborhood filters run before the storage read. The process retains at most
+20,000 node/edge identities and 100,000 correlation spans. The UI reports
+truncated results, incomplete identities, and limited evidence. These bounds
+do not establish a load-tested performance or disk-size guarantee.
+
+**Storage & ingestion** separates the main database, aggregate database, and
+both databases' WAL/SHM files. Sizes include indexes and reusable space, not
+just retained payloads. Export counters count successful OTLP requests,
+including partial-success responses, since process start; they are not event
+counts. Server ACK p99 uses the latest 1,024 successful exports and excludes
+network time. Memory is Go heap allocation. These stats are server-wide;
+topology reads remain tenant-scoped. The backing endpoints are
+`/api/topology/catalog`, `/api/topology/graph`, and `/api/stats/runtime`.
+
 ## Query ingested metrics with PromQL
 
-Set `PROMETHEUS_URL` to enable an optional Prometheus backend. With it unset,
-existing ingestion and metric reads keep their local paths. The `/metrics`
-scrape still reports OtelContext's own health and counters; PromQL queries the
-application and host metrics sent through OTLP.
+### Local database (no Prometheus server)
+
+Enable the embedded upstream PromQL engine over original metric samples stored
+in OtelContext's **main SQLite or PostgreSQL database**:
+
+```dotenv
+PROMQL_LOCAL_ENABLED=true
+PROMETHEUS_URL=
+PROMETHEUS_TENANT_ID=default
+HOT_RETENTION_DAYS=7
+```
+
+Apply `otelcontext migrate up` with the same database configuration before
+starting the new binary. Schema version 5 adds `promql_series` and
+`promql_samples`; existing tables and summarized history are preserved. The
+usual database backup includes the new tables. Production startup checks the
+schema without migrating it.
+
+The local backend needs no separate process, port, or server. OTLP metric ACKs
+require a successful database commit, and local storage participates in
+readiness. It reuses the existing `PROMETHEUS_TIMEOUT_MS` and concurrency settings
+listed below. `PROMETHEUS_REQUIRED=false` does not make local persistence
+optional. Local mode and `PROMETHEUS_URL` are mutually exclusive. As with the
+external backend, this initial implementation binds queries and metric writes to
+`PROMETHEUS_TENANT_ID` (default: `DEFAULT_TENANT`); other tenants retain their
+existing ingestion path and cannot query this backend.
+
+Original samples are retained **from activation onward**. Older metric buckets
+and aggregate sketches cannot reconstruct original samples, counter resets, or
+labels, so they are not exposed as fabricated PromQL history. Queries use a
+consistent database snapshot and exclude expired samples even before the hourly
+retention worker deletes them. Local retention follows `HOT_RETENTION_DAYS`,
+independently of raw trace/log exemplar retention.
+
+The upstream Prometheus 3.15.0 Go engine and OTLP converter (Apache-2.0) provide
+query and conversion semantics. Names and labels retain UTF-8/dots. Resource
+attributes and instrumentation scope are preserved as series labels. Gauges,
+cumulative counters, classic histogram buckets, native exponential histograms,
+and summary series are supported. **Delta sums and histograms are rejected**;
+configure cumulative SDK export. Queries use millisecond timestamps and the
+standard five-minute lookback. Identical series/timestamp retries are
+idempotent; a different value at the same timestamp rejects the whole batch.
+
+Local requests have additional fixed work bounds: 10,000 input datapoints and
+10,000 translated samples per export; 8 MiB of translated sample/label payload;
+128 labels and 16 KiB of labels per series; 64 KiB per encoded sample. Samples
+outside retention or over five minutes in the future are rejected. Queries
+inspect at most 10,000 candidate series across selectors, select at most 1,000
+series per selector, read at most 100,000 samples / 32 MiB of payload, and use
+the engine's 100,000-sample evaluation bound. Excess work returns an explicit
+error rather than partial aggregates. Narrow selectors or query intervals when
+these bounds are reached. HTTP range queries also enforce 11,000 steps.
+
+Full-resolution metric storage consumes additional database space, including
+indexes and WAL. These request limits are not a total disk quota. Existing
+aggregate-mode capacity measurements do not establish this backend's storage
+or ingestion performance; size retention for the actual metric volume.
+
+### External backend (optional alternative)
+
+Set `PROMETHEUS_URL` with `PROMQL_LOCAL_ENABLED=false` to use an external backend.
+With both disabled, ingestion and metric reads keep their legacy local paths.
+The `/metrics` scrape reports OtelContext's own health and counters; both PromQL
+backends query application and host metrics received through OTLP.
 
 Configure Prometheus with its native OTLP receiver enabled and this configuration:
 
@@ -214,7 +332,7 @@ Responses preserve Prometheus envelopes, labels, timestamps, result types,
 warnings, and backend errors. `GET /api/metadata/metrics` discovers retained
 metric names, with optional `service_name`, `start`, and `end` filters. The
 existing `GET /api/metrics?name=...` view returns evaluated scalar samples for
-the bound tenant, marked `sampled` with `OtelContext-Metric-Source: prometheus`.
+the bound tenant, marked `sampled` with `OtelContext-Metric-Source: local` or `prometheus`.
 It cannot flatten native histograms; use PromQL for those. Host service names
 use `host/<host.id>`, falling back to `host.name` when no host ID is available.
 

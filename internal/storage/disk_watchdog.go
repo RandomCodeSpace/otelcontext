@@ -50,6 +50,10 @@ type DiskUsage struct {
 	AvailBytes int64
 }
 
+// FilesystemUsage exposes the existing portable filesystem sampler for the
+// runtime stats panel. Unsupported platforms return an error, never zero free.
+func FilesystemUsage(path string) (DiskUsage, error) { return statfsUsage(path) }
+
 // UsedBytes is the allocated portion of the volume.
 func (d DiskUsage) UsedBytes() int64 {
 	if d.TotalBytes <= 0 {

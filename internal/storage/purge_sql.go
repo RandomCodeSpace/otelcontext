@@ -21,8 +21,10 @@ func batchedDeleteSQL(driver, table, predicate string) string {
 	case "sqlite", "":
 		order := "id"
 		switch table {
-		case "traces", "logs":
+		case "traces", "logs", "promql_samples":
 			order = "timestamp, id"
+		case "promql_series":
+			order = "last_timestamp, id"
 		case "spans":
 			order = "start_time, id"
 		}

@@ -382,6 +382,9 @@ func AutoMigrateModelsWithOptions(db *gorm.DB, driver string, opts MigrateOption
 	}
 
 	migrateModels := []any{&Trace{}, &Span{}, &MetricBucket{}, &ResourceRegistryEntry{}}
+	if driver == "sqlite" || driver == "" || driver == "postgres" || driver == "postgresql" {
+		migrateModels = append(migrateModels, &PromQLSeries{}, &PromQLSample{}, &TopologyEntity{}, &TopologyBucket{})
+	}
 	if !logsPartitioned {
 		migrateModels = append(migrateModels, &Log{})
 	}
