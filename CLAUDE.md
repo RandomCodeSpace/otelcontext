@@ -4,13 +4,13 @@
 
 OtelContext is a self-hosted OTLP observability platform. Single Go binary with an embedded browser-native frontend.
 - **Backend:** Go 1.25, native `net/http` (no frameworks), GORM ORM, gRPC + HTTP for OTLP ingestion
-- **Frontend:** committed semantic HTML, token CSS, and native browser JavaScript under `internal/ui/static/`. The browser fetches REST and MCP data, listens on WebSocket, and renders the service map as accessible SVG using a deterministic golden-angle phyllotaxis layout. Go embeds these source assets directly; there is no Node.js toolchain or generated bundle.
+- **Frontend:** committed semantic HTML, token CSS, and native browser JavaScript under `internal/ui/static/`. Three pages share one design system (`tokens.css`: Carbon palette, self-hosted Geist fonts, Lucide sprite `icons.svg`; helpers in `shell.js`): **Overview** at `/` (`index.html`, `overview.*`), the layered **Service map** at `/service-map` (services → instances → hosts lanes with instance call edges, `service-map.*`), and the GraphRAG **Explorer** at `/explorer` (`explorer.html`, `app.*`). Go embeds these source assets directly; there is no Node.js toolchain or generated bundle.
 - **Ports:** gRPC `:4317` (OTLP), HTTP `:8080` (API + HTTP OTLP + WebSocket + UI)
 
 ## Strict Rules
 
 - NO Express.js/Gin/Echo — use native Go `net/http`
-- Keep the frontend browser-native. Use semantic HTML, token-based CSS in `internal/ui/static/app.css`, and native browser APIs in `internal/ui/static/app.js`. The pinned, embedded Dagre layout dependency is documented in `docs/dependencies/dagre.md`; no frontend build or runtime CDN is required. Go tests own asset-serving contracts; rendered interaction checks own browser behavior.
+- Keep the frontend browser-native. Use semantic HTML, the shared tokens and components in `internal/ui/static/tokens.css` (page stylesheets add layout only), and native browser APIs in ES modules. Embedded third-party assets are pinned and documented in `docs/dependencies/` (Dagre, Geist, Lucide); no frontend build or runtime CDN is required. Go tests own asset-serving contracts; rendered interaction checks own browser behavior.
 - Single-service architecture (no microservices split)
 - All internal DBs must be **embedded** (no external processes)
 - Relational DB (SQLite/MySQL/PostgreSQL/MSSQL) is the **single source of truth**

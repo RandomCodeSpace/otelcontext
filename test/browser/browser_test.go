@@ -999,7 +999,7 @@ func TestProtectedBrowserWorkflow(t *testing.T) {
 			URLPattern:   "*/api/system/graph*",
 			RequestStage: fetch.RequestStageRequest,
 		}}),
-		chromedp.Navigate(app.baseURL()+"/"),
+		chromedp.Navigate(app.baseURL()+"/explorer"),
 	); err != nil {
 		t.Fatalf("open embedded UI: %v", err)
 	}
@@ -1417,7 +1417,7 @@ func TestProtectedBrowserWorkflow(t *testing.T) {
 	if err := chromedp.Run(ctx, chromedp.EmulateViewport(390, 844)); err != nil {
 		t.Fatalf("set mobile viewport for host grouping: %v", err)
 	}
-	if err := chromedp.Run(ctx, chromedp.Navigate(app.baseURL()+"/?group=host&impact=gateway")); err != nil {
+	if err := chromedp.Run(ctx, chromedp.Navigate(app.baseURL()+"/explorer?group=host&impact=gateway")); err != nil {
 		t.Fatalf("reload host grouping on mobile: %v", err)
 	}
 	requireJS(t, ctx, `document.readyState === "complete" && !!document.querySelector("#host-group-button")`, 10*time.Second)
@@ -1482,7 +1482,7 @@ func TestLatencyLabels(t *testing.T) {
 	defer cancelBrowser()
 	ctx, cancel := context.WithTimeout(browserCtx, 60*time.Second)
 	defer cancel()
-	if err := chromedp.Run(ctx, chromedp.Navigate(app.baseURL()+"/")); err != nil {
+	if err := chromedp.Run(ctx, chromedp.Navigate(app.baseURL()+"/explorer")); err != nil {
 		t.Fatal(err)
 	}
 	requireJS(t, ctx, `document.readyState === "complete" && !!document.querySelector('script[type="module"][src="/static/app.js"]')`, 10*time.Second)

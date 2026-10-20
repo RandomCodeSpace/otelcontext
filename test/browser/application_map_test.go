@@ -65,7 +65,7 @@ func openApplicationMap(t *testing.T, shape, artifacts string) applicationMapPag
 	t.Cleanup(smoke.writeDiagnostics)
 	t.Cleanup(func() { assertNoUnexpectedBrowserEvents(t, recorder) })
 	smoke.phase("application-map-" + shape)
-	if err := chromedp.Run(ctx, cdpruntime.Enable(), network.Enable(), cdplog.Enable(), chromedp.EmulateViewport(1600, 1000), chromedp.Navigate(app.baseURL()+"/")); err != nil {
+	if err := chromedp.Run(ctx, cdpruntime.Enable(), network.Enable(), cdplog.Enable(), chromedp.EmulateViewport(1600, 1000), chromedp.Navigate(app.baseURL()+"/explorer")); err != nil {
 		t.Fatal(err)
 	}
 	requireJS(t, ctx, `document.querySelector("#pulse-services")?.textContent.trim() === "150" && document.querySelector("#loading-state").hidden`, 20*time.Second)
@@ -369,7 +369,7 @@ func verifyMixedApplicationMap(t *testing.T, page applicationMapPage) {
 	mapSearch(t, ctx, isolated)
 	mapClick(t, ctx, "#disconnected-list [data-service]")
 	requireJS(t, ctx, fmt.Sprintf(`document.querySelector("#inspector-title").textContent.trim() === %q`, isolated), 5*time.Second)
-	if err := chromedp.Run(ctx, chromedp.Navigate(page.app.baseURL()+"/?service="+url.QueryEscape(isolated))); err != nil {
+	if err := chromedp.Run(ctx, chromedp.Navigate(page.app.baseURL()+"/explorer?service="+url.QueryEscape(isolated))); err != nil {
 		t.Fatal(err)
 	}
 	requireJS(t, ctx, fmt.Sprintf(`!document.querySelector("#disconnected-inventory").hidden && document.querySelector("#inspector-title").textContent.trim() === %q`, isolated), 10*time.Second)

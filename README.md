@@ -131,12 +131,23 @@ For an authenticated deployment, add an `authorization` bearer header and, if ne
 
 ## Service and instance map
 
-Open **`/service-map`**, or use **Service & instance map** in the existing
-explorer. Choose an environment and time range, then apply the filters. Select
-a service to load its one- or two-hop neighborhood; **Inspect instances**
-expands the observed callers and dependencies into individual instances.
-Selecting a node or directed call edge opens its identity, traffic, average
-latency, and errors in the inspector. Refresh is manual.
+The web UI has three pages, linked from the top bar:
+
+- **Overview** (`/`): health summary, KPIs, the services that need attention,
+  a domain map, services by health with one pip per instance, and storage and
+  ingestion figures.
+- **Service map** (`/service-map`): services, instances and hosts in three
+  lanes.
+- **Explorer** (`/explorer`): the GraphRAG application map with root-cause and
+  impact analysis.
+
+On the **Service map**, choose an environment and time range; the page
+refreshes every minute or on demand. Select a service, instance, host or call
+edge to inspect its identity, traffic, average latency and errors. **Focus** a
+service to load its one- or two-hop neighborhood. Switch to **Instances** to
+show the individual instances with their instance-to-instance call edges, plus
+a "runs on" link from each instance to its host. The view is in the URL
+(`?service_name=`, `?namespace=`, `?mode=`, `?range=`), so it can be shared.
 
 Send these **resource attributes** from each application:
 

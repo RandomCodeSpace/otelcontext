@@ -1,6 +1,9 @@
 import { CARD_WIDTH, CARD_HEIGHT, layoutGraph, partitionNeighborhoods, boundedNeighborhood, topologyKey } from "./map-layout.js";
+import { icon } from "./shell.js";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
+// Health is always encoded by shape as well as colour.
+const STATUS_ICON = { healthy: "circle-check", degraded: "triangle-alert", critical: "octagon-x", unknown: "circle-dashed" };
 const POLL_INTERVAL_MS = 30000;
 const TOOL_CACHE_MS = 300000;
 const HOST_PREFIX = "host/";
@@ -363,6 +366,10 @@ function statusColor(status) {
   return "var(--" + status + ")";
 }
 
+function statusIcon(status) {
+  return icon(STATUS_ICON[status] || STATUS_ICON.unknown, "ic ic-sm status-icon " + status);
+}
+
 function statusRank(node) {
   const order = { critical: 0, degraded: 1, unknown: 2, healthy: 3 };
   return order[normalizeStatus(node)] === undefined ? 2 : order[normalizeStatus(node)];
@@ -391,7 +398,7 @@ function currentNode() {
 
 function updateURL(changes) {
   const url = new URL(window.location.href);
-  if (url.pathname !== "/") url.pathname = "/";
+  if (url.pathname !== "/explorer") url.pathname = "/explorer";
   for (const entry of Object.entries(changes)) {
     if (entry[1] === null || entry[1] === undefined || entry[1] === "") {
       url.searchParams.delete(entry[0]);
@@ -423,7 +430,7 @@ function readURL() {
 function setTheme(theme, persist) {
   document.documentElement.dataset.theme = theme;
   const meta = document.querySelector("meta[name=theme-color]");
-  if (meta) meta.setAttribute("content", theme === "light" ? "#f4f6f9" : "#090b10");
+  if (meta) meta.setAttribute("content", theme === "light" ? "#fbfaf8" : "#161615");
   dom.theme.setAttribute("aria-label", theme === "light" ? "Switch to dark theme" : "Switch to light theme");
   if (persist) {
     try {
@@ -510,7 +517,7 @@ function endpointRow(endpoint) {
     textElement("span", "endpoint-label", endpoint.label),
     textElement("code", "endpoint-value", endpoint.value)
   );
-  const copy = textElement("button", "endpoint-copy", "Copy");
+  const copy = textElement("button", "btn btn-sm endpoint-copy", "Copy");
   copy.type = "button";
   copy.dataset.copyEndpoint = endpoint.key;
   copy.setAttribute("aria-label", "Copy " + endpoint.label);
@@ -793,7 +800,7 @@ function renderUptime() {
 function summaryItem(status, value, label) {
   const item = document.createElement("div");
   item.className = "summary-" + status;
-  item.append(textElement("strong", "", String(value)), textElement("span", "", label));
+  item.append(statusIcon(status), textElement("strong", "", String(value)), textElement("span", "", label));
   return item;
 }
 
@@ -819,12 +826,11 @@ function serviceButton(node) {
   button.setAttribute("aria-current", node.id === state.selected ? "true" : "false");
   button.setAttribute("aria-label", node.id + ", " + status + ", health " + formatRatio(node.health_score, 0));
 
-  const dot = document.createElement("span");
-  dot.className = "status-dot " + status;
-  dot.setAttribute("aria-hidden", "true");
   const main = document.createElement("span");
   main.className = "service-row-main";
-  main.appendChild(textElement("span", "service-name", node.id));
+  const name = textElement("span", "service-name", node.id);
+  name.title = node.id;
+  main.appendChild(name);
   const metrics = node.metrics || {};
   const tail = formatP99(metrics.p99_latency_ms, metrics.latency_provenance);
   let detail = tail.value + " " + tail.label.toLowerCase() + " · " + formatRatio(metrics.error_rate, 1) + " error";
@@ -834,7 +840,7 @@ function serviceButton(node) {
   main.title = tail.explanation;
   const health = textElement("span", "service-health", formatRatio(node.health_score, 0));
   health.style.color = statusColor(status);
-  button.append(dot, main, health);
+  button.append(statusIcon(status), main, health);
   button.addEventListener("click", () => openInspector(node.id));
   return button;
 }
@@ -1360,9 +1366,9 @@ function renderGraph() {
     if (searchMatches && searchMatches.has(node.id)) group.classList.add("is-search-match");
     if (impact && impact.has(node.id)) group.classList.add("is-impact");
     if (searchMatches && !searchMatches.has(node.id) || neighbors && !neighbors.has(node.id) && !hostNode || impact && !impact.has(node.id) && !hostNode) group.classList.add("is-dim");
-    group.appendChild(svgElement("rect", { class: "node-card", width: CARD_WIDTH, height: CARD_HEIGHT, rx: 6 }));
-    group.appendChild(svgElement("rect", { class: "node-status-bar", width: 4, height: CARD_HEIGHT, rx: 2 }));
-    appendCardText(group, "node-kind", 14, 18, hostNode ? "HOST" : status.toUpperCase());
+    group.appendChild(svgElement("rect", { class: "node-card", width: CARD_WIDTH, height: CARD_HEIGHT, rx: 4 }));
+    if (!hostNode) group.appendChild(svgElement("use", { class: "node-icon", href: "/static/icons.svg#i-" + STATUS_ICON[status], x: 14, y: 11, width: 14, height: 14 }));
+    appendCardText(group, "node-kind", hostNode ? 14 : 34, 22, hostNode ? "HOST" : status.toUpperCase());
     const name = hostNode ? hostName : node.id;
     const label = appendCardText(group, "node-label", 14, name.length > 24 ? 36 : 41, "");
     if (name.length > 24) {
@@ -1827,7 +1833,7 @@ function verbFrame(hint, buttonLabel, run) {
   const frame = document.createElement("div");
   frame.className = "verb-frame";
   frame.appendChild(textElement("p", "verb-hint", hint));
-  const button = textElement("button", "action-button", buttonLabel);
+  const button = textElement("button", "btn btn-primary", buttonLabel);
   button.type = "button";
   button.addEventListener("click", run);
   frame.appendChild(button);
@@ -1840,7 +1846,7 @@ function loadingTool(tool, service) {
   const panel = document.createElement("div");
   panel.className = "tool-state";
   panel.append(textElement("span", "spinner", ""), document.createTextNode(" Running analysis…"));
-  const cancel = textElement("button", "secondary-button", "Cancel");
+  const cancel = textElement("button", "btn", "Cancel");
   cancel.type = "button";
   cancel.addEventListener("click", () => cancelTool(tool, service));
   frame.append(panel, cancel);
@@ -1851,7 +1857,7 @@ function errorTool(tool, service, message, label) {
   const frame = document.createElement("div");
   frame.className = "verb-frame";
   frame.appendChild(textElement("p", "tool-state", message));
-  const retry = textElement("button", "action-button", label);
+  const retry = textElement("button", "btn btn-primary", label);
   retry.type = "button";
   retry.addEventListener("click", () => runTool(tool, service));
   frame.appendChild(retry);
@@ -1906,7 +1912,7 @@ function renderWhy(node) {
     });
     frame.appendChild(list);
   }
-  const rerun = textElement("button", "secondary-button", "Re-run");
+  const rerun = textElement("button", "btn", "Re-run");
   rerun.type = "button";
   rerun.addEventListener("click", () => runTool("root_cause_analysis", node.id));
   frame.appendChild(rerun);
@@ -1945,7 +1951,7 @@ function renderImpact(node) {
   const header = document.createElement("div");
   header.className = "impact-result-header";
   header.appendChild(textElement("p", "quiet", affected.length + " downstream service" + (affected.length === 1 ? "" : "s") + " affected"));
-  const show = textElement("button", "secondary-button", "Show on map");
+  const show = textElement("button", "btn", "Show on map");
   show.type = "button";
   show.addEventListener("click", () => showImpactOnMap(node.id));
   header.appendChild(show);
@@ -1971,7 +1977,7 @@ function renderImpact(node) {
     }
     frame.appendChild(list);
   }
-  const rerun = textElement("button", "secondary-button", "Re-run");
+  const rerun = textElement("button", "btn", "Re-run");
   rerun.type = "button";
   rerun.addEventListener("click", () => runTool("impact_analysis", node.id));
   frame.appendChild(rerun);
@@ -2018,6 +2024,11 @@ function openConnection(edge) {
   window.setTimeout(() => dom.closeInspector.focus(), 0);
 }
 
+function setInspectorStatus(status) {
+  dom.inspectorStatus.className = "service-status " + status;
+  dom.inspectorStatus.replaceChildren(...(status === "host" ? [] : [statusIcon(status)]));
+}
+
 function renderInspector() {
   const node = currentNode();
   document.body.classList.toggle("has-inspector", Boolean(state.selected || state.selectedHost || state.selectedEdge));
@@ -2035,7 +2046,7 @@ function renderInspector() {
     const edge = state.graph && state.graph.edges.find((item) => connectionKey(item) === state.selectedEdge);
     dom.inspectorEyebrow.textContent = "Connection details";
     dom.inspectorTitle.textContent = edge ? edge.source + " → " + edge.target : "Connection";
-    dom.inspectorStatus.className = "service-status " + (edge && Number(edge.error_rate) > 0.05 ? "critical" : "unknown");
+    setInspectorStatus(edge && Number(edge.error_rate) > 0.05 ? "critical" : "unknown");
     dom.inspectorHealth.textContent = "";
     dom.inspectorBody.replaceChildren(renderConnection(edge));
     return;
@@ -2044,14 +2055,14 @@ function renderInspector() {
   if (state.selectedHost) {
     const host = hostByName(state.selectedHost);
     dom.inspectorTitle.textContent = state.selectedHost;
-    dom.inspectorStatus.className = "service-status host";
+    setInspectorStatus("host");
     dom.inspectorHealth.textContent = host ? formatCount(host.service_count) + (finite(host.service_count, 0) === 1 ? " service" : " services") : "Not reporting";
     dom.inspectorHealth.style.color = host ? "var(--muted)" : "var(--faint)";
     dom.inspectorBody.replaceChildren(renderHostPanel(host));
     return;
   }
   dom.inspectorTitle.textContent = state.selected;
-  dom.inspectorStatus.className = "service-status " + (node ? normalizeStatus(node) : "unknown");
+  setInspectorStatus(node ? normalizeStatus(node) : "unknown");
   dom.inspectorHealth.textContent = node ? formatRatio(node.health_score, 0) : "Not reporting";
   dom.inspectorHealth.style.color = node ? statusColor(normalizeStatus(node)) : "var(--faint)";
   for (const tab of dom.tabs) {
