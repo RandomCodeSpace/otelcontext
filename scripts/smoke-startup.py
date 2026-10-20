@@ -18,7 +18,10 @@ def free_port():
 
 
 def main():
-    binary = str(Path(sys.argv[1]).resolve(strict=True))
+    if len(sys.argv) != 1:
+        raise SystemExit("usage: python3 scripts/smoke-startup.py (no arguments)")
+    # Only run the artifact built at this checkout's fixed CI output location.
+    binary = str(Path(__file__).resolve().parents[1] / ".ci-bin" / "otelcontext")
     with tempfile.TemporaryDirectory(prefix="otelcontext-startup-") as directory:
         http_port, grpc_port = free_port(), free_port()
         while grpc_port == http_port:
@@ -37,6 +40,7 @@ def main():
             try:
                 deadline = time.monotonic() + 30
                 for endpoint in ("live", "ready"):
+                    last_error = None
                     while True:
                         if proc.poll() is not None:
                             raise RuntimeError(f"server exited before /{endpoint}")
@@ -46,10 +50,13 @@ def main():
                             ) as response:
                                 if response.status == 200:
                                     break
-                        except (OSError, urllib.error.URLError):
-                            pass
+                                last_error = RuntimeError(f"HTTP {response.status}")
+                        except (OSError, urllib.error.URLError) as error:
+                            # Startup may briefly refuse connections or return 503.
+                            # Preserve the last failure if the bounded retry expires.
+                            last_error = error
                         if time.monotonic() >= deadline:
-                            raise TimeoutError(f"/{endpoint} did not become healthy")
+                            raise TimeoutError(f"/{endpoint} did not become healthy") from last_error
                         time.sleep(0.2)
                 proc.terminate()
                 if proc.wait(timeout=30) != 0:

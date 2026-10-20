@@ -55,6 +55,6 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: Build merged source
-        run: go build -trimpath -o "${RUNNER_TEMP}/otelcontext" .
+        run: go build -trimpath -o .ci-bin/otelcontext .
       - name: Migrate, start, check health, stop
-        run: python3 scripts/smoke-startup.py "${RUNNER_TEMP}/otelcontext"
+        run: python3 scripts/smoke-startup.py
