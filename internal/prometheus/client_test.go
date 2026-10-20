@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -184,6 +186,14 @@ func TestClientConfigValidation(t *testing.T) {
 }
 
 func TestClientAdmissionBounds(t *testing.T) {
+	db := localDB(t, filepath.Join(t.TempDir(), "main.db"))
+	backends := []struct {
+		name string
+		new  func(Config) (Backend, error)
+	}{
+		{"external", func(cfg Config) (Backend, error) { return NewClient(cfg) }},
+		{"local", func(cfg Config) (Backend, error) { return NewLocal(db, cfg, time.Hour) }},
+	}
 	for _, tc := range []struct {
 		name string
 		max  int
@@ -193,21 +203,27 @@ func TestClientAdmissionBounds(t *testing.T) {
 		{"active exports", 256, func(c *Config, n int) { c.MaxIngestConcurrent = n }},
 		{"waiting exports", 4096, func(c *Config, n int) { c.MaxIngestWaiters = n }},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			cfg := Config{URL: "http://localhost"}
-			tc.set(&cfg, tc.max)
-			c, err := NewClient(cfg)
-			if err != nil {
-				t.Fatalf("documented maximum refused: %v", err)
-			}
-			c.Close()
-			tc.set(&cfg, tc.max+1)
-			c, err = NewClient(cfg)
-			if err == nil {
-				c.Close()
-				t.Fatal("accepted admission limit above documented maximum")
-			}
-		})
+		for _, backend := range backends {
+			t.Run(backend.name+"/"+tc.name, func(t *testing.T) {
+				cfg := Config{URL: "http://localhost"}
+				for _, valid := range []int{0, 1, tc.max} {
+					tc.set(&cfg, valid)
+					c, err := backend.new(cfg)
+					if err != nil {
+						t.Fatalf("valid admission limit %d refused: %v", valid, err)
+					}
+					c.Close()
+				}
+				for _, invalid := range []int{-1, tc.max + 1, math.MaxInt} {
+					tc.set(&cfg, invalid)
+					c, err := backend.new(cfg)
+					if err == nil {
+						c.Close()
+						t.Fatalf("accepted invalid admission limit %d", invalid)
+					}
+				}
+			})
+		}
 	}
 }
 

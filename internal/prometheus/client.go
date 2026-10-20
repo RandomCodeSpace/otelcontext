@@ -65,32 +65,35 @@ func NewClient(cfg Config) (*Client, error) {
 	if err != nil || u == nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Opaque != "" {
 		return nil, errors.New("Prometheus URL must be an absolute HTTP(S) base URL without credentials, query or fragment")
 	}
-	cfg, err = normalizeConfig(cfg)
+	c, err := newBackendClient(cfg)
 	if err != nil {
 		return nil, err
 	}
+	cfg = c.cfg
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.MaxConnsPerHost = cfg.MaxConcurrent + cfg.MaxIngestConcurrent + 1
 	transport.MaxIdleConnsPerHost = transport.MaxConnsPerHost
 	transport.ResponseHeaderTimeout = cfg.Timeout
 	transport.MaxResponseHeaderBytes = 64 << 10
-	return &Client{base: u, cfg: cfg, slots: make(chan struct{}, cfg.MaxConcurrent),
-		ingestBytes: semaphore.NewWeighted(cfg.MaxIngestBytes),
-		ingestSlots: make(chan struct{}, cfg.MaxIngestConcurrent), ingestWaiters: make(chan struct{}, cfg.MaxIngestWaiters), readySlots: make(chan struct{}, 1), http: &http.Client{
-			Transport: transport, Timeout: cfg.Timeout,
-			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-		}}, nil
+	c.base = u
+	c.http = &http.Client{
+		Transport: transport, Timeout: cfg.Timeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	return c, nil
 }
 
-func normalizeConfig(cfg Config) (Config, error) {
+// newBackendClient validates limits and allocates admission queues together.
+// Both backends use this path; only NewClient attaches an HTTP transport.
+func newBackendClient(cfg Config) (*Client, error) {
 	if cfg.TenantID == "" {
 		cfg.TenantID = storage.DefaultTenantID
 	}
 	if storage.SanitizeTenantID(cfg.TenantID) != cfg.TenantID {
-		return cfg, errors.New("invalid Prometheus tenant ID")
+		return nil, errors.New("invalid Prometheus tenant ID")
 	}
 	if cfg.Timeout < 0 || cfg.MaxConcurrent < 0 || cfg.MaxIngestConcurrent < 0 || cfg.MaxIngestWaiters < 0 || cfg.MaxIngestBytes < 0 || cfg.MaxRequestBytes < 0 || cfg.MaxResponseBytes < 0 || cfg.MaxResponseBytes == math.MaxInt64 || cfg.MaxQueryBytes < 0 || cfg.MaxQueryRange < 0 || cfg.MaxSeries < 0 {
-		return cfg, errors.New("Prometheus limits must be positive")
+		return nil, errors.New("Prometheus limits must be positive")
 	}
 	if cfg.Timeout == 0 {
 		cfg.Timeout = 10 * time.Second
@@ -125,9 +128,11 @@ func normalizeConfig(cfg Config) (Config, error) {
 	// Enforce the operator-facing bounds here too: callers can construct a
 	// client without passing through the application's configuration validator.
 	if cfg.MaxConcurrent > 64 || cfg.MaxIngestConcurrent > 256 || cfg.MaxIngestWaiters > 4096 {
-		return cfg, errors.New("Prometheus admission limits exceed maxima: 64 queries, 256 active exports, 4096 waiting exports")
+		return nil, errors.New("Prometheus admission limits exceed maxima: 64 queries, 256 active exports, 4096 waiting exports")
 	}
-	return cfg, nil
+	return &Client{cfg: cfg, slots: make(chan struct{}, cfg.MaxConcurrent),
+		ingestSlots: make(chan struct{}, cfg.MaxIngestConcurrent), ingestWaiters: make(chan struct{}, cfg.MaxIngestWaiters),
+		ingestBytes: semaphore.NewWeighted(cfg.MaxIngestBytes), readySlots: make(chan struct{}, 1)}, nil
 }
 
 func (c *Client) TenantID() string             { return c.cfg.TenantID }

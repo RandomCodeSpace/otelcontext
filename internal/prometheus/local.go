@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/prometheus/prometheus/promql"
-	"golang.org/x/sync/semaphore"
 	"gorm.io/gorm"
 )
 
@@ -36,10 +35,11 @@ type Local struct {
 var _ Backend = (*Local)(nil)
 
 func NewLocal(db *gorm.DB, cfg Config, retention time.Duration) (*Local, error) {
-	cfg, err := normalizeConfig(cfg)
+	c, err := newBackendClient(cfg)
 	if err != nil {
 		return nil, err
 	}
+	cfg = c.cfg
 	if db == nil || retention <= 0 {
 		return nil, errors.New("local PromQL requires a database and positive retention")
 	}
@@ -49,9 +49,6 @@ func NewLocal(db *gorm.DB, cfg Config, retention time.Duration) (*Local, error) 
 	if cfg.MaxSeries > localMaxCandidates {
 		return nil, errors.New("local PromQL series limit exceeds candidate bound")
 	}
-	c := &Client{cfg: cfg, slots: make(chan struct{}, cfg.MaxConcurrent),
-		ingestSlots: make(chan struct{}, cfg.MaxIngestConcurrent), ingestWaiters: make(chan struct{}, cfg.MaxIngestWaiters),
-		ingestBytes: semaphore.NewWeighted(cfg.MaxIngestBytes), readySlots: make(chan struct{}, 1)}
 	return &Local{Client: c, db: db, retention: retention, now: time.Now,
 		engine: promql.NewEngine(promql.EngineOpts{Logger: slog.Default(), MaxSamples: localMaxSamples,
 			Timeout: cfg.Timeout, LookbackDelta: 5 * time.Minute, EnableAtModifier: true, EnableNegativeOffset: true,
