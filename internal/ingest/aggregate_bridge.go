@@ -445,6 +445,8 @@ const otlpDataPointNoRecordedValue uint32 = 1
 
 // OTLP point-type labels for the unsupported/rejection counters.
 const (
+	pointTypeGauge        = "gauge"
+	pointTypeSum          = "sum"
 	pointTypeHistogram    = "histogram"
 	pointTypeExpHistogram = "exponential_histogram"
 	pointTypeSummary      = "summary"

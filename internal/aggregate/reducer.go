@@ -1,6 +1,7 @@
 package aggregate
 
 import (
+	"math"
 	"strings"
 	"time"
 
@@ -503,6 +504,8 @@ const (
 	MetricPointRejectedTemporality
 	// MetricPointRejectedMalformed means the point violates the OTLP data model.
 	MetricPointRejectedMalformed
+	// MetricPointRejectedValue means the aggregate projection cannot represent the value.
+	MetricPointRejectedValue
 )
 
 // MetricPointResult reports what the reducer did with one metric data point,
@@ -523,7 +526,7 @@ type MetricPointResult struct {
 // Rejected reports whether the point must be counted in
 // ExportMetricsPartialSuccess.rejected_data_points.
 func (r MetricPointResult) Rejected() bool {
-	return r.Outcome == MetricPointRejectedTemporality || r.Outcome == MetricPointRejectedMalformed
+	return r.Outcome == MetricPointRejectedTemporality || r.Outcome == MetricPointRejectedMalformed || r.Outcome == MetricPointRejectedValue
 }
 
 // Rejection reasons reported to OTLP clients.
@@ -539,6 +542,9 @@ const (
 	// ReasonUnsupportedType — the point type has no aggregate model at all
 	// (Summary).
 	ReasonUnsupportedType = "unsupported_type"
+	// ReasonNonFiniteValue identifies NaN and infinities, which cannot be folded
+	// into the finite scalar aggregate projection.
+	ReasonNonFiniteValue = "non_finite_value"
 )
 
 // checkHistogramTemporality enforces the #199 Q3 contract: GA aggregates
@@ -607,15 +613,21 @@ func (r *Reducer) ReduceExponentialHistogramPoint(in ExponentialHistogramInput) 
 
 // ReduceMetricPoint folds one metric data point into its metric series,
 // applying the #166 aggregation model for its temporality and monotonicity.
-func (r *Reducer) ReduceMetricPoint(in MetricInput) {
+func (r *Reducer) ReduceMetricPoint(in MetricInput) MetricPointResult {
+	// Validate before interning or advancing cumulative baselines. SQLite binds
+	// NaN as NULL; admitting it would roll back the whole shared commit. Keep
+	// infinities out too, since opposite signs produce NaN during reduction.
+	if math.IsNaN(in.Value) || math.IsInf(in.Value, 0) {
+		return MetricPointResult{Outcome: MetricPointRejectedValue, Reason: ReasonNonFiniteValue}
+	}
 	window, ok := r.admitPoint(SignalMetric, in.Timestamp)
 	if !ok {
-		return
+		return MetricPointResult{Outcome: MetricPointExcluded}
 	}
 	tenantID, tenantOK := r.eng.cache.InternTenant(in.Tenant)
 	if !tenantOK {
 		r.rejectTenant(SignalMetric)
-		return
+		return MetricPointResult{Outcome: MetricPointExcluded}
 	}
 	key := r.metricSeriesKey(tenantID, in.Service, in.Name, in.Attributes, in.ResourceAttributes)
 
@@ -638,13 +650,14 @@ func (r *Reducer) ReduceMetricPoint(in MetricInput) {
 			// Stale or duplicate: it must not move the baseline, synthesize a
 			// delta, or count as a reset.
 			r.stats.StaleCumulative++
-			return
+			return MetricPointResult{Outcome: MetricPointExcluded}
 		}
 		d := r.delta(key, window)
 		d.ObserveCounter(out.Delta, out.Reset)
 	}
 	r.identify(key, window, topoIdentity{Kind: topoMetric, Tenant: in.Tenant, A: in.Service, B: in.Name})
 	r.stats.Accepted[SignalMetric]++
+	return MetricPointResult{Outcome: MetricPointAccepted}
 }
 
 // SeverityTier maps an OTLP severity onto the log StatusClass tier. The numeric
