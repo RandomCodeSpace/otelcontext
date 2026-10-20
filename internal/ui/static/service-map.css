@@ -4,7 +4,9 @@
 .smap {
   position: relative;
   display: grid;
-  grid-template-columns: 248px minmax(0, 1fr) 340px;
+  --rail-w: 248px;
+  --insp-w: 340px;
+  grid-template-columns: var(--rail-w) minmax(0, 1fr) var(--insp-w);
   min-height: 0;
   min-width: 0;
   overflow: hidden;
@@ -72,7 +74,7 @@
 
 /* ---------- Stage ---------- */
 
-.stage { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+.stage { display: flex; flex-direction: column; min-width: 0; min-height: 0; container-type: inline-size; }
 .stage-bar {
   display: flex; align-items: center; gap: var(--s-2); flex: none; min-width: 0;
   height: 44px; padding: 0 var(--s-3); background: var(--bg-1); border-bottom: 1px solid var(--bd-1);
@@ -190,6 +192,8 @@
 .edge.is-lit { opacity: 1; }
 .edge.is-lit.t-ok .line, .edge.is-lit.t-unk .line { stroke: var(--edge-strong); marker-end: url(#mk-strong); }
 .edge.is-dim { opacity: .1; }
+.edge.bundle .line { stroke-linecap: round; }
+.edge.bundle.is-expanded { opacity: .25; }
 .edge.is-selected .line { stroke: var(--tx-1); marker-end: url(#mk-lit); }
 .edge:hover .line { stroke: var(--tx-2); marker-end: url(#mk-lit); }
 .mk path { fill: var(--edge); }
@@ -198,7 +202,7 @@
 .mk-crit path { fill: var(--crit); }
 .mk-lit path { fill: var(--tx-1); }
 
-.run { fill: none; stroke: var(--edge-strong); stroke-width: 1; stroke-dasharray: 3 3; opacity: .4; vector-effect: non-scaling-stroke; transition: opacity .15s var(--ease); }
+.run { fill: none; stroke: var(--edge-strong); stroke-dasharray: 3 3; opacity: .4; vector-effect: non-scaling-stroke; transition: opacity .15s var(--ease); }
 .run.is-lit { opacity: 1; stroke: var(--tx-2); }
 .run.is-dim { opacity: .06; }
 
@@ -297,20 +301,30 @@
 .coverage { font-size: var(--fs-2xs); color: var(--tx-3); }
 .coverage.tone-warn { color: var(--warn); }
 
-.drawer-open, .drawer-close { display: none; }
+.drawer-open { display: none; }
 .scrim { position: absolute; inset: 0; z-index: 15; background: rgb(0 0 0 / .45); }
 [data-theme="light"] .scrim { background: rgb(40 36 30 / .25); }
 
 /* ---------- Responsive ---------- */
 
+@media (min-width: 1024px) {
+  .smap.rail-collapsed { --rail-w: 0px; }
+  /* Hidden in place: the rail keeps its (zero-width) grid cell so the canvas stays in column two. */
+  .smap.rail-collapsed .rail { visibility: hidden; overflow: hidden; border-right: 0; }
+}
+
 @media (max-width: 1439px) {
-  .smap { grid-template-columns: 220px minmax(0, 1fr) 320px; }
+  .smap { --rail-w: 220px; --insp-w: 320px; }
+}
+
+/* The legend shortens to icons whenever the canvas toolbar is narrow. */
+@container (max-width: 1040px) {
   .legend .lg-t { display: none; }
   .legend { gap: var(--s-2); }
 }
 
 @media (max-width: 1279px) {
-  .smap { grid-template-columns: 220px minmax(0, 1fr); }
+  .smap { grid-template-columns: var(--rail-w) minmax(0, 1fr); }
   .inspector {
     position: absolute; top: 0; right: 0; bottom: 0; z-index: 20; width: min(360px, 100%);
     border-left: 1px solid var(--bd-2); box-shadow: var(--shadow-pop);
@@ -331,7 +345,6 @@
     transition: transform .2s var(--ease), visibility 0s linear .2s;
   }
   .smap.rail-open .rail { transform: none; visibility: visible; transition: transform .2s var(--ease); }
-  .rail-open, .drawer-close { display: inline-flex; }
   .refresh .updated { display: none; }
   .refresh { width: var(--h-ctl); padding: 0; }
 }

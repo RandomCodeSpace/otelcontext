@@ -43,7 +43,7 @@
       <aside class="rail" id="rail" aria-label="Layers and filters">
         <div class="rail-head">
           <h2 class="eyebrow">Layers</h2>
-          <button class="btn btn-ghost btn-icon btn-sm drawer-close" type="button" data-close="rail" aria-label="Close layers"><svg class="ic" aria-hidden="true"><use href="/static/icons.svg#i-x"/></svg></button>
+          <button class="btn btn-ghost btn-icon btn-sm" id="rail-close" type="button" aria-label="Hide layers" aria-controls="rail"><svg class="ic" aria-hidden="true"><use href="/static/icons.svg#i-x"/></svg></button>
         </div>
         <div class="rail-scroll panel-scroll">
           <div class="rail-env" id="rail-env"></div>
@@ -66,7 +66,7 @@
       </aside>
       <section class="stage" aria-label="Layered topology">
         <div class="stage-bar">
-          <button class="btn btn-icon drawer-open rail-open" id="rail-open" type="button" aria-label="Show layers" aria-controls="rail" aria-expanded="false"><svg class="ic" aria-hidden="true"><use href="/static/icons.svg#i-layers"/></svg></button>
+          <button class="btn btn-icon" id="rail-open" type="button" aria-label="Show layers" aria-controls="rail" aria-expanded="false"><svg class="ic" aria-hidden="true"><use href="/static/icons.svg#i-layers"/></svg></button>
           <nav class="crumbs" id="crumbs" aria-label="Scope"></nav>
           <span class="spacer"></span>
           <div class="seg mode-seg" role="group" aria-label="Granularity">

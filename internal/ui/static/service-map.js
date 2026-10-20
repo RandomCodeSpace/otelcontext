@@ -12,6 +12,9 @@ const SW = 152, SH = 56, ROW_GAP = 12, COL_GAP = 28, COL_GAP_INST = 88;
 const PW = 136, PH = 24, PILL_GAP = 4, GROUP_HEAD = 24, GROUP_PAD = 8, GROUP_GAP = 12;
 const HW = 168, HOST_GAP = 12, HOST_ROW_GAP = 16, PIP = 8, PIP_ROW = 12;
 const LANE_HEAD = 44, LANE_FOOT = 28, HINT_H = 32;
+// Focused neighbourhoods sit in one tier: each service above its own instances.
+const TW = 136, TGAP = 36, TPW = 128, TIER_MAX = 9, GUTTER_STEP = 6;
+const RAIL_KEY = "oc-map-rail";
 const FONT = { name: "500 13px Geist", sub: "11px Geist", mono: "11px 'Geist Mono'", small: "10px 'Geist Mono'" };
 const TONES = ["ok", "warn", "crit", "unk"];
 
@@ -23,7 +26,7 @@ const state = {
   selected: null, hover: null, tab: "overview",
   scene: null, sceneKey: "", view: { x: 0, y: 0, k: 1 },
   gen: 0, controller: null, traffic: new Map(), trafficController: null,
-  drawer: null, opener: null,
+  drawer: null, opener: null, railCollapsed: false,
 };
 
 const canvas = $("canvas");
@@ -50,14 +53,21 @@ const delay = (ms, signal) => new Promise((resolve, reject) => {
 });
 
 // fetchJSON in shell.js does not expose Retry-After, which topology reads need on 429.
+// 502/504 are retried too: the server's 5s topology deadline can lapse under writer contention.
 async function getJSON(path, signal) {
-  for (let attempt = 0; ; attempt++) {
+  for (let busy = 0, flaky = 0; ;) {
     const response = await fetch(path, {
       signal: AbortSignal.any([signal, AbortSignal.timeout(10000)]),
       cache: "no-store", credentials: "same-origin", headers: { Accept: "application/json" },
     });
-    if (response.status === 429 && attempt < 3) {
+    if (response.status === 429 && busy < 3) {
+      busy++;
       await delay(clamp(Number(response.headers.get("Retry-After")) || 1, 1, 10) * 1000, signal);
+      continue;
+    }
+    if ((response.status === 502 || response.status === 504) && flaky < 2) {
+      flaky++;
+      await delay(flaky * 1000, signal);
       continue;
     }
     if (!response.ok) {
@@ -389,6 +399,51 @@ function link(from, to, via = []) {
   return `M${sx} ${fy} C${bulge} ${fy} ${bulge} ${ty} ${ex} ${ty}`;
 }
 
+// One row in dagre rank order (callers, focus, callees). Edges between
+// non-neighbouring cards arc over the row instead of crossing other cards.
+function tierLayout(services, edges) {
+  const base = serviceLayout(services, edges, COL_GAP);
+  const order = [...services].sort((a, b) => {
+    const p = base.cards.get(a.service_id), q = base.cards.get(b.service_id);
+    return p.col - q.col || p.cy - q.cy;
+  });
+  const slot = new Map(order.map((s, i) => [s.service_id, i]));
+  const center = (i) => i * (TW + TGAP) + TW / 2;
+  const span = (e) => Math.abs(slot.get(e.target) - slot.get(e.source));
+  const arcHeight = (e) => Math.min(72, 20 + 12 * (span(e) - 1));
+  const arcs = edges.filter((e) => e.source !== e.target && slot.get(e.target) - slot.get(e.source) !== 1);
+  const lift = arcs.length ? Math.max(...arcs.map(arcHeight)) + 8 : 0;
+  const cards = new Map(order.map((s, i) => [s.service_id, { cx: center(i), cy: lift + SH / 2, col: i }]));
+  return { tier: true, cards, routes: new Map(), slot, center, arcHeight, height: lift + SH, width: center(order.length - 1) + TW / 2 };
+}
+
+function arc(from, to, height) {
+  const forward = to.x > from.x;
+  const sx = forward ? from.x + from.w - 20 : from.x + 20, ex = forward ? to.x + 20 : to.x + to.w - 20;
+  const lift = from.y - height * 4 / 3;
+  return `M${sx} ${from.y} C${sx} ${lift} ${ex} ${lift} ${ex} ${to.y}`;
+}
+
+// Orthogonal polyline with rounded corners.
+function orth(points, r = 6) {
+  let d = `M${points[0].x} ${points[0].y}`;
+  for (let i = 1; i < points.length - 1; i++) {
+    const a = points[i - 1], c = points[i], n = points[i + 1];
+    const r1 = Math.min(r, Math.hypot(c.x - a.x, c.y - a.y) / 2), r2 = Math.min(r, Math.hypot(n.x - c.x, n.y - c.y) / 2);
+    d += ` L${c.x - Math.sign(c.x - a.x) * r1} ${c.y - Math.sign(c.y - a.y) * r1} Q${c.x} ${c.y} ${c.x + Math.sign(n.x - c.x) * r2} ${c.y + Math.sign(n.y - c.y) * r2}`;
+  }
+  const last = points[points.length - 1];
+  return d + ` L${last.x} ${last.y}`;
+}
+
+// Calls between non-neighbouring groups leave through the gap beside the
+// source, run along a gutter under every group, and climb into the target.
+function gutterRoute(bundle, from, to) {
+  const fy = from.y + from.h / 2, ty = to.y + to.h / 2;
+  const fx = bundle.forward ? from.x + from.w : from.x, tx = bundle.forward ? to.x : to.x + to.w;
+  return orth([{ x: fx, y: fy }, { x: bundle.outX, y: fy }, { x: bundle.outX, y: bundle.gy }, { x: bundle.inX, y: bundle.gy }, { x: bundle.inX, y: ty }, { x: tx, y: ty }]);
+}
+
 // Place hosts at the mean x of what runs on them, then resolve overlaps; wrap when too wide.
 function placeHosts(hosts, width) {
   const step = HW + HOST_GAP;
@@ -417,9 +472,11 @@ function buildScene(extras = {}, head = LANE_HEAD) {
   const sc = scope();
   const tonesBy = new Map();
   for (const n of sc.instNodes) tonesBy.set(n.service_id, [...(tonesBy.get(n.service_id) || []), toneOf(n)]);
-  const gap = sc.showInstances ? COL_GAP_INST : COL_GAP;
-  const layout = sc.services.length ? serviceLayout(sc.services, sc.svcEdges, gap) : null;
-  const scene = { ...sc, lanes: [], cards: [], groups: [], pills: [], hostChips: [], edges: [], iedges: [], runs: [], hint: null };
+  const tier = sc.focused && sc.services.length <= TIER_MAX;
+  const layout = !sc.services.length ? null : tier ? tierLayout(sc.services, sc.svcEdges) :
+    serviceLayout(sc.services, sc.svcEdges, sc.showInstances ? COL_GAP_INST : COL_GAP);
+  const cw = tier ? TW : SW, pw = tier ? TPW : PW;
+  const scene = { ...sc, tier, lanes: [], cards: [], groups: [], pills: [], hostChips: [], edges: [], iedges: [], bundles: [], runs: [], hint: null, pillOf: new Map() };
   let y = 0;
   const lane = (key, label, height) => {
     const top = y;
@@ -436,21 +493,39 @@ function buildScene(extras = {}, head = LANE_HEAD) {
       const c = layout.cards.get(s.service_id);
       const tones = tonesBy.get(s.service_id) || [];
       const count = Math.max(s.instance_count || 0, tones.length);
-      scene.cards.push({ node: s, x: c.cx - SW / 2, y: top + c.cy - SH / 2, w: SW, h: SH, col: c.col, tone: toneOf(s),
-        pips: [...tones, ...Array(Math.max(0, count - tones.length)).fill("unk")], focus: s.service_id === state.focus && sc.focused });
+      scene.cards.push({ node: s, x: c.cx - cw / 2, y: top + c.cy - SH / 2, w: cw, h: SH, col: c.col, tone: toneOf(s),
+        pips: tier ? null : [...tones, ...Array(Math.max(0, count - tones.length)).fill("unk")], focus: s.service_id === state.focus && sc.focused });
     }
     const cardOf = new Map(scene.cards.map((c) => [c.node.service_id, c]));
     const maxRate = Math.max(1e-9, ...sc.svcEdges.map((e) => e.request_rate_rps || 0));
     for (const e of sc.svcEdges) {
-      const via = layout.routes.get(e.source + ">" + e.target).map((p) => ({ x: p.x, y: top + p.y }));
-      scene.edges.push({ edge: e, d: link(cardOf.get(e.source), cardOf.get(e.target), via), tone: toneFromErrorRate(e.error_rate, e.calls),
-        width: 1.25 + 2.25 * Math.sqrt((e.request_rate_rps || 0) / maxRate) });
+      const from = cardOf.get(e.source), to = cardOf.get(e.target);
+      if (tier && from === to) continue;
+      const d = !tier ? link(from, to, layout.routes.get(e.source + ">" + e.target).map((p) => ({ x: p.x, y: top + p.y }))) :
+        to.col - from.col === 1 ? link(from, to) : arc(from, to, layout.arcHeight(e));
+      scene.edges.push({ edge: e, d, tone: toneFromErrorRate(e.error_rate, e.calls), width: 1.25 + 2.25 * Math.sqrt((e.request_rate_rps || 0) / maxRate) });
     }
   }
 
-  const pillOf = new Map();
   if (state.layers.instances && layout) {
     if (sc.showInstances && sc.instNodes.length) {
+      const colOf = (serviceId) => layout.cards.get(serviceId)?.col;
+      const serviceOf = new Map(sc.instNodes.map((n) => [n.id, n.service_id]));
+      // Tier view: calls that would cross another group travel bundled along a gutter.
+      const pairs = new Map();
+      if (tier) {
+        for (const e of sc.instEdges) {
+          const a = serviceOf.get(e.source), b = serviceOf.get(e.target);
+          if (a === b || colOf(b) - colOf(a) === 1) continue;
+          const pair = pairs.get(a + ">" + b) || { pair: a + ">" + b, source: a, target: b, forward: colOf(b) > colOf(a), edges: [], calls: 0, errors: 0, rate: 0, duration: 0 };
+          pair.edges.push(e);
+          pair.calls += e.calls || 0;
+          pair.errors += e.errors || 0;
+          pair.rate += e.request_rate_rps || 0;
+          pair.duration += (e.avg_latency_ms || 0) * (e.calls || 0);
+          pairs.set(pair.pair, pair);
+        }
+      }
       const columns = new Map();
       for (const s of sc.services) {
         const members = sc.instNodes.filter((n) => n.service_id === s.service_id)
@@ -461,27 +536,45 @@ function buildScene(extras = {}, head = LANE_HEAD) {
       }
       const heights = [...columns.values()].map((list) => list.reduce((sum, g) =>
         sum + GROUP_HEAD + g.members.length * (PH + PILL_GAP) - PILL_GAP + GROUP_PAD + GROUP_GAP, -GROUP_GAP));
-      const top = lane("instances", "Instances", Math.max(0, ...heights));
+      const groupsHeight = Math.max(0, ...heights);
+      const top = lane("instances", "Instances", groupsHeight + (pairs.size ? 12 + pairs.size * GUTTER_STEP : 0));
       for (const [col, list] of columns) {
         let gy = top;
         for (const { s, members } of list.sort((a, b) => a.cy - b.cy)) {
-          const x = layout.center(col) - SW / 2;
+          const x = layout.center(col) - cw / 2;
           const h = GROUP_HEAD + members.length * (PH + PILL_GAP) - PILL_GAP + GROUP_PAD;
-          scene.groups.push({ node: s, x, y: gy, w: SW, h, focus: s.service_id === state.focus && sc.focused,
-            label: s.name, count: members.length + (members.length === 1 ? " instance" : " instances") });
+          scene.groups.push({ node: s, x, y: gy, w: cw, h, col, focus: s.service_id === state.focus && sc.focused,
+            label: s.name, count: members.length + (tier ? " inst" : members.length === 1 ? " instance" : " instances") });
           members.forEach((n, i) => {
-            const pill = { node: n, x: x + (SW - PW) / 2, y: gy + GROUP_HEAD + i * (PH + PILL_GAP), w: PW, h: PH, tone: toneOf(n), col };
+            const pill = { node: n, x: x + (cw - pw) / 2, y: gy + GROUP_HEAD + i * (PH + PILL_GAP), w: pw, h: PH, tone: toneOf(n), col };
             scene.pills.push(pill);
-            pillOf.set(n.id, pill);
+            scene.pillOf.set(n.id, pill);
           });
           gy += h + GROUP_GAP;
         }
       }
+      const groupOf = new Map(scene.groups.map((g) => [g.node.service_id, g]));
+      const bundleRate = Math.max(1e-9, ...[...pairs.values()].map((b) => b.rate));
+      [...pairs.values()].sort((a, b) => Math.abs(colOf(a.target) - colOf(a.source)) - Math.abs(colOf(b.target) - colOf(b.source)) || colOf(a.source) - colOf(b.source))
+        .forEach((b, j) => {
+          const from = groupOf.get(b.source), to = groupOf.get(b.target);
+          const edge = sc.svcEdges.find((e) => e.source === b.source && e.target === b.target);
+          Object.assign(b, {
+            key: edge ? "e:" + edge.id : "b:" + b.pair, gy: top + groupsHeight + 12 + j * GUTTER_STEP,
+            outX: b.forward ? from.x + from.w + TGAP / 2 : from.x - TGAP / 2, inX: b.forward ? to.x - TGAP / 2 : to.x + to.w + TGAP / 2,
+            tone: toneFromErrorRate(b.calls ? b.errors / b.calls : 0, b.calls), width: 1.5 + 2.5 * Math.sqrt(b.rate / bundleRate),
+            summary: { request_rate_rps: b.rate, error_rate: b.calls ? b.errors / b.calls : 0, avg_latency_ms: b.calls ? b.duration / b.calls : 0 },
+          });
+          b.d = gutterRoute(b, from, to);
+          scene.bundles.push(b);
+        });
+      const bundleOf = new Map(scene.bundles.flatMap((b) => b.edges.map((e) => [e.id, b])));
       const maxRate = Math.max(1e-9, ...sc.instEdges.map((e) => e.request_rate_rps || 0));
       for (const e of sc.instEdges) {
-        const from = pillOf.get(e.source), to = pillOf.get(e.target);
+        const from = scene.pillOf.get(e.source), to = scene.pillOf.get(e.target);
         if (!from || !to) continue;
-        scene.iedges.push({ edge: e, d: link(from, to), tone: toneFromErrorRate(e.error_rate, e.calls), width: 1 + Math.sqrt((e.request_rate_rps || 0) / maxRate) });
+        const bundle = bundleOf.get(e.id);
+        scene.iedges.push({ edge: e, bundle, d: bundle ? null : link(from, to), tone: toneFromErrorRate(e.error_rate, e.calls), width: 1 + Math.sqrt((e.request_rate_rps || 0) / maxRate) });
       }
     } else {
       const top = lane("instances", "Instances", HINT_H);
@@ -495,7 +588,7 @@ function buildScene(extras = {}, head = LANE_HEAD) {
     }
   }
 
-  const width = Math.max(layout?.width || 0, SW);
+  const width = Math.max(layout?.width || 0, cw);
   if (state.layers.hosts) {
     const byName = new Map(state.hosts.map((h) => [h.name, h]));
     const linked = new Map();
@@ -506,10 +599,10 @@ function buildScene(extras = {}, head = LANE_HEAD) {
       linked.set(host, entry);
     };
     if (scene.pills.length) {
-      for (const p of scene.pills) for (const h of p.node.hosts) want(h, p.x + PW / 2, p.tone);
+      for (const p of scene.pills) for (const h of p.node.hosts) want(h, p.x + p.w / 2, p.tone);
     } else {
       const names = new Set(sc.services.map((s) => s.name));
-      const cardX = new Map(scene.cards.map((c) => [c.node.service_id, c.x + SW / 2]));
+      const cardX = new Map(scene.cards.map((c) => [c.node.service_id, c.x + c.w / 2]));
       const fallbackX = width / 2;
       for (const s of sc.services) for (const h of s.hosts) want(h, cardX.get(s.service_id) ?? fallbackX);
       for (const h of state.hosts) {
@@ -528,14 +621,7 @@ function buildScene(extras = {}, head = LANE_HEAD) {
       for (const h of chips) {
         scene.hostChips.push({ ...h, y: top + h.row * (hh + HOST_ROW_GAP), w: HW, h: hh, tone: h.tones.length ? worst(h.tones) : "unk", pipCols, pipRows });
       }
-      if (scene.pills.length) {
-        const chipOf = new Map(scene.hostChips.map((c) => [c.name, c]));
-        const bend = scene.lanes.find((l) => l.key === "instances").contentBottom + 12;
-        for (const p of scene.pills) for (const name of p.node.hosts) {
-          const chip = chipOf.get(name);
-          if (chip) scene.runs.push({ key: "r:" + p.node.id + "|" + name, d: runsPath(p.x + PW / 2, p.y + PH, chip, bend) });
-        }
-      }
+      if (scene.pills.length) bundleRuns(scene);
     } else {
       const top = lane("hosts", "Hosts", HINT_H);
       scene.hostHint = { y: top + HINT_H / 2, text: "No host placement reported for this scope" };
@@ -548,10 +634,38 @@ function buildScene(extras = {}, head = LANE_HEAD) {
   return scene;
 }
 
-function runsPath(x, y, chip, bend) {
-  const hx = chip.x + chip.w / 2;
-  const mid = bend + (chip.y - bend) / 2;
-  return `M${x} ${y} V${bend} C${x} ${mid} ${hx} ${mid} ${hx} ${chip.y}`;
+// One placement connector per (service group, host), weighted by how many of
+// the group's instances run there. Ends spread along both boxes to avoid a knot.
+function bundleRuns(scene) {
+  const chipOf = new Map(scene.hostChips.map((c) => [c.name, c]));
+  const groupOf = new Map(scene.groups.map((g) => [g.node.service_id, g]));
+  scene.runsBend = scene.lanes.find((l) => l.key === "instances").contentBottom + 12;
+  const pairs = new Map();
+  for (const p of scene.pills) for (const host of p.node.hosts) {
+    const chip = chipOf.get(host), group = groupOf.get(p.node.service_id);
+    if (!chip || !group) continue;
+    const key = "r:" + p.node.service_id + "|" + host;
+    const pair = pairs.get(key) || { key, chip, group, count: 0 };
+    pair.count++;
+    pairs.set(key, pair);
+  }
+  const list = [...pairs.values()];
+  const spread = (items, box, own) => {
+    items.sort((a, b) => own(a) - own(b));
+    items.forEach((item, i) => { item[box === "group" ? "sx" : "ex"] = item[box].x + item[box].w * (i + 1) / (items.length + 1); });
+  };
+  for (const g of scene.groups) spread(list.filter((r) => r.group === g), "group", (r) => r.chip.x);
+  for (const c of scene.hostChips) spread(list.filter((r) => r.chip === c), "chip", (r) => r.group.x);
+  for (const r of list) {
+    const g = r.group;
+    const [start, x] = scene.tier ? [`M${r.sx} ${g.y + g.h}`, r.sx] : [`M${g.x} ${g.y + GROUP_HEAD / 2} H${g.x - 8}`, g.x - 8];
+    scene.runs.push({ key: r.key, d: runsPath(start, x, r.ex, r.chip.y, scene.runsBend), width: clamp(0.5 + 0.5 * r.count, 1, 4) });
+  }
+}
+
+function runsPath(start, x, chipX, chipY, bend) {
+  const mid = bend + (chipY - bend) / 2;
+  return `${start} V${bend} C${x} ${mid} ${chipX} ${mid} ${chipX} ${chipY}`;
 }
 
 // ---------- Scene rendering ----------
@@ -575,19 +689,26 @@ function nodeGroup(key, x, y, label, className) {
 }
 
 function drawCard(c) {
-  const s = c.node;
+  const s = c.node, w = c.w;
   const metric = s.requests ? fmtRate(s.request_rate_rps) + " · " + fmtPercent(s.error_rate) : "no traffic";
+  const count = c.pips ? c.pips.length : s.instance_count || 0;
   const label = [s.name, nsLabel(s.namespace), TONE_LABEL[c.tone], s.requests ? fmtRate(s.request_rate_rps) + ", " + fmtPercent(s.error_rate) + " errors" : "no traffic",
-    c.pips.length + (c.pips.length === 1 ? " instance" : " instances")].join(", ");
+    count + (count === 1 ? " instance" : " instances")].join(", ");
   const g = nodeGroup("s:" + s.service_id, c.x, c.y, label, "svc t-" + c.tone + (c.focus ? " is-focus" : ""));
-  if (c.tone === "crit") g.append(svg("rect", { class: "halo", x: -4, y: -4, width: SW + 8, height: SH + 8, rx: 6 }));
-  g.append(svg("rect", { class: "box", width: SW, height: SH, rx: 4 }));
+  if (c.tone === "crit") g.append(svg("rect", { class: "halo", x: -4, y: -4, width: w + 8, height: SH + 8, rx: 6 }));
+  g.append(svg("rect", { class: "box", width: w, height: SH, rx: 4 }));
   g.append(place(icon(TONE_ICON[c.tone], "ic ic-sm tone-" + c.tone), 10, 8));
-  g.append(svg("text", { class: "t-name", x: 30, y: 20 }, fit(s.name, SW - 40, FONT.name)));
-  g.append(svg("text", { class: "t-sub", x: 30, y: 33 }, fit(nsLabel(s.namespace), SW - 40, FONT.sub)));
-  const metricWidth = textWidth(metric, FONT.small);
-  g.append(svg("text", { class: "t-small t-metric" + (c.tone === "crit" || c.tone === "warn" ? " tone-" + c.tone : ""), x: SW - 10, y: 47, "text-anchor": "end" }, metric));
-  g.append(pips(c.pips, 10, 38, clamp(Math.floor((SW - 28 - metricWidth) / PIP), 2, 12)));
+  g.append(svg("text", { class: "t-name", x: 30, y: 20 }, fit(s.name, w - 40, FONT.name)));
+  g.append(svg("text", { class: "t-sub", x: 30, y: 33 }, fit(nsLabel(s.namespace), w - 40, FONT.sub)));
+  const metricClass = "t-small t-metric" + (c.tone === "crit" || c.tone === "warn" ? " tone-" + c.tone : "");
+  if (c.pips) {
+    const metricWidth = textWidth(metric, FONT.small);
+    g.append(svg("text", { class: metricClass, x: w - 10, y: 47, "text-anchor": "end" }, metric));
+    g.append(pips(c.pips, 10, 38, clamp(Math.floor((w - 28 - metricWidth) / PIP), 2, 12)));
+  } else {
+    // In a tier the instances sit right below the card; the pips would repeat them.
+    g.append(svg("text", { class: metricClass, x: 30, y: 47 }, fit(metric, w - 40, FONT.small)));
+  }
   g.append(svg("title", {}, [s.name, nsLabel(s.namespace), envLabel(s.environment)].join(" · ")));
   return g;
 }
@@ -596,11 +717,11 @@ function drawPill(p) {
   const n = p.node;
   const label = "Instance " + (n.instance || shortInstance(n)) + " of " + n.name + ", " + TONE_LABEL[p.tone] + ", average " + fmtMs(n.avg_latency_ms) + (n.hosts[0] ? ", on " + n.hosts[0] : "");
   const g = nodeGroup("i:" + n.id, p.x, p.y, label, "inst t-" + p.tone);
-  g.append(svg("rect", { class: "box", width: PW, height: PH, rx: 4 }));
+  g.append(svg("rect", { class: "box", width: p.w, height: PH, rx: 4 }));
   g.append(place(icon(TONE_ICON[p.tone], "ic ic-xs tone-" + p.tone), 8, 6, 12));
   const latency = n.requests ? fmtMs(n.avg_latency_ms) : "—";
-  g.append(svg("text", { class: "t-small t-metric", x: PW - 8, y: 16, "text-anchor": "end" }, latency));
-  g.append(svg("text", { class: "t-mono", x: 26, y: 16 }, fit(shortInstance(n), PW - 42 - textWidth(latency, FONT.small), FONT.mono)));
+  g.append(svg("text", { class: "t-small t-metric", x: p.w - 8, y: 16, "text-anchor": "end" }, latency));
+  g.append(svg("text", { class: "t-mono", x: 26, y: 16 }, fit(shortInstance(n), p.w - 42 - textWidth(latency, FONT.small), FONT.mono)));
   g.append(svg("title", {}, [n.instance || shortInstance(n), n.hosts.join(", ") || "host unknown", "avg " + latency].join(" · ")));
   return g;
 }
@@ -631,7 +752,7 @@ function drawHost(h) {
 function drawEdge(key, item, name) {
   const g = svg("g", { class: "edge t-" + item.tone, "data-key": key });
   g.append(svg("path", { class: "hit", d: item.d }));
-  g.append(svg("path", { class: "line" + (item.tone === "crit" && key.startsWith("e:") ? " edge-hot" : ""), d: item.d, "stroke-width": item.width.toFixed(2), "marker-end": "url(#mk-" + item.tone + ")" }));
+  g.append(svg("path", { class: "line" + (item.tone === "crit" && key.startsWith("e:") && !item.pair ? " edge-hot" : ""), d: item.d, "stroke-width": item.width.toFixed(2), "marker-end": "url(#mk-" + item.tone + ")" }));
   g.append(svg("title", {}, name + " · " + fmtRate(item.edge.request_rate_rps) + " · " + fmtPercent(item.edge.error_rate) + " errors · avg " + fmtMs(item.edge.avg_latency_ms)));
   return g;
 }
@@ -662,13 +783,20 @@ function renderScene(scene) {
     groups.append(g);
   }
   const runs = svg("g", { class: "runs" });
-  for (const r of scene.runs) runs.append(svg("path", { class: "run", d: r.d, "data-key": r.key }));
+  for (const r of scene.runs) runs.append(svg("path", { class: "run", d: r.d, "data-key": r.key, "stroke-width": r.width }));
   const live = svg("g", { class: "runs runs-live" });
   const links = svg("g", { class: "links" });
   const edges = svg("g", { class: "edges" });
   const order = (a, b) => toneRank(b.tone) - toneRank(a.tone);
   for (const e of [...scene.edges].sort(order)) edges.append(drawEdge("e:" + e.edge.id, e, nameOf.get(e.edge.source) + " → " + nameOf.get(e.edge.target)));
-  for (const e of [...scene.iedges].sort(order)) edges.append(drawEdge("x:" + e.edge.id, e, nameOf.get(e.edge.source) + " → " + nameOf.get(e.edge.target)));
+  for (const e of [...scene.iedges].filter((item) => item.d).sort(order)) edges.append(drawEdge("x:" + e.edge.id, e, nameOf.get(e.edge.source) + " → " + nameOf.get(e.edge.target)));
+  for (const b of [...scene.bundles].sort(order)) {
+    const el = drawEdge(b.key, { ...b, edge: b.summary }, nameOf.get(b.source) + " → " + nameOf.get(b.target) + " · " + b.edges.length + " instance calls");
+    el.classList.add("bundle");
+    el.dataset.bundle = b.pair;
+    edges.append(el);
+  }
+  const expanded = svg("g", { class: "edges edges-live" });
   const nodes = svg("g", { class: "nodes" });
   for (const c of scene.cards) nodes.append(drawCard(c));
   for (const p of scene.pills) nodes.append(drawPill(p));
@@ -677,11 +805,9 @@ function renderScene(scene) {
   for (const hint of [scene.hint, scene.hostHint].filter(Boolean)) {
     hints.append(svg("text", { class: "t-hint", x: scene.width / 2, y: hint.y + 4, "text-anchor": "middle" }, hint.text));
   }
-  world.append(lanes, groups, runs, live, links, edges, nodes, hints);
+  world.append(lanes, groups, runs, live, links, edges, expanded, nodes, hints);
   map.replaceChildren(defs, world);
-  scene.world = world;
-  scene.live = live;
-  scene.links = links;
+  Object.assign(scene, { world, live, links, expanded, nameOf });
   $("lane-labels").replaceChildren(...scene.lanes.map((lane) => element("span", "lane-label eyebrow", lane.label)));
 }
 
@@ -696,10 +822,13 @@ function related(key) {
   const pillsOf = (test) => sc.pills.filter((p) => test(p.node));
   const lightPill = (p) => {
     lit.add(keyOf("i", p.node.id));
-    for (const h of p.node.hosts) { lit.add(keyOf("h", h)); lit.add("r:" + p.node.id + "|" + h); }
+    for (const h of p.node.hosts) { lit.add(keyOf("h", h)); lit.add("r:" + p.node.service_id + "|" + h); }
   };
   const lightIEdges = (test) => {
-    for (const e of sc.iedges) if (test(e.edge)) { lit.add(keyOf("x", e.edge.id)); lit.add(keyOf("i", e.edge.source)); lit.add(keyOf("i", e.edge.target)); }
+    for (const e of sc.iedges) if (test(e.edge)) {
+      lit.add(keyOf("x", e.edge.id)); lit.add(keyOf("i", e.edge.source)); lit.add(keyOf("i", e.edge.target));
+      if (e.bundle) lit.add(e.bundle.key);
+    }
   };
   if (kind === "s") {
     lit.add(keyOf("g", id));
@@ -719,6 +848,9 @@ function related(key) {
     if (sc.pills.length) {
       for (const p of pillsOf((n) => n.hosts.includes(id))) { lightPill(p); lit.add(keyOf("s", p.node.service_id)); lit.add(keyOf("g", p.node.service_id)); }
     } else for (const s of servicesOnHost(id)) lit.add(keyOf("s", s.service_id));
+  } else if (kind === "b") {
+    const b = sc.bundles.find((item) => item.key === key);
+    if (b) lightIEdges((x) => b.edges.includes(x));
   } else if (kind === "e") {
     const e = sc.edges.find((item) => item.edge.id === id)?.edge;
     if (e) {
@@ -753,43 +885,78 @@ function paint() {
   if (!sc) return;
   const selected = state.selected;
   const active = state.hover || selected;
+  sc.live.replaceChildren();
+  sc.links.replaceChildren();
+  sc.expanded.replaceChildren();
+  const expanded = active ? drawActive(sc, active) : new Set();
+  const cardOf = new Map(sc.cards.map((c) => [c.node.service_id, c]));
+  const activeService = active?.[0] === "s" ? active.slice(2) : active?.[0] === "i" ? sc.pillOf.get(active.slice(2))?.node.service_id : null;
+  // In a tier every card sits on its own group; elsewhere only the focus and the active service are joined.
+  for (const g of sc.groups) {
+    const card = cardOf.get(g.node.service_id);
+    if (card && (sc.tier || card.focus || g.node.service_id === activeService)) sc.links.append(svg("path", { class: "group-link", d: groupLink(card, g) }));
+  }
   const lit = active ? related(active) : null;
   for (const el of map.querySelectorAll("[data-key]")) {
     const key = el.dataset.key;
     el.classList.toggle("is-dim", Boolean(lit) && !lit.has(key));
     el.classList.toggle("is-lit", Boolean(lit) && lit.has(key));
     el.classList.toggle("is-selected", key === selected);
+    if (el.dataset.bundle) el.classList.toggle("is-expanded", expanded.has(el.dataset.bundle));
   }
-  // Placement connectors at service granularity exist only for the active element.
-  sc.live.replaceChildren();
-  sc.links.replaceChildren();
-  if (!active) return;
+}
+
+// Detail that exists only for the active element: per-pill calls inside a
+// bundle, per-pill placement, and service placement at service granularity.
+function drawActive(sc, active) {
   const kind = active[0], id = active.slice(2);
-  const cardOf = new Map(sc.cards.map((c) => [c.node.service_id, c]));
   const chipOf = new Map(sc.hostChips.map((c) => [c.name, c]));
-  const above = sc.lanes.find((l) => l.key === "instances") || sc.lanes.find((l) => l.key === "services");
-  const bend = above ? above.contentBottom + 12 : 0;
+  const expanded = new Set();
   if (!sc.pills.length) {
+    const cardOf = new Map(sc.cards.map((c) => [c.node.service_id, c]));
+    const above = sc.lanes.find((l) => l.key === "instances") || sc.lanes.find((l) => l.key === "services");
+    const bend = above ? above.contentBottom + 12 : 0;
     const pairs = kind === "s" ? hostsOfService(id).map((h) => [id, h]) : kind === "h" ? servicesOnHost(id).map((s) => [s.service_id, id]) : [];
     for (const [serviceId, host] of pairs) {
       const card = cardOf.get(serviceId), chip = chipOf.get(host);
-      if (card && chip) sc.live.append(svg("path", { class: "run is-lit", d: runsPath(card.x + SW / 2, card.y + SH, chip, Math.max(bend, card.y + SH + 8)) }));
+      if (!card || !chip) continue;
+      const x = card.x + card.w / 2;
+      sc.live.append(svg("path", { class: "run is-lit", "stroke-width": 1, d: runsPath(`M${x} ${card.y + SH}`, x, chip.x + chip.w / 2, chip.y, Math.max(bend, card.y + SH + 8)) }));
+    }
+    return expanded;
+  }
+  const pill = (pid) => sc.pillOf.get(pid);
+  const inBundle = kind === "i" ? (e) => e.source === id || e.target === id :
+    kind === "s" ? (e) => pill(e.source)?.node.service_id === id || pill(e.target)?.node.service_id === id :
+    kind === "x" ? (e) => e.id === id :
+    (e) => sc.bundles.some((b) => b.key === active && b.edges.includes(e));
+  for (const item of sc.iedges) {
+    if (!item.bundle || !inBundle(item.edge)) continue;
+    expanded.add(item.bundle.pair);
+    const e = item.edge;
+    sc.expanded.append(drawEdge("x:" + e.id, { ...item, d: gutterRoute(item.bundle, pill(e.source), pill(e.target)) }, sc.nameOf.get(e.source) + " → " + sc.nameOf.get(e.target)));
+  }
+  const placed = kind === "i" ? [pill(id)] : kind === "s" ? sc.pills.filter((p) => p.node.service_id === id) :
+    kind === "h" ? sc.pills.filter((p) => p.node.hosts.includes(id)) :
+    kind === "x" ? sc.iedges.filter((item) => item.edge.id === id).flatMap((item) => [pill(item.edge.source), pill(item.edge.target)]) : [];
+  const groupOf = new Map(sc.groups.map((g) => [g.node.service_id, g]));
+  for (const p of placed.filter(Boolean)) {
+    const g = groupOf.get(p.node.service_id);
+    for (const host of p.node.hosts) {
+      const chip = chipOf.get(host);
+      if (!chip || (kind === "h" && host !== id)) continue;
+      const x = g.x - 6;
+      sc.live.append(svg("path", { class: "run is-lit", "stroke-width": 1, d: runsPath(`M${p.x} ${p.y + p.h / 2} H${x}`, x, chip.x + chip.w / 2, chip.y, sc.runsBend) }));
     }
   }
-  const serviceId = kind === "s" ? id : kind === "i" ? sc.pills.find((p) => p.node.id === id)?.node.service_id : null;
-  const card = cardOf.get(serviceId), group = sc.groups.find((g) => g.node.service_id === serviceId);
-  if (card && group) sc.links.append(svg("path", { class: "group-link", d: groupLink(card, group) }));
-  for (const focus of sc.cards.filter((c) => c.focus && c.node.service_id !== serviceId)) {
-    const g = sc.groups.find((item) => item.node.service_id === focus.node.service_id);
-    if (g) sc.links.append(svg("path", { class: "group-link", d: groupLink(focus, g) }));
-  }
+  return expanded;
 }
 
 // A card's own group may sit below other cards of its column; route around them on the left.
 function groupLink(card, group) {
   const blocked = state.scene.cards.some((c) => c !== card && c.col === card.col && c.y > card.y) ||
     state.scene.groups.some((g) => g !== group && g.x === group.x && g.y < group.y);
-  const cx = card.x + SW / 2;
+  const cx = card.x + card.w / 2;
   if (!blocked) return `M${cx} ${card.y + SH} V${group.y}`;
   const gutter = card.x - 12;
   return `M${card.x} ${card.y + SH / 2} H${gutter} V${group.y + GROUP_HEAD / 2} H${group.x}`;
@@ -1092,7 +1259,8 @@ function details(summary, pairs) {
 }
 
 function selectable(node, key) {
-  if (!state.scene || !map.querySelector(`[data-key="${CSS.escape(key)}"]`)) return node;
+  const drawn = map.querySelector(`[data-key="${CSS.escape(key)}"]`) || state.scene?.iedges.some((e) => "x:" + e.edge.id === key);
+  if (!state.scene || !drawn) return node;
   node.setAttribute("role", "button");
   node.tabIndex = 0;
   const choose = () => {
@@ -1490,6 +1658,21 @@ function unfocus() {
   renderAll({ refit: true });
 }
 
+// The rail folds away at any width so the canvas can take the room; phones and tablets use a drawer instead.
+function applyRail() {
+  $("main").classList.toggle("rail-collapsed", state.railCollapsed);
+  const open = mqRail.matches ? state.drawer === "rail" : !state.railCollapsed;
+  $("rail-open").setAttribute("aria-expanded", String(open));
+  $("rail-open").setAttribute("aria-label", open ? "Hide layers" : "Show layers");
+}
+
+function toggleRail(open = mqRail.matches ? state.drawer !== "rail" : state.railCollapsed) {
+  if (mqRail.matches) return open ? openDrawer("rail") : closeDrawer();
+  state.railCollapsed = !open;
+  try { localStorage.setItem(RAIL_KEY, state.railCollapsed ? "collapsed" : "open"); } catch { /* preference is optional */ }
+  applyRail();
+}
+
 function drawerPanel(name) {
   return name === "rail" ? $("rail") : $("inspector");
 }
@@ -1502,9 +1685,10 @@ function openDrawer(name) {
   $("main").classList.add(name + "-open");
   $("scrim").hidden = false;
   syncDrawers();
-  (name === "rail" ? $("rail-open") : $("insp-open")).setAttribute("aria-expanded", "true");
+  if (name === "inspector") $("insp-open").setAttribute("aria-expanded", "true");
+  applyRail();
   const panel = drawerPanel(name);
-  requestAnimationFrame(() => panel.querySelector(".insp-close, .drawer-close, button, a, input")?.focus());
+  requestAnimationFrame(() => panel.querySelector(".insp-close, #rail-close, button, a, input")?.focus());
 }
 
 function closeDrawer(restore = true) {
@@ -1513,7 +1697,8 @@ function closeDrawer(restore = true) {
   state.drawer = null;
   $("main").classList.remove(name + "-open");
   $("scrim").hidden = true;
-  (name === "rail" ? $("rail-open") : $("insp-open")).setAttribute("aria-expanded", "false");
+  if (name === "inspector") $("insp-open").setAttribute("aria-expanded", "false");
+  applyRail();
   syncDrawers();
   if (restore && state.opener?.isConnected) state.opener.focus();
   else if (restore) canvas.focus();
@@ -1554,7 +1739,7 @@ function renderAll({ refit = false } = {}) {
   if (state.svc && !state.failure && !empty) {
     const before = state.sceneKey;
     layoutAndFit(refit || !state.scene);
-    state.sceneKey = sceneKey(state.scene);
+    if (state.scene) state.sceneKey = sceneKey(state.scene);
     if (!refit && before && before !== state.sceneKey) layoutAndFit(true);
   }
   renderControls();
@@ -1723,16 +1908,16 @@ for (const tab of tabs) {
   });
 }
 
-$("rail-open").addEventListener("click", () => state.drawer === "rail" ? closeDrawer() : openDrawer("rail"));
+$("rail-open").addEventListener("click", () => toggleRail());
+$("rail-close").addEventListener("click", () => toggleRail(false));
 $("insp-open").addEventListener("click", () => state.drawer === "inspector" ? closeDrawer() : openDrawer("inspector"));
-for (const b of document.querySelectorAll("[data-close]")) b.addEventListener("click", () => closeDrawer());
 $("scrim").addEventListener("click", () => closeDrawer());
 
 document.addEventListener("keydown", (e) => {
   const typing = e.target.closest?.("input, select, textarea");
   if (e.key === "/" && !typing && !e.metaKey && !e.ctrlKey) {
     e.preventDefault();
-    if (mqRail.matches) openDrawer("rail");
+    toggleRail(true);
     requestAnimationFrame(() => $("search").focus());
   } else if (e.key === "Escape") {
     if (typing === $("search") && $("search").value) return;
@@ -1741,7 +1926,7 @@ document.addEventListener("keydown", (e) => {
   }
 });
 
-for (const mq of [mqInspector, mqRail]) mq.addEventListener("change", syncDrawers);
+for (const mq of [mqInspector, mqRail]) mq.addEventListener("change", () => { syncDrawers(); applyRail(); });
 mqCompact.addEventListener("change", placeEnvironment);
 
 let resizeTimer = 0;
@@ -1760,6 +1945,13 @@ document.addEventListener("visibilitychange", () => {
 
 initShell();
 readURL();
+try {
+  const stored = localStorage.getItem(RAIL_KEY);
+  state.railCollapsed = stored ? stored === "collapsed" : innerWidth < 1440;
+} catch {
+  state.railCollapsed = innerWidth < 1440;
+}
+applyRail();
 placeEnvironment();
 syncDrawers();
 renderRail();
