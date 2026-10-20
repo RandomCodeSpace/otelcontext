@@ -35,7 +35,15 @@ jobs:
         run: go vet ./...
 
       - name: go test (race)
-        run: go test -race -count=1 -timeout 180s ./...
+        run: |
+          # The aggregate race suite takes over six minutes cumulatively.
+          # Keep the existing per-package budget for every other package.
+          package_list=$(go list ./...)
+          mapfile -t other_packages < <(printf '%s\n' "$package_list" | grep -vx 'github.com/RandomCodeSpace/otelcontext/internal/aggregate')
+          test_status=0
+          go test -race -count=1 -timeout 10m ./internal/aggregate || test_status=$?
+          go test -race -count=1 -timeout 180s "${other_packages[@]}" || test_status=$?
+          exit "$test_status"
 
       - name: loadsim build tag compiles
         run: go build -tags loadtest ./test/loadsim/...

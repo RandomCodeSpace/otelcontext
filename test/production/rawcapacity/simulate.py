@@ -11,7 +11,6 @@ import collections
 import datetime as dt
 import hashlib
 import json
-import os
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -63,7 +62,8 @@ def usage(path) -> dict[str, Any]:
             s = p.stat()
             files[suffix or "db"] = {"bytes": s.st_size, "allocated": s.st_blocks * 512}
         except FileNotFoundError:
-            pass
+            # SQLite sidecars may be absent or removed during checkpointing.
+            continue
     return {"files": files, "bytes": sum(x["bytes"] for x in files.values()),
             "allocated": sum(x["allocated"] for x in files.values())}
 

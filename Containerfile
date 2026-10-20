@@ -8,7 +8,7 @@ COPY *.go ./
 COPY internal/ ./internal/
 RUN go build -mod=readonly -trimpath -buildvcs=false -ldflags="-s -w -buildid=" -o /out/otelcontext . \
  && mkdir -p /out/data /out/tmp \
- && chmod 1777 /out/tmp
+ && chmod 0700 /out/tmp
 
 FROM scratch
 ARG VERSION=dev

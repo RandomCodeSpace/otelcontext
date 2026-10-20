@@ -123,6 +123,7 @@ func fractionalSummaryFixture(t *testing.T, late bool) (*Engine, *SQLiteStore, Q
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer tx.Rollback()
 	var ids []SeriesID
 	var windows []int64
 	var deltas []*AggregateDelta
@@ -518,6 +519,7 @@ func TestServiceSummaryFractionalCountArithmetic(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			defer tx.Rollback()
 			if _, err := tx.Exec(`INSERT INTO aggregate_dict VALUES (2,1,?,?),(4,1,?,?),(5,1,?,?)`, KindService, []byte(OtherValue), KindOperation, []byte(OtherValue), KindDimTuple, []byte(OtherValue)); err != nil {
 				t.Fatal(err)
 			}

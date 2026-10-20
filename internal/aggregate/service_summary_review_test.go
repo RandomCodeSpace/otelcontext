@@ -19,6 +19,7 @@ func checkSummaryArithmeticFallback(t *testing.T, values []float64, services, na
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer tx.Rollback()
 	var series []SeriesRow
 	var ids []SeriesID
 	var deltas []*AggregateDelta
@@ -122,6 +123,7 @@ func TestServiceSummaryArithmeticEligibility(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			defer tx.Rollback()
 			seedSeries(t, tx, []SeriesRow{{ID: 1, Key: storeKey(101)}, {ID: 2, Key: storeKey(100)}})
 			insertRows(t, tx, "aggregate_buckets", []SeriesID{1}, []int64{rollupTestHour}, []*AggregateDelta{{Count: 1, DurationSum: tc.source}})
 			var ids []SeriesID
@@ -169,6 +171,7 @@ func TestServiceSummaryArithmeticEligibility(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		defer tx.Rollback()
 		seedSeries(t, tx, []SeriesRow{{ID: 1, Key: storeKey(100)}})
 		insertRows(t, tx, "aggregate_buckets", []SeriesID{1, 1}, []int64{rollupTestHour, rollupTestHour + 300}, []*AggregateDelta{{Count: 1, DurationSum: .25}, {Count: 1, DurationSum: .75}})
 		if err := tx.Commit(); err != nil {
@@ -188,6 +191,7 @@ func TestServiceSummaryDeltaOverflowGrouping(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer tx.Rollback()
 	seedSeries(t, tx, []SeriesRow{{ID: 1, Key: storeKey(100)}})
 	insertRows(t, tx, "aggregate_buckets", []SeriesID{1}, []int64{rollupTestHour}, []*AggregateDelta{{}})
 	insertRows(t, tx, "aggregate_delta_log", []SeriesID{1, 1}, []int64{rollupTestHour, rollupTestHour + 300}, []*AggregateDelta{{Count: math.MaxInt64}, {Count: 1}})

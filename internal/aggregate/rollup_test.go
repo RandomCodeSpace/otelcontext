@@ -591,6 +591,7 @@ func TestRollupMixedSketchScalesAndIncompleteHistogram(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer tx.Rollback()
 	seedSeries(t, tx, series)
 	var ids []SeriesID
 	var windows []int64
@@ -705,6 +706,7 @@ func TestRollupLogHeavySeriesCoverage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer tx.Rollback()
 	seedSeries(t, tx, series)
 	insertRows(t, tx, "aggregate_buckets", ids, windows, deltas)
 	if err := tx.Commit(); err != nil {
@@ -731,6 +733,7 @@ func TestRollupPreservesSaturationProvenanceAcrossHours(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer tx.Rollback()
 	seedSeries(t, tx, []SeriesRow{{ID: 1, Key: storeKey(1)}})
 	var ids []SeriesID
 	var windows []int64

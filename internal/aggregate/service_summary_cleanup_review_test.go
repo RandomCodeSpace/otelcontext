@@ -59,6 +59,7 @@ func TestReviewServiceSummaryCleanupEligibilityBounded(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			defer tx.Rollback()
 			var series []SeriesRow
 			var ids []SeriesID
 			var windows []int64

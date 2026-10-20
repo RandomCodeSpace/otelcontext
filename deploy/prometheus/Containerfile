@@ -4,8 +4,11 @@ FROM golang:1.26.9@sha256:37cfcca63222ec499bec5e8ad7aad52dbf7529db36d5812b8eae2f
 ENV CGO_ENABLED=0 GOTOOLCHAIN=local
 WORKDIR /src
 ADD --checksum=sha256:eee7ec029ffdba7d9ee59171cad5ddaff10e71514b0bae1a6fde6dc1ae99e181 https://codeload.github.com/prometheus/prometheus/tar.gz/5241a27fe3c6983549fccc32f6e65917408c63cd /source.tar.gz
+# Lock the same patched dependency versions and checksums used by the reviewed build.
+COPY dependencies.patch /tmp/dependencies.patch
 RUN tar -xzf /source.tar.gz --strip-components=1 -C /src \
- && go get golang.org/x/net@v0.60.0 \
+ && git apply --unidiff-zero /tmp/dependencies.patch \
+ && go mod download \
  && go mod verify
 # This internal OTLP/query companion needs no web console or frontend toolchain.
 RUN go build -mod=readonly -trimpath -buildvcs=false -tags netgo \
@@ -14,7 +17,7 @@ RUN go build -mod=readonly -trimpath -buildvcs=false -tags netgo \
 RUN go build -mod=readonly -trimpath -buildvcs=false -tags netgo \
       -ldflags='-s -w -buildid= -X github.com/prometheus/common/version.Version=3.15.0' \
       -o /out/promtool ./cmd/promtool \
- && mkdir -p /out/data /out/tmp && chmod 1777 /out/tmp
+ && mkdir -p /out/data /out/tmp && chmod 0700 /out/tmp
 
 FROM scratch
 LABEL org.opencontainers.image.source="https://github.com/prometheus/prometheus" \

@@ -581,6 +581,7 @@ func TestServiceSummaryScalarArithmetic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer tx.Rollback()
 	keys := []SeriesRow{{ID: 1, Key: storeKey(100)}, {ID: 2, Key: storeKey(101)}}
 	seedSeries(t, tx, keys)
 	d := spanDelta(1, 5)
@@ -933,6 +934,7 @@ func TestServiceSummaryWideSketchAndUnsafeFallback(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			defer tx.Rollback()
 			seedSeries(t, tx, []SeriesRow{{ID: 1, Key: storeKey(100)}, {ID: 2, Key: storeKey(101)}})
 			a, b := NewSketch(), NewSketch()
 			for i := 0; i < n; i++ {
@@ -1003,8 +1005,12 @@ func TestServiceSummaryEndpointCancellationAndFilter(t *testing.T) {
 	if _, err := e.QueryTopology(ctx, q); !errors.Is(err, context.Canceled) {
 		t.Fatal("cancelled pinned snapshot", err)
 	}
-	if s.reader.Stats().InUse != 0 {
-		t.Fatal("cancelled endpoint leaked reader")
+	// database/sql may still be returning the connection from its cancellation
+	// goroutine after the endpoint's Rollback sees ErrTxDone.
+	pingCtx, stop := context.WithTimeout(context.Background(), time.Second)
+	defer stop()
+	if err := s.reader.PingContext(pingCtx); err != nil || s.reader.Stats().InUse != 0 {
+		t.Fatalf("cancelled endpoint leaked reader: %v %+v", err, s.reader.Stats())
 	}
 }
 
@@ -1094,6 +1100,7 @@ func TestServiceSummarySharedNameAndIdentityCoverage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer tx.Rollback()
 	if _, err := tx.Exec(`INSERT INTO aggregate_dict VALUES (2,1,?,?),(3,1,?,?),(4,1,?,?)`, KindService, []byte(OtherValue), KindOperation, []byte(OtherValue), KindDimTuple, []byte(OtherValue)); err != nil {
 		t.Fatal(err)
 	}
@@ -1173,6 +1180,7 @@ func TestServiceSummaryRejectsNoncanonicalSource(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer tx.Rollback()
 	key := storeKey(100)
 	key.Signal = SignalLog
 	seedSeries(t, tx, []SeriesRow{{ID: 1, Key: key}})
@@ -1349,6 +1357,7 @@ func TestServiceSummarySketchFallbackProvenance(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			defer tx.Rollback()
 			key1, key2 := storeKey(100), storeKey(101)
 			if kind == "cross-service" {
 				key2.ServiceID = 9

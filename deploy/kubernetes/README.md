@@ -71,9 +71,12 @@ contains Go 1.27.1 and `x/net` 0.58.0. Its October 18, 2026 Trivy scan reports
 HIGH CVE-2026-78669 in `x/net` and HIGH CVE-2026-78667, CVE-2026-78669,
 CVE-2026-97031 in the standard library. Do not substitute that image for the
 patched build. The companion applies the same security versions as the app,
-also raising its `x/term` to the required 0.46.0. It includes `promtool` and the
-upstream LICENSE/NOTICE. The frontend console is omitted; OTLP, PromQL, and
-management health endpoints are available. No experimental feature is enabled.
+also raising its `x/term` to the required 0.46.0. The checked-in
+[`go.mod`/`go.sum` patch](../prometheus/dependencies.patch) locks that existing
+resolution; the image build does not select dependency updates. It includes
+`promtool` and the upstream LICENSE/NOTICE. The frontend console is omitted;
+OTLP, PromQL, and management health endpoints are available. No experimental
+feature is enabled.
 Review the [upstream advisories](https://github.com/prometheus/prometheus/security/advisories)
 when refreshing these pins. Re-scan the published image digests before rollout.
 

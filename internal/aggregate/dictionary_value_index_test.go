@@ -135,6 +135,7 @@ func TestDictionaryValueIndexScalarOrder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer tx.Rollback()
 	// Series order and identity order give different SQLite SUM bits. The
 	// dictionary lookup index must preserve each authoritative selector's order.
 	values := []float64{1.4210854715202004e-14, 7.663350976776343e-47, 1.313717310304516e-46, 1.5777218104420236e-30, 40, 120}

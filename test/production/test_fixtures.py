@@ -3,8 +3,7 @@ import io
 import json
 import pathlib
 import tempfile
-import unittest
-from unittest import mock
+import unittest.mock
 
 import fixtures
 
@@ -79,16 +78,16 @@ class FixtureTests(unittest.TestCase):
             fixtures.http_client("http://example.test", None)
 
     def test_host_failure_report_does_not_count_partial_ack(self):
-        response = mock.MagicMock()
+        response = unittest.mock.MagicMock()
         response.__enter__.return_value = response
         response.status = 200
         response.read.return_value = b'{"partialSuccess":{"rejectedDataPoints":"1"}}'
-        client = mock.Mock()
+        client = unittest.mock.Mock()
         client.open.return_value = response
         with tempfile.TemporaryDirectory() as temp:
             report = pathlib.Path(temp) / "report.ndjson"
             args = argparse.Namespace(hosts=20, interval=10, duration=1, url="https://example.test", ca_file=None, timeout=1, report=str(report))
-            with mock.patch.object(fixtures, "http_client", return_value=client), mock.patch("sys.stdout", new_callable=io.StringIO):
+            with unittest.mock.patch.object(fixtures, "http_client", return_value=client), unittest.mock.patch("sys.stdout", new_callable=io.StringIO):
                 with self.assertRaises(ValueError):
                     fixtures.send_hosts(args)
             summary = json.loads(report.read_text())["summary"]

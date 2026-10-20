@@ -14,7 +14,7 @@ class SimulationTests(unittest.TestCase):
                          "2026-10-19 19:00:00.123456789+00:00")
         self.assertIsNone(sim.shifted(None, 3600))
         self.assertEqual(sim.identity("", 2), "")
-        self.assertEqual(sim.identity("abc", 2), sim.identity("abc", 2))
+        self.assertEqual(sim.identity("abc", 2), "b36cb309eb00982a96a4f9aca2c81849")
         self.assertNotEqual(sim.identity("abc", 2), sim.identity("abc", 3))
 
     @unittest.skipUnless(os.environ.get("RAWCAPACITY_HELPER"), "build helper and set RAWCAPACITY_HELPER")
