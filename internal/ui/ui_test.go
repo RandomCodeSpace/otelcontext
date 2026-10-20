@@ -162,9 +162,9 @@ func TestRegisterRoutesUsesCommittedAssets(t *testing.T) {
 		t.Fatalf("RegisterRoutes: %v", err)
 	}
 
-	index := request(t, mux, http.MethodGet, "/", nil)
+	index := request(t, mux, http.MethodGet, "/explorer", nil)
 	if index.Code != http.StatusOK || !strings.Contains(index.Body.String(), "Application map") {
-		t.Fatalf("index = %d, contains screen heading = %v", index.Code, strings.Contains(index.Body.String(), "Application map"))
+		t.Fatalf("explorer = %d, contains screen heading = %v", index.Code, strings.Contains(index.Body.String(), "Application map"))
 	}
 	for _, marker := range []string{
 		"type=\"module\" src=\"/static/app.js\"",
@@ -174,10 +174,14 @@ func TestRegisterRoutesUsesCommittedAssets(t *testing.T) {
 		"id=\"shortcut-dialog\"",
 	} {
 		if !strings.Contains(index.Body.String(), marker) {
-			t.Errorf("index is missing %q", marker)
+			t.Errorf("explorer is missing %q", marker)
 		}
 	}
-	for _, target := range []string{"/static/app.css", "/static/app.js", "/static/favicon.svg", "/static/map-layout.js", "/static/dagre.min.js", "/static/dagre.min.js.LEGAL.txt"} {
+	for _, target := range []string{
+		"/static/app.css", "/static/app.js", "/static/favicon.svg", "/static/map-layout.js", "/static/dagre.min.js", "/static/dagre.min.js.LEGAL.txt",
+		"/static/tokens.css", "/static/shell.js", "/static/icons.svg", "/static/icons.svg.LEGAL.txt",
+		"/static/geist.woff2", "/static/geist-mono.woff2", "/static/geist.woff2.LEGAL.txt",
+	} {
 		rec := request(t, mux, http.MethodGet, target, nil)
 		if rec.Code != http.StatusOK || rec.Body.Len() == 0 {
 			t.Errorf("%s: status = %d, bytes = %d", target, rec.Code, rec.Body.Len())
@@ -192,8 +196,8 @@ func TestServiceMapServesSeparateEmbeddedPage(t *testing.T) {
 	}
 	page := request(t, mux, http.MethodGet, "/service-map", nil)
 	if page.Code != http.StatusOK || !strings.Contains(page.Body.String(), "/static/service-map.js") ||
-		!strings.Contains(page.Body.String(), "Storage & ingestion") {
-		t.Fatalf("service map = %d; missing page assets or heading", page.Code)
+		!strings.Contains(page.Body.String(), "/static/tokens.css") {
+		t.Fatalf("service map = %d; missing page assets", page.Code)
 	}
 	for _, asset := range []string{"service-map.js", "service-map.css"} {
 		response := request(t, mux, http.MethodGet, "/static/"+asset, nil)
@@ -202,9 +206,10 @@ func TestServiceMapServesSeparateEmbeddedPage(t *testing.T) {
 		}
 	}
 	root := request(t, mux, http.MethodGet, "/", nil)
-	if !strings.Contains(root.Body.String(), `href="/service-map"`) ||
-		!strings.Contains(root.Body.String(), "/static/app.js") {
-		t.Fatal("existing explorer or service-map navigation missing")
+	for _, marker := range []string{`href="/service-map"`, `href="/explorer"`, "/static/overview.js", "Storage & ingestion"} {
+		if !strings.Contains(root.Body.String(), marker) {
+			t.Errorf("overview is missing %q", marker)
+		}
 	}
 }
 
@@ -224,6 +229,16 @@ func TestCommittedUIHasNoFrontendBuildContract(t *testing.T) {
 		"service-map.html":       true,
 		"service-map.css":        true,
 		"service-map.js":         true,
+		"explorer.html":          true,
+		"overview.css":           true,
+		"overview.js":            true,
+		"shell.js":               true,
+		"tokens.css":             true,
+		"icons.svg":              true,
+		"icons.svg.LEGAL.txt":    true,
+		"geist.woff2":            true,
+		"geist-mono.woff2":       true,
+		"geist.woff2.LEGAL.txt":  true,
 	}
 	for _, entry := range entries {
 		if entry.IsDir() || !wantAssets[entry.Name()] {
@@ -235,7 +250,7 @@ func TestCommittedUIHasNoFrontendBuildContract(t *testing.T) {
 		t.Errorf("embedded UI is missing source asset %q", name)
 	}
 
-	for _, name := range []string{"index.html", "app.css", "app.js", "map-layout.js", "service-map.html", "service-map.css", "service-map.js"} {
+	for _, name := range []string{"index.html", "explorer.html", "app.css", "app.js", "map-layout.js", "service-map.html", "service-map.css", "service-map.js", "overview.css", "overview.js", "shell.js", "tokens.css", "icons.svg"} {
 		body, readErr := fs.ReadFile(content, "static/"+name)
 		if readErr != nil {
 			t.Fatalf("read %s: %v", name, readErr)

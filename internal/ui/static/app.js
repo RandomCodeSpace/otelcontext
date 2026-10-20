@@ -391,7 +391,7 @@ function currentNode() {
 
 function updateURL(changes) {
   const url = new URL(window.location.href);
-  if (url.pathname !== "/") url.pathname = "/";
+  if (url.pathname !== "/explorer") url.pathname = "/explorer";
   for (const entry of Object.entries(changes)) {
     if (entry[1] === null || entry[1] === undefined || entry[1] === "") {
       url.searchParams.delete(entry[0]);

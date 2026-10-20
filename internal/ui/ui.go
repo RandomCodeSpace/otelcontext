@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io/fs"
+	"mime"
 	"net/http"
 	"path"
 	"strings"
@@ -28,6 +29,9 @@ func RegisterRoutes(mux *http.ServeMux) error {
 	mux.Handle("/", handler)
 	return nil
 }
+
+// Go's built-in MIME table has no entry for the self-hosted fonts.
+func init() { _ = mime.AddExtensionType(".woff2", "font/woff2") }
 
 var reservedRoots = []string{"/api", "/v1", "/ws", "/mcp", "/metrics"}
 
@@ -81,6 +85,10 @@ func (h *embeddedHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if cleanPath == "/service-map" {
 		h.serveAsset(w, r, "service-map.html")
+		return
+	}
+	if cleanPath == "/explorer" {
+		h.serveAsset(w, r, "explorer.html")
 		return
 	}
 	if cleanPath == "/" || cleanPath == "/index.html" {
