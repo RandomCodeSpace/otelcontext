@@ -54,6 +54,7 @@ func applyAggregate(eng *aggregate.Engine, r *aggregate.Reducer) error {
 			slog.Error("aggregate commit failed: device out of space — failing the Export so the client retries", "error", err)
 			return grpcstatus.Errorf(codes.ResourceExhausted, "aggregate store commit failed: no space left on device")
 		}
+		slog.Error("aggregate store commit failed", "error", err)
 		return grpcstatus.Errorf(codes.Unavailable, "aggregate store commit failed")
 	}
 	slog.Error("aggregate shadow commit failed (legacy path remains the source of truth)", "error", err)

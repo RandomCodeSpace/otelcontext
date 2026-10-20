@@ -12,6 +12,16 @@ most recently published tag.
 
 ## [Unreleased]
 
+## [v0.6.5] - 2026-10-20
+
+### Fixed
+
+- Log the original storage error at ERROR level when an aggregate-mode ingest
+  commit fails unexpectedly. OTLP clients still receive the generic retryable
+  error without database details. This makes commit failures diagnosable at the
+  default log level; it does not fix the underlying storage failure or change
+  persistence, retry, or schema behavior.
+
 ## [v0.6.4] - 2026-10-20
 
 ### Added

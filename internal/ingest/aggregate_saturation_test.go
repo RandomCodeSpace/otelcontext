@@ -1,7 +1,10 @@
 package ingest
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -84,6 +87,32 @@ func TestApplyAggregateCommitFailureByMode(t *testing.T) {
 	shadow := engineWithApplier(t, aggregate.ModeShadow, boom)
 	if err := applyAggregate(shadow, reducerWithOneSpan(shadow)); err != nil {
 		t.Fatalf("shadow mode commit failure = %v, want nil (legacy path is the source of truth)", err)
+	}
+}
+
+func TestApplyAggregateCommitFailureLogsCause(t *testing.T) {
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	cause := errors.New("test storage failure at /private/aggregate.db")
+	eng := engineWithApplier(t, aggregate.ModeAggregate, cause)
+	err := applyAggregate(eng, reducerWithOneSpan(eng))
+	st := grpcstatus.Convert(err)
+	if st.Code() != codes.Unavailable || st.Message() != "aggregate store commit failed" {
+		t.Fatalf("client response = %v, want generic UNAVAILABLE without storage details", err)
+	}
+
+	var entry struct {
+		Level string `json:"level"`
+		Error string `json:"error"`
+	}
+	if err := json.NewDecoder(&logs).Decode(&entry); err != nil {
+		t.Fatalf("missing server-side storage error: %v; logs=%q", err, logs.String())
+	}
+	if entry.Level != "ERROR" || entry.Error != cause.Error() {
+		t.Fatalf("server log = %+v, want ERROR with original storage cause %q", entry, cause)
 	}
 }
 
