@@ -1947,9 +1947,9 @@ initShell();
 readURL();
 try {
   const stored = localStorage.getItem(RAIL_KEY);
-  state.railCollapsed = stored ? stored === "collapsed" : innerWidth < 1440;
+  state.railCollapsed = stored ? stored === "collapsed" : innerWidth < 1600;
 } catch {
-  state.railCollapsed = innerWidth < 1440;
+  state.railCollapsed = innerWidth < 1600;
 }
 applyRail();
 placeEnvironment();
