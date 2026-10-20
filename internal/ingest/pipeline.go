@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
@@ -649,6 +650,20 @@ type PipelineStats struct {
 	Capacity        int
 	QueueBytes      int64 // approx bytes currently reserved by in-flight batches
 	MaxBytes        int64 // configured byte cap
+}
+
+// Saturation reports the fullest admission bound. Bytes include batches being
+// processed, whose reservations remain held even after they leave the queue.
+// Non-positive bounds are ignored; the result is not clamped at one.
+func (s PipelineStats) Saturation() float64 {
+	ratio := 0.0
+	if s.Capacity > 0 {
+		ratio = math.Max(ratio, float64(s.QueueDepth)/float64(s.Capacity))
+	}
+	if s.MaxBytes > 0 {
+		ratio = math.Max(ratio, float64(s.QueueBytes)/float64(s.MaxBytes))
+	}
+	return ratio
 }
 
 // worker drains the queue. Exits when stopCh closes (after draining

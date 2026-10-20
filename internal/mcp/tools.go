@@ -8,7 +8,6 @@ import (
 
 	"github.com/RandomCodeSpace/otelcontext/internal/aggregate"
 	"github.com/RandomCodeSpace/otelcontext/internal/graphrag"
-	"github.com/RandomCodeSpace/otelcontext/internal/httpconst"
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 	"github.com/RandomCodeSpace/otelcontext/internal/topology"
 )
@@ -20,9 +19,7 @@ const (
 )
 
 // toolDefs is the canonical list of triage-essential tools exposed by the
-// OtelContext MCP server. The surface was reduced from 21 to 7 in
-// 2026-05-24 so the platform survives 120 services on SQLite — see
-// docs/superpowers/specs/2026-05-24-mcp-7tool-sqlite-survival-design.md.
+// OtelContext MCP server. History reads are bounded by retention, page size, and the shared call budget.
 // schemaOpt mutates an InputSchema being built by mkTool. Use param(...) and
 // required(...) to compose schemas without re-typing the InputSchema /
 // Properties scaffolding on every tool definition.
@@ -53,25 +50,29 @@ func mkTool(name, desc string, opts ...schemaOpt) Tool {
 }
 
 var toolDefs = []Tool{
-	mkTool("get_anomaly_timeline", "Returns recent anomalies with temporal causal links, optionally filtered by service. The triage entry point — answers \"what's wrong right now\". Aggregate-backed: complete within aggregate retention, independent of which traces were retained as raw exemplars.",
+	mkTool("get_anomaly_timeline", "Returns recent anomalies with temporal causal links, optionally filtered by service. The triage entry point — answers \"what's wrong right now\". In-memory detections cover at most 24 hours and may be lost on restart. Persisted investigations supplement this list within aggregate retention; neither is a complete history of anomalies.",
 		param("since", "string", "Start time RFC3339. Defaults to 1h ago."),
 		param("service", "string", "Filter by service."),
 	),
-	mkTool("get_service_map", "Returns the service topology with health scores, error rates, call counts, and dependency edges. Aggregate-backed: counts describe ALL accepted telemetry, not the sampled subset, and are complete within aggregate retention.",
+	mkTool("get_service_map", "Returns the service topology with health scores, error rates, call counts, and dependency edges. In aggregate mode, unfiltered counts describe accepted telemetry within aggregate retention. Identities may be collapsed into __other__; coverage metadata reports the actual source, range and limits.",
 		param("depth", "number", "Max traversal depth (default 3)."),
 		param("service", "string", "Focus on a specific service and its neighbors."),
+		param("start", "string", "Optional RFC3339 range start; defaults to 1h before end when end is supplied."),
+		param("end", "string", "Optional RFC3339 range end; defaults to now when start is supplied."),
 		param("group_by", "string", "Set to \"host\" to wrap the map as {services, hosts}: `hosts` lists the tenant's hosts, each with its bounded, sorted service list. Omitted: the bare service array, unchanged."),
 	),
-	mkTool("get_service_health", "Returns detailed health metrics for a specific service: error rate, latency, request counts and dependency edges. Aggregate-backed and complete within aggregate retention. Returns an explicit \"not found in the current tenant window\" message rather than an empty guess.",
+	mkTool("get_service_health", "Returns detailed health metrics for a specific service: error rate, latency, request counts and dependency edges. Optional start/end read disk history within aggregate retention. Coverage reports the actual range and source. Returns an explicit \"not found in the current tenant window\" message rather than an empty guess.",
 		required("service_name"),
 		param("service_name", "string", "The service name to query."),
+		param("start", "string", "Optional RFC3339 range start."),
+		param("end", "string", "Optional RFC3339 range end."),
 	),
 	mkTool("root_cause_analysis", "Ranked probable root causes with evidence: error chains, anomalous metrics, correlated logs. Each ranked cause carries a `coverage` block: `source=retained_exemplar` means a complete retained error chain backs it, `partial_exemplar` means the upstream walk stopped at a span that was not retained (the named service is NOT proven to be the root), and `not_retained_or_not_found` means the ranking rests on aggregate anomaly evidence with no chain behind it. Errors are always eligible for retention but never all retained — treat a partial cause as a lead, not a conclusion.",
 		required("service"),
 		param("service", "string", "Service experiencing issues."),
 		param("time_range", "string", "Lookback window. Defaults to '15m'."),
 	),
-	mkTool("impact_analysis", "BFS downstream from a service to find all affected services and impact scores. Aggregate-backed: edges come from the aggregate topology snapshot and are complete within aggregate retention.",
+	mkTool("impact_analysis", "BFS downstream from a service using the current in-memory topology. This does not scan aggregate retention; use get_service_map with start/end for historical dependencies.",
 		required("service"),
 		param("service", "string", "Service to analyze blast radius for."),
 		param("depth", "number", "Max traversal depth (default 5)."),
@@ -80,15 +81,15 @@ var toolDefs = []Tool{
 		required("trace_id"),
 		param("trace_id", "string", "The trace ID to visualize."),
 	),
-	mkTool("search_logs", "Searches log entries by severity, service, body text, trace ID, and time range. Returns id, timestamp, severity, service_name, body, trace_id. **Limited to the last 24 hours** — windows entirely outside the 24h cap are rejected. Strongly recommend setting `service` and/or `severity` to scope the search; unscoped keyword queries scan large row counts when FTS5 is disabled. Use severity=ERROR to find errors, query= for full-text search, trace_id= to correlate with a trace. Use page= for pagination.",
+	mkTool("search_logs", "Searches log entries by severity, service, body text, trace ID, and time range. Returns id, timestamp, severity, service_name, body, trace_id. Searches the configured raw retention, defaulting to the most recent 24 hours. Coverage reports requested and available ranges. Raw exemplars are sampled in aggregate mode. Strongly recommend setting `service` and/or `severity` to scope the search; unscoped keyword queries scan large row counts when FTS5 is disabled. Use severity=ERROR to find errors, query= for full-text search, trace_id= to correlate with a trace. Use page= for pagination.",
 		param("query", "string", "Full-text search in log body. SQLite uses stemmed token-prefix matching and BM25 ranking when FTS5 is enabled; use trace_id for exact trace lookup."),
 		param("severity", "string", "Filter by severity level: ERROR, WARN, INFO, DEBUG."),
 		param("service", "string", "Filter by service name (exact match)."),
 		param("trace_id", "string", "Filter logs belonging to a specific trace ID."),
-		param("start", "string", "Start time RFC3339. Defaults to 24h ago. Cannot be earlier than now-24h; older values are clamped."),
+		param("start", "string", "Start time RFC3339. Defaults to 24h before end. Clamped to configured raw retention with explicit coverage."),
 		param("end", "string", "End time RFC3339. Defaults to now. Cannot exceed now; future values are clamped."),
 		param("limit", "number", "Max results per page (default 50, max 200)."),
-		param("page", "number", "Page number for pagination (default 0)."),
+		param("page", "number", "Page number for pagination (default 0); offset is capped at 10000."),
 	),
 	mkTool("promql_query", "Evaluate PromQL over ingested application and host metrics. Returns the unmodified Prometheus JSON envelope, including labels, timestamps, result type, warnings and errors. This is separate from the internal self-monitoring scrape.",
 		required("query"), param("query", "string", `PromQL expression, maximum 16384 bytes. Native OTLP NoTranslation preserves dots: {__name__="system.cpu.utilization","host.name"="host-a"}. Standard PromQL operators and functions apply.`),
@@ -101,6 +102,9 @@ var toolDefs = []Tool{
 		param("start", "string", "RFC3339 or Unix seconds, inclusive."), param("end", "string", "RFC3339 or Unix seconds, inclusive."),
 		param("step", "string", "Positive duration such as 5m, or seconds."),
 		param("timeout", "string", "Optional timeout, maximum 30s."), param("limit", "number", "Maximum returned series, 1 to 1000."),
+	),
+	mkTool("get_log_summary", "Accepted log counts from aggregate buckets across retained history, including logs whose raw bodies were not sampled. Five-minute resolution; no raw text or severity breakdown. Coverage and actual bucket bounds accompany results.",
+		param("service", "string", "Optional exact service name."), param("start", "string", "RFC3339 start; defaults to 24h before end."), param("end", "string", "RFC3339 end; defaults to now."),
 	),
 }
 
@@ -149,11 +153,12 @@ func (s *Server) toolHandler(ctx context.Context, name string, args map[string]a
 		"search_logs":          s.toolSearchLogs,
 		"promql_query":         s.toolPromQLQuery,
 		"promql_query_range":   s.toolPromQLRange,
+		"get_log_summary":      s.toolLogSummary,
 	}
 	if fn, ok := dispatch[name]; ok {
 		result := fn(ctx, args)
 		if name == "get_service_map" || name == "get_service_health" {
-			return s.withTopologyCoverage(ctx, result)
+			return result
 		}
 		return s.withCoverage(result, toolCoverage[name])
 	}
@@ -176,6 +181,7 @@ var toolCoverage = map[string]aggregate.Coverage{
 	"search_logs":          aggregate.CoverageExemplar,
 	"promql_query":         "", // Backend envelope owns metric coverage and warnings.
 	"promql_query_range":   "",
+	"get_log_summary":      "",
 }
 
 // coverageMeta is the body metadata appended to every successful tool result
@@ -192,36 +198,6 @@ type coverageMeta struct {
 	DroppedOperations uint64 `json:"dropped_operations,omitempty"`
 	DroppedEdges      uint64 `json:"dropped_edges,omitempty"`
 	DroppedMetrics    uint64 `json:"dropped_metrics,omitempty"`
-}
-
-func (s *Server) withTopologyCoverage(ctx context.Context, result ToolCallResult) ToolCallResult {
-	if s == nil || !s.aggregateMode || result.IsError || s.topology == nil || s.topology.Source() != topology.SourceAggregate {
-		return result
-	}
-	snapshot, err := s.topology.Snapshot(ctx, topology.Query{})
-	if err != nil {
-		return errorResult("topology provider unavailable")
-	}
-	coverage := snapshot.Meta.Coverage
-	if coverage == "" {
-		coverage = string(aggregate.CoverageFull)
-	}
-	data, err := json.Marshal(coverageMeta{
-		Coverage:          coverage,
-		Note:              snapshot.Meta.CoverageNote,
-		Source:            string(snapshot.Meta.Source),
-		Epoch:             snapshot.Meta.Epoch,
-		Revision:          snapshot.Meta.Revision,
-		Truncated:         snapshot.Meta.Truncated,
-		DroppedServices:   snapshot.Meta.DroppedServices,
-		DroppedOperations: snapshot.Meta.DroppedOperations,
-		DroppedEdges:      snapshot.Meta.DroppedEdges,
-		DroppedMetrics:    snapshot.Meta.DroppedMetrics,
-	})
-	if err == nil {
-		result.Content = append(result.Content, ContentItem{Type: "text", Text: string(data)})
-	}
-	return result
 }
 
 // withCoverage appends coverage metadata as an ADDITIONAL content item.
@@ -248,6 +224,9 @@ func (s *Server) withCoverage(res ToolCallResult, c aggregate.Coverage) ToolCall
 // toolGetServiceHealth returns the ServiceMap entry for svcName scoped to
 // the tenant on ctx.
 func (s *Server) toolGetServiceHealth(ctx context.Context, args map[string]any) ToolCallResult {
+	if s.useTopologySnapshot(args) {
+		return s.topologyTool(ctx, args, true)
+	}
 	svcName, _ := args["service_name"].(string)
 	if svcName == "" {
 		return errorResult("service_name is required")
@@ -296,67 +275,12 @@ func toLogSummaries(logs []storage.Log) []logSummary {
 	return out
 }
 
-func (s *Server) toolSearchLogs(ctx context.Context, args map[string]any) ToolCallResult {
-	var start, end time.Time
-	parseTime(args, "start", &start)
-	parseTime(args, "end", &end)
-
-	// Enforce the 24h cap centrally so an MCP caller cannot bypass via the
-	// alternate HTTP transport. clampTo24h handles defaults (zero values) and
-	// returns a clean error when the window is entirely older than the cap.
-	clampedStart, clampedEnd, capErr := storage.ClampSearchWindowTo24h(start, end, time.Now())
-	if capErr != nil {
-		return errorResult(capErr.Error())
-	}
-	start, end = clampedStart, clampedEnd
-
-	limit := argInt(args, "limit", 50)
-	if limit > 200 {
-		limit = 200
-	}
-	page := argInt(args, "page", 0)
-
-	filter := storage.LogFilter{
-		StartTime: start,
-		EndTime:   end,
-		Limit:     limit,
-		Offset:    page * limit,
-	}
-	if v, ok := args["severity"].(string); ok && v != "" {
-		filter.Severity = v
-	}
-	if v, ok := args["service"].(string); ok && v != "" {
-		filter.ServiceName = v
-	}
-	if v, ok := args["query"].(string); ok && v != "" {
-		filter.Search = v
-	}
-	if v, ok := args["trace_id"].(string); ok && v != "" {
-		filter.TraceID = v
-	}
-
-	logs, total, err := s.repo.GetLogsV2(mcpCtx(ctx), filter)
-	if err != nil {
-		return errorResult(fmt.Sprintf("search_logs failed: %v", err))
-	}
-
-	result := map[string]any{
-		"total":   total,
-		"page":    page,
-		"limit":   limit,
-		"count":   len(logs),
-		"entries": toLogSummaries(logs),
-	}
-	data, err := json.Marshal(result)
-	if err != nil {
-		return errorResult(fmt.Sprintf("failed to marshal search results: %v", err))
-	}
-	return resourceResult(resourceURIPrefix+"logs/search", httpconst.ContentTypeJSON, string(data))
-}
-
 // --- GraphRAG Tool implementations ---
 
 func (s *Server) toolGetServiceMap(ctx context.Context, args map[string]any) ToolCallResult {
+	if s.useTopologySnapshot(args) {
+		return s.topologyTool(ctx, args, false)
+	}
 	if s.graphRAG == nil {
 		return errorResult(errGraphRAGNotInit)
 	}
@@ -407,70 +331,6 @@ func (s *Server) hosts(ctx context.Context) topology.HostProjection {
 	return s.topology.Hosts(mcpCtx(ctx))
 }
 
-// toolTraceGraph answers with the retained span tree and an explicit coverage
-// block (#163's causal-analysis quality contract). A trace nobody retained is
-// answered "not retained or not found" — a definitive, successful response.
-// Fabricating certainty about a trace that was never persisted is the failure
-// mode this replaces.
-func (s *Server) toolTraceGraph(ctx context.Context, args map[string]any) ToolCallResult {
-	if s.graphRAG == nil {
-		return errorResult(errGraphRAGNotInit)
-	}
-	traceID, _ := args["trace_id"].(string)
-	if traceID == "" {
-		return errorResult("trace_id is required")
-	}
-	tctx := mcpCtx(ctx)
-	res := s.graphRAG.TraceGraph(tctx, traceID)
-	if len(res.Spans) == 0 {
-		// The in-memory trace TTL is shorter than raw retention, so a trace
-		// that WAS retained can still be absent from the graph. The DB row
-		// carries the truncation counters the exemplar policy stamped on it.
-		if enriched, ok := s.traceGraphFromDB(tctx, traceID); ok {
-			res = enriched
-		}
-	}
-	data, err := json.Marshal(res)
-	if err != nil {
-		return errorResult(fmt.Sprintf("failed to marshal trace graph: %v", err))
-	}
-	return resourceResult(resourceURIPrefix+"traces/"+traceID, httpconst.ContentTypeJSON, string(data))
-}
-
-// traceGraphFromDB reads the persisted trace row for a trace the in-memory
-// window no longer holds and renders its coverage from the retained/observed
-// counters the exemplar policy stamped on it.
-func (s *Server) traceGraphFromDB(ctx context.Context, traceID string) (graphrag.TraceGraphResult, bool) {
-	if s.repo == nil {
-		return graphrag.TraceGraphResult{}, false
-	}
-	trace, err := s.repo.GetTrace(ctx, traceID)
-	if err != nil {
-		return graphrag.TraceGraphResult{}, false
-	}
-	out := graphrag.TraceGraphResult{
-		TraceID: traceID,
-		Coverage: graphrag.Coverage{
-			Complete: true,
-			Source:   graphrag.CoverageRetained,
-			Note:     "trace row retained; its spans are outside the in-memory trace window",
-		},
-	}
-	if trace.Truncated != nil && *trace.Truncated {
-		out.Coverage.Complete = false
-		out.Coverage.Truncated = true
-		out.Coverage.Source = graphrag.CoveragePartial
-		out.Coverage.Note = "trace was truncated by the per-trace span/byte bound"
-	}
-	if trace.RetainedSpanCount != nil {
-		out.Coverage.RetainedSpans = *trace.RetainedSpanCount
-	}
-	if trace.ObservedSpanCount != nil {
-		out.Coverage.ObservedSpans = *trace.ObservedSpanCount
-	}
-	return out, true
-}
-
 func (s *Server) toolImpactAnalysis(ctx context.Context, args map[string]any) ToolCallResult {
 	if s.graphRAG == nil {
 		return errorResult(errGraphRAGNotInit)
@@ -496,23 +356,44 @@ func (s *Server) toolRootCauseAnalysis(ctx context.Context, args map[string]any)
 	if svcName == "" {
 		return errorResult(errServiceRequired)
 	}
-	since := time.Now().Add(-15 * time.Minute)
-	parseTimeRange(args, "time_range", &since)
+	now := time.Now().UTC()
+	lookback := 15 * time.Minute
+	if raw, ok := args["time_range"]; ok {
+		v, ok := raw.(string)
+		if !ok {
+			return errorResult("time_range must be a duration")
+		}
+		var err error
+		lookback, err = time.ParseDuration(v)
+		if err != nil || lookback <= 0 || lookback > s.historyRetention {
+			return errorResult("time_range must be positive and within configured history retention")
+		}
+	}
+	since := now.Add(-lookback)
 
 	causes := s.graphRAG.RootCauseAnalysis(mcpCtx(ctx), svcName, since)
 	data, err := json.Marshal(causes)
 	if err != nil {
 		return errorResult(fmt.Sprintf("failed to marshal root cause analysis: %v", err))
 	}
-	return textResult(string(data))
+	return s.investigationHistory(ctx, textResult(string(data)), svcName, since, now)
 }
 
 func (s *Server) toolGetAnomalyTimeline(ctx context.Context, args map[string]any) ToolCallResult {
 	if s.graphRAG == nil {
 		return errorResult(errGraphRAGNotInit)
 	}
-	since := time.Now().Add(-1 * time.Hour)
-	parseTime(args, "since", &since)
+	now := time.Now().UTC()
+	since, err := strictTime(args, "since")
+	if err != nil {
+		return errorResult(err.Error())
+	}
+	if since.IsZero() {
+		since = now.Add(-time.Hour)
+	}
+	if !since.Before(now) || now.Sub(since) > s.historyRetention {
+		return errorResult("since must be within configured history retention and before now")
+	}
 	service, _ := args["service"].(string)
 
 	var anomalies []*graphrag.AnomalyNode
@@ -525,16 +406,7 @@ func (s *Server) toolGetAnomalyTimeline(ctx context.Context, args map[string]any
 	if err != nil {
 		return errorResult(fmt.Sprintf("failed to marshal anomaly timeline: %v", err))
 	}
-	return textResult(string(data))
-}
-
-// parseTimeRange converts a duration-like string (e.g. "15m", "1h") to a since time.
-func parseTimeRange(args map[string]any, key string, since *time.Time) {
-	if v, ok := args[key].(string); ok && v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			*since = time.Now().Add(-d)
-		}
-	}
+	return s.investigationHistory(ctx, textResult(string(data)), service, since, now)
 }
 
 // --- Helpers ---
@@ -583,14 +455,6 @@ func errorResult(msg string) ToolCallResult {
 	return ToolCallResult{
 		IsError: true,
 		Content: []ContentItem{{Type: "text", Text: "Error: " + msg}},
-	}
-}
-
-func parseTime(args map[string]any, key string, dest *time.Time) {
-	if v, ok := args[key].(string); ok && v != "" {
-		if t, err := time.Parse(time.RFC3339, v); err == nil {
-			*dest = t
-		}
 	}
 }
 

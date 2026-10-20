@@ -296,8 +296,8 @@ func registerResource(reg *topology.Registry, tenant, service string, slots reso
 
 // resolveServiceIdentity resolves the service identity of one resource
 // (#280). A declared service.name wins. Without one, a resource carrying
-// host.name or host.id is a host entity named topology.HostPrefix + host.name
-// (host.id when there is no name); consumers recognise it with
+// host.name or host.id is a host entity named topology.HostPrefix + host.id
+// (host.name when there is no ID); consumers recognise it with
 // topology.IsHostEntity. A resource with neither keeps unknown-service. A
 // client-declared name inside the reserved host/ namespace is accepted as sent
 // and counted on otelcontext_ingest_reserved_service_prefix_total{signal}.
@@ -309,8 +309,6 @@ func resolveServiceIdentity(slots resourceSlots, metrics *telemetry.Metrics, sig
 		return slots.serviceName
 	}
 	switch {
-	case slots.hostName != "":
-		return topology.HostPrefix + slots.hostName
 	case slots.host != "":
 		return topology.HostPrefix + slots.host
 	}

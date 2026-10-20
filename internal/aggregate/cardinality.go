@@ -456,6 +456,19 @@ func (l *Limiter) overflowKey(key SeriesKey) SeriesKey {
 	return other
 }
 
+// admittedKey resolves the identity of an already applied delta without
+// consuming capacity or changing overflow counters.
+func (l *Limiter) admittedKey(key SeriesKey, window int64) (SeriesKey, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if _, ok := l.present[SeriesWindowKey{Key: key, WindowStart: window}]; ok {
+		return key, true
+	}
+	other := l.overflowKey(key)
+	_, ok := l.present[SeriesWindowKey{Key: other, WindowStart: window}]
+	return other, ok
+}
+
 func (l *Limiter) nameCap(s Signal) int {
 	switch s {
 	case SignalTraceOp, SignalServiceEdge:

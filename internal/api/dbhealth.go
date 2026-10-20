@@ -3,13 +3,83 @@ package api
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"net/http"
+	"net/url"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/RandomCodeSpace/otelcontext/internal/telemetry"
+	_ "github.com/glebarez/go-sqlite"
 )
+
+// SQLiteReadinessProbe owns a single read-only connection independent of the
+// query and writer pools. A range query holding every query connection must
+// not make a database that is still accepting exports appear unreachable.
+// Capacity and writer failures remain separate readiness checks.
+type SQLiteReadinessProbe struct {
+	db *sql.DB
+}
+
+// NewSQLiteReadinessProbe opens an existing on-disk database without creating
+// or migrating it. Call Close after HTTP shutdown. Private in-memory databases
+// cannot be probed from another connection; keep their original store probe.
+func NewSQLiteReadinessProbe(path string) (*SQLiteReadinessProbe, error) {
+	if path == "" || path == ":memory:" {
+		return nil, fmt.Errorf("readiness probe requires an on-disk SQLite database")
+	}
+	var uri *url.URL
+	if strings.HasPrefix(path, "file:") {
+		var err error
+		uri, err = url.Parse(path)
+		if err != nil {
+			return nil, fmt.Errorf("readiness database URI: %w", err)
+		}
+	} else {
+		abs, err := filepath.Abs(path)
+		if err != nil {
+			return nil, fmt.Errorf("readiness database path: %w", err)
+		}
+		uri = &url.URL{Scheme: "file", Path: abs}
+	}
+	q := uri.Query()
+	if q.Get("mode") == "memory" || uri.Opaque == ":memory:" {
+		return nil, fmt.Errorf("readiness probe requires an on-disk SQLite database")
+	}
+	q.Set("mode", "ro")
+	q.Set("cache", "private")
+	q.Del("_txlock")
+	q.Del("_pragma")
+	q.Add("_pragma", "query_only(1)")
+	q.Add("_pragma", "busy_timeout(1000)")
+	q.Add("_pragma", "cache_size(-64)")
+	uri.RawQuery = q.Encode()
+	db, err := sql.Open("sqlite", uri.String())
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	p := &SQLiteReadinessProbe{db: db}
+	ctx, cancel := context.WithTimeout(context.Background(), aggregateDBPingTimeout)
+	defer cancel()
+	if err := p.PingContext(ctx); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("open readiness database: %w", err)
+	}
+	return p, nil
+}
+
+// PingContext reads the database header, unlike SELECT 1 which can succeed
+// without touching database pages. It uses the caller's existing probe deadline.
+func (p *SQLiteReadinessProbe) PingContext(ctx context.Context) error {
+	var version int
+	return p.db.QueryRowContext(ctx, "PRAGMA schema_version").Scan(&version)
+}
+
+func (p *SQLiteReadinessProbe) Close() error { return p.db.Close() }
 
 // DBPinger is the minimum DB interface DBHealth needs. *sql.DB satisfies it;
 // tests can pass a stub.

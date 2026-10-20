@@ -112,14 +112,17 @@ type SQLiteStore struct {
 	// "no commit interleaves" across its read-then-write phases.
 	writeMu chan struct{}
 
-	uuid string
+	uuid         string
+	rollupCancel context.CancelFunc
+	rollupDone   chan struct{}
 }
 
 // OpenSQLiteStore opens (creating if absent) the aggregate database.
 //
 // Schema handling per #162: absent schema is created at the current version; a
 // partial schema, missing meta, or any version mismatch fails startup with an
-// explicit error. There are no automatic migrations in v1.
+// explicit error. Compatible read indexes are added before the store opens;
+// table and encoding versions still require an explicit rebuild on mismatch.
 func OpenSQLiteStore(cfg StoreConfig) (*SQLiteStore, error) {
 	if cfg.Path == "" {
 		cfg.Path = DefaultAggregateDBPath
@@ -180,6 +183,15 @@ func OpenSQLiteStore(cfg StoreConfig) (*SQLiteStore, error) {
 		_ = s.Close()
 		return nil, err
 	}
+	if err := s.ensureRollupSchema(); err != nil {
+		_ = s.Close()
+		return nil, fmt.Errorf("aggregate store: hourly schema: %w", err)
+	}
+	if err := s.ensureServiceSummarySchema(); err != nil {
+		_ = s.Close()
+		return nil, fmt.Errorf("aggregate store: service summary schema: %w", err)
+	}
+	s.startRollups()
 	return s, nil
 }
 
@@ -293,6 +305,7 @@ func (s *SQLiteStore) unlockWriter() { <-s.writeMu }
 
 // Close releases both pools.
 func (s *SQLiteStore) Close() error {
+	s.stopRollups()
 	var errs []error
 	if s.reader != nil {
 		if err := s.reader.Close(); err != nil {
@@ -351,6 +364,18 @@ const deltaColumnDDL = `point_count INTEGER NOT NULL,
 // deltaValuePlaceholders matches deltaColumnList's arity.
 const deltaValuePlaceholders = `?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?`
 
+// The series-leading covering index lets history summaries reduce each series
+// before joining names, without sorting retained bucket rows or fetching their
+// sketch blobs. Window/sketch reads keep the primary-key window scan.
+const historySummaryIndexDDL = `CREATE INDEX IF NOT EXISTS idx_aggregate_buckets_series_window
+	ON aggregate_buckets (series_id, window_start, point_count, error_count,
+		request_count, error_request_count, duration_count, duration_sum, log_count)`
+
+// Identity coverage looks up sentinel IDs by value across tenants and kinds.
+// The scoped unique index cannot serve that lookup; this index also covers id.
+const dictionaryValueIndexDDL = `CREATE INDEX IF NOT EXISTS idx_aggregate_dict_value
+	ON aggregate_dict (value)`
+
 // schemaDDL is the complete aggregate schema (#162).
 func schemaDDL() []string {
 	return []string{
@@ -372,6 +397,7 @@ func schemaDDL() []string {
 		)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_aggregate_dict_scope
 			ON aggregate_dict (tenant_id, kind, value)`,
+		dictionaryValueIndexDDL,
 
 		// Explicit identity columns, no generic variant (#162). status_class
 		// carries span status for traces/edges; severity carries the log
@@ -425,6 +451,8 @@ func schemaDDL() []string {
 			PRIMARY KEY (window_start, series_id)
 		) WITHOUT ROWID`,
 
+		historySummaryIndexDDL,
+
 		`CREATE TABLE IF NOT EXISTS aggregate_baseline (
 			series_id INTEGER NOT NULL,
 			producer_id BLOB NOT NULL,
@@ -472,6 +500,14 @@ func (s *SQLiteStore) ensureSchema(allowRebuild bool) error {
 	case len(present) == len(aggregateTables):
 		err := s.verifyMeta()
 		if err == nil {
+			// Additive and idempotent: retain the UUID, versions and every
+			// row. An index-build failure refuses startup, never rebuilds.
+			if _, err := s.writer.Exec(historySummaryIndexDDL); err != nil {
+				return fmt.Errorf("aggregate store: add history summary index: %w", err)
+			}
+			if _, err := s.writer.Exec(dictionaryValueIndexDDL); err != nil {
+				return fmt.Errorf("aggregate store: add dictionary value index: %w", err)
+			}
 			return nil
 		}
 		var schemaErr *SchemaError
@@ -996,9 +1032,9 @@ func (s *SQLiteStore) FinalizableWindows(cutoff int64, limit int) ([]int64, erro
 // pre-merged this was O(commits x dirty series) — ~1.6M rows and 16 s of
 // blocked ingestion every five minutes at 10k pts/s (#173).
 //
-// The delta rows are still streamed from the READ pool while the writes go to
-// the writer transaction: bounded is not the same as small, and there is no
-// reason to hold the whole window in memory to satisfy one transaction.
+// Delta rows stream inside the writer transaction. Finalization must not wait
+// for a read-pool connection while holding the writer: a rollup builder can
+// hold the last read connection while waiting to publish its next write batch.
 func (s *SQLiteStore) FinalizeWindow(windowStart int64) (FinalizeStats, error) {
 	start := time.Now()
 	stats, err := s.finalizeWindow(windowStart)
@@ -1042,15 +1078,10 @@ func (s *SQLiteStore) finalizeWindow(windowStart int64) (FinalizeStats, error) {
 	return stats, nil
 }
 
-// materializeWindow streams the window's delta rows from the READ pool and
-// writes one bucket per row into the writer transaction. The delta log holds at
-// most one row per (window, series), so there is no cross-row merge left to do
-// here — the merging happened on the commit path, spread across thousands of
-// short transactions instead of concentrated into one long one.
-//
-// The statements are prepared once for the whole window: at a few thousand rows
-// the per-row statement compile the old code paid was itself a measurable slice
-// of the lock hold.
+// materializeWindow validates the window's deltas inside the writer transaction.
+// New windows use one INSERT SELECT, avoiding per-row trigger compilation.
+// Re-finalization streams and merges each delta with its existing bucket using
+// prepared statements. Neither path holds the full window in Go memory.
 func (s *SQLiteStore) materializeWindow(tx *sql.Tx, windowStart int64, stats *FinalizeStats) error {
 	// A window is normally finalized exactly once, and then no bucket row for
 	// it exists yet. Probing aggregate_buckets per series would be thousands of
@@ -1086,7 +1117,7 @@ func (s *SQLiteStore) materializeWindow(tx *sql.Tx, windowStart int64, stats *Fi
 	}
 	defer func() { _ = insBucket.Close() }()
 
-	rows, err := s.reader.Query(
+	rows, err := tx.Query(
 		`SELECT series_id, `+deltaColumnList+`
 		 FROM aggregate_delta_log
 		 WHERE window_start = ?
@@ -1107,6 +1138,12 @@ func (s *SQLiteStore) materializeWindow(tx *sql.Tx, windowStart int64, stats *Fi
 			return err
 		}
 		stats.DeltaRows++
+		if !rewrite {
+			// Still decode/validate every payload before copying it. A new
+			// window needs no merge; one INSERT SELECT also compiles the
+			// invalidation trigger once rather than once per series.
+			continue
+		}
 
 		// A window finalized during downtime recovery and then again by the
 		// scheduler must ADD to its bucket, not replace it.
@@ -1142,6 +1179,21 @@ func (s *SQLiteStore) materializeWindow(tx *sql.Tx, windowStart int64, stats *Fi
 	}
 	if err := rows.Close(); err != nil {
 		return fmt.Errorf("read deltas: %w", err)
+	}
+	if !rewrite && stats.DeltaRows > 0 {
+		res, err := tx.Exec(`INSERT INTO aggregate_buckets(window_start,series_id,`+deltaColumnList+`)
+		 SELECT window_start,series_id,`+deltaColumnList+` FROM aggregate_delta_log WHERE window_start=?`, windowStart)
+		if err != nil {
+			return fmt.Errorf("copy new window: %w", err)
+		}
+		copied, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if copied != int64(stats.DeltaRows) {
+			return fmt.Errorf("copied %d buckets after validating %d deltas", copied, stats.DeltaRows)
+		}
+		stats.Buckets = stats.DeltaRows
 	}
 	return nil
 }
@@ -1187,6 +1239,9 @@ func (s *SQLiteStore) purgeBefore(cutoff int64) (PurgeStats, error) {
 	}
 	if n, err := res.RowsAffected(); err == nil {
 		stats.Baselines = n
+	}
+	if err := s.purgeServiceSummaries(context.Background(), cutoff); err != nil {
+		return stats, err
 	}
 	return stats, nil
 }
@@ -1350,23 +1405,11 @@ func (s *SQLiteStore) ReadBuckets(ctx context.Context, sel Selector) (BucketPage
 const sumColumnList = `point_count, error_count, request_count, error_request_count,
 	duration_count, duration_sum, log_count`
 
-// SumBuckets implements Store. It is the scalar-totals path of the #197 read
-// contract: the database does the SUM/COUNT and returns one row per group, so
-// there is no row cap to truncate and no arithmetic for the caller to get
-// wrong on a partial page.
-//
-// The result size is bounded by the GROUPING — at most (windows x services x
-// signals), all three of which are already bounded by the retention horizon and
-// the cardinality limiter — and never by the number of rows scanned. That is
-// the structural difference from ReadBuckets, whose result size IS the row
-// count.
-func (s *SQLiteStore) SumBuckets(ctx context.Context, sel Selector, by GroupBy) ([]SumRow, error) {
-	if _, err := sel.Validate(); err != nil {
-		return nil, err
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
+func sumBucketsQuery(sel Selector, by GroupBy) (string, []any) {
+	return sumHistoryQuery(sel, by, false)
+}
+
+func sumHistoryQuery(sel Selector, by GroupBy, rolled bool) (string, []any) {
 	var (
 		sb         strings.Builder
 		args       []any
@@ -1400,34 +1443,82 @@ func (s *SQLiteStore) SumBuckets(ctx context.Context, sel Selector, by GroupBy) 
 		outerKeys.WriteString(", ")
 		branchKeys.WriteString(" AS " + g.col + ", ")
 	}
+	// Only a complete, fixed hour has one hourly row per series. Keep any
+	// wider or partial selector on the authoritative bucket path.
+	rolled = rolled && by&GroupByWindow == 0 && !sel.SketchOnly &&
+		sel.Start == hourStart(sel.Start) && sel.End-sel.Start == rollupHour
 	// Each durable table is aggregated in its own branch and the outer query
 	// only re-sums the two grouped results. Aggregating over the UNION ALL as
 	// one derived table hid the scan order from the planner, so even a
-	// window-only grouping — whose rows arrive in primary-key order — was
-	// pushed through a sorter over every bucket row in range. Inside a branch
-	// the planner sees the scan and groups by window without sorting; the
-	// outer sort covers a few hundred grouped rows, not a few hundred
-	// thousand (#290).
+	// window-only grouping was pushed through a sorter over every bucket row
+	// in range (#290). Window reads now use a covering index within one hour;
+	// their branch sort covers only that slice, and the outer sort receives
+	// grouped results. Wider direct reads keep the window-leading scan.
 	sb.WriteString(`SELECT ` + outerKeys.String() +
 		`COALESCE(SUM(point_count),0), COALESCE(SUM(error_count),0),
 		COALESCE(SUM(request_count),0), COALESCE(SUM(error_request_count),0),
 		COALESCE(SUM(duration_count),0), COALESCE(SUM(duration_sum),0),
-		COALESCE(SUM(log_count),0) FROM (`)
-	branch := branchKeys.String() +
-		`SUM(t.point_count) AS point_count, SUM(t.error_count) AS error_count,
+		COALESCE(SUM(log_count),0), COALESCE(SUM(identity_count),0) FROM (`)
+	sums := `SUM(t.point_count) AS point_count, SUM(t.error_count) AS error_count,
 		SUM(t.request_count) AS request_count, SUM(t.error_request_count) AS error_request_count,
 		SUM(t.duration_count) AS duration_count, SUM(t.duration_sum) AS duration_sum,
 		SUM(t.log_count) AS log_count`
-	for i, src := range bucketSources {
+	identityPredicate := `s.service_id IN (SELECT id FROM aggregate_dict WHERE value = ?)
+			OR s.name_id IN (SELECT id FROM aggregate_dict WHERE value = ?)
+			OR s.dims_id IN (SELECT id FROM aggregate_dict WHERE value = ?)`
+	if !joinSeries {
+		identityPredicate = `t.series_id IN (SELECT s.id FROM aggregate_series s WHERE ` + identityPredicate + `)`
+	}
+	identitySum := `SUM(CASE WHEN ` + identityPredicate + ` THEN t.point_count ELSE 0 END) AS identity_count`
+	branch := branchKeys.String() + sums + `, ` + identitySum
+	sources := []string{"aggregate_buckets", "aggregate_delta_log"}
+	if rolled {
+		// The caller has checked this complete hour in the same read snapshot.
+		sources[0] = "aggregate_hourly"
+	}
+	for i, table := range sources {
 		if i > 0 {
 			sb.WriteString(` UNION ALL `)
 		}
-		fmt.Fprintf(&sb, `SELECT %s FROM %s t`, branch, src.table)
-		if joinSeries {
-			sb.WriteString(` JOIN aggregate_series s ON s.id = t.series_id`)
+		args = append(args, []byte(OtherValue), []byte(OtherValue), []byte(OtherValue))
+		if table == "aggregate_hourly" && joinSeries {
+			// The fixed hour and PRIMARY KEY(window_start, series_id) already
+			// give one row per series. Reduce directly into the requested groups
+			// and filter the joined identity instead of rebuilding an IN list.
+			fmt.Fprintf(&sb, `SELECT %s FROM aggregate_hourly t INDEXED BY idx_aggregate_hourly_summary
+			 JOIN aggregate_series s ON s.id = t.series_id
+			 WHERE t.window_start = ? AND t.window_start < ? AND `, branch)
+			args = append(args, sel.Start, sel.End)
+			args = appendSeriesFilter(&sb, sel, args)
+			if len(sel.SeriesIDs) > 0 {
+				sb.WriteString(` AND t.series_id IN (` + placeholders(len(sel.SeriesIDs)) + `)`)
+				for _, id := range sel.SeriesIDs {
+					args = append(args, int64(id))
+				}
+			}
+		} else if joinSeries && by&GroupByWindow == 0 {
+			// Reduce authoritative fallback ranges in series order before
+			// resolving group identities.
+			fmt.Fprintf(&sb, `SELECT %s FROM (SELECT t.series_id, %s FROM %s t`, branch, sums, table)
+			if table == "aggregate_buckets" {
+				sb.WriteString(` INDEXED BY idx_aggregate_buckets_series_window`)
+			}
+			sb.WriteString(` WHERE `)
+			args = appendBucketFilter(&sb, sel, args)
+			sb.WriteString(` GROUP BY t.series_id) t JOIN aggregate_series s ON s.id = t.series_id`)
+		} else {
+			index := "sqlite_autoindex_" + table + "_1"
+			if table == "aggregate_buckets" && by&GroupByWindow != 0 && !sel.SketchOnly &&
+				sel.Start > 0 && sel.End > sel.Start && sel.End-hourStart(sel.Start) <= rollupHour {
+				index = "idx_aggregate_buckets_series_window"
+			}
+			fmt.Fprintf(&sb, `SELECT %s FROM %s t INDEXED BY %s`, branch, table, index)
+			if joinSeries {
+				sb.WriteString(` JOIN aggregate_series s ON s.id = t.series_id`)
+			}
+			sb.WriteString(` WHERE `)
+			args = appendBucketFilter(&sb, sel, args)
 		}
-		sb.WriteString(` WHERE `)
-		args = appendBucketFilter(&sb, sel, args)
 		if len(group) > 0 {
 			sb.WriteString(` GROUP BY ` + strings.Join(group, ", "))
 		}
@@ -1437,9 +1528,100 @@ func (s *SQLiteStore) SumBuckets(ctx context.Context, sel Selector, by GroupBy) 
 		sb.WriteString(` GROUP BY ` + strings.Join(group, ", "))
 	}
 
+	return sb.String(), args
+}
+
+// SumBuckets implements Store. It is the scalar-totals path of the #197 read
+// contract: the database does the SUM/COUNT and returns one row per group, so
+// there is no row cap to truncate and no arithmetic for the caller to get
+// wrong on a partial page.
+//
+// The result size is bounded by the GROUPING — at most (windows x services x
+// signals), all three of which are already bounded by the retention horizon and
+// the cardinality limiter — and never by the number of rows scanned. That is
+// the structural difference from ReadBuckets, whose result size IS the row
+// count.
+func (s *SQLiteStore) SumBuckets(ctx context.Context, sel Selector, by GroupBy) ([]SumRow, error) {
+	if _, err := sel.Validate(); err != nil {
+		return nil, err
+	}
+	tx, err := s.reader.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	return sumSQLiteSnapshot(ctx, tx, sel, by)
+}
+func sumSQLiteSnapshot(ctx context.Context, tx sqliteQueryer, sel Selector, by GroupBy) ([]SumRow, error) {
+	if _, err := sel.Validate(); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if sel.SketchOnly {
+		return readSumBuckets(ctx, tx, sel, by, false)
+	}
+	if by&GroupByWindow != 0 {
+		return sumWindowSnapshot(ctx, tx, sel, by)
+	}
+	return sumRollupSnapshot(ctx, tx, sel, by)
+}
+
+// sumWindowSnapshot bounds covering-index sorting to one aligned hour at a
+// time. Each window belongs to exactly one chunk, so concatenation preserves
+// every group without re-summing counters in Go. The caller's transaction
+// keeps finalization and retention from changing ownership between chunks.
+// This bounds the time slice, not bytes: series cardinality still matters.
+func sumWindowSnapshot(ctx context.Context, tx sqliteQueryer, sel Selector, by GroupBy) ([]SumRow, error) {
+	return sumWindowSnapshotFor(ctx, tx, sel, by, false)
+}
+
+// The traffic projection shares the existing hour planner and snapshot. Its
+// partial SumRows are converted to trafficSumRow before reaching QueryBuckets.
+func sumWindowSnapshotFor(ctx context.Context, tx sqliteQueryer, sel Selector, by GroupBy, trafficOnly bool) ([]SumRow, error) {
+	var out []SumRow
+	for start := sel.Start; start < sel.End; {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		chunk := sel
+		chunk.Start = start
+		// Compare before adding to avoid overflowing at the end of int64.
+		if sel.End-hourStart(start) > rollupHour {
+			chunk.End = hourStart(start) + rollupHour
+		}
+		part, used, err := readSummaryProjection(ctx, tx, chunk, by, trafficOnly)
+		if err == nil && !used {
+			part, err = readSumBuckets(ctx, tx, chunk, by, false)
+		}
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, part...)
+		start = chunk.End
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// sqliteQueryer lets all statements of a logical read share a transaction.
+type sqliteQueryer interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
+func readSumBuckets(ctx context.Context, db sqliteQueryer, sel Selector, by GroupBy, rolled bool) ([]SumRow, error) {
+	query, args := sumHistoryQuery(sel, by, rolled)
+	return readSumQuery(ctx, db, query, args)
+}
+
+func readSumQuery(ctx context.Context, db sqliteQueryer, query string, args []any) ([]SumRow, error) {
+
 	// Group columns come from the fixed GroupBy table above, bucketSources owns
 	// both table names, and appendBucketFilter binds every selector value.
-	rows, err := s.reader.QueryContext(ctx, sb.String(), args...) // NOSONAR
+	rows, err := db.QueryContext(ctx, query, args...) // NOSONAR
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
@@ -1453,14 +1635,14 @@ func (s *SQLiteStore) SumBuckets(ctx context.Context, sel Selector, by GroupBy) 
 			return nil, err
 		}
 		var (
-			r                              SumRow
-			window, service, name, signal  int64
-			count, errCount, reqs, errReqs int64
-			durCount, logCount             int64
-			durSum                         float64
+			r                                 SumRow
+			window, service, name, signal     int64
+			count, errCount, reqs, errReqs    int64
+			durCount, logCount, identityCount int64
+			durSum                            float64
 		)
 		if err := rows.Scan(&window, &service, &name, &signal,
-			&count, &errCount, &reqs, &errReqs, &durCount, &durSum, &logCount); err != nil {
+			&count, &errCount, &reqs, &errReqs, &durCount, &durSum, &logCount, &identityCount); err != nil {
 			return nil, fmt.Errorf("aggregate store: sum buckets: %w", err)
 		}
 		r.WindowStart = window
@@ -1474,6 +1656,7 @@ func (s *SQLiteStore) SumBuckets(ctx context.Context, sel Selector, by GroupBy) 
 		r.DurationCount = uint64(durCount)    // #nosec G115 -- counters are written from uint64
 		r.LogCount = uint64(logCount)         // #nosec G115 -- counters are written from uint64
 		r.DurationSum = durSum
+		r.IdentityCount = clampUint64(identityCount)
 		out = append(out, r)
 	}
 	if err := ctx.Err(); err != nil {
@@ -1482,42 +1665,50 @@ func (s *SQLiteStore) SumBuckets(ctx context.Context, sel Selector, by GroupBy) 
 	return out, rows.Err()
 }
 
-// VisitSketches implements Store. Both durable tables are streamed once, in
-// their natural PRIMARY KEY (window_start, series_id) range order — no ORDER
-// BY, no LIMIT, no keyset resume. ReadBuckets must maintain a total (window,
-// series, source) order across a UNION of both tables, which forces a sort
-// per page and a re-scan per keyset resume; a wide dashboard range paid that
-// price hundreds of times over (#219). A sketch merge is order-independent,
-// so this path pays it zero times.
+// VisitSketches uses hourly sketches only when merging them preserves the
+// original bins and accuracy metadata. Both the candidate and authoritative
+// fallback are branches of one statement, with no sorting or pagination.
 func (s *SQLiteStore) VisitSketches(ctx context.Context, sel Selector, visit func(serviceID uint32, sk *Sketch) error) error {
+	tx, err := s.reader.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	return visitServiceSummarySketches(ctx, tx, sel, visit)
+}
+
+func visitSQLiteSketches(ctx context.Context, db sqliteQueryer, sel Selector, visit func(uint32, *Sketch) error) error {
 	if _, err := sel.Validate(); err != nil {
 		return err
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	for _, src := range bucketSources {
-		if err := s.visitTableSketches(ctx, src.table, sel, visit); err != nil {
-			return err
-		}
-	}
-	return nil
-}
 
-// visitTableSketches streams one table's sketch-bearing rows to visit.
-func (s *SQLiteStore) visitTableSketches(ctx context.Context, table string, sel Selector, visit func(uint32, *Sketch) error) error {
 	var (
 		sb   strings.Builder
 		args []any
 	)
-	// The table name is one of the two bucketSources literals, never input.
-	fmt.Fprintf(&sb, `SELECT s.service_id, t.sketch FROM %s t
-		JOIN aggregate_series s ON s.id = t.series_id WHERE `, table)
-	sel.SketchOnly = true
-	args = appendBucketFilter(&sb, sel, args)
-	// table is one of the bucketSources literals and appendBucketFilter binds
-	// every selector value. No caller input becomes SQL structure.
-	rows, err := s.reader.QueryContext(ctx, sb.String(), args...) // NOSONAR
+	// One statement pins both tables to the same SQLite snapshot. Separate
+	// reads could miss a delta moved into buckets by concurrent finalization.
+	args = appendRollupRanges(&sb, sel, true)
+	// Bind membership once: duplicating a large accepted selector in all five
+	// branches can exceed SQLite's parameter budget.
+	sb.WriteString(`, rollup_series AS MATERIALIZED (SELECT id FROM aggregate_series WHERE `)
+	args = appendSeriesFilter(&sb, sel, args)
+	if len(sel.SeriesIDs) > 0 {
+		sb.WriteString(` AND id IN (` + placeholders(len(sel.SeriesIDs)) + `)`)
+		for _, id := range sel.SeriesIDs {
+			args = append(args, int64(id))
+		}
+	}
+	sb.WriteString(`) SELECT 0 AS fallback, service_id, sketch FROM (`)
+	args = appendRollupSketchUnion(&sb, sel, args, true)
+	sb.WriteString(`) UNION ALL SELECT 1 AS fallback, service_id, sketch FROM (`)
+	args = appendRollupSketchUnion(&sb, sel, args, false)
+	sb.WriteString(`)`)
+	// The table names are fixed and every selector value is bound.
+	rows, err := db.QueryContext(ctx, sb.String(), args...) // NOSONAR
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
@@ -1525,28 +1716,60 @@ func (s *SQLiteStore) visitTableSketches(ctx context.Context, table string, sel 
 		return fmt.Errorf("aggregate store: visit sketches: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
-	// One scratch sketch per stream: every row decodes into it and the
-	// visitor folds it away before the next row overwrites it. Allocating a
-	// 2 KiB Sketch per row made a wide-range dashboard a garbage generator
-	// first and a query second (#290).
-	var (
-		scratch Sketch
-		service int64
-		blob    sql.RawBytes
-	)
+	// Hourly merging must not change saturation-event provenance or collapse
+	// fine bins before a later scale change. Probe the candidate stream before
+	// calling the visitor. Safe default-scale sketches with a bounded combined
+	// bin counts/range merge losslessly for any grouping.
+	//
+	// The final UNION branch streams original rows if the probe is unsafe. On
+	// the normal path we close it after its first row, without scanning history.
+	// Both alternatives share ONE statement/snapshot, even during purge/finalize.
+	var scratch Sketch
+	probe := NewSketch()
+	byService := make(map[uint32]*Sketch)
+	var order []uint32
+	safe := true
+	var blob sql.RawBytes
 	for rows.Next() {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := rows.Scan(&service, &blob); err != nil {
+		var fallback, service int64
+		if err := rows.Scan(&fallback, &service, &blob); err != nil {
 			return fmt.Errorf("aggregate store: visit sketches: %w", err)
+		}
+		if fallback == 1 && safe {
+			break
+		}
+		if fallback == 0 && !safe {
+			continue
 		}
 		if err := DecodeSketchInto(&scratch, blob); err != nil {
 			return fmt.Errorf("aggregate store: visit sketches: decode: %w", err)
 		}
-		if err := visit(uint32(service), &scratch); err != nil { // #nosec G115 -- dictionary IDs are uint32
-			return err
+		id := uint32(service) // #nosec G115 -- dictionary IDs are uint32
+		if fallback == 1 {
+			if err := visit(id, &scratch); err != nil {
+				return err
+			}
+			continue
 		}
+		if scratch.Scale() != SketchDefaultScale || scratch.Collapsed() || scratch.Saturations() != 0 {
+			safe = false
+			byService = nil
+			continue
+		}
+		probe.Merge(&scratch)
+		if probe.Collapsed() || probe.Saturations() != 0 {
+			safe = false
+			byService = nil
+			continue
+		}
+		if byService[id] == nil {
+			byService[id] = NewSketch()
+			order = append(order, id)
+		}
+		byService[id].Merge(&scratch)
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -1554,7 +1777,17 @@ func (s *SQLiteStore) visitTableSketches(ctx context.Context, table string, sel 
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("aggregate store: visit sketches: %w", err)
 	}
-	return nil
+	if safe {
+		for _, id := range order {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if err := visit(id, byService[id]); err != nil {
+				return err
+			}
+		}
+	}
+	return ctx.Err()
 }
 
 // bucketSources are the two durable tables a store-owned row can live in, in
@@ -1576,13 +1809,16 @@ var bucketSources = [...]struct {
 // appendBucketUnion writes the UNION ALL over both durable tables with the
 // given per-row projection and appends its bind arguments. The projection is
 // evaluated against alias `t` (the table) and, when joinSeries is set, `s`
-// (its aggregate_series row).
+// (its aggregate_series row). Force the WITHOUT ROWID primary index: otherwise
+// SQLite can choose the scalar covering index and perform a table lookup for
+// every sketch. NOT INDEXED does not prevent that choice on WITHOUT ROWID tables.
+// Both table names and their primary-index names are schema-owned constants.
 func appendBucketUnion(sb *strings.Builder, sel Selector, projection string, joinSeries bool, args []any) []any {
 	for i, src := range bucketSources {
 		if i > 0 {
 			sb.WriteString(` UNION ALL `)
 		}
-		fmt.Fprintf(sb, `SELECT %d AS src, %s FROM %s t`, src.src, projection, src.table)
+		fmt.Fprintf(sb, `SELECT %d AS src, %s FROM %s t INDEXED BY sqlite_autoindex_%s_1`, src.src, projection, src.table, src.table)
 		if joinSeries {
 			sb.WriteString(` JOIN aggregate_series s ON s.id = t.series_id`)
 		}
@@ -1606,9 +1842,30 @@ func appendBucketUnion(sb *strings.Builder, sel Selector, projection string, joi
 // never reaches the join or the aggregator. Measured at 144 windows x 6,000
 // series it halved the traffic SUM and the sketch stream (#290).
 func appendBucketFilter(sb *strings.Builder, sel Selector, args []any) []any {
-	sb.WriteString(`t.window_start >= ? AND t.window_start < ?
-		AND t.series_id IN (SELECT id FROM aggregate_series WHERE tenant_id = ?`)
-	args = append(args, sel.Start, sel.End, int64(sel.TenantID))
+	sb.WriteString(`t.window_start >= ? AND t.window_start < ? AND `)
+	args = append(args, sel.Start, sel.End)
+	return appendBucketScope(sb, sel, args)
+}
+
+func appendBucketScope(sb *strings.Builder, sel Selector, args []any) []any {
+	sb.WriteString(`t.series_id IN (SELECT id FROM aggregate_series WHERE `)
+	args = appendSeriesFilter(sb, sel, args)
+	sb.WriteString(`)`)
+	if len(sel.SeriesIDs) > 0 {
+		sb.WriteString(` AND t.series_id IN (` + placeholders(len(sel.SeriesIDs)) + `)`)
+		for _, id := range sel.SeriesIDs {
+			args = append(args, int64(id))
+		}
+	}
+	if sel.SketchOnly {
+		sb.WriteString(` AND t.sketch IS NOT NULL`)
+	}
+	return args
+}
+
+func appendSeriesFilter(sb *strings.Builder, sel Selector, args []any) []any {
+	sb.WriteString(`tenant_id = ?`)
+	args = append(args, int64(sel.TenantID))
 	switch {
 	case sel.Signal != SignalUnspecified:
 		sb.WriteString(` AND signal = ?`)
@@ -1619,15 +1876,11 @@ func appendBucketFilter(sb *strings.Builder, sel Selector, args []any) []any {
 			args = append(args, int64(sig))
 		}
 	}
-	sb.WriteString(`)`)
-	if len(sel.SeriesIDs) > 0 {
-		sb.WriteString(` AND t.series_id IN (` + placeholders(len(sel.SeriesIDs)) + `)`)
-		for _, id := range sel.SeriesIDs {
+	if len(sel.ServiceIDs) > 0 {
+		sb.WriteString(` AND service_id IN (` + placeholders(len(sel.ServiceIDs)) + `)`)
+		for _, id := range sel.ServiceIDs {
 			args = append(args, int64(id))
 		}
-	}
-	if sel.SketchOnly {
-		sb.WriteString(` AND t.sketch IS NOT NULL`)
 	}
 	return args
 }

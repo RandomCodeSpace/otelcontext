@@ -27,7 +27,7 @@ It starts with SQLite and no external services. When you need more, the main tel
 
 - **A live service map** that shows dependencies, health, latency, and active anomalies.
 - **Incident context in one place** with related traces, logs, metrics, and impact analysis.
-- **Nine MCP tools** for investigating your system from an AI client or coding agent.
+- **Ten MCP tools** for investigating your system from an AI client or coding agent.
 - **Standard OTLP input** over gRPC and HTTP, so existing SDKs and Collectors can send data directly.
 - **A simple first run** with one binary and a local SQLite database.
 - **Self-hosted data** with retention controls, health probes, and Prometheus metrics.
@@ -216,7 +216,7 @@ metric names, with optional `service_name`, `start`, and `end` filters. The
 existing `GET /api/metrics?name=...` view returns evaluated scalar samples for
 the bound tenant, marked `sampled` with `OtelContext-Metric-Source: prometheus`.
 It cannot flatten native histograms; use PromQL for those. Host service names
-keep the existing `host/<host.name>` convention, falling back to `host.id`.
+use `host/<host.id>`, falling back to `host.name` when no host ID is available.
 
 MCP advertises `promql_query` and `promql_query_range` through `tools/list`.
 They return uncached Prometheus envelopes and share MCP's concurrency, timeout,

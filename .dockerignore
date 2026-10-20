@@ -1,0 +1,8 @@
+# Allow only build inputs. In particular, never send local data or .env secrets.
+**
+!Containerfile
+!go.mod
+!go.sum
+!*.go
+!internal/
+!internal/**

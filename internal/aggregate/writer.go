@@ -48,7 +48,10 @@ const (
 	// DefaultCommitMaxPendingBytes bounds un-committed delta payload.
 	DefaultCommitMaxPendingBytes = 64 << 20
 	// DefaultCommitMaxWaiters bounds Export goroutines parked on a commit.
-	DefaultCommitMaxWaiters = 512
+	// Allow a synchronized export of all three signals from 200 services,
+	// with headroom before the readiness admission threshold. Bytes and
+	// deltas remain independently bounded.
+	DefaultCommitMaxWaiters = 1024
 	// DefaultCommitMaxPendingDeltas is the defensive delta-count bound.
 	DefaultCommitMaxPendingDeltas = 200000
 	// DefaultFinalizeIntervalSec is how often the writer looks for windows

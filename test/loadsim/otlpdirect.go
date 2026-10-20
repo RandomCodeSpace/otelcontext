@@ -27,6 +27,8 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -37,6 +39,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	grpcstatus "google.golang.org/grpc/status"
@@ -154,7 +157,10 @@ type directConfig struct {
 	endpoint   string
 	tenantID   string
 	insecure   bool
+	caFile     string
+	serverName string
 	services   int
+	hosts      int
 	spanRate   float64 // per service, per second
 	logRate    float64
 	metricRate float64
@@ -185,12 +191,14 @@ type directEmitter struct {
 
 	res *resourcepb.Resource
 
-	seq       int
-	carry     float64
-	startNano uint64 // metric start_time_unix_nano for cumulative points
-	counter   int64  // cumulative request counter value
-	resetCtr  int64  // cumulative counter that resets every ~5 minutes
-	resetAt   time.Time
+	seq            int
+	carry          float64
+	startNano      uint64 // metric start_time_unix_nano for cumulative points
+	counter        int64  // cumulative request counter value
+	resetCtr       int64  // cumulative counter that resets every ~5 minutes
+	resetAt        time.Time
+	resetStartNano uint64
+	lastMetricNano uint64
 
 	out emitterResult
 }
@@ -217,6 +225,57 @@ func intAttr(k string, v int64) *commonpb.KeyValue {
 	return &commonpb.KeyValue{Key: k, Value: &commonpb.AnyValue{
 		Value: &commonpb.AnyValue_IntValue{IntValue: v},
 	}}
+}
+
+// transportCredentials verifies TLS using system roots plus an optional test CA.
+func transportCredentials(useInsecure bool, caFile, serverName string) (credentials.TransportCredentials, error) {
+	if useInsecure {
+		if caFile != "" || serverName != "" {
+			return nil, fmt.Errorf("TLS options require -insecure=false")
+		}
+		return insecure.NewCredentials(), nil
+	}
+	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12, ServerName: serverName}
+	if caFile != "" {
+		pem, err := os.ReadFile(caFile)
+		if err != nil {
+			return nil, fmt.Errorf("read TLS CA: %w", err)
+		}
+		roots, err := x509.SystemCertPool()
+		if err != nil {
+			roots = x509.NewCertPool()
+		}
+		if !roots.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("TLS CA file contains no certificates")
+		}
+		tlsConfig.RootCAs = roots
+	}
+	return credentials.NewTLS(tlsConfig), nil
+}
+
+// A partial response does not identify which timestamps were rejected. Exclude
+// the whole batch from the durable ledger rather than inventing ACK coverage.
+func partialExportError(rejected int64, message string) error {
+	if rejected == 0 {
+		return nil
+	}
+	return fmt.Errorf("OTLP partial rejection: %d points: %s", rejected, message)
+}
+
+func addMockHost(resource *resourcepb.Resource, serviceIndex, hosts int) {
+	if hosts <= 0 {
+		return
+	}
+	i := serviceIndex % hosts
+	resource.Attributes = append(resource.Attributes,
+		strAttr("host.id", fmt.Sprintf("mock-host-id-%03d", i)),
+		strAttr("host.name", fmt.Sprintf("mock-node-%03d", i)),
+		strAttr("host.arch", "amd64"), strAttr("os.type", "linux"),
+		strAttr("host.cpu.model", "Mock 8-core server"),
+		intAttr("host.cpu.logical.count", 8), intAttr("host.memory.total", 32<<30),
+		strAttr("k8s.node.name", fmt.Sprintf("mock-node-%03d", i)),
+		strAttr("k8s.namespace.name", "loadtest"),
+	)
 }
 
 func randomID(n int) []byte {
@@ -266,22 +325,31 @@ func (e *directEmitter) run(ctx context.Context, wg *sync.WaitGroup) {
 			req, c := e.buildSpans(n)
 			contrib = c
 			send = func(c context.Context) error {
-				_, err := e.traceClient.Export(c, req)
-				return err
+				resp, err := e.traceClient.Export(c, req)
+				if err != nil {
+					return err
+				}
+				return partialExportError(resp.GetPartialSuccess().GetRejectedSpans(), resp.GetPartialSuccess().GetErrorMessage())
 			}
 		case kindLogs:
 			req, c := e.buildLogs(n)
 			contrib = c
 			send = func(c context.Context) error {
-				_, err := e.logClient.Export(c, req)
-				return err
+				resp, err := e.logClient.Export(c, req)
+				if err != nil {
+					return err
+				}
+				return partialExportError(resp.GetPartialSuccess().GetRejectedLogRecords(), resp.GetPartialSuccess().GetErrorMessage())
 			}
 		case kindMetrics:
 			req, c := e.buildMetrics(n)
 			contrib = c
 			send = func(c context.Context) error {
-				_, err := e.metricClient.Export(c, req)
-				return err
+				resp, err := e.metricClient.Export(c, req)
+				if err != nil {
+					return err
+				}
+				return partialExportError(resp.GetPartialSuccess().GetRejectedDataPoints(), resp.GetPartialSuccess().GetErrorMessage())
 			}
 		}
 
@@ -419,11 +487,12 @@ type latencySentinelReport struct {
 	ExportMS      float64 `json:"export_ms"`
 }
 
-func emitLatencySentinel(ctx context.Context, endpoint, tenantID string, useInsecure bool, reportPath string) error {
-	dialOpts := []grpc.DialOption{grpc.WithDefaultCallOptions(grpc.MaxCallSendMsgSize(16 << 20))}
-	if useInsecure {
-		dialOpts = append(dialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+func emitLatencySentinel(ctx context.Context, endpoint, tenantID string, useInsecure bool, caFile, serverName, reportPath string) error {
+	creds, err := transportCredentials(useInsecure, caFile, serverName)
+	if err != nil {
+		return err
 	}
+	dialOpts := []grpc.DialOption{grpc.WithDefaultCallOptions(grpc.MaxCallSendMsgSize(16 << 20)), grpc.WithTransportCredentials(creds)}
 	conn, err := grpc.NewClient(endpoint, dialOpts...)
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
@@ -436,8 +505,12 @@ func emitLatencySentinel(ctx context.Context, endpoint, tenantID string, useInse
 		ctx = metadata.AppendToOutgoingContext(ctx, "x-tenant-id", tenantID)
 	}
 	started := time.Now()
-	if _, err := coltracepb.NewTraceServiceClient(conn).Export(ctx, req); err != nil {
+	resp, err := coltracepb.NewTraceServiceClient(conn).Export(ctx, req)
+	if err != nil {
 		return fmt.Errorf("export: %w", err)
+	}
+	if err := partialExportError(resp.GetPartialSuccess().GetRejectedSpans(), resp.GetPartialSuccess().GetErrorMessage()); err != nil {
+		return err
 	}
 	report := latencySentinelReport{
 		SchemaVersion: "otelcontext.latency-sentinel.v1", Service: latencySentinelService,
@@ -547,16 +620,32 @@ func countPct(s string) int {
 // gauge, and a cumulative counter that resets every ~5 minutes.
 func (e *directEmitter) buildMetrics(n int) (*colmetricspb.ExportMetricsServiceRequest, gatecore.Contribution) {
 	wallNow := time.Now()
-	now := uint64(wallNow.UnixNano()) // #nosec G115 -- wall clock, always positive
 	var counterPts, gaugePts, resetPts []*metricspb.NumberDataPoint
-
-	if time.Since(e.resetAt) > 5*time.Minute {
-		e.resetCtr = 0
-		e.resetAt = time.Now()
-		e.startNano = now
+	interval := e.cfg.interval
+	if interval <= 0 {
+		interval = time.Duration(n) * time.Millisecond
 	}
-
+	spacing := interval / time.Duration(max(n, 1))
+	if spacing < time.Millisecond {
+		spacing = time.Millisecond
+	}
+	first := wallNow.Add(-time.Duration(n-1) * spacing)
+	if e.resetStartNano == 0 {
+		e.resetStartNano = e.startNano
+	}
+	if wallNow.Sub(e.resetAt) > 5*time.Minute {
+		e.resetCtr = 0
+		e.resetAt = wallNow
+		e.resetStartNano = uint64(first.UnixNano()) // #nosec G115 -- synthetic contemporary timestamps
+	}
+	contrib := gatecore.Contribution{}
 	for i := 0; i < n; i++ {
+		now := uint64(first.Add(time.Duration(i) * spacing).UnixNano()) // #nosec G115 -- synthetic contemporary timestamps
+		if now <= e.lastMetricNano {
+			now = e.lastMetricNano + uint64(time.Millisecond)
+		}
+		e.lastMetricNano = now
+		contrib.Add(time.Unix(0, int64(now)), gatecore.WindowSecs) // #nosec G115 -- contemporary timestamp
 		switch e.seq % 3 {
 		case 0:
 			e.counter++
@@ -573,16 +662,12 @@ func (e *directEmitter) buildMetrics(n int) (*colmetricspb.ExportMetricsServiceR
 		default:
 			e.resetCtr++
 			resetPts = append(resetPts, &metricspb.NumberDataPoint{
-				StartTimeUnixNano: e.startNano,
+				StartTimeUnixNano: e.resetStartNano,
 				TimeUnixNano:      now,
 				Value:             &metricspb.NumberDataPoint_AsInt{AsInt: e.resetCtr},
 			})
 		}
 		e.seq++
-	}
-	contrib := gatecore.Contribution{}
-	for i := 0; i < n; i++ {
-		contrib.Add(wallNow, gatecore.WindowSecs)
 	}
 
 	var ms []*metricspb.Metric
@@ -763,14 +848,26 @@ func writeReport(path string, rep runReport) error {
 // runDirect drives the whole measured run: settle, sustained, burst. It returns
 // the finished report.
 func runDirect(ctx context.Context, cfg directConfig, settle, sustained, burst time.Duration, reportPath string) (runReport, error) {
+	if cfg.services <= 0 || cfg.hosts < 0 || cfg.interval <= 0 || cfg.callTimout <= 0 {
+		return runReport{}, fmt.Errorf("services, batch interval and call timeout must be positive; hosts must be nonnegative")
+	}
+	creds, err := transportCredentials(cfg.insecure, cfg.caFile, cfg.serverName)
+	if err != nil {
+		return runReport{}, err
+	}
 	dialOpts := []grpc.DialOption{
 		grpc.WithDefaultCallOptions(grpc.MaxCallSendMsgSize(16 << 20)),
-	}
-	if cfg.insecure {
-		dialOpts = append(dialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		grpc.WithTransportCredentials(creds),
 	}
 
 	conns := make([]*grpc.ClientConn, cfg.services)
+	defer func() {
+		for _, cc := range conns {
+			if cc != nil {
+				_ = cc.Close()
+			}
+		}
+	}()
 	emitters := make([]*directEmitter, 0, cfg.services*kindCount)
 	for i := 0; i < cfg.services; i++ {
 		cc, err := grpc.NewClient(cfg.endpoint, dialOpts...)
@@ -781,6 +878,7 @@ func runDirect(ctx context.Context, cfg directConfig, settle, sustained, burst t
 		svc := serviceName(i)
 		inst := fmt.Sprintf("%s-instance-0", svc)
 		res := newResource(svc, inst)
+		addMockHost(res, i, cfg.hosts)
 		now := uint64(time.Now().UnixNano()) // #nosec G115 -- wall clock, always positive
 		for k, rate := range map[signalKind]float64{
 			kindSpans:   cfg.spanRate,
@@ -809,14 +907,6 @@ func runDirect(ctx context.Context, cfg directConfig, settle, sustained, burst t
 			emitters = append(emitters, e)
 		}
 	}
-	defer func() {
-		for _, cc := range conns {
-			if cc != nil {
-				_ = cc.Close()
-			}
-		}
-	}()
-
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -885,6 +975,10 @@ func runDirect(ctx context.Context, cfg directConfig, settle, sustained, burst t
 	cfgMap := map[string]interface{}{
 		"endpoint":            cfg.endpoint,
 		"services":            cfg.services,
+		"mock_hosts":          cfg.hosts,
+		"tls_enabled":         !cfg.insecure,
+		"tls_server_name":     cfg.serverName,
+		"partial_ack_policy":  "exclude batch with any rejected points",
 		"span_rate_per_svc":   cfg.spanRate,
 		"log_rate_per_svc":    cfg.logRate,
 		"metric_rate_per_svc": cfg.metricRate,

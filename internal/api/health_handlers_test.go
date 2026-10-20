@@ -2,12 +2,39 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
+	"github.com/RandomCodeSpace/otelcontext/internal/ingest"
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 )
+
+func TestReadyPipelineByteSaturation(t *testing.T) {
+	p := ingest.NewPipeline(nil, nil, ingest.PipelineConfig{Capacity: 100, Workers: 1, MaxBytes: 1 << 20})
+	s := newTestServer(t)
+	s.SetPipelineSaturationProbe(func() float64 { return p.Stats().Saturation() })
+	batch := func(n int) *ingest.Batch {
+		return &ingest.Batch{Type: ingest.SignalLogs, HasError: true, Logs: []storage.Log{{Body: strings.Repeat("x", n)}}}
+	}
+	if _, err := p.Submit(batch(500 << 10)); err != nil {
+		t.Fatal(err)
+	}
+	if code, checks := readyChecks(t, s); code != http.StatusOK {
+		t.Fatalf("ready before byte saturation: code=%d checks=%v", code, checks)
+	}
+	if _, err := p.Submit(batch(500 << 10)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Submit(batch(100 << 10)); !errors.Is(err, ingest.ErrQueueFull) {
+		t.Fatalf("submit beyond byte cap = %v, want ErrQueueFull", err)
+	}
+	if code, checks := readyChecks(t, s); code != http.StatusServiceUnavailable || !strings.HasPrefix(checks["pipeline"], "saturated") {
+		t.Fatalf("ready with only two batches filling byte budget: code=%d checks=%v", code, checks)
+	}
+}
 
 // newTestServer constructs a minimal Server for health-endpoint tests.
 // GraphRAG is left nil; readiness treats a nil coordinator as "skipped".

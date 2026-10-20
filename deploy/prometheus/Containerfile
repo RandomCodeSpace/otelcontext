@@ -1,0 +1,38 @@
+# Stable Prometheus source with only the required Go/x/net security updates.
+# The official v3.15.0 binaries use vulnerable go1.27.1 and x/net v0.58.0.
+FROM golang:1.26.9@sha256:37cfcca63222ec499bec5e8ad7aad52dbf7529db36d5812b8eae2f0621aa92d6 AS build
+ENV CGO_ENABLED=0 GOTOOLCHAIN=local
+WORKDIR /src
+ADD --checksum=sha256:eee7ec029ffdba7d9ee59171cad5ddaff10e71514b0bae1a6fde6dc1ae99e181 https://codeload.github.com/prometheus/prometheus/tar.gz/5241a27fe3c6983549fccc32f6e65917408c63cd /source.tar.gz
+# Lock the same patched dependency versions and checksums used by the reviewed build.
+COPY dependencies.patch /tmp/dependencies.patch
+RUN tar -xzf /source.tar.gz --strip-components=1 -C /src \
+ && git apply --unidiff-zero /tmp/dependencies.patch \
+ && go mod download \
+ && go mod verify
+# This internal OTLP/query companion needs no web console or frontend toolchain.
+RUN go build -mod=readonly -trimpath -buildvcs=false -tags netgo \
+      -ldflags='-s -w -buildid= -X github.com/prometheus/common/version.Version=3.15.0 -X github.com/prometheus/common/version.Revision=5241a27fe3c6983549fccc32f6e65917408c63cd -X github.com/prometheus/common/version.Branch=otelcontext-security-build' \
+      -o /out/prometheus ./cmd/prometheus
+RUN go build -mod=readonly -trimpath -buildvcs=false -tags netgo \
+      -ldflags='-s -w -buildid= -X github.com/prometheus/common/version.Version=3.15.0' \
+      -o /out/promtool ./cmd/promtool \
+ && mkdir -p /out/data /out/tmp && chmod 0700 /out/tmp
+
+FROM scratch
+LABEL org.opencontainers.image.source="https://github.com/prometheus/prometheus" \
+      org.opencontainers.image.version="3.15.0-go1.26.9-xnet0.60.0" \
+      org.opencontainers.image.revision="5241a27fe3c6983549fccc32f6e65917408c63cd" \
+      org.opencontainers.image.licenses="Apache-2.0"
+COPY --from=build /out/prometheus /bin/prometheus
+COPY --from=build /out/promtool /bin/promtool
+COPY --from=build /src/LICENSE /LICENSE
+COPY --from=build /src/NOTICE /NOTICE
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=build --chown=65532:65532 /out/data /prometheus
+COPY --from=build --chown=65532:65532 /out/tmp /tmp
+USER 65532:65532
+WORKDIR /prometheus
+EXPOSE 9090
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["/bin/prometheus"]

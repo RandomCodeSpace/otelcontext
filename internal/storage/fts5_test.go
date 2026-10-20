@@ -309,12 +309,22 @@ func TestGetLogsV2_FTS5_FiltersStillApply(t *testing.T) {
 // that already has the table + triggers.
 func TestSetupSQLiteFTS5_Idempotent(t *testing.T) {
 	repo := newTestRepo(t)
-	// newTestRepo already ran setupSQLiteFTS5 via AutoMigrateModels; running
-	// it a second time must not error or duplicate triggers.
+	if err := repo.db.Create(&Log{TenantID: "default", Severity: "INFO", Body: "second-run sentinel", ServiceName: "s", Timestamp: time.Now().UTC()}).Error; err != nil {
+		t.Fatal(err)
+	}
+	var before, after int64
+	if err := repo.db.Raw("SELECT total_changes()").Scan(&before).Error; err != nil {
+		t.Fatal(err)
+	}
 	if err := setupSQLiteFTS5(repo.db); err != nil {
 		t.Fatalf("re-run setupSQLiteFTS5: %v", err)
 	}
-	repo.db.Create(&Log{TenantID: "default", Severity: "INFO", Body: "second-run sentinel", ServiceName: "s", Timestamp: time.Now().UTC()})
+	if err := repo.db.Raw("SELECT total_changes()").Scan(&after).Error; err != nil {
+		t.Fatal(err)
+	}
+	if after != before {
+		t.Fatalf("complete index was rewritten: total_changes before=%d after=%d", before, after)
+	}
 	logs, err := repo.SearchLogs(context.Background(), "sentinel", 10)
 	if err != nil {
 		t.Fatalf("search: %v", err)

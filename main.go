@@ -9,8 +9,10 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -573,35 +575,30 @@ func main() {
 		// Dictionary IDs become DB-owned: the in-memory registrar's IDs are
 		// provisional and would strand every persisted SeriesKey on restart.
 		//
-		// The per-kind caps bound dictionary DISK growth. A name that can never
-		// appear in an admitted series is pure disk cost, so each name namespace
-		// is capped at the series budget that could reference it; past the cap
-		// the value resolves to __other__, the designed degradation. Service,
-		// tenant and dimension namespaces stay uncapped — they are bounded by
-		// the deployment and by AGGREGATE_METRIC_DIMS respectively.
-		//
-		// #200 Q3 closed the remaining holes: the service, dim-key, dim-value
-		// and dim-tuple namespaces are capped per tenant AND instance-wide,
-		// every value carries an encoded-length bound, and the tenant
-		// namespace is capped and REFUSES rather than degrading.
+		// Historical identities outlive active series. Give retained names
+		// independent bounded headroom so ordinary churn does not consume all
+		// identity slots before the current series budget is reached.
 		aggBounds := aggregate.Bounds{
 			MaxValueBytes:  cfg.AggregateMaxValueBytes,
 			MaxTenantBytes: cfg.AggregateMaxTenantBytes,
 			MaxTenants:     cfg.AggregateMaxTenants,
 			PerTenantKind: map[aggregate.Kind]int{
-				aggregate.KindOperation:   cfg.AggregateMaxSeriesTraces + cfg.AggregateMaxSeriesEdges,
-				aggregate.KindMetricName:  cfg.AggregateMaxSeriesMetrics,
-				aggregate.KindLogTemplate: cfg.AggregateMaxSeriesLogs,
+				aggregate.KindOperation:   cfg.AggregateMaxOperationNamesPerTenant,
+				aggregate.KindMetricName:  cfg.AggregateMaxMetricNamesPerTenant,
+				aggregate.KindLogTemplate: cfg.AggregateMaxLogTemplatesPerTenant,
 				aggregate.KindService:     cfg.AggregateMaxServicesPerTenant,
 				aggregate.KindDimKey:      cfg.AggregateMaxDimKeysPerTenant,
 				aggregate.KindDimValue:    cfg.AggregateMaxDimValuesPerTenant,
 				aggregate.KindDimTuple:    cfg.AggregateMaxDimTuplesPerTenant,
 			},
 			InstanceKind: map[aggregate.Kind]int{
-				aggregate.KindService:  cfg.AggregateMaxServices,
-				aggregate.KindDimKey:   cfg.AggregateMaxDimKeys,
-				aggregate.KindDimValue: cfg.AggregateMaxDimValues,
-				aggregate.KindDimTuple: cfg.AggregateMaxDimTuples,
+				aggregate.KindOperation:   cfg.AggregateMaxOperationNames,
+				aggregate.KindMetricName:  cfg.AggregateMaxMetricNames,
+				aggregate.KindLogTemplate: cfg.AggregateMaxLogTemplates,
+				aggregate.KindService:     cfg.AggregateMaxServices,
+				aggregate.KindDimKey:      cfg.AggregateMaxDimKeys,
+				aggregate.KindDimValue:    cfg.AggregateMaxDimValues,
+				aggregate.KindDimTuple:    cfg.AggregateMaxDimTuples,
 			},
 		}
 		registrar, err := aggregate.NewDurableRegistrarWithBounds(aggStore, aggBounds)
@@ -712,7 +709,9 @@ func main() {
 		// raw rows are exemplars attached to a seven-day aggregate dataset and
 		// a two-day purge is budget enforcement. In legacy and shadow the raw
 		// rows ARE the dataset and the same purge would be data loss.
-		retention.SetExemplarRetention(cfg.ExemplarRetentionDays)
+		if cfg.AggregateMode == aggregate.ModeAggregate {
+			retention.SetExemplarRetention(cfg.ExemplarRetentionDays)
+		}
 
 		// Retention owns the hourly aggregate purge and the conservative daily
 		// ANALYZE. No VACUUM on this file, by decision (#162).
@@ -793,6 +792,13 @@ func main() {
 	if prometheusClient != nil {
 		mcpServer.SetPromQLQuerier(prometheusClient, prometheusClient.TenantID())
 	}
+	rawRetention := cfg.HotRetentionDays
+	if cfg.AggregateMode == aggregate.ModeAggregate {
+		rawRetention = cfg.ExemplarRetentionDays
+	}
+	mcpServer.SetRawRetention(time.Duration(rawRetention) * 24 * time.Hour)
+	mcpServer.SetHistoryRetention(time.Duration(cfg.HotRetentionDays) * 24 * time.Hour)
+	mcpServer.SetTraceHorizon(graphRAGCfg.TraceTTL)
 	slog.Info("🤖 MCP server initialized",
 		"path", cfg.MCPPath,
 		"enabled", cfg.MCPEnabled,
@@ -811,6 +817,7 @@ func main() {
 	if cfg.AggregateMode == aggregate.ModeAggregate && aggEngine != nil {
 		apiServer.SetAggregateEngine(aggEngine)
 		mcpServer.SetAggregateMode(true)
+		mcpServer.SetLogSummaryQuerier(aggEngine)
 		// Per-event log/metric broadcasts are replaced by the coalesced,
 		// revision-driven snapshot.
 		hub.SetAggregateMode(true)
@@ -894,14 +901,15 @@ func main() {
 		)
 	}
 
-	// Disk watchdog (#201 Q5). statfs on the data volume drives staged
-	// shedding with hysteresis; per-component file sizes attribute the 8 GiB
-	// budget table (#201 Q1) so the seven-day gate (#202) validates it against
-	// measurements rather than intent.
+	// Enforce application data bytes and filesystem free-space headroom
+	// separately; a shared PVC filesystem may contain unrelated workloads.
 	diskWatchdog := storage.NewDiskWatchdog(storage.DiskWatchdogConfig{
 		Path:        cfg.DataDiskPath,
 		BudgetBytes: int64(cfg.DataDiskBudgetMB) * 1024 * 1024,
-		Metrics:     metrics,
+		DataUsage: func(path string) (int64, error) {
+			return applicationDiskUsage(cfg, path)
+		},
+		Metrics: metrics,
 		OnRawOff: func() {
 			// At >=95% waiting up to an hour for the next retention tick is
 			// not a plan. Purge the expired exemplar tier now, then checkpoint
@@ -1003,11 +1011,7 @@ func main() {
 	}
 	if ingestPipeline != nil {
 		apiServer.SetPipelineSaturationProbe(func() float64 {
-			st := ingestPipeline.Stats()
-			if st.Capacity == 0 {
-				return 0
-			}
-			return float64(st.QueueDepth) / float64(st.Capacity)
+			return ingestPipeline.Stats().Saturation()
 		})
 	}
 	if aggRecovery != nil {
@@ -1029,8 +1033,20 @@ func main() {
 		MaxDeltaLogAgeSeconds:    float64(cfg.ReadyMaxDeltaLogAgeS),
 		MaxAggregateDiskRatio:    cfg.ReadyMaxAggregateDiskRatio,
 	})
+	var aggregateReadinessProbe *api.SQLiteReadinessProbe
 	if aggStore != nil {
-		apiServer.SetAggregateDBProbe(aggStore.PingContext)
+		aggregateURI, _ := url.Parse(aggStore.Path())
+		inMemory := aggStore.Path() == ":memory:" || (aggregateURI != nil && aggregateURI.Scheme == "file" && (aggregateURI.Opaque == ":memory:" || aggregateURI.Query().Get("mode") == "memory"))
+		if inMemory {
+			apiServer.SetAggregateDBProbe(aggStore.PingContext)
+		} else {
+			probe, err := api.NewSQLiteReadinessProbe(aggStore.Path())
+			if err != nil {
+				fatal("aggregate readiness probe initialization failed", err)
+			}
+			aggregateReadinessProbe = probe
+			apiServer.SetAggregateDBProbe(probe.PingContext)
+		}
 	}
 	if aggWriter != nil {
 		aggDiskBudget := int64(cfg.ReadyAggregateDiskBudgetMB) * 1024 * 1024
@@ -1350,6 +1366,9 @@ func main() {
 	httpHandler = api.MetricsMiddleware(metrics, httpHandler)
 	if cfg.APIRateLimitRPS > 0 {
 		rl := api.NewRateLimiter(float64(cfg.APIRateLimitRPS))
+		if err := rl.SetTrustedProxies(cfg.APITrustedProxyCIDRs); err != nil {
+			fatal("trusted proxy configuration rejected", err)
+		}
 		// OTLP ingestion paths (/v1/*) are exempt from the per-IP rate limiter.
 		//
 		// Why: OTLP collectors batch aggressively and a healthy agent routinely
@@ -1635,10 +1654,14 @@ func main() {
 			return resourceRegistry.Flush(stepCtx, repo.DB())
 		}},
 		{name: "aggregate_store", run: func(context.Context) error {
-			if aggStore == nil {
-				return nil
+			var probeErr error
+			if aggregateReadinessProbe != nil {
+				probeErr = aggregateReadinessProbe.Close()
 			}
-			return aggStore.Close()
+			if aggStore == nil {
+				return probeErr
+			}
+			return errors.Join(probeErr, aggStore.Close())
 		}},
 		{name: "main_database", run: func(context.Context) error {
 			return repo.Close()
@@ -1794,7 +1817,44 @@ func sqliteMainDBPath(cfg *config.Config) string {
 	if cfg.DBDSN == "" {
 		return "OtelContext.db"
 	}
-	return cfg.DBDSN
+	if cfg.DBDSN == ":memory:" {
+		return ""
+	}
+	if strings.HasPrefix(cfg.DBDSN, "file:") {
+		u, err := url.Parse(cfg.DBDSN)
+		if err != nil || u.Query().Get("mode") == "memory" || u.Opaque == ":memory:" {
+			return ""
+		}
+		if u.Opaque != "" {
+			p, err := url.PathUnescape(u.Opaque)
+			if err != nil {
+				return ""
+			}
+			return p
+		}
+		return u.Path
+	}
+	path, _, _ := strings.Cut(cfg.DBDSN, "?")
+	return path
+}
+
+func applicationDiskUsage(cfg *config.Config, path string) (int64, error) {
+	extra := []string{cfg.DLQPath}
+	for _, dbPath := range []string{sqliteMainDBPath(cfg), cfg.AggregateDBPath} {
+		if dbPath == "" {
+			continue
+		}
+		// SQLite places WAL/SHM beside the real database, even when the
+		// configured filename is a symlink outside the data directory.
+		resolved, err := filepath.EvalSymlinks(dbPath)
+		if err == nil {
+			dbPath = resolved
+		} else if !os.IsNotExist(err) {
+			return 0, err
+		}
+		extra = append(extra, dbPath, dbPath+"-wal", dbPath+"-shm")
+	}
+	return storage.ApplicationDataBytes(path, extra...)
 }
 
 // legacyMetricPath reports whether the legacy metric path — the TSDB

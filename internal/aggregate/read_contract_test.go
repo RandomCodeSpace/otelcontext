@@ -165,8 +165,15 @@ func seedSeries(t testing.TB, tx *sql.Tx, rows []SeriesRow) {
 func newSeedFixture(t *testing.T) *seedFixture {
 	t.Helper()
 	now := mustTime(t, "2026-08-21T12:02:00Z")
-	e := testEngine(t, now)
 	store := newTestStoreAt(t, filepath.Join(t.TempDir(), "aggregate.db"), StoreConfig{})
+	reg, err := NewDurableRegistrar(store, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, err := NewEngine(EngineConfig{Mode: ModeShadow, Now: func() time.Time { return now }, Registrar: reg})
+	if err != nil {
+		t.Fatal(err)
+	}
 	e.SetStore(store)
 
 	tenantID, _ := e.TenantID("default")
@@ -241,6 +248,10 @@ func newSeedFixture(t *testing.T) *seedFixture {
 		t.Fatalf("begin seed tx: %v", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	// Endpoint reads resolve names in the same snapshot as the seeded rows.
+	if err := insertDicts(tx, reg.DrainPending()); err != nil {
+		t.Fatalf("seed dictionary: %v", err)
+	}
 	seedSeries(t, tx, series)
 	insertRows(t, tx, "aggregate_buckets", bucketIDs, bucketWindows, bucketDeltas)
 	insertRows(t, tx, "aggregate_delta_log", deltaIDs, deltaWindows, deltaDeltas)

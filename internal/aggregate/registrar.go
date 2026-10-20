@@ -269,6 +269,14 @@ func (r *DurableRegistrar) Lookup(id uint32) (DictEntry, bool) {
 	return e, ok
 }
 
+func (r *DurableRegistrar) FindID(tenantID uint32, kind Kind, value string) (uint32, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	id, ok := r.ids[dictScope{tenant: tenantID, kind: kind}][value]
+	_, blocked := r.fenced[id]
+	return id, ok && !blocked
+}
+
 // DrainPending returns the staged rows for inclusion in the next group commit.
 // They stay staged until Committed confirms them, so a failed commit re-offers
 // them instead of stranding an ID that no row backs.

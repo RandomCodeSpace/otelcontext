@@ -137,8 +137,8 @@ func TestToolDescriptionsStateTheirCoverageLimits(t *testing.T) {
 	for _, tool := range toolDefs {
 		byName[tool.Name] = tool.Description
 	}
-	if len(byName) != 9 {
-		t.Fatalf("tool surface has %d tools, want 9", len(byName))
+	if len(byName) != 10 {
+		t.Fatalf("tool surface has %d tools, want 10", len(byName))
 	}
 	for name, want := range map[string]string{
 		"trace_graph":          "not_retained_or_not_found",

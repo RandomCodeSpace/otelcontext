@@ -1,0 +1,27 @@
+# Patched Go toolchain, pinned multi-platform index. No runtime OS packages.
+FROM golang:1.26.9@sha256:37cfcca63222ec499bec5e8ad7aad52dbf7529db36d5812b8eae2f0621aa92d6 AS build
+ENV CGO_ENABLED=0 GOTOOLCHAIN=local
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY *.go ./
+COPY internal/ ./internal/
+RUN go build -mod=readonly -trimpath -buildvcs=false -ldflags="-s -w -buildid=" -o /out/otelcontext . \
+ && mkdir -p /out/data /out/tmp \
+ && chmod 0700 /out/tmp
+
+FROM scratch
+ARG VERSION=dev
+ARG REVISION=unknown
+LABEL org.opencontainers.image.source="https://github.com/RandomCodeSpace/otelcontext" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${REVISION}"
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=build /out/otelcontext /otelcontext
+COPY --from=build --chown=65532:65532 /out/data /var/lib/otelcontext
+COPY --from=build --chown=65532:65532 /out/tmp /tmp
+USER 65532:65532
+WORKDIR /var/lib/otelcontext
+EXPOSE 8080 4317
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["/otelcontext"]

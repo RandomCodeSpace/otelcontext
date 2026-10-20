@@ -742,8 +742,12 @@ func (e *Engine) PlanAdmission(m DeltaMap) *AdmissionPlan {
 		}
 		if existing, ok := resolved[target]; ok {
 			// Two source series collapsed onto the same overflow series.
-			// Totals are preserved; only identity detail is gone.
-			existing.Merge(d)
+			// Preserve the reducer-owned inputs: its topology projection
+			// still folds each original delta after admission completes.
+			merged := &AggregateDelta{}
+			merged.Merge(existing)
+			merged.Merge(d)
+			resolved[target] = merged
 			continue
 		}
 		resolved[target] = d

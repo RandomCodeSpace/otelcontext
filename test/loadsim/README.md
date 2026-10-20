@@ -20,6 +20,8 @@ backend robustness and gate releases via `make loadtest`.
 - Producers come online linearly over `--warmup` (default 5s).
 - `--profile aggregate-acceptance` applies acceptance test shape: 150 services, ~10k points/s
   sustained (75% spans, 15% logs, 10% metrics split across the services).
+- `--profile production-200` uses 200 services at 50 spans, 10 logs and 7 metric
+  points per service per second: 13,400 points/s. Use `--direct` for measured ACKs.
 - `--burst multiplier x duration` (e.g. `2x30s`) temporarily multiplies all rates for the
   specified duration to exercise backpressure.
 - Progress reported every 5s with per-signal counters; final summary on exit.
@@ -51,7 +53,7 @@ bin/loadsim -profile=aggregate-acceptance -burst=2x30s -duration=60s
 | `--profile` | `""` | Predefined profile (e.g. `aggregate-acceptance`); overrides `--services/--rate/--logs-rate/--metrics-rate` |
 | `--burst` | `""` | Burst spec (e.g. `2x30s` for 2× multiplier for 30s); sustains normal rates before/after |
 | `--duration` | `60s` | Test duration |
-| `--insecure` | `true` | Skip TLS verification |
+| `--insecure` | `true` | Use plaintext gRPC; false enables verified TLS |
 | `--tenant-id` | `""` | Attach `x-tenant-id` metadata (empty = omit) |
 | `--warmup` | `5s` | Linear producer ramp-up window |
 
@@ -62,12 +64,53 @@ bin/loadsim -profile=aggregate-acceptance -burst=2x30s -duration=60s
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--direct` | `false` | Use the direct OTLP emission engine |
+| `--tls-ca` | `""` | Optional PEM CA added to system roots; requires `--insecure=false` |
+| `--tls-server-name` | `""` | Optional verified TLS server name override |
+| `--hosts` | `0` | Assign services across mocked hosts with distinct IDs/names, CPU/memory specifications and Kubernetes node attributes |
 | `--settle` | `60s` | Unmeasured settle window before the sustained phase |
 | `--batch-interval` | `250ms` | Per-emitter batch tick |
 | `--call-timeout` | `30s` | Per-`Export` deadline |
 | `--report` | `""` | Write the JSON latency/throughput report here |
 | `--ack-ledger` | `""` | Persist the per-aggregate-window attempted-vs-ACKed contribution ledger here. Required by the seven-day recovery gate (#202): it is the only record of what the client believes was acknowledged, and therefore the only way to check "no acknowledged loss" across a `kill -9`. |
 | `--ack-ledger-flush` | `2s` | How often the ledger is fsynced, so a copy predating a server crash always exists on disk |
+
+For a three-hour 200-service run through the TLS ingress:
+
+```bash
+bin/loadsim -direct -profile=production-200 -hosts=20 \
+  -endpoint=telemetry.example.com:443 -insecure=false \
+  -batch-interval=1s -settle=30s -duration=3h -burst=2x60s \
+  -report=load.json -ack-ledger=acks.json
+```
+
+Partial OTLP responses with rejected points count as failed requests. The whole
+batch is excluded from ACK totals and the durability ledger because the response
+does not identify rejected timestamps. A warning with zero rejected points still
+counts as accepted. Host attributes are mocked specifications, not measurements
+of the test machine; capture actual server CPU, RAM and cgroup limits separately.
+
+## Current production-200 acceptance targets
+
+The bounded local profile uses 200 services and 20 hosts within a shared
+4 CPU/8 GiB stack budget: OtelContext 3 CPU/6 GiB and Prometheus 1 CPU/2 GiB.
+OS, Kubernetes and injected Istio overhead are additional.
+
+- Sustained load: 13,400 points/s for 360 seconds; combined all-signal ACK p99
+  must be **at most 600 ms**, inclusive.
+- Burst: 2x load for the full 60 seconds; combined all-signal ACK p99 must be
+  **at most 1,000 ms**, inclusive.
+- Seven-day HTTP reads must each complete within **15 seconds**, inclusive;
+  MCP reads within **5 seconds**, inclusive.
+- Exact acknowledged aggregate reconciliation, native sample accounting, no
+  unexpected drops or identity overflow, healthy readiness, no OOM, and cleanup
+  remain required.
+
+The sustained target changed from 500 ms by user decision on October 20, 2026.
+The simulator reports measurements; it does not enforce these production-200
+acceptance targets. The separate `test/gate` release profile keeps its existing
+criteria. Historical measurements and their original verdicts remain unchanged.
+See the [v0.6.3 evidence and qualifications](../../docs/release-notes/v0.6.3-readiness.md)
+for the existing r4 run's reassessment; no new load run accompanied this decision.
 
 ## Output
 

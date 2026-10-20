@@ -71,9 +71,12 @@ func (p *AggregateProvider) snapshot(ctx context.Context, q Query) (Snapshot, er
 	}
 	meta.Epoch = result.Epoch
 	meta.Revision = result.Revision
+	meta.IdentityCoverage = result.IdentityCoverage
 	if result.Coverage != "" && !meta.Truncated {
 		meta.Coverage = string(result.Coverage)
 		meta.CoverageNote = result.Coverage.Note()
+	} else if result.IdentityCoverage.Limited() && !projection.IdentityCoverage.Limited() {
+		meta.CoverageNote += "; " + aggregate.LimitedCoverageNote
 	}
 	snap := Snapshot{
 		Nodes: make([]Node, 0, len(result.Nodes)),
@@ -114,9 +117,16 @@ func (p *AggregateProvider) snapshot(ctx context.Context, q Query) (Snapshot, er
 func aggregateMetadata(id Identity, projection aggregate.TopologySnapshot) Metadata {
 	coverage := aggregate.CoverageFull
 	coverageNote := coverage.Note()
+	if projection.IdentityCoverage.Limited() {
+		coverage = aggregate.CoverageLimited
+		coverageNote = coverage.Note()
+	}
 	if projection.Truncated() {
 		coverage = aggregate.CoverageSampled
 		coverageNote = "topology is incomplete because configured projection caps refused accepted facts; dropped_* counts identify the omissions"
+		if projection.IdentityCoverage.Limited() {
+			coverageNote += "; " + aggregate.LimitedCoverageNote
+		}
 	}
 	return Metadata{
 		Source:            SourceAggregate,
@@ -129,6 +139,7 @@ func aggregateMetadata(id Identity, projection aggregate.TopologySnapshot) Metad
 		DroppedOperations: projection.DroppedOperations,
 		DroppedEdges:      projection.DroppedEdges,
 		DroppedMetrics:    projection.DroppedMetrics,
+		IdentityCoverage:  projection.IdentityCoverage,
 	}
 }
 

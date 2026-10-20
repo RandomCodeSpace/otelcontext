@@ -8,6 +8,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/RandomCodeSpace/otelcontext/internal/config"
+	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 	"gorm.io/gorm"
 )
 
@@ -44,6 +46,17 @@ func RequireExact(ctx context.Context, db *gorm.DB, driver string) (Status, erro
 	if !status.Usable() {
 		return status, &StateError{Operation: "startup", Status: status}
 	}
+	if NormalizeDriver(driver) == "sqlite" && config.LogFTSEnabledFromEnv() {
+		sqlDB, err := db.DB()
+		if err != nil {
+			return status, err
+		}
+		if err := storage.CheckSQLiteLogFTS(ctx, sqlDB); err != nil {
+			status.State = StateIncompatible
+			status.Detail = "LOG_FTS_ENABLED=true: " + err.Error()
+			return status, fmt.Errorf("startup refused: LOG_FTS_ENABLED=true: %w; run `otelcontext migrate up` with LOG_FTS_ENABLED=true before starting", err)
+		}
+	}
 	return status, nil
 }
 
@@ -68,7 +81,8 @@ func newRunner(driver string) (*runner, error) {
 	return &runner{registry: registry}, nil
 }
 
-// Up installs an empty supported database or applies every pending migration.
+// Up installs an empty supported database, applies pending migrations, and
+// provisions configured optional indexes even when the version is already exact.
 func Up(ctx context.Context, db *gorm.DB, driver string) (Status, error) {
 	driver = NormalizeDriver(driver)
 	if !SupportsVersioned(driver) {
@@ -79,7 +93,32 @@ func Up(ctx context.Context, db *gorm.DB, driver string) (Status, error) {
 	if err != nil {
 		return Status{}, err
 	}
-	return r.up(ctx, db, driver)
+	status, err := r.up(ctx, db, driver)
+	if err != nil || driver != "sqlite" || !config.LogFTSEnabledFromEnv() {
+		return status, err
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		return status, err
+	}
+	err = withLockedTransaction(ctx, sqlDB, driver, func(tx sqlExecutor) error {
+		rows, err := loadRawLedger(ctx, tx)
+		if err != nil {
+			return err
+		}
+		actual, err := validateRawLedger(rows, r.registry)
+		if err != nil {
+			return err
+		}
+		if actual != len(r.registry) {
+			return errors.New("log FTS provisioning requires an exact migration ledger")
+		}
+		return storage.EnsureSQLiteLogFTS(ctx, tx)
+	})
+	if err != nil {
+		return status, fmt.Errorf("provision configured SQLite log FTS: %w", err)
+	}
+	return status, nil
 }
 
 func (r *runner) up(ctx context.Context, db *gorm.DB, driver string) (Status, error) {

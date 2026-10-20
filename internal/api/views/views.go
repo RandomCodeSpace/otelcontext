@@ -126,11 +126,12 @@ type DashboardStats struct {
 	SpanErrors       int64   `json:"span_errors,omitempty"`
 	SpanErrorRate    float64 `json:"span_error_rate,omitempty"`
 
-	Coverage     string                      `json:"coverage,omitempty"`
-	CoverageNote string                      `json:"coverage_note,omitempty"`
-	Accuracy     *aggregate.AccuracyMetadata `json:"accuracy,omitempty"`
-	Epoch        string                      `json:"epoch,omitempty"`
-	Revision     uint64                      `json:"revision,omitempty"`
+	Coverage         string                      `json:"coverage,omitempty"`
+	CoverageNote     string                      `json:"coverage_note,omitempty"`
+	IdentityCoverage *aggregate.IdentityCoverage `json:"identity_coverage,omitempty"`
+	Accuracy         *aggregate.AccuracyMetadata `json:"accuracy,omitempty"`
+	Epoch            string                      `json:"epoch,omitempty"`
+	Revision         uint64                      `json:"revision,omitempty"`
 }
 
 // ServiceMapNode is a node on the service topology view.
@@ -164,12 +165,13 @@ type ServiceMapMetrics struct {
 	Nodes []ServiceMapNode `json:"nodes"`
 	Edges []ServiceMapEdge `json:"edges"`
 
-	Source       string `json:"source,omitempty"`
-	Coverage     string `json:"coverage,omitempty"`
-	CoverageNote string `json:"coverage_note,omitempty"`
-	Epoch        string `json:"epoch,omitempty"`
-	Revision     uint64 `json:"revision,omitempty"`
-	Truncated    bool   `json:"truncated,omitempty"`
+	Source           string                      `json:"source,omitempty"`
+	Coverage         string                      `json:"coverage,omitempty"`
+	CoverageNote     string                      `json:"coverage_note,omitempty"`
+	IdentityCoverage *aggregate.IdentityCoverage `json:"identity_coverage,omitempty"`
+	Epoch            string                      `json:"epoch,omitempty"`
+	Revision         uint64                      `json:"revision,omitempty"`
+	Truncated        bool                        `json:"truncated,omitempty"`
 
 	DroppedServices   uint64 `json:"dropped_services,omitempty"`
 	DroppedOperations uint64 `json:"dropped_operations,omitempty"`
@@ -430,6 +432,7 @@ func DashboardStatsFromAggregate(r *aggregate.DashboardResult) DashboardStats {
 		LatencyProvenance: &provenance,
 		Coverage:          string(r.Coverage),
 		CoverageNote:      r.Coverage.Note(),
+		IdentityCoverage:  &r.IdentityCoverage,
 		Accuracy:          &acc,
 		Epoch:             r.Epoch,
 		Revision:          r.Revision,
@@ -481,12 +484,13 @@ func ServiceMapMetricsFromAggregate(r *aggregate.TopologyResult) ServiceMapMetri
 		}
 	}
 	return ServiceMapMetrics{
-		Nodes:        nodes,
-		Edges:        edges,
-		Coverage:     string(r.Coverage),
-		CoverageNote: r.Coverage.Note(),
-		Epoch:        r.Epoch,
-		Revision:     r.Revision,
+		Nodes:            nodes,
+		Edges:            edges,
+		Coverage:         string(r.Coverage),
+		CoverageNote:     r.Coverage.Note(),
+		IdentityCoverage: &r.IdentityCoverage,
+		Epoch:            r.Epoch,
+		Revision:         r.Revision,
 	}
 }
 
@@ -522,6 +526,7 @@ func ServiceMapMetricsFromTopology(snapshot topology.Snapshot) ServiceMapMetrics
 		out.Source = string(snapshot.Meta.Source)
 		out.Coverage = snapshot.Meta.Coverage
 		out.CoverageNote = snapshot.Meta.CoverageNote
+		out.IdentityCoverage = &snapshot.Meta.IdentityCoverage
 		out.Epoch = snapshot.Meta.Epoch
 		out.Revision = snapshot.Meta.Revision
 		out.Truncated = snapshot.Meta.Truncated
