@@ -163,8 +163,8 @@ Each run writes `read-latency-v1.json` into its `OTELCONTEXT_PROOF_DIR`, so
 give the two shapes separate directories. State goes under `TMPDIR` when set.
 The test fails when any assertion fails and still writes the JSON.
 
-CI runs both shapes on every pull request as `read latency proof · legacy`
-and `read latency proof · aggregate` (`.github/workflows/ci.yml`) and uploads
+Scheduled or manual extended validation runs both shapes as `read latency proof · legacy`
+and `read latency proof · aggregate` (`.github/workflows/extended.yml`) and uploads
 `read-latency-<shape>-<sha>` for 14 days. The untagged helpers (percentiles,
 evaluation, JSON, exposition parsing, memory accounting) are covered by the
 normal `go test ./...`. Each shape now spends up to five minutes settling

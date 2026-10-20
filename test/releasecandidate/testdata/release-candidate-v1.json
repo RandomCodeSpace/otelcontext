@@ -24,104 +24,9 @@
     "annotated_tag": true,
     "required_checks": [
       {
-        "name": "build · vet · test",
+        "name": "main validation",
         "conclusion": "success",
         "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100000"
-      },
-      {
-        "name": "SonarCloud Code Analysis",
-        "conclusion": "success",
-        "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100001"
-      },
-      {
-        "name": "browser smoke",
-        "conclusion": "success",
-        "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100002"
-      },
-      {
-        "name": "database proof · sqlite",
-        "conclusion": "success",
-        "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100003"
-      },
-      {
-        "name": "database proof · postgres-16",
-        "conclusion": "success",
-        "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100004"
-      },
-      {
-        "name": "topology proof · legacy",
-        "conclusion": "success",
-        "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100005"
-      },
-      {
-        "name": "topology proof · aggregate-shadow",
-        "conclusion": "success",
-        "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100006"
-      },
-      {
-        "name": "topology proof · aggregate",
-        "conclusion": "success",
-        "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100007"
-      },
-      {
-        "name": "shutdown proof · legacy",
-        "conclusion": "success",
-        "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100008"
-      },
-      {
-        "name": "shutdown proof · aggregate-shadow",
-        "conclusion": "success",
-        "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100009"
-      },
-      {
-        "name": "shutdown proof · aggregate",
-        "conclusion": "success",
-        "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100010"
-      },
-      {
-        "name": "backup proof · legacy",
-        "conclusion": "success",
-        "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100011"
-      },
-      {
-        "name": "backup proof · aggregate-shadow",
-        "conclusion": "success",
-        "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100012"
-      },
-      {
-        "name": "backup proof · aggregate",
-        "conclusion": "success",
-        "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100013"
-      },
-      {
-        "name": "database backup proof · mysql-8.4",
-        "conclusion": "success",
-        "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100014"
-      },
-      {
-        "name": "database backup proof · postgres-16",
-        "conclusion": "success",
-        "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100015"
-      },
-      {
-        "name": "database backup proof · sqlserver-2022",
-        "conclusion": "success",
-        "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100016"
-      },
-      {
-        "name": "latency proof · legacy",
-        "conclusion": "success",
-        "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100017"
-      },
-      {
-        "name": "latency proof · aggregate-shadow",
-        "conclusion": "success",
-        "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100018"
-      },
-      {
-        "name": "latency proof · aggregate",
-        "conclusion": "success",
-        "url": "https://github.com/RandomCodeSpace/otelcontext/runs/52100019"
       }
     ],
     "event": "push"
@@ -350,6 +255,195 @@
     ]
   },
   "jobs": [
+    {
+      "name": "Release integration / backup proof · aggregate",
+      "id": 49518000223,
+      "conclusion": "success",
+      "url": "https://github.com/RandomCodeSpace/otelcontext/actions/runs/17640023311/job/49518000223",
+      "started_at": "2026-09-03T10:02:00Z",
+      "completed_at": "2026-09-03T10:04:30Z",
+      "required_for": "limited_production"
+    },
+    {
+      "name": "Release integration / backup proof · aggregate-shadow",
+      "id": 49518000222,
+      "conclusion": "success",
+      "url": "https://github.com/RandomCodeSpace/otelcontext/actions/runs/17640023311/job/49518000222",
+      "started_at": "2026-09-03T10:02:00Z",
+      "completed_at": "2026-09-03T10:04:30Z",
+      "required_for": "limited_production"
+    },
+    {
+      "name": "Release integration / backup proof · legacy",
+      "id": 49518000221,
+      "conclusion": "success",
+      "url": "https://github.com/RandomCodeSpace/otelcontext/actions/runs/17640023311/job/49518000221",
+      "started_at": "2026-09-03T10:02:00Z",
+      "completed_at": "2026-09-03T10:04:30Z",
+      "required_for": "limited_production"
+    },
+    {
+      "name": "Release integration / database backup proof · mysql-8.4",
+      "id": 49518000225,
+      "conclusion": "success",
+      "url": "https://github.com/RandomCodeSpace/otelcontext/actions/runs/17640023311/job/49518000225",
+      "started_at": "2026-09-03T10:02:00Z",
+      "completed_at": "2026-09-03T10:04:30Z",
+      "required_for": "limited_production"
+    },
+    {
+      "name": "Release integration / database backup proof · postgres-16",
+      "id": 49518000224,
+      "conclusion": "success",
+      "url": "https://github.com/RandomCodeSpace/otelcontext/actions/runs/17640023311/job/49518000224",
+      "started_at": "2026-09-03T10:02:00Z",
+      "completed_at": "2026-09-03T10:04:30Z",
+      "required_for": "limited_production"
+    },
+    {
+      "name": "Release integration / database backup proof · sqlserver-2022",
+      "id": 49518000226,
+      "conclusion": "success",
+      "url": "https://github.com/RandomCodeSpace/otelcontext/actions/runs/17640023311/job/49518000226",
+      "started_at": "2026-09-03T10:02:00Z",
+      "completed_at": "2026-09-03T10:04:30Z",
+      "required_for": "limited_production"
+    },
+    {
+      "name": "Release integration / latency proof · aggregate",
+      "id": 49518000217,
+      "conclusion": "success",
+      "url": "https://github.com/RandomCodeSpace/otelcontext/actions/runs/17640023311/job/49518000217",
+      "started_at": "2026-09-03T10:02:00Z",
+      "completed_at": "2026-09-03T10:04:30Z",
+      "required_for": "limited_production"
+    },
+    {
+      "name": "Release integration / latency proof · aggregate-shadow",
+      "id": 49518000216,
+      "conclusion": "success",
+      "url": "https://github.com/RandomCodeSpace/otelcontext/actions/runs/17640023311/job/49518000216",
+      "started_at": "2026-09-03T10:02:00Z",
+      "completed_at": "2026-09-03T10:04:30Z",
+      "required_for": "limited_production"
+    },
+    {
+      "name": "Release integration / latency proof · legacy",
+      "id": 49518000215,
+      "conclusion": "success",
+      "url": "https://github.com/RandomCodeSpace/otelcontext/actions/runs/17640023311/job/49518000215",
+      "started_at": "2026-09-03T10:02:00Z",
+      "completed_at": "2026-09-03T10:04:30Z",
+      "required_for": "limited_production"
+    },
+    {
+      "name": "Release integration / race tests",
+      "id": 49518000211,
+      "conclusion": "success",
+      "url": "https://github.com/RandomCodeSpace/otelcontext/actions/runs/17640023311/job/49518000211",
+      "started_at": "2026-09-03T10:02:00Z",
+      "completed_at": "2026-09-03T10:04:30Z",
+      "required_for": "limited_production"
+    },
+    {
+      "name": "Release integration / shutdown proof · aggregate",
+      "id": 49518000220,
+      "conclusion": "success",
+      "url": "https://github.com/RandomCodeSpace/otelcontext/actions/runs/17640023311/job/49518000220",
+      "started_at": "2026-09-03T10:02:00Z",
+      "completed_at": "2026-09-03T10:04:30Z",
+      "required_for": "limited_production"
+    },
+    {
+      "name": "Release integration / shutdown proof · aggregate-shadow",
+      "id": 49518000219,
+      "conclusion": "success",
+      "url": "https://github.com/RandomCodeSpace/otelcontext/actions/runs/17640023311/job/49518000219",
+      "started_at": "2026-09-03T10:02:00Z",
+      "completed_at": "2026-09-03T10:04:30Z",
+      "required_for": "limited_production"
+    },
+    {
+      "name": "Release integration / shutdown proof · legacy",
+      "id": 49518000218,
+      "conclusion": "success",
+      "url": "https://github.com/RandomCodeSpace/otelcontext/actions/runs/17640023311/job/49518000218",
+      "started_at": "2026-09-03T10:02:00Z",
+      "completed_at": "2026-09-03T10:04:30Z",
+      "required_for": "limited_production"
+    },
+    {
+      "name": "Release integration / topology proof · aggregate",
+      "id": 49518000214,
+      "conclusion": "success",
+      "url": "https://github.com/RandomCodeSpace/otelcontext/actions/runs/17640023311/job/49518000214",
+      "started_at": "2026-09-03T10:02:00Z",
+      "completed_at": "2026-09-03T10:04:30Z",
+      "required_for": "limited_production"
+    },
+    {
+      "name": "Release integration / topology proof · aggregate-shadow",
+      "id": 49518000213,
+      "conclusion": "success",
+      "url": "https://github.com/RandomCodeSpace/otelcontext/actions/runs/17640023311/job/49518000213",
+      "started_at": "2026-09-03T10:02:00Z",
+      "completed_at": "2026-09-03T10:04:30Z",
+      "required_for": "limited_production"
+    },
+    {
+      "name": "Release integration / topology proof · legacy",
+      "id": 49518000212,
+      "conclusion": "success",
+      "url": "https://github.com/RandomCodeSpace/otelcontext/actions/runs/17640023311/job/49518000212",
+      "started_at": "2026-09-03T10:02:00Z",
+      "completed_at": "2026-09-03T10:04:30Z",
+      "required_for": "limited_production"
+    },
+    {
+      "name": "Release security / Gitleaks (secret scan)",
+      "id": 49518000230,
+      "conclusion": "success",
+      "url": "https://github.com/RandomCodeSpace/otelcontext/actions/runs/17640023311/job/49518000230",
+      "started_at": "2026-09-03T10:02:00Z",
+      "completed_at": "2026-09-03T10:04:30Z",
+      "required_for": "limited_production"
+    },
+    {
+      "name": "Release security / OSV-Scanner (SCA)",
+      "id": 49518000227,
+      "conclusion": "success",
+      "url": "https://github.com/RandomCodeSpace/otelcontext/actions/runs/17640023311/job/49518000227",
+      "started_at": "2026-09-03T10:02:00Z",
+      "completed_at": "2026-09-03T10:04:30Z",
+      "required_for": "limited_production"
+    },
+    {
+      "name": "Release security / SBOM (SPDX + CycloneDX)",
+      "id": 49518000231,
+      "conclusion": "success",
+      "url": "https://github.com/RandomCodeSpace/otelcontext/actions/runs/17640023311/job/49518000231",
+      "started_at": "2026-09-03T10:02:00Z",
+      "completed_at": "2026-09-03T10:04:30Z",
+      "required_for": "limited_production"
+    },
+    {
+      "name": "Release security / Semgrep (SAST)",
+      "id": 49518000229,
+      "conclusion": "success",
+      "url": "https://github.com/RandomCodeSpace/otelcontext/actions/runs/17640023311/job/49518000229",
+      "started_at": "2026-09-03T10:02:00Z",
+      "completed_at": "2026-09-03T10:04:30Z",
+      "required_for": "limited_production"
+    },
+    {
+      "name": "Release security / Trivy (filesystem + container scan)",
+      "id": 49518000228,
+      "conclusion": "success",
+      "url": "https://github.com/RandomCodeSpace/otelcontext/actions/runs/17640023311/job/49518000228",
+      "started_at": "2026-09-03T10:02:00Z",
+      "completed_at": "2026-09-03T10:04:30Z",
+      "required_for": "limited_production"
+    },
     {
       "name": "browser smoke · release binary",
       "id": 49518000107,

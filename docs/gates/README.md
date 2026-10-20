@@ -28,7 +28,7 @@ What it deliberately does not certify: host power-loss durability, Pod-reschedul
 | `crash_run` | A third load run, persisting a per-window **ACK ledger** to disk every two seconds. Partway through, the gate snapshots the on-disk ledger and sends **SIGKILL** to the server process, restarts it, and times `/ready`. It is long enough that at least two aggregate windows fall entirely inside it, so the per-window comparison has both an exact window and the crash-affected one. | 16 min |
 | `measure` | Disk walk, final scrape, query completeness over the full seven-day range, threshold evaluation, report. | 2-5 min |
 
-Total wall time is roughly four to five hours. **It is manual.** CI compiles the gate binary and runs its unit tests; it never runs the protocol on a shared runner.
+Total wall time is roughly four to five hours. **It is manual.** Release integration compiles the gate binary and runs its unit tests; it never runs the protocol on a shared runner.
 
 ## Running it
 

@@ -120,11 +120,44 @@ The disposable verifier used by the release gate is [`scripts/prove-systemd-rele
 
 ### Release promotion
 
-A release is a draft until the exact candidate is proven. `scripts/release.sh vX.Y.Z[-pre] [--release] [--dry-run]` refuses to tag unless HEAD equals `origin/main` and every status check that branch protection requires on `main` reports `success` for that commit. It then creates one annotated tag, pushes it once, and with `--release` opens a draft GitHub release with notes. Tags are never moved, deleted, or reused; a failed candidate gets a new version.
+A release is a draft until the exact candidate is proven. `scripts/release.sh vX.Y.Z[-pre] [--release] [--dry-run]` refuses to tag unless HEAD equals protected `origin/main` and the latest push-to-main CI run for that exact commit has succeeded, including `main validation`. PR checks are enforced before merge and are not expected to run again on the merged commit. It then creates one annotated tag, pushes it once, and with `--release` opens a draft GitHub release with notes. Tags are never moved, deleted, or reused; a failed candidate gets a new version.
 
 `.github/workflows/release.yml` runs at the tag ref: `source identity` binds protected `main`, the tag, and the 40-character SHA; `goreleaser` uploads the four archives, four SBOMs, `checksums.txt`, `checksums.txt.sig`, and `checksums.txt.pem` to the draft; `verify signed assets` checks digests, certificate, signature identity, archive contents, version, and embedded UI; the `database lifecycle gate` (SQLite, PostgreSQL 16, MySQL 8.4, SQL Server 2022), `browser smoke · release binary`, `systemd proof · release archive`, and `linux arm64 smoke` jobs run the extracted release binary; `release candidate manifest` writes `release-candidate-v1.json` into the workflow artifact `release-candidate-<tag>-<sha>` (retained 90 days); `publish` un-drafts the release only when limited production is approved. A failed candidate stays an unpublished draft with its evidence.
 
 To re-prove an existing draft, dispatch the workflow at the tag ref: `gh workflow run release.yml --ref <tag>`. It verifies the assets already on the draft and never rebuilds them. Aggregate certification is `aggregate-release-gate.yml`, dispatched separately against the same signed Linux archive; it does not block publication and publication does not depend on it.
+
+### CI stages and required checks
+
+| Stage | Checks |
+| --- | --- |
+| Pull request | Build, vet, non-race unit tests (including fast SQLite/migration regressions), CI contract tests, Gitleaks, SonarCloud and CodeQL |
+| Push to main | CGO-disabled build, isolated SQLite migration, `/live`, `/ready`, clean SIGTERM exit |
+| Release tag | Full race suite and tagged-tool checks; three-mode topology, latency semantics, shutdown and restore proofs; native database backup matrices; full security scanners; existing signed-binary database, browser, systemd and ARM64 proofs |
+| Scheduled/manual | Read-latency fixtures, source browser/systemd proofs, extended database checks, full security scans, Scorecard and ingestion baselines |
+
+Superseded PR CI/security runs cancel. Main runs and release runs do not cancel
+each other. SonarCloud and CodeQL use GitHub-managed integrations; their
+additional main/scheduled analyses are independent of these workflow triggers.
+
+Main branch protection requires `build · vet · test` (GitHub Actions app 15368),
+`Gitleaks (secret scan)` (15368), `SonarCloud Code Analysis` (12526), and
+`CodeQL` (GitHub code scanning app 57789). Keep existing strictness, review,
+admin-enforcement and other protection settings. Do **not** require `main
+validation` for PRs: it runs after merge.
+
+When adopting this split, first push the workflow PR and verify those four
+checks on its current head. Then replace only the required-status-check list
+with the four checks and their app IDs, retaining a copy of the prior list.
+The removed matrix checks now live in `integration.yml`, `database-proof.yml`
+and `extended.yml`; leaving their old names required would block every PR.
+This configuration transition does not authorize merging any paused PR.
+
+The release manifest requires every release integration and security job to
+be present and successful. Failure, cancellation, skip or missing evidence
+blocks publication. Exact-main verification is shared by `release.sh` and the
+tag workflow in `scripts/check-release-source.sh`; a failed or pending newer
+run cannot reuse an older success. Performance fixtures and the manual
+seven-day production gate remain separate evidence, not release certification.
 
 ### Whole-origin proxy
 

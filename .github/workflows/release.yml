@@ -1,8 +1,9 @@
 name: Release (artifacts + signing)
 
 # Runs only at a version tag ref. GoReleaser stages a signed DRAFT release
-# (release.draft in .goreleaser.yaml); every proof job consumes the exact draft
-# assets; the draft is published only after the limited-production manifest is
+# (release.draft in .goreleaser.yaml). Integration tests bind to the tag source;
+# packaging and database proofs consume the signed assets. Publication requires
+# all integration/security jobs and the limited-production manifest to be
 # approved. A workflow_dispatch at a tag ref (gh workflow run release.yml
 # --ref vX.Y.Z) re-proves the existing draft assets without rebuilding them.
 # Job names are a contract with test/releasecandidate manifest: do not rename.
@@ -29,6 +30,7 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
+      actions: read
       checks: read
       statuses: read
     outputs:
@@ -74,47 +76,18 @@ jobs:
 
           work="${RUNNER_TEMP}/source-identity"
           install -d -m 0755 "${work}/artifact"
-          # The protection endpoint itself needs administration:read, which the
-          # workflow token cannot hold; the branch object exposes the same
-          # required contexts publicly.
-          gh api "repos/${GITHUB_REPOSITORY}/branches/main" \
-            --jq '.protection.required_status_checks.contexts[]' > "${work}/required-contexts.txt"
-          test -s "${work}/required-contexts.txt"
-          gh api --paginate "repos/${GITHUB_REPOSITORY}/commits/${sha}/check-runs?per_page=100" \
-            --jq '.check_runs[]' | jq -s . > "${work}/check-runs.json"
-          gh api "repos/${GITHUB_REPOSITORY}/commits/${sha}/status" > "${work}/status.json"
-          : > "${work}/required-checks.jsonl"
-          while IFS= read -r context; do
-            jq -nc --arg name "${context}" \
-              --slurpfile runs "${work}/check-runs.json" \
-              --slurpfile status "${work}/status.json" '
-              ([$runs[0][] | select(.name == $name)] | sort_by(.started_at) | last) as $run
-              | ([$status[0].statuses[]? | select(.context == $name)] | sort_by(.updated_at) | last) as $st
-              | if $run != null then
-                  {name:$name, conclusion:(if $run.status == "completed" then ($run.conclusion // "missing") else $run.status end), url:($run.html_url // "")}
-                elif $st != null then
-                  {name:$name, conclusion:$st.state, url:($st.target_url // "")}
-                else
-                  {name:$name, conclusion:"missing", url:""}
-                end' >> "${work}/required-checks.jsonl"
-          done < "${work}/required-contexts.txt"
-          echo "required checks for ${sha}:"
-          jq -r '"  " + .conclusion + "\t" + .name' "${work}/required-checks.jsonl"
-          failing="$(jq -r 'select(.conclusion != "success") | .name' "${work}/required-checks.jsonl")"
-          if [ -n "${failing}" ]; then
-            echo "required checks are not all successful for ${sha}:" >&2
-            printf '  %s\n' "${failing}" >&2
-            exit 1
-          fi
+          # Merge protection covers PR checks; require the exact merged-source
+          # validation here rather than duplicating the PR matrix on main.
+          bash scripts/check-release-source.sh "${sha}" > "${work}/required-checks.json"
 
           jq -n \
             --arg tag "${tag}" --arg sha "${sha}" --arg ref "${GITHUB_REF}" \
             --arg go_version "$(go version | awk '{print $3}')" \
             --arg event "${GITHUB_EVENT_NAME}" \
-            --slurpfile checks "${work}/required-checks.jsonl" '
+            --slurpfile checks "${work}/required-checks.json" '
             {schema_version:"otelcontext.source-identity.v1",tag:$tag,sha:$sha,ref:$ref,ref_type:"tag",
              protected_main:true,clean_tree:true,go_version:$go_version,annotated_tag:true,
-             required_checks:$checks,event:$event}' > "${work}/artifact/source-identity-v1.json"
+             required_checks:$checks[0],event:$event}' > "${work}/artifact/source-identity-v1.json"
           cat "${work}/artifact/source-identity-v1.json"
           {
             echo "tag=${tag}"
@@ -131,6 +104,20 @@ jobs:
           path: ${{ env.SOURCE_IDENTITY_DIR }}
           if-no-files-found: error
           retention-days: 90
+
+  integration:
+    name: Release integration
+    needs: source-identity
+    uses: ./.github/workflows/integration.yml
+    permissions:
+      contents: read
+
+  security:
+    name: Release security
+    needs: source-identity
+    uses: ./.github/workflows/security.yml
+    permissions:
+      contents: read
 
   goreleaser:
     name: goreleaser
@@ -798,7 +785,7 @@ jobs:
 
   manifest:
     name: release candidate manifest
-    needs: [source-identity, verify-assets, database-proof, browser-smoke, systemd-proof, arm64-smoke]
+    needs: [source-identity, verify-assets, integration, security, database-proof, browser-smoke, systemd-proof, arm64-smoke]
     if: ${{ always() && needs.source-identity.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
