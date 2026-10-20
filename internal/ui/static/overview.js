@@ -79,7 +79,7 @@ function setRange(range) {
   url.searchParams.set("range", range);
   history.replaceState(null, "", url);
   render();
-  refresh();
+  void refresh();
 }
 
 // Joined views over the raw responses, rebuilt on each render.
@@ -414,7 +414,7 @@ function renderAtlas(m) {
     const a = nsById.get(e.source);
     const b = nsById.get(e.target);
     if (!a || !b || a === b || !domains.has(a) || !domains.has(b)) continue;
-    const key = [a, b].sort().join("\u0000");
+    const key = (a < b ? [a, b] : [b, a]).join("\u0000");
     const pair = pairs.get(key) || { a: domains.get(a < b ? a : b), b: domains.get(a < b ? b : a), calls: 0, errors: 0 };
     pair.calls += e.calls || 0;
     pair.errors += e.errors || 0;
@@ -743,10 +743,10 @@ new ResizeObserver(() => {
   atlasFrame = requestAnimationFrame(() => renderAtlas(model()));
 }).observe($("atlas"));
 setInterval(renderLive, 1000);
-setInterval(() => { if (!document.hidden) refresh(); }, POLL_MS);
+setInterval(() => { if (!document.hidden) void refresh(); }, POLL_MS);
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden && Date.now() - state.updatedAt > POLL_MS) refresh();
+  if (!document.hidden && Date.now() - state.updatedAt > POLL_MS) void refresh();
   renderLive();
 });
 render();
-refresh();
+void refresh();

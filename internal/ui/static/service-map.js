@@ -1618,7 +1618,7 @@ function select(key, { open = true } = {}) {
   renderInspector();
   if (key.startsWith("s:")) {
     const s = lookup().service(key.slice(2));
-    if (s) loadTraffic(s.name);
+    if (s) void loadTraffic(s.name);
   }
   if (open && mqInspector.matches) openDrawer("inspector");
 }
@@ -1642,7 +1642,7 @@ function focusService(id) {
   state.notice = "";
   closeDrawer();
   writeURL();
-  load({ full: false, refit: true });
+  void load({ full: false, refit: true });
 }
 
 function unfocus() {
@@ -1757,7 +1757,7 @@ function renderAll({ refit = false } = {}) {
   const subject = state.selected || (state.focus ? "s:" + state.focus : "");
   if (subject.startsWith("s:")) {
     const s = lookup().service(subject.slice(2));
-    if (s) loadTraffic(s.name);
+    if (s) void loadTraffic(s.name);
   }
 }
 
@@ -1869,12 +1869,12 @@ $("env").addEventListener("change", () => {
   state.env = $("env").value === "*" ? undefined : JSON.parse($("env").value);
   state.focus = "";
   state.selected = null;
-  load();
+  void load();
 });
 for (const b of document.querySelectorAll("[data-range]")) b.addEventListener("click", () => {
   if (state.range === b.dataset.range) return;
   state.range = b.dataset.range;
-  load();
+  void load();
 });
 for (const b of document.querySelectorAll("[data-mode]")) b.addEventListener("click", () => {
   if (state.mode === b.dataset.mode) return;
@@ -1884,7 +1884,7 @@ for (const b of document.querySelectorAll("[data-mode]")) b.addEventListener("cl
 $("hops").addEventListener("change", () => {
   state.hops = Number($("hops").value) === 2 ? 2 : 1;
   writeURL();
-  load({ full: false });
+  void load({ full: false });
 });
 $("search").addEventListener("input", () => { state.query = $("search").value; renderResults(); });
 $("search").addEventListener("keydown", (e) => {
@@ -1937,10 +1937,10 @@ new ResizeObserver(() => {
 
 setInterval(() => {
   renderStatus();
-  if (!document.hidden && !state.loading && state.updated && Date.now() - state.updated >= REFRESH_MS) load({ refit: false });
+  if (!document.hidden && !state.loading && state.updated && Date.now() - state.updated >= REFRESH_MS) void load({ refit: false });
 }, 5000);
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden && state.updated && Date.now() - state.updated >= REFRESH_MS && !state.loading) load({ refit: false });
+  if (!document.hidden && state.updated && Date.now() - state.updated >= REFRESH_MS && !state.loading) void load({ refit: false });
 });
 
 initShell();
