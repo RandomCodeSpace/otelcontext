@@ -260,8 +260,8 @@ func Baseline(ctx context.Context, db *gorm.DB, driver, release string) (Baselin
 		if err != nil {
 			return err
 		}
-		if count != len(ownedTableNames) {
-			return fmt.Errorf("migrate baseline refused: found %d of %d required tables after locking", count, len(ownedTableNames))
+		if want := len(schemaSpec(baselineVersion)); count != want {
+			return fmt.Errorf("migrate baseline refused: found %d of %d required tables after locking", count, want)
 		}
 		now := time.Now().UTC()
 		for _, entry := range r.registry[:baselineVersion] {
@@ -416,11 +416,11 @@ func countOwnedTables(ctx context.Context, tx sqlExecutor, driver string) (int, 
 	if NormalizeDriver(driver) == "postgres" {
 		err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM information_schema.tables
 WHERE table_schema = current_schema()
-AND table_name IN ('traces','spans','metric_buckets','logs','investigations','drain_templates')`).Scan(&count)
+AND table_name IN ('traces','spans','metric_buckets','logs','investigations','drain_templates','promql_series','promql_samples','topology_entities','topology_buckets')`).Scan(&count)
 	} else {
 		err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master
 WHERE type = 'table'
-AND name IN ('traces','spans','metric_buckets','logs','investigations','drain_templates')`).Scan(&count)
+AND name IN ('traces','spans','metric_buckets','logs','investigations','drain_templates','promql_series','promql_samples','topology_entities','topology_buckets')`).Scan(&count)
 	}
 	if err != nil {
 		return 0, fmt.Errorf("count OtelContext tables: %w", err)

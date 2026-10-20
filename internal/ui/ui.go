@@ -79,6 +79,10 @@ func (h *embeddedHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.serveAsset(w, r, strings.TrimPrefix(cleanPath, "/static/"))
 		return
 	}
+	if cleanPath == "/service-map" {
+		h.serveAsset(w, r, "service-map.html")
+		return
+	}
 	if cleanPath == "/" || cleanPath == "/index.html" {
 		h.serveIndex(w, r)
 		return

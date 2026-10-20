@@ -12,6 +12,30 @@ most recently published tag.
 
 ## [Unreleased]
 
+## [v0.6.4] - 2026-10-20
+
+### Added
+
+- Opt-in local PromQL using the upstream Go engine and original OTLP samples in
+  OtelContext's SQLite or PostgreSQL database. HTTP and MCP queries need no
+  separate Prometheus server. The existing external backend remains available.
+- A service and instance map at `/service-map`, with environment separation,
+  directed calls, host placement, bounded neighborhoods, and identity and
+  coverage details. The existing explorer remains available.
+- Storage and ingestion statistics showing main and aggregate database files,
+  WAL/SHM sidecars, available disk, Go heap, export counts, and server ACK p99.
+
+### Changed
+
+- Additive main-database migrations 5 and 6 create original metric-sample and
+  instance-topology tables. Run `migrate up` before production startup.
+- Local PromQL retains samples from activation onward, follows
+  `HOT_RETENTION_DAYS`, and requires cumulative counters and histograms.
+  Existing summarized metric history is not reconstructed.
+- Read the [upgrade steps and feature limits](docs/release-notes/v0.6.4-local-promql-instance-map.md)
+  before upgrading. The new storage and topology paths have focused correctness
+  checks; the earlier production load results do not measure their capacity.
+
 ## [v0.6.3] - 2026-10-20
 
 ### Fixed

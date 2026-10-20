@@ -1,5 +1,5 @@
-// Package prometheus forwards original OTLP metrics and queries a single-tenant
-// Prometheus server. Prometheus owns translation, durable storage and PromQL.
+// Package prometheus provides tenant-bound OTLP metric storage and PromQL,
+// using either the local database and embedded engine or an external server.
 package prometheus
 
 import (
@@ -65,6 +65,27 @@ func NewClient(cfg Config) (*Client, error) {
 	if err != nil || u == nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Opaque != "" {
 		return nil, errors.New("Prometheus URL must be an absolute HTTP(S) base URL without credentials, query or fragment")
 	}
+	c, err := newBackendClient(cfg)
+	if err != nil {
+		return nil, err
+	}
+	cfg = c.cfg
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxConnsPerHost = cfg.MaxConcurrent + cfg.MaxIngestConcurrent + 1
+	transport.MaxIdleConnsPerHost = transport.MaxConnsPerHost
+	transport.ResponseHeaderTimeout = cfg.Timeout
+	transport.MaxResponseHeaderBytes = 64 << 10
+	c.base = u
+	c.http = &http.Client{
+		Transport: transport, Timeout: cfg.Timeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	return c, nil
+}
+
+// newBackendClient validates limits and allocates admission queues together.
+// Both backends use this path; only NewClient attaches an HTTP transport.
+func newBackendClient(cfg Config) (*Client, error) {
 	if cfg.TenantID == "" {
 		cfg.TenantID = storage.DefaultTenantID
 	}
@@ -109,17 +130,9 @@ func NewClient(cfg Config) (*Client, error) {
 	if cfg.MaxConcurrent > 64 || cfg.MaxIngestConcurrent > 256 || cfg.MaxIngestWaiters > 4096 {
 		return nil, errors.New("Prometheus admission limits exceed maxima: 64 queries, 256 active exports, 4096 waiting exports")
 	}
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.MaxConnsPerHost = cfg.MaxConcurrent + cfg.MaxIngestConcurrent + 1
-	transport.MaxIdleConnsPerHost = transport.MaxConnsPerHost
-	transport.ResponseHeaderTimeout = cfg.Timeout
-	transport.MaxResponseHeaderBytes = 64 << 10
-	return &Client{base: u, cfg: cfg, slots: make(chan struct{}, cfg.MaxConcurrent),
-		ingestBytes: semaphore.NewWeighted(cfg.MaxIngestBytes),
-		ingestSlots: make(chan struct{}, cfg.MaxIngestConcurrent), ingestWaiters: make(chan struct{}, cfg.MaxIngestWaiters), readySlots: make(chan struct{}, 1), http: &http.Client{
-			Transport: transport, Timeout: cfg.Timeout,
-			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-		}}, nil
+	return &Client{cfg: cfg, slots: make(chan struct{}, cfg.MaxConcurrent),
+		ingestSlots: make(chan struct{}, cfg.MaxIngestConcurrent), ingestWaiters: make(chan struct{}, cfg.MaxIngestWaiters),
+		ingestBytes: semaphore.NewWeighted(cfg.MaxIngestBytes), readySlots: make(chan struct{}, 1)}, nil
 }
 
 func (c *Client) TenantID() string             { return c.cfg.TenantID }

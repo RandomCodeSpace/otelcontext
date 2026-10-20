@@ -27,6 +27,7 @@ import (
 	"github.com/RandomCodeSpace/otelcontext/internal/graphrag"
 	"github.com/RandomCodeSpace/otelcontext/internal/ingest"
 	"github.com/RandomCodeSpace/otelcontext/internal/mcp"
+	"github.com/RandomCodeSpace/otelcontext/internal/migrate"
 	"github.com/RandomCodeSpace/otelcontext/internal/prometheus"
 	"github.com/RandomCodeSpace/otelcontext/internal/queue"
 	"github.com/RandomCodeSpace/otelcontext/internal/realtime"
@@ -166,7 +167,7 @@ func main() {
 	if err := cfg.Validate(); err != nil {
 		fatal("invalid configuration", err)
 	}
-	var prometheusClient *prometheus.Client
+	var prometheusClient prometheus.Backend
 	if cfg.PrometheusURL != "" {
 		prometheusClient, err = prometheus.NewClient(prometheus.Config{
 			URL: cfg.PrometheusURL, TenantID: cfg.PrometheusTenantID,
@@ -246,6 +247,17 @@ func main() {
 		fatal("Database schema compatibility gate failed", err)
 	}
 	slog.Info("💾 Storage initialized", "driver", cfg.DBDriver)
+	if cfg.PromQLLocalEnabled {
+		prometheusClient, err = prometheus.NewLocal(repo.DB(), prometheus.Config{
+			TenantID: cfg.PrometheusTenantID, Timeout: time.Duration(cfg.PrometheusTimeoutMs) * time.Millisecond,
+			MaxConcurrent: cfg.PrometheusMaxConcurrent, MaxIngestConcurrent: cfg.PrometheusMaxIngestConcurrent,
+			MaxIngestWaiters: cfg.PrometheusMaxIngestWaiters,
+		}, time.Duration(cfg.HotRetentionDays)*24*time.Hour)
+		if err != nil {
+			fatal("initialize local PromQL", err)
+		}
+		defer prometheusClient.Close()
+	}
 
 	// No listener or background worker may start before the schema gate above.
 	// Pace the GC against a soft memory ceiling so RSS stays bounded under
@@ -529,7 +541,7 @@ func main() {
 	// tsdbAgg is nil in aggregate mode: MetricsServer then skips the RawMetric
 	// build entirely (see exportNumberPoints).
 	metricsServer := ingest.NewMetricsServer(repo, metrics, tsdbAgg, cfg)
-	if err := metricsServer.SetPrometheusClient(prometheusClient, cfg.PrometheusRequired); err != nil {
+	if err := metricsServer.SetPrometheusClient(prometheusClient, cfg.PrometheusRequired || cfg.PromQLLocalEnabled); err != nil {
 		fatal("configure metric backend", err)
 	}
 
@@ -545,6 +557,16 @@ func main() {
 	traceServer.SetResourceRegistry(resourceRegistry)
 	logsServer.SetResourceRegistry(resourceRegistry)
 	metricsServer.SetResourceRegistry(resourceRegistry)
+	var instanceGraph *topology.InstanceGraph
+	if migrate.SupportsVersioned(cfg.DBDriver) {
+		instanceGraph, err = topology.NewInstanceGraph(appCtx, repo.DB(), time.Duration(cfg.HotRetentionDays)*24*time.Hour)
+		if err != nil {
+			fatal("instance topology could not be reloaded", err)
+		}
+		traceServer.SetInstanceGraph(instanceGraph)
+		logsServer.SetInstanceGraph(instanceGraph)
+		metricsServer.SetInstanceGraph(instanceGraph)
+	}
 
 	// Aggregate engine + durable store (AGGREGATE_MODE != legacy). The reducer
 	// runs inside Export() ahead of the sampler; the group-commit writer makes
@@ -778,8 +800,14 @@ func main() {
 	apiServer.SetGraph(svcGraph)
 	apiServer.SetGraphRAG(graphRAG)
 	apiServer.SetTopologyProvider(topologyProvider)
+	apiServer.SetInstanceGraph(instanceGraph)
+	runtimeFiles := api.RuntimeFiles{MainDB: sqliteMainDBPath(cfg), Mode: string(cfg.AggregateMode), RetentionDays: cfg.HotRetentionDays}
+	if aggStore != nil {
+		runtimeFiles.AggregateDB = cfg.AggregateDBPath
+	}
+	apiServer.SetRuntimeFiles(runtimeFiles)
 	apiServer.SetPrometheusClient(prometheusClient)
-	if cfg.PrometheusRequired {
+	if cfg.PrometheusRequired || cfg.PromQLLocalEnabled {
 		apiServer.SetPrometheusReadinessProbe(prometheusClient.Ready)
 	}
 
@@ -1450,6 +1478,13 @@ func main() {
 	}()
 
 	// Resource registry dirty tick: evict idle entries, publish gauges, flush.
+	if instanceGraph != nil {
+		bootWG.Add(1)
+		go func() {
+			defer bootWG.Done()
+			instanceGraph.Run(appCtx)
+		}()
+	}
 	bootWG.Add(1)
 	go func() {
 		defer bootWG.Done()
@@ -1651,7 +1686,11 @@ func main() {
 		{name: "resource_registry", run: func(stepCtx context.Context) error {
 			// After boot_workers: the tick loop has exited, so this is the
 			// only writer, and the main database is still open.
-			return resourceRegistry.Flush(stepCtx, repo.DB())
+			var graphErr error
+			if instanceGraph != nil {
+				graphErr = instanceGraph.Flush(stepCtx)
+			}
+			return errors.Join(graphErr, resourceRegistry.Flush(stepCtx, repo.DB()))
 		}},
 		{name: "aggregate_store", run: func(context.Context) error {
 			var probeErr error

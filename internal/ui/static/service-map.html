@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#111820">
+  <title>Service map · OtelContext</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/service-map.css">
+  <script src="/static/dagre.min.js"></script>
+  <script type="module" src="/static/service-map.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#canvas">Skip to service map</a>
+<main class="screen">
+  <header class="topbar">
+    <a class="brand" href="/service-map"><span class="brand-mark" aria-hidden="true">⌘</span><span>OTEL<b>CONTEXT</b></span></a>
+    <nav class="nav" aria-label="Main navigation"><span class="active">Service map</span><a href="/">Advanced explorer</a></nav>
+    <div class="header-tools"><span class="tag" id="mode">Loading mode…</span><span class="health" id="connection" role="status">Connecting…</span></div>
+  </header>
+  <div class="title-row">
+    <div><h1>Service map</h1><p>Observed dependencies · expand a service to inspect its instances.</p></div>
+    <div class="title-right"><strong id="retention">Retention unavailable</strong><br>Five-minute topology summaries</div>
+  </div>
+  <div class="inventory" aria-label="Resource inventory">
+    <div><div class="eyebrow">Service names</div><strong id="total-services">—</strong><div class="caption">All environments · selected range</div></div>
+    <div><div class="eyebrow">Service instances</div><strong id="total-instances">—</strong><div class="caption" id="identity-count-note">Known instance identities</div></div>
+    <div><div class="eyebrow">Hosts</div><strong id="total-hosts">—</strong><div class="caption">Latest reported placement</div></div>
+    <div><div class="eyebrow">Successful exports</div><strong id="total-exports">—</strong><div class="caption">Server total · since process start</div></div>
+    <div><div class="eyebrow">Total storage</div><strong id="total-storage">—</strong><div class="caption">Main + aggregate + WAL / SHM</div></div>
+  </div>
+  <div class="querybar">
+    <label>Environment <select id="env" aria-label="Environment"><option value="*">All environments</option></select></label>
+    <label>Time <select id="time" aria-label="Time range"><option value="15">Last 15 minutes</option><option value="60">Last hour</option><option value="1440">Last 24 hours</option></select></label>
+    <button id="apply" class="primary" disabled>Apply filters</button><span id="query-state" class="query-state">Loading topology…</span>
+    <span class="grow"></span><span class="subtle">Auto-refresh off</span><button id="refresh" class="quiet">↻ Refresh</button>
+  </div>
+  <div class="map-error" id="error" role="alert" hidden></div>
+  <div class="layout">
+    <aside class="rail">
+      <div class="rail-head"><h2>Services</h2><span class="subtle" id="catalog-count">—</span></div>
+      <input id="search" type="search" placeholder="Find service…" aria-label="Find service">
+      <p class="group-label">Select a service to focus</p><div class="service-list" id="service-list"></div>
+      <button class="group-button" id="show-group">Show environment overview</button>
+      <div class="rail-note"><b>Focus before expanding.</b><br>Select a service to see its neighbors. Drill down for instance-level calls. Host labels describe placement, not dependencies.</div>
+      <div id="feedback" class="feedback" aria-live="polite"></div>
+    </aside>
+    <section class="map" aria-label="Observed dependency graph">
+      <div class="map-toolbar">
+        <div class="segments" aria-label="Graph level"><button id="services" aria-pressed="true">Services</button><button id="instances" aria-pressed="false">Instances</button></div>
+        <label class="depth">Neighbors <select id="depth" aria-label="Neighbor depth"><option value="1">1 hop</option><option value="2">2 hops</option></select></label>
+        <div class="view-controls"><button id="zoom-out" aria-label="Zoom out">−</button><button id="zoom-fit">Fit</button><button id="zoom-in" aria-label="Zoom in">+</button></div>
+      </div>
+      <div class="map-scope"><span><span id="env-badge" class="environment">—</span><span id="scope" class="scope-label">Overview</span></span><span id="graph-count">—</span></div>
+      <div class="canvas" id="canvas" tabindex="0" aria-label="Service graph; drag background to pan, arrow keys to move"></div>
+      <div class="map-bottom"><span><span class="legend-arrow">→</span>Observed call direction</span><label><input type="checkbox" id="hosts"> Show host labels</label><span>Click a node or edge</span></div>
+      <div class="bounds" id="bounds">Loading bounded graph…</div>
+      <details class="coverage"><summary id="coverage-label">Topology coverage</summary><p id="coverage-note"></p></details>
+    </section>
+    <aside class="inspector" aria-label="Selected node or edge" aria-live="polite">
+      <div class="selection-kind"><span class="eyebrow" id="inspect-kind">Selection</span><span class="subtle" id="inspect-env">—</span></div>
+      <h2 id="inspect-name">Select a node or edge</h2><div class="selection-id" id="inspect-id"></div>
+      <span class="pill" id="inspect-status">No selection</span>
+      <div class="attrs"><div class="attr"><span id="attr-label">Instances</span><strong id="inspect-host">—</strong></div><div class="attr"><span>Coverage</span><strong id="inspect-coverage">—</strong></div></div>
+      <div class="metrics"><div><span id="rate-label">Entry spans / sec</span><b id="inspect-rate">—</b></div><div><span>Avg latency</span><b id="inspect-lat">—</b></div><div><span>Error rate</span><b id="inspect-err">—</b></div></div>
+      <div class="relation" id="relation">Call edges require a matching trace and parent span.</div>
+      <button class="instance-action" id="drill" disabled>Inspect instances →</button>
+      <details><summary id="attributes-summary">Identity & evidence</summary><pre id="attributes"></pre></details>
+    </aside>
+  </div>
+  <div class="section-title"><h2>Storage & ingestion</h2><span class="subtle">Server-wide counters · manual refresh</span></div>
+  <section class="stats" aria-label="Storage and ingestion statistics">
+    <div class="panel">
+      <h3>Complete telemetry footprint</h3><div class="storage-main"><span class="big" id="storage-total">—</span><span class="subtle" id="disk-free">Free space unavailable</span></div>
+      <div class="storage-bar" id="storage-bar" aria-hidden="true"></div>
+      <div class="kv"><span><i class="swatch" style="background:#76b6ff"></i>Main DB · samples, exemplars & topology</span><b id="storage-main">—</b></div>
+      <div class="kv"><span><i class="swatch" style="background:#66c7b4"></i>Aggregate DB · summaries</span><b id="storage-aggregate">—</b></div>
+      <div class="kv"><span><i class="swatch" style="background:#d7ad68"></i>WAL + SHM · both databases</span><b id="storage-sidecars">—</b></div>
+      <div class="fine" id="storage-note">Measuring database files…</div>
+    </div>
+    <div class="panel">
+      <h3>Successful OTLP exports · since start</h3>
+      <div class="rate-row"><span>Traces</span><b id="trace-exports">—</b></div>
+      <div class="rate-row"><span>Metrics</span><b id="metric-exports">—</b></div>
+      <div class="rate-row"><span>Logs</span><b id="log-exports">—</b></div>
+      <div class="fine">Counts are successful requests, including partial-success responses—not individual spans, metric points or logs.</div>
+    </div>
+    <div class="panel">
+      <h3>Ingestion health</h3>
+      <div class="status-grid"><div><span>Failed exports · since start</span><b id="failed-exports">—</b></div><div><span>Server ACK p99</span><b id="ack-p99">—</b></div><div><span>Raw queue usage</span><b id="queue-usage">—</b></div><div><span>App heap</span><b id="app-memory">—</b></div></div>
+      <div class="fine" id="latency-note">Latency unavailable.</div>
+    </div>
+  </section>
+  <footer class="foot"><span>Environment comes from telemetry. Missing values appear as Unknown. Map history begins when this feature is enabled.</span><span id="refresh-time">Manual refresh · no background polling</span></footer>
+  <noscript>Enable JavaScript to load the service map. The JSON API is available at /api/topology/graph.</noscript>
+</main>
+</body>
+</html>

@@ -335,7 +335,7 @@ func (r *RetentionScheduler) runPurge(ctx context.Context) {
 		n    int64
 		err  error
 	}
-	results := make(chan result, 3)
+	results := make(chan result, 4)
 
 	// runGuarded wraps each purge goroutine so a panic still sends on the
 	// results channel. Without this, a panic inside a repo method would leave
@@ -372,9 +372,13 @@ func (r *RetentionScheduler) runPurge(ctx context.Context) {
 		return r.repo.PurgeMetricBucketsBatched(ctx, cutoff, r.purgeBatchSize, r.purgeBatchSleep)
 	})
 
+	runGuarded("promql", func() (int64, error) {
+		return r.repo.PurgePromQLBatched(ctx, cutoff, r.purgeBatchSize, r.purgeBatchSleep)
+	})
+
 	purgeFailed := false
 	totals := map[string]int64{}
-	totalRuns := 2 + logsExpected
+	totalRuns := 3 + logsExpected
 	for range totalRuns {
 		res := <-results
 		if res.err != nil {
@@ -490,6 +494,15 @@ func (r *RetentionScheduler) runPurgeSerial(ctx context.Context, cutoff time.Tim
 	}
 	if metrics != nil && metricsPurged > 0 {
 		metrics.RetentionRowsPurgedTotal.WithLabelValues("metric_buckets", driver).Add(float64(metricsPurged))
+	}
+
+	promqlPurged, err := r.repo.PurgePromQLBatched(ctx, cutoff, r.purgeBatchSize, r.purgeBatchSleep)
+	if err != nil {
+		slog.Error("retention: purge local PromQL failed", "error", err)
+		purgeFailed = true
+	}
+	if metrics != nil && promqlPurged > 0 {
+		metrics.RetentionRowsPurgedTotal.WithLabelValues("promql", driver).Add(float64(promqlPurged))
 	}
 
 	if metrics != nil {

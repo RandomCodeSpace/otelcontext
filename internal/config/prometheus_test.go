@@ -60,3 +60,36 @@ func TestPrometheusDisabledByDefault(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestLocalPromQLConfig(t *testing.T) {
+	t.Setenv("DB_DRIVER", "sqlite")
+	t.Setenv("PROMETHEUS_URL", "")
+	t.Setenv("PROMQL_LOCAL_ENABLED", "true")
+	t.Setenv("PROMETHEUS_REQUIRED", "true")
+	c, err := Load("__no_such_env_file__")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.PromQLLocalEnabled {
+		t.Fatal("local backend not enabled")
+	}
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name   string
+		change func(*Config)
+	}{
+		{"two backends", func(c *Config) { c.PrometheusURL = "http://localhost:9090" }},
+		{"unsupported database", func(c *Config) { c.DBDriver = "mysql" }},
+		{"unbounded queries", func(c *Config) { c.PrometheusMaxConcurrent = 1000 }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bad := *c
+			tc.change(&bad)
+			if err := bad.Validate(); err == nil {
+				t.Fatal("invalid local configuration accepted")
+			}
+		})
+	}
+}

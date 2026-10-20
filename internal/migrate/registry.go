@@ -13,7 +13,7 @@ const (
 	// LedgerTable is shared by main storage and GraphRAG migrations.
 	LedgerTable = "otelcontext_schema_migrations"
 	// CurrentVersion is the exact relational schema version required by this binary.
-	CurrentVersion = 4
+	CurrentVersion = 6
 )
 
 //go:embed sql/*/*.sql
@@ -41,6 +41,8 @@ func registryFor(driver string) ([]migration, error) {
 		{2, "v0.4.0-beta.2", "002_v0_4_0_beta_2.sql"},
 		{3, "v0.5.0", "003_v0_5_0.sql"},
 		{4, "span-retention-index", "004_span_retention_index.sql"},
+		{5, "local-promql", "005_local_promql.sql"},
+		{6, "instance-topology", "006_instance_topology.sql"},
 	}
 	registry := make([]migration, 0, len(definitions))
 	for _, definition := range definitions {

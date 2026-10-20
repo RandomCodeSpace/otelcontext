@@ -117,6 +117,8 @@ type Config struct {
 
 	// Prometheus is an optional tenant-bound metric store and PromQL backend.
 	// Required mode makes backend availability part of ingest ACKs and readiness.
+	// PromQLLocalEnabled stores original samples in the main DB and embeds PromQL.
+	PromQLLocalEnabled            bool
 	PrometheusURL                 string
 	PrometheusRequired            bool
 	PrometheusTenantID            string
@@ -580,6 +582,7 @@ func Load(customPath string) (*Config, error) {
 		APIRateLimitRPS:               getEnvInt("API_RATE_LIMIT_RPS", 100),
 		APITrustedProxyCIDRs:          splitCSV(getEnv("API_TRUSTED_PROXY_CIDRS", "")),
 		PrometheusURL:                 strings.TrimSpace(getEnv("PROMETHEUS_URL", "")),
+		PromQLLocalEnabled:            getEnvBool("PROMQL_LOCAL_ENABLED", false),
 		PrometheusRequired:            getEnvBool("PROMETHEUS_REQUIRED", false),
 		PrometheusTenantID:            getEnv("PROMETHEUS_TENANT_ID", getEnv("DEFAULT_TENANT", "default")),
 		PrometheusTimeoutMs:           getEnvInt("PROMETHEUS_TIMEOUT_MS", 10000),
@@ -1008,12 +1011,18 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("API_TRUSTED_PROXY_CIDRS contains invalid CIDR %q", cidr)
 		}
 	}
-	if c.PrometheusRequired && c.PrometheusURL == "" {
+	if c.PromQLLocalEnabled && c.PrometheusURL != "" {
+		return fmt.Errorf("PROMQL_LOCAL_ENABLED and PROMETHEUS_URL are mutually exclusive")
+	}
+	if c.PromQLLocalEnabled && c.DBDriver != "sqlite" && c.DBDriver != "postgres" && c.DBDriver != "postgresql" {
+		return fmt.Errorf("PROMQL_LOCAL_ENABLED supports SQLite and PostgreSQL")
+	}
+	if c.PrometheusRequired && c.PrometheusURL == "" && !c.PromQLLocalEnabled {
 		return fmt.Errorf("PROMETHEUS_REQUIRED requires PROMETHEUS_URL")
 	}
-	if c.PrometheusURL != "" {
+	if c.PrometheusURL != "" || c.PromQLLocalEnabled {
 		u, err := url.Parse(c.PrometheusURL)
-		if err != nil || u == nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Opaque != "" {
+		if !c.PromQLLocalEnabled && (err != nil || u == nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Opaque != "") {
 			return fmt.Errorf("PROMETHEUS_URL must be an absolute HTTP(S) base URL without credentials, query or fragment")
 		}
 		if c.PrometheusTimeoutMs < 1 || c.PrometheusTimeoutMs > 30000 {

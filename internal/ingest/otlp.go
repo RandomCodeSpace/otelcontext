@@ -116,10 +116,11 @@ func tenantFromResource(attrs []*commonpb.KeyValue) string {
 }
 
 type TraceServer struct {
-	repo         *storage.Repository
-	metrics      *telemetry.Metrics
-	logCallback  func(storage.Log)
-	spanCallback func(storage.Span) // called for each span after persistence
+	instanceGraph *topology.InstanceGraph
+	repo          *storage.Repository
+	metrics       *telemetry.Metrics
+	logCallback   func(storage.Log)
+	spanCallback  func(storage.Span) // called for each span after persistence
 	// topologyObserver, when set, is invoked for EVERY received span BEFORE the
 	// sampler's keep/drop decision so cross-service call topology survives
 	// sampling (see graphrag.GraphRAG.ObserveSpanTopology). Args:
@@ -150,9 +151,10 @@ type TraceServer struct {
 }
 
 type LogsServer struct {
-	repo        *storage.Repository
-	metrics     *telemetry.Metrics
-	logCallback func(storage.Log)
+	instanceGraph *topology.InstanceGraph
+	repo          *storage.Repository
+	metrics       *telemetry.Metrics
+	logCallback   func(storage.Log)
 	// aggregateEngine — see TraceServer.aggregateEngine. Reduction runs before
 	// the severity gate.
 	aggregateEngine *aggregate.Engine
@@ -171,11 +173,12 @@ type LogsServer struct {
 }
 
 type MetricsServer struct {
+	instanceGraph      *topology.InstanceGraph
 	repo               *storage.Repository
 	metrics            *telemetry.Metrics
 	aggregator         *tsdb.Aggregator
 	metricCallback     func(tsdb.RawMetric)
-	prometheusClient   *prometheus.Client
+	prometheusClient   prometheus.Backend
 	prometheusRequired bool
 	// aggregateEngine — see TraceServer.aggregateEngine.
 	aggregateEngine *aggregate.Engine
@@ -350,8 +353,9 @@ func (s *MetricsServer) SetMetricCallback(cb func(tsdb.RawMetric)) {
 }
 
 // Export handles incoming OTLP metrics data.
-func (s *MetricsServer) Export(ctx context.Context, req *colmetricspb.ExportMetricsServiceRequest) (*colmetricspb.ExportMetricsServiceResponse, error) {
+func (s *MetricsServer) Export(ctx context.Context, req *colmetricspb.ExportMetricsServiceRequest) (response *colmetricspb.ExportMetricsServiceResponse, exportErr error) {
 	start := time.Now()
+	defer func() { s.metrics.RecordExportResult("metrics", exportErr == nil, time.Since(start)) }()
 	defer func() { s.metrics.ObserveIngestDuration("metrics", time.Since(start)) }()
 	if s.prometheusClient == nil {
 		return s.exportMetrics(ctx, req, nil, false, start)
@@ -428,7 +432,7 @@ func (s *MetricsServer) Export(ctx context.Context, req *colmetricspb.ExportMetr
 
 // SetPrometheusClient must run before serving requests. Required mode fails
 // closed when its backend cannot accept metrics; nil preserves legacy behavior.
-func (s *MetricsServer) SetPrometheusClient(client *prometheus.Client, required bool) error {
+func (s *MetricsServer) SetPrometheusClient(client prometheus.Backend, required bool) error {
 	if required && client == nil {
 		return errors.New("required Prometheus backend is not configured")
 	}
@@ -465,6 +469,7 @@ func (s *MetricsServer) exportMetrics(ctx context.Context, req *colmetricspb.Exp
 
 		tenantID := resolveTenant(ctx, resourceAttrs, s.defaultTenant, s.trustResourceTenant)
 		registerResource(s.resourceRegistry, tenantID, serviceName, slots, topology.SignalMetrics, start)
+		registerInstanceResource(s.instanceGraph, tenantID, serviceName, slots, topology.SignalMetrics, start)
 
 		var producerIdentity aggregate.ResourceIdentity
 		var acceptedBefore uint64
@@ -667,8 +672,14 @@ func (s *MetricsServer) exportNumberPoints(
 }
 
 // Export handles incoming OTLP trace data.
-func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceServiceRequest) (*coltracepb.ExportTraceServiceResponse, error) {
+func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceServiceRequest) (response *coltracepb.ExportTraceServiceResponse, exportErr error) {
 	start := time.Now()
+	defer func() {
+		if exportErr == nil && s.instanceGraph != nil {
+			s.observeInstanceTraces(ctx, req, start)
+		}
+		s.metrics.RecordExportResult("traces", exportErr == nil, time.Since(start))
+	}()
 	defer func() { s.metrics.ObserveIngestDuration("traces", time.Since(start)) }()
 	slog.Debug("📥 [TRACES] Received Request", "resource_spans", len(req.ResourceSpans))
 
@@ -1172,8 +1183,9 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 }
 
 // Export handles incoming OTLP log data.
-func (s *LogsServer) Export(ctx context.Context, req *collogspb.ExportLogsServiceRequest) (*collogspb.ExportLogsServiceResponse, error) {
+func (s *LogsServer) Export(ctx context.Context, req *collogspb.ExportLogsServiceRequest) (response *collogspb.ExportLogsServiceResponse, exportErr error) {
 	start := time.Now()
+	defer func() { s.metrics.RecordExportResult("logs", exportErr == nil, time.Since(start)) }()
 	defer func() { s.metrics.ObserveIngestDuration("logs", time.Since(start)) }()
 	// slog.Debug("📥 [LOGS] Received Request", "resource_logs", len(req.ResourceLogs))
 
@@ -1201,6 +1213,7 @@ func (s *LogsServer) Export(ctx context.Context, req *collogspb.ExportLogsServic
 
 			tenantID := resolveTenant(ctx, resourceLogs.Resource.Attributes, s.defaultTenant, s.trustResourceTenant)
 			registerResource(s.resourceRegistry, tenantID, serviceName, slots, topology.SignalLogs, start)
+			registerInstanceResource(s.instanceGraph, tenantID, serviceName, slots, topology.SignalLogs, start)
 
 			localLogs := make([]storage.Log, 0)
 			exemplarRes := s.exemplar.NewReservation()

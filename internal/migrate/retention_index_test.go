@@ -76,7 +76,7 @@ VALUES ('alpha', 'kept', 'span', ?, '{"preserve":"payload"}')`, stamp).Error; er
 	}
 	mustExecFTS(t, db, "PRAGMA query_only=OFF")
 	after, err := Up(ctx, db, "sqlite")
-	if err != nil || after.ActualVersion != 4 || after.State != StateExact {
+	if err != nil || after.ActualVersion != CurrentVersion || after.State != StateExact {
 		t.Fatalf("upgrade: status=%#v err=%v", after, err)
 	}
 	if !reflect.DeepEqual(before.Applied, after.Applied[:3]) {

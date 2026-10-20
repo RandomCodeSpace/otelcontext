@@ -185,6 +185,29 @@ func TestRegisterRoutesUsesCommittedAssets(t *testing.T) {
 	}
 }
 
+func TestServiceMapServesSeparateEmbeddedPage(t *testing.T) {
+	mux := http.NewServeMux()
+	if err := RegisterRoutes(mux); err != nil {
+		t.Fatal(err)
+	}
+	page := request(t, mux, http.MethodGet, "/service-map", nil)
+	if page.Code != http.StatusOK || !strings.Contains(page.Body.String(), "/static/service-map.js") ||
+		!strings.Contains(page.Body.String(), "Storage & ingestion") {
+		t.Fatalf("service map = %d; missing page assets or heading", page.Code)
+	}
+	for _, asset := range []string{"service-map.js", "service-map.css"} {
+		response := request(t, mux, http.MethodGet, "/static/"+asset, nil)
+		if response.Code != http.StatusOK || response.Body.Len() == 0 {
+			t.Fatalf("%s = %d", asset, response.Code)
+		}
+	}
+	root := request(t, mux, http.MethodGet, "/", nil)
+	if !strings.Contains(root.Body.String(), `href="/service-map"`) ||
+		!strings.Contains(root.Body.String(), "/static/app.js") {
+		t.Fatal("existing explorer or service-map navigation missing")
+	}
+}
+
 func TestCommittedUIHasNoFrontendBuildContract(t *testing.T) {
 	entries, err := fs.ReadDir(content, "static")
 	if err != nil {
@@ -198,6 +221,9 @@ func TestCommittedUIHasNoFrontendBuildContract(t *testing.T) {
 		"map-layout.js":          true,
 		"dagre.min.js":           true,
 		"dagre.min.js.LEGAL.txt": true,
+		"service-map.html":       true,
+		"service-map.css":        true,
+		"service-map.js":         true,
 	}
 	for _, entry := range entries {
 		if entry.IsDir() || !wantAssets[entry.Name()] {
@@ -209,7 +235,7 @@ func TestCommittedUIHasNoFrontendBuildContract(t *testing.T) {
 		t.Errorf("embedded UI is missing source asset %q", name)
 	}
 
-	for _, name := range []string{"index.html", "app.css", "app.js", "map-layout.js"} {
+	for _, name := range []string{"index.html", "app.css", "app.js", "map-layout.js", "service-map.html", "service-map.css", "service-map.js"} {
 		body, readErr := fs.ReadFile(content, "static/"+name)
 		if readErr != nil {
 			t.Fatalf("read %s: %v", name, readErr)

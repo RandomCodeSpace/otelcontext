@@ -26,6 +26,7 @@ import (
 
 // Metrics holds all internal Prometheus metrics for OtelContext self-monitoring.
 type Metrics struct {
+	exportStats exportStats
 	// --- Existing ---
 	IngestionRate     prometheus.Counter
 	ActiveConnections prometheus.Gauge
@@ -119,7 +120,7 @@ type Metrics struct {
 	// TSDBRingSeriesActive and TSDBRingSeriesRejected remain registered for
 	// metric-name compatibility. Production does not instantiate the legacy
 	// ring, so both collectors remain zero.
-	TSDBRingSeriesActive  prometheus.Gauge
+	TSDBRingSeriesActive   prometheus.Gauge
 	TSDBRingSeriesRejected prometheus.Counter
 	DrainTemplatesActive   prometheus.Gauge
 
