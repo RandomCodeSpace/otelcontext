@@ -3,10 +3,12 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="theme-color" content="#090b10">
+    <meta name="theme-color" content="#161615">
     <meta name="description" content="Live service health and dependency map for OtelContext.">
-    <title>OtelContext</title>
+    <title>Explorer · OtelContext</title>
     <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+    <link rel="preload" href="/static/geist.woff2" as="font" type="font/woff2" crossorigin>
+    <link rel="stylesheet" href="/static/tokens.css">
     <link rel="stylesheet" href="/static/app.css">
     <script src="/static/dagre.min.js"></script>
     <script type="module" src="/static/app.js"></script>
@@ -14,136 +16,141 @@
   <body>
     <a class="skip-link" href="#workspace">Skip to service map</a>
 
-    <div class="app-shell">
-      <header class="pulse-bar" aria-label="System pulse">
-        <a class="brand" href="/" aria-label="OtelContext home">
-          <img src="/static/favicon.svg" alt="" width="28" height="28">
-          <span>OTEL<span class="brand-accent">CONTEXT</span></span>
-        </a>
-
-        <div class="connection" id="connection-status" role="status" aria-live="polite">
-          <span class="live-dot" aria-hidden="true"></span>
-          <span id="connection-label">Connecting</span>
-        </div>
-
-        <dl class="pulse-metrics" aria-label="Current system metrics">
-          <div>
-            <dt>Healthy services</dt>
-            <dd id="pulse-health">—</dd>
+    <div class="shell">
+      <header class="topbar">
+        <a class="brand" href="/" aria-label="OtelContext overview"><span class="brand-mark" aria-hidden="true"></span><span class="brand-name">OtelContext</span></a>
+        <span class="vr hide-sm" aria-hidden="true"></span>
+        <nav class="topnav" aria-label="Primary">
+          <a href="/"><svg class="ic" aria-hidden="true"><use href="/static/icons.svg#i-layout-dashboard"/></svg><span>Overview</span></a>
+          <a href="/service-map"><svg class="ic" aria-hidden="true"><use href="/static/icons.svg#i-waypoints"/></svg><span>Service map</span></a>
+          <a href="/explorer" aria-current="page"><svg class="ic" aria-hidden="true"><use href="/static/icons.svg#i-compass"/></svg><span>Explorer</span></a>
+        </nav>
+        <div class="topbar-tools">
+          <div class="connection" id="connection-status" role="status" aria-live="polite">
+            <span class="live-dot" aria-hidden="true"></span>
+            <span id="connection-label">Connecting</span>
           </div>
-          <div>
-            <dt>Error</dt>
-            <dd id="pulse-errors">—</dd>
-          </div>
-          <div>
-            <dt id="pulse-latency-label">P99</dt>
-            <dd id="pulse-p99">—</dd>
-          </div>
-          <div>
-            <dt>Services</dt>
-            <dd id="pulse-services">—</dd>
-          </div>
-          <div class="pulse-up">
-            <dt>Uptime</dt>
-            <dd id="pulse-uptime">—</dd>
-          </div>
-          <div class="pulse-db">
-            <dt>Database</dt>
-            <dd id="pulse-db">—</dd>
-          </div>
-        </dl>
-
-        <div class="header-actions">
-          <a class="scope-action" href="/service-map">Service &amp; instance map</a>
-          <span class="coverage-badge" id="coverage-badge" hidden></span>
-          <button class="icon-button" id="command-button" type="button" aria-label="Open command menu" aria-keyshortcuts="Control+K Meta+K" title="Open command menu (Ctrl+K)">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 7h8M8 12h8M8 17h5"/><circle cx="5" cy="7" r="1"/><circle cx="5" cy="12" r="1"/><circle cx="5" cy="17" r="1"/></svg>
+          <span class="badge coverage-badge" id="coverage-badge" hidden></span>
+          <span class="vr hide-sm" aria-hidden="true"></span>
+          <button class="btn btn-ghost btn-icon" id="command-button" type="button" aria-label="Open command menu" aria-keyshortcuts="Control+K Meta+K" title="Open command menu (Ctrl+K)">
+            <svg class="ic" aria-hidden="true"><use href="/static/icons.svg#i-command"/></svg>
           </button>
           <details class="connect-menu" id="connect-menu">
-            <summary id="connect-toggle" aria-label="Show connection endpoints">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 12h8M5 8v8m14-8v8M3 12h2m14 0h2"/></svg>
+            <summary class="btn btn-ghost" id="connect-toggle" aria-label="Show connection endpoints">
+              <svg class="ic" aria-hidden="true"><use href="/static/icons.svg#i-plug"/></svg>
               <span>Connect</span>
             </summary>
             <div class="connect-popover" id="connect-endpoints" aria-label="Connection endpoints"></div>
           </details>
-          <button class="icon-button" id="refresh-button" type="button" aria-label="Refresh data" title="Refresh data">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.34 5.66M20 4v7h-7"/></svg>
+          <button class="btn btn-ghost btn-icon" id="refresh-button" type="button" aria-label="Refresh data" title="Refresh data">
+            <svg class="ic" aria-hidden="true"><use href="/static/icons.svg#i-refresh-cw"/></svg>
           </button>
-          <button class="icon-button" id="theme-button" type="button" aria-label="Switch to light theme" title="Toggle theme">
-            <svg class="sun-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.42 1.42m11.3 11.3 1.42 1.42M2 12h2m16 0h2M4.93 19.07l1.42-1.42m11.3-11.3 1.42-1.42"/></svg>
-            <svg class="moon-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8Z"/></svg>
+          <button class="btn btn-ghost btn-icon" id="theme-button" type="button" aria-label="Switch to light theme" title="Toggle theme">
+            <svg class="ic sun-icon" aria-hidden="true"><use href="/static/icons.svg#i-sun"/></svg>
+            <svg class="ic moon-icon" aria-hidden="true"><use href="/static/icons.svg#i-moon"/></svg>
           </button>
         </div>
       </header>
 
       <main id="workspace" class="workspace">
+        <section class="pulse-strip" aria-label="System pulse">
+          <dl class="pulse-metrics" aria-label="Current system metrics">
+            <div>
+              <dt>Healthy services</dt>
+              <dd id="pulse-health">—</dd>
+            </div>
+            <div>
+              <dt>Error</dt>
+              <dd id="pulse-errors">—</dd>
+            </div>
+            <div>
+              <dt id="pulse-latency-label">P99</dt>
+              <dd id="pulse-p99">—</dd>
+            </div>
+            <div>
+              <dt>Services</dt>
+              <dd id="pulse-services">—</dd>
+            </div>
+            <div class="pulse-up">
+              <dt>Uptime</dt>
+              <dd id="pulse-uptime">—</dd>
+            </div>
+            <div class="pulse-db">
+              <dt>Database</dt>
+              <dd id="pulse-db">—</dd>
+            </div>
+          </dl>
+        </section>
+
         <aside class="service-rail" aria-labelledby="services-heading">
           <div class="rail-heading">
-            <div>
-              <p class="eyebrow" id="rail-eyebrow">Worst first</p>
-              <h2 id="services-heading">System index</h2>
-            </div>
-            <span id="service-count">0</span>
+            <h2 id="services-heading">System index</h2>
+            <span class="badge" id="service-count">0</span>
           </div>
           <div class="severity-summary" id="severity-summary" aria-label="Service health breakdown"></div>
-          <div class="index-switch" aria-label="System index">
+          <div class="index-switch seg" aria-label="System index">
             <button id="neighborhood-index-button" type="button" aria-pressed="true">Neighborhoods</button>
             <button id="service-index-button" type="button" aria-pressed="false">Services</button>
           </div>
+          <p class="eyebrow rail-eyebrow" id="rail-eyebrow">Worst first</p>
           <div class="neighborhood-list" id="neighborhood-list"></div>
           <div class="service-list" id="service-list"></div>
         </aside>
+
         <section class="map-panel" aria-labelledby="map-heading">
           <div class="map-toolbar">
             <div class="map-heading-group">
               <h1 id="map-heading">Application map</h1>
-              <div class="map-navigation" aria-label="Map navigation">
-                <button class="scope-action" id="map-back-button" type="button" disabled>Back</button>
-                <button class="scope-action" id="system-overview-button" type="button">System overview</button>
-              </div>
+              <p id="map-summary" class="map-summary" role="status">Loading service relationships…</p>
             </div>
             <div class="view-controls">
-              <div class="view-switch" aria-label="View">
-                <button id="map-view-button" type="button" aria-pressed="true">Map</button>
-                <button id="list-view-button" type="button" aria-pressed="false">List</button>
+              <div class="view-switch seg" aria-label="View">
+                <button id="map-view-button" type="button" aria-pressed="true"><svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#i-map"/></svg><span class="ctl-label">Map</span></button>
+                <button id="list-view-button" type="button" aria-pressed="false"><svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#i-list"/></svg><span class="ctl-label">List</span></button>
               </div>
-              <button class="group-toggle" id="host-group-button" type="button" aria-pressed="false" aria-disabled="true" title="Loading hosts…">
-                <i class="host-mark" aria-hidden="true"></i>By host
+              <button class="btn group-toggle" id="host-group-button" type="button" aria-pressed="false" aria-disabled="true" title="Loading hosts…">
+                <i class="host-mark" aria-hidden="true"></i><span class="ctl-label">By host</span>
               </button>
             </div>
-            <label class="search-field">
+            <label class="search-field field">
               <span class="sr-only">Find a service</span>
-              <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.2-3.2"/></svg>
+              <svg class="ic" aria-hidden="true"><use href="/static/icons.svg#i-search"/></svg>
               <input id="service-search" type="search" placeholder="Find a service…" autocomplete="off">
               <span id="search-count" aria-live="polite"></span>
+              <kbd aria-hidden="true">/</kbd>
             </label>
           </div>
 
           <div class="map-scope" aria-label="Map scope">
-            <p id="map-summary" class="map-summary" role="status">Loading service relationships…</p>
+            <div class="map-navigation" aria-label="Map navigation">
+              <button class="btn btn-ghost btn-sm" id="map-back-button" type="button" disabled><svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#i-arrow-left"/></svg>Back</button>
+              <button class="btn btn-ghost btn-sm scope-action" id="system-overview-button" type="button"><svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#i-boxes"/></svg>System overview</button>
+            </div>
+            <span class="vr scope-divider" aria-hidden="true"></span>
             <label class="scope-field" for="component-select">
               <span>Service group</span>
-              <select id="component-select" aria-label="Service group"></select>
+              <select class="select" id="component-select" aria-label="Service group"></select>
             </label>
             <label class="scope-field" for="scope-select">
               <span>Show</span>
-              <select id="scope-select">
+              <select class="select" id="scope-select">
                 <option value="all">Full group</option>
                 <option value="neighbors">Callers and dependencies</option>
                 <option value="callers">Callers</option>
                 <option value="dependencies">Dependencies</option>
               </select>
             </label>
-            <button class="scope-action" id="reset-scope-button" type="button" hidden>Show full group</button>
-            <button class="scope-action inventory-action" id="disconnected-button" type="button" hidden>No observed dependencies (0)</button>
+            <button class="btn btn-ghost btn-sm scope-action" id="reset-scope-button" type="button" hidden>Show full group</button>
+            <button class="btn btn-ghost btn-sm scope-action inventory-action" id="disconnected-button" type="button" hidden>No observed dependencies (0)</button>
           </div>
 
           <div class="impact-banner" id="impact-banner" role="status" hidden>
+            <svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#i-zap"/></svg>
             <span id="impact-label"></span>
-            <button id="clear-impact-button" type="button" aria-label="Clear blast radius">Clear</button>
+            <button class="btn btn-ghost btn-sm" id="clear-impact-button" type="button" aria-label="Clear blast radius">Clear</button>
           </div>
 
-          <div class="map-stage" id="map-stage">
+          <div class="map-stage dot-grid" id="map-stage">
             <section class="system-overview" id="system-overview" aria-labelledby="overview-heading" hidden>
               <header class="overview-header">
                 <h2 id="overview-heading">System overview</h2>
@@ -157,15 +164,14 @@
             </div>
 
             <div class="error-state" id="error-state" role="alert" hidden>
+              <svg class="ic tone-crit" aria-hidden="true"><use href="/static/icons.svg#i-octagon-x"/></svg>
               <p class="state-title">The service graph did not load.</p>
               <p id="error-message"></p>
-              <button id="retry-button" type="button">Try again</button>
+              <button class="btn" id="retry-button" type="button">Try again</button>
             </div>
 
             <div class="empty-state" id="empty-state" hidden>
-              <div class="empty-mark" aria-hidden="true">
-                <span></span><span></span><span></span>
-              </div>
+              <svg class="ic tone-faint" aria-hidden="true"><use href="/static/icons.svg#i-radio"/></svg>
               <p class="state-title">Waiting for telemetry</p>
               <p>Point an OpenTelemetry exporter or MCP client at this server. Services appear here as soon as spans arrive.</p>
               <div class="empty-endpoints" id="empty-endpoints" aria-label="Connection endpoints"></div>
@@ -194,15 +200,16 @@
                 </svg>
               </button>
               <div class="map-controls" aria-label="Map controls">
-                <button id="zoom-in-button" type="button" aria-label="Zoom in">+</button>
-                <button id="zoom-out-button" type="button" aria-label="Zoom out">−</button>
-                <button id="fit-button" type="button" aria-label="Fit graph to view">Fit</button>
+                <button class="btn btn-icon" id="zoom-in-button" type="button" aria-label="Zoom in"><svg class="ic" aria-hidden="true"><use href="/static/icons.svg#i-plus"/></svg></button>
+                <button class="btn btn-icon" id="zoom-out-button" type="button" aria-label="Zoom out"><svg class="ic" aria-hidden="true"><use href="/static/icons.svg#i-minus"/></svg></button>
+                <button class="btn" id="fit-button" type="button" aria-label="Fit graph to view">Fit</button>
               </div>
               <div class="map-legend" aria-label="Service status legend">
-                <span><i class="status-dot healthy"></i>Healthy</span>
-                <span><i class="status-dot degraded"></i>Degraded</span>
-                <span><i class="status-dot critical"></i>Critical</span>
+                <span><svg class="ic ic-xs tone-ok" aria-hidden="true"><use href="/static/icons.svg#i-circle-check"/></svg>Healthy</span>
+                <span><svg class="ic ic-xs tone-warn" aria-hidden="true"><use href="/static/icons.svg#i-triangle-alert"/></svg>Degraded</span>
+                <span><svg class="ic ic-xs tone-crit" aria-hidden="true"><use href="/static/icons.svg#i-octagon-x"/></svg>Critical</span>
                 <span><i class="host-mark"></i>Host</span>
+                <span class="legend-runs-on"><i class="runs-on-mark"></i>Runs on</span>
               </div>
             </div>
 
@@ -225,8 +232,6 @@
             <div class="mobile-list" id="mobile-list" hidden></div>
           </div>
         </section>
-
-
       </main>
     </div>
 
@@ -234,13 +239,13 @@
     <aside class="inspector" id="inspector" aria-labelledby="inspector-title" aria-hidden="true" inert>
       <header class="inspector-header">
         <span class="service-status" id="inspector-status" aria-hidden="true"></span>
-        <div>
+        <div class="inspector-heading">
           <p class="eyebrow" id="inspector-eyebrow">Service inspector</p>
           <h2 id="inspector-title">Service</h2>
         </div>
         <span class="health-value" id="inspector-health"></span>
-        <button class="icon-button" id="close-inspector-button" type="button" aria-label="Close inspector">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg>
+        <button class="btn btn-ghost btn-icon" id="close-inspector-button" type="button" aria-label="Close inspector">
+          <svg class="ic" aria-hidden="true"><use href="/static/icons.svg#i-x"/></svg>
         </button>
       </header>
       <div class="inspector-tabs" id="inspector-tabs" role="tablist" aria-label="Inspector sections">
@@ -259,13 +264,13 @@
             <p class="eyebrow">Quick navigation</p>
             <h2 id="command-title">Command menu</h2>
           </div>
-          <button class="icon-button" id="close-command-button" type="button" aria-label="Close command menu">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg>
+          <button class="btn btn-ghost btn-icon" id="close-command-button" type="button" aria-label="Close command menu">
+            <svg class="ic" aria-hidden="true"><use href="/static/icons.svg#i-x"/></svg>
           </button>
         </header>
-        <label class="command-search">
+        <label class="command-search field">
           <span class="sr-only">Filter commands</span>
-          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.2-3.2"/></svg>
+          <svg class="ic" aria-hidden="true"><use href="/static/icons.svg#i-search"/></svg>
           <input id="command-search" type="search" placeholder="Search commands and services…" autocomplete="off">
         </label>
         <div class="command-results" id="command-results"></div>
@@ -280,8 +285,8 @@
             <p class="eyebrow">Reference</p>
             <h2 id="shortcut-title">Keyboard shortcuts</h2>
           </div>
-          <button class="icon-button" id="close-shortcut-button" type="button" aria-label="Close keyboard shortcuts">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg>
+          <button class="btn btn-ghost btn-icon" id="close-shortcut-button" type="button" aria-label="Close keyboard shortcuts">
+            <svg class="ic" aria-hidden="true"><use href="/static/icons.svg#i-x"/></svg>
           </button>
         </header>
         <dl class="shortcut-list">
