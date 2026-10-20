@@ -68,13 +68,18 @@ const (
 // GET  /mcp  — SSE stream for real-time notifications
 // OPTIONS /mcp — CORS preflight
 type Server struct {
-	repo          *storage.Repository
-	metrics       *telemetry.Metrics
-	topology      topology.Provider
-	graphRAG      *graphrag.GraphRAG
-	defaultTenant string
-	promQL        PromQLQuerier
-	promQLTenant  string
+	repo             *storage.Repository
+	metrics          *telemetry.Metrics
+	topology         topology.Provider
+	graphRAG         *graphrag.GraphRAG
+	defaultTenant    string
+	promQL           PromQLQuerier
+	promQLTenant     string
+	rawRetention     time.Duration
+	historyRetention time.Duration
+	traceHorizon     time.Duration
+	startedAt        time.Time
+	logSummary       LogSummaryQuerier
 
 	// aggregateMode makes every successful tool result carry coverage body
 	// metadata. Set only in AGGREGATE_MODE=aggregate; legacy and shadow
@@ -119,13 +124,17 @@ func New(
 		defaultTenant = storage.DefaultTenantID
 	}
 	s := &Server{
-		repo:          repo,
-		metrics:       metrics,
-		topology:      topologyProvider,
-		defaultTenant: defaultTenant,
-		callSlots:     make(chan struct{}, defaultMaxConcurrentCalls),
-		callTimeout:   defaultCallTimeout,
-		cache:         newResultCache(defaultCacheTTL, 4096),
+		repo:             repo,
+		metrics:          metrics,
+		topology:         topologyProvider,
+		defaultTenant:    defaultTenant,
+		rawRetention:     24 * time.Hour,
+		historyRetention: 7 * 24 * time.Hour,
+		traceHorizon:     graphrag.DefaultConfig().TraceTTL,
+		startedAt:        time.Now().UTC(),
+		callSlots:        make(chan struct{}, defaultMaxConcurrentCalls),
+		callTimeout:      defaultCallTimeout,
+		cache:            newResultCache(defaultCacheTTL, 4096),
 	}
 	metrics.RegisterReadCache("mcp_result", s.cache.Stats)
 	return s
@@ -418,18 +427,8 @@ type mcpTopologyPayload struct {
 	Edges     []graph.ServiceEdge
 	UpdatedAt time.Time
 
-	Source       string `json:"source,omitempty"`
-	Coverage     string `json:"coverage,omitempty"`
-	CoverageNote string `json:"coverage_note,omitempty"`
-	Epoch        string `json:"epoch,omitempty"`
-	Revision     uint64 `json:"revision,omitempty"`
-	Reset        bool   `json:"reset,omitempty"`
-	Truncated    bool   `json:"truncated,omitempty"`
-
-	DroppedServices   uint64 `json:"dropped_services,omitempty"`
-	DroppedOperations uint64 `json:"dropped_operations,omitempty"`
-	DroppedEdges      uint64 `json:"dropped_edges,omitempty"`
-	DroppedMetrics    uint64 `json:"dropped_metrics,omitempty"`
+	topology.Metadata
+	Reset bool `json:"reset,omitempty"`
 }
 
 func (s *Server) topologyNotification(ctx context.Context, last topology.Identity, haveLast bool) (string, topology.Identity, bool) {
@@ -449,21 +448,13 @@ func (s *Server) topologyNotification(ctx context.Context, last topology.Identit
 		return "", topology.Identity{}, false
 	}
 	payload := mcpTopologyPayload{
-		Nodes:             make(map[string]*graph.ServiceNode, len(snapshot.Nodes)),
-		Edges:             make([]graph.ServiceEdge, 0, len(snapshot.Edges)),
-		UpdatedAt:         snapshot.Meta.End,
-		Source:            string(snapshot.Meta.Source),
-		Coverage:          snapshot.Meta.Coverage,
-		CoverageNote:      snapshot.Meta.CoverageNote,
-		Epoch:             identity.Epoch,
-		Revision:          identity.Revision,
-		Reset:             !haveLast || identity.Epoch != last.Epoch,
-		Truncated:         snapshot.Meta.Truncated,
-		DroppedServices:   snapshot.Meta.DroppedServices,
-		DroppedOperations: snapshot.Meta.DroppedOperations,
-		DroppedEdges:      snapshot.Meta.DroppedEdges,
-		DroppedMetrics:    snapshot.Meta.DroppedMetrics,
+		Nodes:     make(map[string]*graph.ServiceNode, len(snapshot.Nodes)),
+		Edges:     make([]graph.ServiceEdge, 0, len(snapshot.Edges)),
+		UpdatedAt: snapshot.Meta.End,
+		Metadata:  snapshot.Meta,
+		Reset:     !haveLast || identity.Epoch != last.Epoch,
 	}
+	payload.Epoch, payload.Revision = identity.Epoch, identity.Revision
 	if payload.UpdatedAt.IsZero() {
 		payload.UpdatedAt = time.Now().UTC()
 	}

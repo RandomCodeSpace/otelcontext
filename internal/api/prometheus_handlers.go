@@ -74,7 +74,7 @@ func (s *Server) servePrometheusQuery(w http.ResponseWriter, r *http.Request, ra
 
 // metricSelectors uses Prometheus NoTranslation: OTLP names and attribute keys
 // stay exact. Quoted matchers prevent user-provided names becoming PromQL code.
-// Host-only resources lack service.name and use host.name, then host.id, just
+// Host-only resources lack service.name and use host.id, then host.name, just
 // as resolveServiceIdentity does on ingest. Explicit service names still win.
 func metricSelectors(name, service string) []string {
 	match := `__name__=~".+"`
@@ -88,8 +88,8 @@ func metricSelectors(name, service string) []string {
 	if strings.HasPrefix(service, topology.HostPrefix) {
 		host := strconv.Quote(strings.TrimPrefix(service, topology.HostPrefix))
 		selectors = append(selectors,
-			"{"+match+`,"service.name"="","host.name"=`+host+"}",
-			"{"+match+`,"service.name"="","host.name"="","host.id"=`+host+"}")
+			"{"+match+`,"service.name"="","host.id"=`+host+"}",
+			"{"+match+`,"service.name"="","host.id"="","host.name"=`+host+"}")
 	}
 	if service == "unknown-service" {
 		selectors = append(selectors, "{"+match+`,"service.name"="","host.name"="","host.id"=""}`)
@@ -171,9 +171,9 @@ func (s *Server) handlePrometheusMetricBuckets(w http.ResponseWriter, r *http.Re
 		}
 		service := series.Metric["service.name"]
 		if service == "" {
-			host := series.Metric["host.name"]
+			host := series.Metric["host.id"]
 			if host == "" {
-				host = series.Metric["host.id"]
+				host = series.Metric["host.name"]
 			}
 			if host != "" {
 				service = topology.HostPrefix + host

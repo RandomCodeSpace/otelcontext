@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"log"
 	"log/slog"
@@ -17,74 +18,148 @@ import (
 // are mirrored via the triggers installed in setupSQLiteFTS5.
 const fts5LogsTable = "logs_fts"
 
-// setupSQLiteFTS5 provisions the FTS5 virtual table for log search on SQLite
-// and the AFTER INSERT/DELETE/UPDATE triggers that keep it in sync with the
-// `logs` base table. The implementation is idempotent: it tolerates an
-// existing virtual table left over from a previous boot, repairs missing
-// triggers, and runs an initial backfill via the `rebuild` command so that
-// rows present in `logs` before the FTS table existed (e.g. migrating an
-// older OtelContext.db) are included in the BM25 index.
-//
-// Tokenizer rationale: `porter unicode61 remove_diacritics 2` chosen for:
-//   - unicode61: case-insensitive, splits on whitespace+punctuation
-//   - remove_diacritics 2: strips accents (latency vs latência both match)
-//   - porter: English stemming so "panic" matches "panicked"/"panicking"
-//
-// All three are pure-SQLite — they do not require external linkage and work
-// on the modernc.org/sqlite (glebarez) build used in this project.
-func setupSQLiteFTS5(db *gorm.DB) error {
-	create := `CREATE VIRTUAL TABLE IF NOT EXISTS ` + fts5LogsTable + ` USING fts5(
-		body,
-		service_name,
-		content='logs',
-		content_rowid='id',
-		tokenize='porter unicode61 remove_diacritics 2'
-	)`
-	if err := db.Exec(create).Error; err != nil {
-		// FTS5 is included in the modernc.org/sqlite amalgamation by default;
-		// if this fails, the build was compiled without FTS5. Surface the
-		// failure so SearchLogs can fall back to LIKE rather than producing
-		// a confusing "no such table" error later.
-		return fmt.Errorf("create fts5 virtual table: %w", err)
-	}
+// sqliteLogFTSConnection accepts the migration runner's locked connection and
+// GORM's transaction without giving either path its own copy of the FTS DDL.
+type sqliteLogFTSConnection interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
 
-	triggers := []struct {
-		name string
-		ddl  string
-	}{
-		{
-			name: "logs_ai",
-			ddl: `CREATE TRIGGER IF NOT EXISTS logs_ai AFTER INSERT ON logs BEGIN
-				INSERT INTO ` + fts5LogsTable + `(rowid, body, service_name) VALUES (new.id, new.body, new.service_name);
-			END`,
-		},
-		{
-			name: "logs_ad",
-			ddl: `CREATE TRIGGER IF NOT EXISTS logs_ad AFTER DELETE ON logs BEGIN
-				INSERT INTO ` + fts5LogsTable + `(` + fts5LogsTable + `, rowid, body, service_name) VALUES ('delete', old.id, old.body, old.service_name);
-			END`,
-		},
-		{
-			name: "logs_au",
-			ddl: `CREATE TRIGGER IF NOT EXISTS logs_au AFTER UPDATE ON logs BEGIN
-				INSERT INTO ` + fts5LogsTable + `(` + fts5LogsTable + `, rowid, body, service_name) VALUES ('delete', old.id, old.body, old.service_name);
-				INSERT INTO ` + fts5LogsTable + `(rowid, body, service_name) VALUES (new.id, new.body, new.service_name);
-			END`,
-		},
+type sqliteLogFTSObject struct {
+	name string
+	kind string
+	ddl  string
+}
+
+// Keep these definitions compatible with the existing AutoMigrate index.
+// Porter provides stemming, unicode61 handles case and punctuation, and
+// remove_diacritics handles accented text in the modernc SQLite build.
+var sqliteLogFTSObjects = []sqliteLogFTSObject{
+	{
+		name: fts5LogsTable,
+		kind: "table",
+		ddl: `CREATE VIRTUAL TABLE IF NOT EXISTS ` + fts5LogsTable + ` USING fts5(
+            body,
+            service_name,
+            content='logs',
+            content_rowid='id',
+            tokenize='porter unicode61 remove_diacritics 2'
+        )`,
+	},
+	{
+		name: "logs_ai",
+		kind: "trigger",
+		ddl: `CREATE TRIGGER IF NOT EXISTS logs_ai AFTER INSERT ON logs BEGIN
+            INSERT INTO ` + fts5LogsTable + `(rowid, body, service_name) VALUES (new.id, new.body, new.service_name);
+        END`,
+	},
+	{
+		name: "logs_ad",
+		kind: "trigger",
+		ddl: `CREATE TRIGGER IF NOT EXISTS logs_ad AFTER DELETE ON logs BEGIN
+            INSERT INTO ` + fts5LogsTable + `(` + fts5LogsTable + `, rowid, body, service_name) VALUES ('delete', old.id, old.body, old.service_name);
+        END`,
+	},
+	{
+		name: "logs_au",
+		kind: "trigger",
+		ddl: `CREATE TRIGGER IF NOT EXISTS logs_au AFTER UPDATE ON logs BEGIN
+            INSERT INTO ` + fts5LogsTable + `(` + fts5LogsTable + `, rowid, body, service_name) VALUES ('delete', old.id, old.body, old.service_name);
+            INSERT INTO ` + fts5LogsTable + `(rowid, body, service_name) VALUES (new.id, new.body, new.service_name);
+        END`,
+	},
+}
+
+// CheckSQLiteLogFTS verifies the optional log-search schema without DDL or a
+// corpus scan. It does not perform a full index integrity check.
+func CheckSQLiteLogFTS(ctx context.Context, db sqliteLogFTSConnection) error {
+	missing, err := missingSQLiteLogFTSObjects(ctx, db)
+	if err != nil {
+		return err
 	}
-	for _, tr := range triggers {
-		if err := db.Exec(tr.ddl).Error; err != nil {
-			return fmt.Errorf("create trigger %s: %w", tr.name, err)
+	if len(missing) != 0 {
+		names := make([]string, len(missing))
+		for i, object := range missing {
+			names[i] = object.name
+		}
+		return fmt.Errorf("missing SQLite log FTS objects: %s", strings.Join(names, ", "))
+	}
+	return nil
+}
+
+// EnsureSQLiteLogFTS provisions or repairs the optional SQLite log index. The
+// caller must supply a transaction covering this entire call, and commit only
+// on success. The versioned migration runner supplies its BEGIN IMMEDIATE
+// connection; AutoMigrate supplies a GORM transaction. Driver and configuration
+// checks belong to the caller.
+//
+// Missing triggers mean writes may have escaped indexing, so any repair also
+// rebuilds from logs. A complete existing index performs only a schema read.
+func EnsureSQLiteLogFTS(ctx context.Context, tx sqliteLogFTSConnection) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	missing, err := missingSQLiteLogFTSObjects(ctx, tx)
+	if err != nil || len(missing) == 0 {
+		return err
+	}
+	for _, object := range missing {
+		if _, err := tx.ExecContext(ctx, object.ddl); err != nil {
+			return fmt.Errorf("create SQLite log FTS %s: %w", object.name, err)
 		}
 	}
-
-	// Backfill any rows already present in `logs` but not yet in the FTS index.
-	// `rebuild` is a no-op on a fresh DB and cheap on a populated one — FTS5
-	// streams the source rows once.
-	if err := db.Exec(`INSERT INTO ` + fts5LogsTable + `(` + fts5LogsTable + `) VALUES ('rebuild')`).Error; err != nil {
-		return fmt.Errorf("rebuild fts5 index: %w", err)
+	if _, err := tx.ExecContext(ctx, `INSERT INTO `+fts5LogsTable+`(`+fts5LogsTable+`) VALUES ('rebuild')`); err != nil {
+		return fmt.Errorf("rebuild SQLite log FTS index: %w", err)
 	}
+	// Confirm the postcondition before the caller commits. This also checks
+	// cancellation if a short rebuild finished before SQLite saw its interrupt.
+	return CheckSQLiteLogFTS(ctx, tx)
+}
 
+func missingSQLiteLogFTSObjects(ctx context.Context, db sqliteLogFTSConnection) ([]sqliteLogFTSObject, error) {
+	rows, err := db.QueryContext(ctx, `SELECT name, type, sql FROM sqlite_master
+        WHERE name COLLATE NOCASE IN ('logs_fts', 'logs_ai', 'logs_ad', 'logs_au')`)
+	if err != nil {
+		return nil, fmt.Errorf("inspect SQLite log FTS schema: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	objects := make(map[string]sqliteLogFTSObject)
+	for rows.Next() {
+		var object sqliteLogFTSObject
+		if err := rows.Scan(&object.name, &object.kind, &object.ddl); err != nil {
+			return nil, fmt.Errorf("read SQLite log FTS schema: %w", err)
+		}
+		objects[strings.ToLower(object.name)] = object
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read SQLite log FTS schema: %w", err)
+	}
+	var missing []sqliteLogFTSObject
+	for _, expected := range sqliteLogFTSObjects {
+		actual, found := objects[expected.name]
+		if !found {
+			missing = append(missing, expected)
+		} else if actual.kind != expected.kind || normalizeSQLiteFTSDDL(actual.ddl) != normalizeSQLiteFTSDDL(expected.ddl) {
+			// Do not replace an unknown schema or claim its triggers keep the
+			// index synchronized. An operator must inspect the conflicting object.
+			return nil, fmt.Errorf("incompatible SQLite log FTS object %s; inspect its definition before retrying migration", expected.name)
+		}
+	}
+	return missing, ctx.Err()
+}
+
+func normalizeSQLiteFTSDDL(ddl string) string {
+	// SQLite omits IF NOT EXISTS from sqlite_master. Ignore formatting, while
+	// comparing the known DDL instead of accepting arbitrary same-name objects.
+	return strings.ReplaceAll(strings.Join(strings.Fields(strings.ToLower(ddl)), " "), "if not exists ", "")
+}
+
+func setupSQLiteFTS5(db *gorm.DB) error {
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		return EnsureSQLiteLogFTS(tx.Statement.Context, tx.Statement.ConnPool)
+	}); err != nil {
+		return err
+	}
 	log.Println("🔎 SQLite: FTS5 BM25 index ready on logs(body, service_name)")
 	return nil
 }

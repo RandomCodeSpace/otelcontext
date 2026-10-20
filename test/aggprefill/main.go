@@ -3,8 +3,11 @@
 // Command aggprefill fills an aggregate store with a fully populated seven-day
 // history for the release-gate disk-sizing measurement.
 //
-// It writes 6,000 materialized series x 288 windows/day x 7 days = 2,016
-// windows = 12,096,000 rows in aggregate_buckets, using only the public
+// By default it writes 6,000 series x 2,016 windows = 12,096,000 rows.
+// The explicit synthetic-200 log profile writes 14,500 series x 2,016 windows
+// = 29,232,000 rows, reusing the same 500 historical log template names. This
+// models measured log density, not exact production miner identities.
+// Rows go to aggregate_buckets using only the public
 // aggregate store API: one CommitGroup per window followed by FinalizeWindow of
 // that window. Latency series carry real sketches built from a per-series
 // lognormal distribution, so the encoded blob sizes are representative rather
@@ -13,6 +16,7 @@
 // Build tag: prefill. Run with:
 //
 //	go run -tags prefill ./test/aggprefill -db /path/to/aggregate.db
+//	go run -tags prefill ./test/aggprefill -db /path/to/fresh.db -log-profile synthetic-200 -services 200
 package main
 
 import (
@@ -29,7 +33,7 @@ import (
 	"github.com/RandomCodeSpace/otelcontext/internal/aggregate"
 )
 
-// Series mix, matching the configured per-signal caps in internal/config.
+// Default series mix. The synthetic log profile changes only the log count.
 const (
 	numTraceSeries  = 2400
 	numEdgeSeries   = 500
@@ -38,7 +42,12 @@ const (
 	numSystemSeries = 200
 	totalSeries     = numTraceSeries + numEdgeSeries + numLogSeries + numMetricSeries + numSystemSeries
 
-	numServices = 120
+	defaultServices = 120
+
+	legacyLogProfile = "legacy"
+	denseLogProfile  = "synthetic-200"
+	denseServices    = 200
+	denseLogSeries   = denseServices * 45
 
 	windowsPerDay = 288
 	days          = 7
@@ -94,7 +103,18 @@ func main() {
 	dbPath := flag.String("db", "./data/aggregate.db", "aggregate database path")
 	workers := flag.Int("workers", 8, "delta-building worker goroutines")
 	numWindows := flag.Int("windows", totalWindows, "windows to fill (default is the full 7-day gate: 2016)")
+	services := flag.Int("services", defaultServices, "service identities (1..2400; synthetic-200 log profile requires 200)")
+	servicePrefix := flag.String("service-prefix", "checkout-svc-", "service name prefix, followed by a zero-padded three-digit index")
+	endTime := flag.String("end-time", "", "exclusive RFC3339 end, aligned to 5 minutes; empty preserves current-window default")
+	logProfile := flag.String("log-profile", legacyLogProfile, "log density: legacy (500 keys) or synthetic-200 (9000 keys, 500 shared names; requires -services 200)")
 	flag.Parse()
+	if err := validatePrefill(*logProfile, *services, *servicePrefix, *numWindows); err != nil {
+		log.Fatal(err)
+	}
+	endWindow, err := prefillEndWindow(*endTime, time.Now().UTC())
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	if err := os.MkdirAll(filepath.Dir(*dbPath), 0o755); err != nil {
 		log.Fatalf("mkdir: %v", err)
@@ -114,27 +134,32 @@ func main() {
 		}
 	}()
 
-	dicts, specs := buildIdentities()
-	log.Printf("identities: %d dict rows, %d series", len(dicts), len(specs))
+	dicts, specs := buildIdentities(*services, *servicePrefix, *logProfile)
+	log.Printf("identities: %d dict rows, %d series; log-profile=%s, expected buckets=%d",
+		len(dicts), len(specs), *logProfile, int64(len(specs))*int64(*numWindows))
 
 	seriesRows := make([]aggregate.SeriesRow, len(specs))
+	seen := make(map[aggregate.SeriesKey]bool, len(specs))
 	for i := range specs {
 		if err := specs[i].key.Validate(); err != nil {
 			log.Fatalf("series %d key invalid: %v", i, err)
 		}
+		if seen[specs[i].key] {
+			log.Fatalf("series %d duplicates key %+v", i, specs[i].key)
+		}
+		seen[specs[i].key] = true
 		seriesRows[i] = aggregate.SeriesRow{ID: specs[i].id, Key: specs[i].key}
 	}
 
 	// Reusable per-window state. Sketches are pre-attached so ObserveSpan never
 	// allocates and the per-window allocation cost stays flat.
-	deltas := make([]aggregate.AggregateDelta, totalSeries)
-	rows := make([]aggregate.DeltaRow, totalSeries)
+	deltas := make([]aggregate.AggregateDelta, len(specs))
+	rows := make([]aggregate.DeltaRow, len(specs))
 	numLatency := numTraceSeries + numEdgeSeries
 	sketches := make([]aggregate.Sketch, numLatency)
 	freshSketch := *aggregate.NewSketch()
 
-	// Window range: 2016 aligned five-minute windows ending at the current one.
-	endWindow := aggregate.WindowStart(time.Now().UTC())
+	// Explicit end-time excludes that boundary's window, keeping live ingest separate.
 	firstWindow := endWindow - int64(*numWindows-1)*windowSecs
 
 	if *workers < 1 {
@@ -142,7 +167,7 @@ func main() {
 	}
 	stats := make([]*workerStats, *workers)
 	rngs := make([]*rand.Rand, *workers)
-	bounds := partition(totalSeries, *workers)
+	bounds := partition(len(specs), *workers)
 	for w := 0; w < *workers; w++ {
 		stats[w] = &workerStats{}
 		rngs[w] = rand.New(rand.NewPCG(uint64(w)+1, 0x9e3779b97f4a7c15))
@@ -171,8 +196,10 @@ func main() {
 
 	start := time.Now()
 	var (
-		totalDeltaRows int
-		totalBuckets   int
+		totalDeltaRows   int64
+		totalBuckets     int64
+		windowsFinalized int
+		diskGuardTripped bool
 	)
 
 	for wi := 0; wi < *numWindows; wi++ {
@@ -203,10 +230,11 @@ func main() {
 		if err != nil {
 			log.Fatalf("window %d (%d): finalize: %v", wi, windowStart, err)
 		}
-		totalDeltaRows += fs.DeltaRows
-		totalBuckets += fs.Buckets
-		if fs.Buckets != totalSeries {
-			log.Fatalf("window %d (%d): finalized %d buckets, want %d", wi, windowStart, fs.Buckets, totalSeries)
+		totalDeltaRows += int64(fs.DeltaRows)
+		totalBuckets += int64(fs.Buckets)
+		windowsFinalized++
+		if fs.Buckets != len(specs) || fs.DeltaRows != len(specs) {
+			log.Fatalf("window %d (%d): finalized %d buckets from %d deltas, want %d each", wi, windowStart, fs.Buckets, fs.DeltaRows, len(specs))
 		}
 
 		if (wi+1)%100 == 0 || wi == *numWindows-1 {
@@ -219,6 +247,7 @@ func main() {
 				el.Truncate(time.Second), rate, eta.Truncate(time.Second),
 				human(db), human(wal), human(shm), human(sum))
 			if sum > diskGuardBytes {
+				diskGuardTripped = true
 				log.Printf("DISK GUARD TRIPPED: %d bytes > %d; stopping early", sum, diskGuardBytes)
 				break
 			}
@@ -237,14 +266,23 @@ func main() {
 
 	// Pre-checkpoint sizes, store still open.
 	db, wal, shm, sum := dbSizes(*dbPath)
-	fmt.Printf("\n=== PREFILL DONE ===\n")
+	if diskGuardTripped {
+		fmt.Printf("\n=== PREFILL INCOMPLETE ===\n")
+	} else {
+		fmt.Printf("\n=== PREFILL DONE ===\n")
+	}
+	fmt.Printf("log_profile: %s\n", *logProfile)
+	fmt.Printf("windows_expected: %d\n", *numWindows)
+	fmt.Printf("bucket_rows_expected: %d\n", int64(len(specs))*int64(*numWindows))
 	fmt.Printf("wall_time_seconds: %.1f (%s)\n", elapsed.Seconds(), elapsed.Truncate(time.Second))
-	fmt.Printf("windows_finalized: %d\n", *numWindows)
+	fmt.Printf("windows_finalized: %d\n", windowsFinalized)
 	fmt.Printf("bucket_rows_written: %d\n", totalBuckets)
 	fmt.Printf("delta_rows_incorporated: %d\n", totalDeltaRows)
-	fmt.Printf("first_window: %d  last_window: %d\n", firstWindow, endWindow)
+	fmt.Printf("first_window: %d  last_window: %d\n", firstWindow, firstWindow+int64(windowsFinalized-1)*windowSecs)
 	fmt.Printf("series_total: %d\n", len(specs))
-	fmt.Printf("services_total: %d\n", numServices)
+	fmt.Printf("services_total: %d\n", *services)
+	fmt.Printf("log_series_total: %d\n", logSeriesCount(*logProfile))
+	fmt.Printf("log_template_names: %d\n", numLogSeries)
 	fmt.Printf("dashboard_requests: %d\n", requests)
 	fmt.Printf("dashboard_request_errors: %d\n", requestErrors)
 	fmt.Printf("dashboard_spans: %d\n", spans)
@@ -260,6 +298,46 @@ func main() {
 	fmt.Printf("POST-CLOSE sizes: db=%d wal=%d shm=%d sum=%d\n", db, wal, shm, sum)
 
 	reportSketchStats(stats)
+	if diskGuardTripped {
+		log.Fatal("prefill incomplete: disk guard tripped")
+	}
+}
+
+func validatePrefill(profile string, services int, prefix string, windows int) error {
+	if services < 1 || services > numTraceSeries || prefix == "" || windows < 1 {
+		return fmt.Errorf("services must be 1..2400, service-prefix nonempty, and windows positive")
+	}
+	switch profile {
+	case legacyLogProfile:
+	case denseLogProfile:
+		if services != denseServices {
+			return fmt.Errorf("log-profile %s requires -services %d", profile, denseServices)
+		}
+	default:
+		return fmt.Errorf("unknown log-profile %q: want %s or %s", profile, legacyLogProfile, denseLogProfile)
+	}
+	return nil
+}
+
+func logSeriesCount(profile string) int {
+	if profile == denseLogProfile {
+		return denseLogSeries
+	}
+	return numLogSeries
+}
+
+func prefillEndWindow(raw string, now time.Time) (int64, error) {
+	if raw == "" {
+		return aggregate.WindowStart(now), nil
+	}
+	end, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return 0, fmt.Errorf("end-time: %w", err)
+	}
+	if end.After(now) || end.Nanosecond() != 0 || end.Unix()%windowSecs != 0 {
+		return 0, fmt.Errorf("end-time must be in the past and aligned to 5 minutes")
+	}
+	return end.Unix() - windowSecs, nil
 }
 
 // partition splits n items into w contiguous ranges, returned as w+1 bounds.
@@ -376,10 +454,10 @@ func buildRange(specs []seriesSpec, deltas []aggregate.AggregateDelta, sketches 
 	}
 }
 
-// buildIdentities mints the dictionary rows and the 6,000 series specs. Dict
+// buildIdentities mints dictionary rows and series specs for a validated profile. Dict
 // IDs are globally unique because aggregate_dict.id is the primary key; values
 // are unique within (tenant, kind) because of idx_aggregate_dict_scope.
-func buildIdentities() ([]aggregate.DictRow, []seriesSpec) {
+func buildIdentities(numServices int, prefix, logProfile string) ([]aggregate.DictRow, []seriesSpec) {
 	var dicts []aggregate.DictRow
 	nextDict := uint32(0)
 	add := func(tenant uint32, kind aggregate.Kind, value string) uint32 {
@@ -394,7 +472,7 @@ func buildIdentities() ([]aggregate.DictRow, []seriesSpec) {
 
 	serviceIDs := make([]uint32, numServices)
 	for i := range serviceIDs {
-		serviceIDs[i] = add(tenantID, aggregate.KindService, fmt.Sprintf("checkout-svc-%03d", i))
+		serviceIDs[i] = add(tenantID, aggregate.KindService, fmt.Sprintf("%s%03d", prefix, i))
 	}
 
 	// Deterministic per-series distribution parameters.
@@ -407,7 +485,8 @@ func buildIdentities() ([]aggregate.DictRow, []seriesSpec) {
 		return mu, sigma
 	}
 
-	specs := make([]seriesSpec, 0, totalSeries)
+	wantSeries := totalSeries - numLogSeries + logSeriesCount(logProfile)
+	specs := make([]seriesSpec, 0, wantSeries)
 	nextSeries := aggregate.SeriesID(0)
 	newID := func() aggregate.SeriesID { nextSeries++; return nextSeries }
 
@@ -441,7 +520,7 @@ func buildIdentities() ([]aggregate.DictRow, []seriesSpec) {
 		svc := i % numServices
 		callee := (i*7 + 3) % numServices
 		nameID := add(tenantID, aggregate.KindOperation,
-			fmt.Sprintf("edge:checkout-svc-%03d->checkout-svc-%03d#%03d", svc, callee, i))
+			fmt.Sprintf("edge:%s%03d->%s%03d#%03d", prefix, svc, prefix, callee, i))
 		mu, sigma := drawLatency()
 		specs = append(specs, seriesSpec{
 			id:   newID(),
@@ -462,11 +541,14 @@ func buildIdentities() ([]aggregate.DictRow, []seriesSpec) {
 		})
 	}
 
-	// 500 log series. No sketch.
-	for i := 0; i < numLogSeries; i++ {
-		svc := i % numServices
-		nameID := add(tenantID, aggregate.KindLogTemplate,
+	// Both profiles retain exactly the same 500 historical template names.
+	// Names may be shared across services; the complete SeriesKey stays unique.
+	logNames := make([]uint32, numLogSeries)
+	for i := range logNames {
+		logNames[i] = add(tenantID, aggregate.KindLogTemplate,
 			fmt.Sprintf("template-%04d: request <*> failed with <*> after <*> ms", i))
+	}
+	appendLog := func(svc int, nameID uint32, tier aggregate.StatusClass, i int) {
 		specs = append(specs, seriesSpec{
 			id:   newID(),
 			kind: kindLog,
@@ -475,10 +557,35 @@ func buildIdentities() ([]aggregate.DictRow, []seriesSpec) {
 				ServiceID:   serviceIDs[svc],
 				NameID:      nameID,
 				Signal:      aggregate.SignalLog,
-				StatusClass: aggregate.StatusClass(i%6 + 1),
+				StatusClass: tier,
 			},
 			baseRate: 20 + (i*11)%181,
 		})
+	}
+	if logProfile == denseLogProfile {
+		// The measured 20-template / 12-severity joint cycle has these pairs
+		// for template index modulo 4: 20 INFO, 10 DEBUG, 10 WARN, 5 ERROR.
+		// This is synthetic history, not production miner identity replay.
+		tiers := [][]aggregate.StatusClass{
+			{aggregate.SeverityTierInfo, aggregate.SeverityTierWarn},
+			{aggregate.SeverityTierInfo, aggregate.SeverityTierDebug},
+			{aggregate.SeverityTierInfo, aggregate.SeverityTierDebug},
+			{aggregate.SeverityTierInfo, aggregate.SeverityTierWarn, aggregate.SeverityTierError},
+		}
+		i := 0
+		for svc := 0; svc < numServices; svc++ {
+			for template := 0; template < 20; template++ {
+				nameID := logNames[(svc*20+template)%len(logNames)]
+				for _, tier := range tiers[template%len(tiers)] {
+					appendLog(svc, nameID, tier, i)
+					i++
+				}
+			}
+		}
+	} else {
+		for i, nameID := range logNames {
+			appendLog(i%numServices, nameID, aggregate.StatusClass(i%6+1), i)
+		}
 	}
 
 	// 2,400 native metric series: half gauge-like, half cumulative counter.
@@ -525,8 +632,8 @@ func buildIdentities() ([]aggregate.DictRow, []seriesSpec) {
 		})
 	}
 
-	if len(specs) != totalSeries {
-		log.Fatalf("built %d series, want %d", len(specs), totalSeries)
+	if len(specs) != wantSeries {
+		log.Fatalf("built %d series, want %d", len(specs), wantSeries)
 	}
 	return dicts, specs
 }

@@ -2,6 +2,8 @@ package aggregate
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"math"
 	"sort"
@@ -33,6 +35,9 @@ type Coverage string
 const (
 	// CoverageFull means the numbers describe every accepted event.
 	CoverageFull Coverage = "full"
+	// CoverageLimited preserves counts but has lost names or dimensions to
+	// configured cardinality bounds. It is not a sampled count.
+	CoverageLimited Coverage = "limited"
 	// CoverageSampled means part of the response is derived from a subset of
 	// events — exact where the aggregate engine counted, partial elsewhere.
 	CoverageSampled Coverage = "sampled"
@@ -54,12 +59,16 @@ const (
 	// ExemplarCoverageNote explains an exemplar-only response.
 	ExemplarCoverageNote = "results come from retained raw exemplars only; " +
 		"a missing exemplar does not mean zero matching events occurred"
+	LimitedCoverageNote = "unfiltered counts include all accepted telemetry; " +
+		"some names or dimensions were merged into __other__; named results may be incomplete"
 )
 
 // Note returns the caveat that belongs with a coverage value, or "" for full
 // coverage, which needs none.
 func (c Coverage) Note() string {
 	switch c {
+	case CoverageLimited:
+		return LimitedCoverageNote
 	case CoverageSampled:
 		return SampledCoverageNote
 	case CoverageExemplar:
@@ -217,10 +226,11 @@ type TrafficPoint struct {
 
 // BucketsResult is the answer to QueryBuckets.
 type BucketsResult struct {
-	Points   []TrafficPoint
-	Coverage Coverage
-	Epoch    string
-	Revision uint64
+	Points           []TrafficPoint
+	Coverage         Coverage
+	Epoch            string
+	Revision         uint64
+	IdentityCoverage IdentityCoverage
 }
 
 // ServiceStat is one service's aggregate accounting over the queried range.
@@ -270,6 +280,7 @@ type DashboardResult struct {
 	Coverage          Coverage
 	Epoch             string
 	Revision          uint64
+	IdentityCoverage  IdentityCoverage
 }
 
 // TopologyEdge is one caller/callee edge of the topology.
@@ -288,11 +299,12 @@ type TopologyEdge struct {
 // with a different range, a different tenant scope and a different retention
 // rule, and nothing in the response said so.
 type TopologyResult struct {
-	Nodes    []ServiceStat
-	Edges    []TopologyEdge
-	Coverage Coverage
-	Epoch    string
-	Revision uint64
+	Nodes            []ServiceStat
+	Edges            []TopologyEdge
+	Coverage         Coverage
+	Epoch            string
+	Revision         uint64
+	IdentityCoverage IdentityCoverage
 }
 
 // asInt64 narrows an aggregate counter to the signed type the wire format uses,
@@ -327,6 +339,14 @@ type visitFunc func(windowStart int64, key SeriesKey, d *AggregateDelta)
 //
 // hasStore is false when memory owns the whole range or no store is attached.
 func (e *Engine) plan(ctx context.Context, q Query, visit visitFunc) (Ownership, Selector, bool, error) {
+	own, sel, hasStore, err := e.planStore(ctx, q, visit, e.Store())
+	if hasStore {
+		sel.ServiceIDs = e.selectedServiceIDs(sel.TenantID, q.Services)
+	}
+	return own, sel, hasStore, err
+}
+
+func (e *Engine) planStore(ctx context.Context, q Query, visit visitFunc, st Store) (Ownership, Selector, bool, error) {
 	var (
 		own Ownership
 		sel Selector
@@ -370,10 +390,14 @@ func (e *Engine) plan(ctx context.Context, q Query, visit visitFunc) (Ownership,
 			storeEnd = w
 		}
 	}
-	if storeEnd <= start || e.Store() == nil {
+	if storeEnd <= start || st == nil {
 		return own, sel, false, nil
 	}
-	return own, Selector{TenantID: tenantID, Start: start, End: storeEnd, Signal: q.Signal}, true, nil
+	var ids []uint32
+	if _, sqlite := st.(*SQLiteStore); !sqlite {
+		ids = e.selectedServiceIDs(tenantID, q.Services)
+	}
+	return own, Selector{TenantID: tenantID, Start: start, End: storeEnd, Signal: q.Signal, ServiceIDs: ids}, true, nil
 }
 
 // readMutable visits the memory-owned windows in [start, end) and returns the
@@ -454,17 +478,29 @@ func splitSelector(sel Selector) []Selector {
 	return out
 }
 
+// SQLite partitions hourly and five-minute sources inside one transaction. Keep
+// its read snapshot intact across finalization, rollup publication and purge.
+func historySelectors(st Store, sel Selector) []Selector {
+	if _, ok := st.(*SQLiteStore); ok {
+		return []Selector{sel}
+	}
+	return splitSelector(sel)
+}
+
 // sumStore runs the SQL aggregation over the store-owned sub-range, one
 // chunk per connection, and re-sums the grouped rows the chunks return.
 func (e *Engine) sumStore(ctx context.Context, sel Selector, by GroupBy) ([]SumRow, error) {
+	return sumStoreFrom(ctx, e.Store(), sel, by)
+}
+
+func sumStoreFrom(ctx context.Context, st Store, sel Selector, by GroupBy) ([]SumRow, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	st := e.Store()
 	if st == nil {
 		return nil, nil
 	}
-	chunks := splitSelector(sel)
+	chunks := historySelectors(st, sel)
 	if len(chunks) == 1 {
 		return st.SumBuckets(ctx, sel, by)
 	}
@@ -484,36 +520,42 @@ func (e *Engine) sumStore(ctx context.Context, sel Selector, by GroupBy) ([]SumR
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	type groupKey struct {
-		window        int64
-		service, name uint32
-		signal        Signal
-	}
-	merged := make(map[groupKey]int)
+	merged := make(map[sumGroupKey]int)
 	var out []SumRow
 	for _, rows := range results {
 		for _, r := range rows {
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
-			key := groupKey{r.WindowStart, r.ServiceID, r.NameID, r.Signal}
-			i, ok := merged[key]
-			if !ok {
-				merged[key] = len(out)
-				out = append(out, r)
-				continue
-			}
-			acc := &out[i]
-			acc.Count += r.Count
-			acc.ErrorCount += r.ErrorCount
-			acc.RequestCount += r.RequestCount
-			acc.ErrorRequestCount += r.ErrorRequestCount
-			acc.DurationCount += r.DurationCount
-			acc.DurationSum += r.DurationSum
-			acc.LogCount += r.LogCount
+			out = mergeSumRow(out, merged, r)
 		}
 	}
 	return out, nil
+}
+
+type sumGroupKey struct {
+	window        int64
+	service, name uint32
+	signal        Signal
+}
+
+func mergeSumRow(out []SumRow, groups map[sumGroupKey]int, r SumRow) []SumRow {
+	key := sumGroupKey{r.WindowStart, r.ServiceID, r.NameID, r.Signal}
+	i, ok := groups[key]
+	if !ok {
+		groups[key] = len(out)
+		return append(out, r)
+	}
+	acc := &out[i]
+	acc.Count += r.Count
+	acc.ErrorCount += r.ErrorCount
+	acc.RequestCount += r.RequestCount
+	acc.ErrorRequestCount += r.ErrorRequestCount
+	acc.DurationCount += r.DurationCount
+	acc.DurationSum += r.DurationSum
+	acc.LogCount += r.LogCount
+	acc.IdentityCount += r.IdentityCount
+	return out
 }
 
 // mergeStoreSketches folds every store-owned sketch in sel's range into merge.
@@ -523,7 +565,8 @@ func (e *Engine) sumStore(ctx context.Context, sel Selector, by GroupBy) ([]SumR
 // keyset-paged ReadBuckets — a sort per page plus a re-scan per resume, paid
 // hundreds of times over a wide range — and resolved every page's series
 // identities just to apply a service filter. A sketch merge is commutative
-// and associative, so VisitSketches streams the rows once in table order,
+// in its counts and bins, but saturation-event provenance depends on merge
+// grouping. VisitSketches streams the rows once in table order,
 // and the filter memoizes ONE dictionary lookup per distinct service ID.
 //
 // The range is read in chunks on the read pool (see splitSelector). Each
@@ -532,10 +575,13 @@ func (e *Engine) sumStore(ctx context.Context, sel Selector, by GroupBy) ([]SumR
 // visitor runs on the calling goroutine and sees one sketch per service
 // instead of one per stored row.
 func (e *Engine) visitStoreSketches(ctx context.Context, sel Selector, filter map[string]struct{}, visit func(uint32, *Sketch)) error {
+	return visitStoreSketchesFrom(ctx, e.Store(), nil, e.serviceNameByID, sel, filter, visit)
+}
+
+func visitStoreSketchesFrom(ctx context.Context, st Store, snapshot sqliteQueryer, name func(uint32) string, sel Selector, filter map[string]struct{}, visit func(uint32, *Sketch)) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	st := e.Store()
 	if st == nil {
 		return nil
 	}
@@ -543,18 +589,43 @@ func (e *Engine) visitStoreSketches(ctx context.Context, sel Selector, filter ma
 	sel.SketchOnly = true
 	chunks := splitSelector(sel)
 	perChunk := make([]map[uint32]*Sketch, len(chunks))
-	g, groupCtx := errgroup.WithContext(ctx)
-	for i, chunk := range chunks {
-		i, chunk := i, chunk
-		g.Go(func() error {
-			rows, err := e.collectStoreSketches(groupCtx, st, chunk, filter)
-			perChunk[i] = rows
+	if sqlite, ok := st.(*SQLiteStore); ok {
+		// Preserve the engine's logical merge groups while sharing one snapshot
+		// across chunks, markers, authoritative rows and rollups. In particular,
+		// finalization/purge between chunks cannot change their source ownership.
+		var err error
+		if snapshot == nil {
+			tx, openErr := sqlite.reader.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+			if openErr != nil {
+				return openErr
+			}
+			defer tx.Rollback()
+			snapshot = tx
+		}
+		read := func(ctx context.Context, chunk Selector, visit func(uint32, *Sketch) error) error {
+			return visitServiceSummarySketches(ctx, snapshot, chunk, visit)
+		}
+		for i, chunk := range chunks {
+			perChunk[i], err = collectStoreSketchesNamed(ctx, read, chunk, filter, name)
+			if err != nil {
+				return err
+			}
+		}
+	} else {
+		g, groupCtx := errgroup.WithContext(ctx)
+		for i, chunk := range chunks {
+			i, chunk := i, chunk
+			g.Go(func() error {
+				rows, err := collectStoreSketchesNamed(groupCtx, st.VisitSketches, chunk, filter, name)
+				perChunk[i] = rows
+				return err
+			})
+		}
+		if err := g.Wait(); err != nil {
 			return err
-		})
+		}
 	}
-	if err := g.Wait(); err != nil {
-		return err
-	}
+
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -586,20 +657,24 @@ func (e *Engine) visitStoreSketches(ctx context.Context, sel Selector, filter ma
 // collectStoreSketches streams one chunk's sketch rows and folds them into one
 // sketch per service, applying the service filter with one memoized
 // dictionary lookup per distinct service ID.
-func (e *Engine) collectStoreSketches(ctx context.Context, st Store, sel Selector, filter map[string]struct{}) (map[uint32]*Sketch, error) {
+func (e *Engine) collectStoreSketches(ctx context.Context, read func(context.Context, Selector, func(uint32, *Sketch) error) error, sel Selector, filter map[string]struct{}) (map[uint32]*Sketch, error) {
+	return collectStoreSketchesNamed(ctx, read, sel, filter, e.serviceNameByID)
+}
+
+func collectStoreSketchesNamed(ctx context.Context, read func(context.Context, Selector, func(uint32, *Sketch) error) error, sel Selector, filter map[string]struct{}, name func(uint32) string) (map[uint32]*Sketch, error) {
 	var verdict map[uint32]bool
 	if filter != nil {
 		verdict = make(map[uint32]bool, len(filter))
 	}
 	out := make(map[uint32]*Sketch)
-	err := st.VisitSketches(ctx, sel, func(serviceID uint32, sk *Sketch) error {
+	err := read(ctx, sel, func(serviceID uint32, sk *Sketch) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		if filter != nil {
 			ok, seen := verdict[serviceID]
 			if !seen {
-				_, ok = filter[e.serviceNameByID(serviceID)]
+				_, ok = filter[name(serviceID)]
 				verdict[serviceID] = ok
 			}
 			if !ok {
@@ -686,6 +761,25 @@ func (c *trafficCounters) addSum(r SumRow) {
 	c.spanErrors += asInt64(r.ErrorCount)
 }
 
+// QueryBuckets consumes exactly these fields. Keeping DurationSum out of this
+// private type prevents a count projection from becoming a latency estimate.
+type trafficSumRow struct {
+	window   int64
+	service  uint32
+	identity uint64
+	counts   trafficCounters
+}
+
+func trafficRows(rows []SumRow) []trafficSumRow {
+	out := make([]trafficSumRow, 0, len(rows))
+	for _, row := range rows {
+		r := trafficSumRow{window: row.WindowStart, service: row.ServiceID, identity: row.IdentityCount}
+		r.counts.addSum(row)
+		out = append(out, r)
+	}
+	return out
+}
+
 // QueryBuckets returns per-window traffic counts. It is the traffic-chart
 // query: one point per five-minute window, never one row per series.
 //
@@ -693,10 +787,12 @@ func (c *trafficCounters) addSum(r SumRow) {
 // service when a service filter forces it), so the 20,000-row read cap cannot
 // reach it. That is #194 blocker 4 for this query class.
 func (e *Engine) QueryBuckets(ctx context.Context, q Query) (*BucketsResult, error) {
+	st := e.Store()
 	if q.Signal == SignalUnspecified {
 		q.Signal = SignalTraceOp
 	}
 	filter := serviceFilter(q.Services)
+	var identity IdentityCoverage
 	byWindow := make(map[int64]*trafficCounters)
 	at := func(window int64) *trafficCounters {
 		c := byWindow[window]
@@ -707,36 +803,72 @@ func (e *Engine) QueryBuckets(ctx context.Context, q Query) (*BucketsResult, err
 		return c
 	}
 
-	own, sel, hasStore, err := e.plan(ctx, q, func(windowStart int64, key SeriesKey, d *AggregateDelta) {
+	own, sel, hasStore, err := e.planStore(ctx, q, func(windowStart int64, key SeriesKey, d *AggregateDelta) {
+		if identityMatchesFilter(e.serviceName(key), filter) && e.identityLimited(key) {
+			identity.add(key.Signal, d.Count)
+		}
 		if filter != nil {
 			if _, ok := filter[e.serviceName(key)]; !ok {
 				return
 			}
 		}
 		at(windowStart).add(d)
-	})
+	}, st)
 	if err != nil {
 		return nil, err
 	}
 	if hasStore {
+		snapshot, err := beginEndpointSnapshot(ctx, st, &sel, q.Services)
+		if err != nil {
+			return nil, err
+		}
+		defer snapshot.close()
+		name := e.nameByID
+		if snapshot.tx != nil {
+			name = func(id uint32) string { return snapshot.name(ctx, id) }
+		}
+		sumsFor := func(sel Selector, by GroupBy) ([]trafficSumRow, error) {
+			var rows []SumRow
+			var err error
+			if snapshot.tx != nil {
+				if _, err := sel.Validate(); err != nil {
+					return nil, err
+				}
+				rows, err = sumWindowSnapshotFor(ctx, snapshot.tx, sel, by, true)
+			} else {
+				rows, err = sumStoreFrom(ctx, st, sel, by)
+			}
+			return trafficRows(rows), err
+		}
 		// The service dimension is only requested when a filter needs it:
 		// grouping by window alone keeps the result one row per window.
 		by := GroupByWindow
 		if filter != nil {
 			by |= GroupByService
 		}
-		sums, err := e.sumStore(ctx, sel, by)
+		sums, err := sumsFor(sel, by)
 		if err != nil {
 			return nil, err
 		}
 		for _, r := range sums {
+			if identityMatchesFilter(name(r.service), filter) {
+				identity.add(q.Signal, r.identity)
+			}
 			if filter != nil {
-				if _, ok := filter[e.serviceNameByID(r.ServiceID)]; !ok {
+				if _, ok := filter[name(r.service)]; !ok {
 					continue
 				}
 			}
-			at(r.WindowStart).addSum(r)
+			c := at(r.window)
+			c.requests += r.counts.requests
+			c.errRequests += r.counts.errRequests
+			c.spans += r.counts.spans
+			c.spanErrors += r.counts.spanErrors
 		}
+		if snapshot.err != nil {
+			return nil, snapshot.err
+		}
+		snapshot.close()
 	}
 
 	points := make([]TrafficPoint, 0, len(byWindow))
@@ -751,10 +883,11 @@ func (e *Engine) QueryBuckets(ctx context.Context, q Query) (*BucketsResult, err
 	}
 	sort.Slice(points, func(i, j int) bool { return points[i].WindowStart.Before(points[j].WindowStart) })
 	return &BucketsResult{
-		Points:   points,
-		Coverage: CoverageFull,
-		Epoch:    own.Epoch,
-		Revision: own.Revision,
+		Points:           points,
+		Coverage:         identity.coverage(),
+		IdentityCoverage: identity,
+		Epoch:            own.Epoch,
+		Revision:         own.Revision,
 	}, nil
 }
 
@@ -810,8 +943,10 @@ func (a *dashAccum) addSum(r SumRow) {
 // once and merged in Go (#219). Doing both through one capped read is exactly
 // what made the old dashboard quietly wrong past 20,000 rows.
 func (e *Engine) QueryDashboard(ctx context.Context, q Query) (*DashboardResult, error) {
+	st := e.Store()
 	q.Signal = SignalUnspecified // the scan covers traces and logs in one pass
 	filter := serviceFilter(q.Services)
+	var identity IdentityCoverage
 
 	var (
 		total    dashAccum
@@ -843,8 +978,11 @@ func (e *Engine) QueryDashboard(ctx context.Context, q Query) (*DashboardResult,
 		acc.addSum(r)
 	}
 
-	own, sel, hasStore, err := e.plan(ctx, q, func(_ int64, key SeriesKey, d *AggregateDelta) {
+	own, sel, hasStore, err := e.planStore(ctx, q, func(_ int64, key SeriesKey, d *AggregateDelta) {
 		name := e.serviceName(key)
+		if (key.Signal == SignalTraceOp || key.Signal == SignalLog) && identityMatchesFilter(name, filter) && e.identityLimited(key) {
+			identity.add(key.Signal, d.Count)
+		}
 		if filter != nil {
 			if _, ok := filter[name]; !ok {
 				return
@@ -864,22 +1002,40 @@ func (e *Engine) QueryDashboard(ctx context.Context, q Query) (*DashboardResult,
 			RequestCount: d.RequestCount, ErrorRequestCount: d.ErrorRequestCount,
 			DurationCount: d.DurationCount, DurationSum: d.DurationSum,
 		})
-	})
+	}, st)
 	if err != nil {
 		return nil, err
 	}
 	if hasStore {
+		snapshot, err := beginEndpointSnapshot(ctx, st, &sel, q.Services)
+		if err != nil {
+			return nil, err
+		}
+		defer snapshot.close()
+		name := e.nameByID
+		if snapshot.tx != nil {
+			name = func(id uint32) string { return snapshot.name(ctx, id) }
+		}
+		sumsFor := func(sel Selector, by GroupBy) ([]SumRow, error) {
+			if snapshot.tx != nil {
+				return sumSQLiteSnapshot(ctx, snapshot.tx, sel, by)
+			}
+			return sumStoreFrom(ctx, st, sel, by)
+		}
 		// Only the two signals the switch below consumes enter the scan:
 		// edge and metric rows are half the table and every one of them was
 		// sorted by the GROUP BY just to be discarded here (#290).
 		sumSel := sel
 		sumSel.Signals = []Signal{SignalTraceOp, SignalLog}
-		sums, err := e.sumStore(ctx, sumSel, GroupByService|GroupBySignal)
+		sums, err := sumsFor(sumSel, GroupByService|GroupBySignal)
 		if err != nil {
 			return nil, err
 		}
 		for _, r := range sums {
-			name := e.serviceNameByID(r.ServiceID)
+			name := name(r.ServiceID)
+			if identityMatchesFilter(name, filter) {
+				identity.add(r.Signal, r.IdentityCount)
+			}
 			if filter != nil {
 				if _, ok := filter[name]; !ok {
 					continue
@@ -893,9 +1049,13 @@ func (e *Engine) QueryDashboard(ctx context.Context, q Query) (*DashboardResult,
 			}
 		}
 
-		if err := e.mergeStoreSketches(ctx, sel, filter, mergeSketch); err != nil {
+		if err := visitStoreSketchesFrom(ctx, st, snapshot.txQueryer(), name, sel, filter, func(_ uint32, sk *Sketch) { mergeSketch(sk) }); err != nil {
 			return nil, err
 		}
+		if snapshot.err != nil {
+			return nil, snapshot.err
+		}
+		snapshot.close()
 	}
 
 	res := &DashboardResult{
@@ -907,7 +1067,8 @@ func (e *Engine) QueryDashboard(ctx context.Context, q Query) (*DashboardResult,
 		ActiveServices:    int64(len(services)),
 		Accuracy:          AccuracyFromSketch(merged),
 		LatencyProvenance: latency.Provenance{P99: PercentileFromSketch(merged)},
-		Coverage:          CoverageFull,
+		Coverage:          identity.coverage(),
+		IdentityCoverage:  identity,
 		Epoch:             own.Epoch,
 		Revision:          own.Revision,
 	}
@@ -971,11 +1132,13 @@ func topFailing(perSvc map[string]*dashAccum, limit int) []ServiceStat {
 // ends survive, so the result is never a graph with edges hanging off nodes it
 // does not contain.
 func (e *Engine) QueryTopology(ctx context.Context, q Query) (*TopologyResult, error) {
+	st := e.Store()
 	// No signal filter: the trace-op series carry the nodes and the
 	// service-edge series carry the edges, and both must be read through the
 	// one plan that pins tenant, range and ownership.
 	q.Signal = SignalUnspecified
 	filter := serviceFilter(q.Services)
+	var identity IdentityCoverage
 	keep := func(name string) bool {
 		if name == "" {
 			return false
@@ -1006,7 +1169,10 @@ func (e *Engine) QueryTopology(ctx context.Context, q Query) (*TopologyResult, e
 		return acc
 	}
 
-	own, sel, hasStore, err := e.plan(ctx, q, func(_ int64, key SeriesKey, d *AggregateDelta) {
+	own, sel, hasStore, err := e.planStore(ctx, q, func(_ int64, key SeriesKey, d *AggregateDelta) {
+		if (key.Signal == SignalTraceOp || key.Signal == SignalServiceEdge) && identityMatchesFilter(e.serviceName(key), filter) && e.identityLimited(key) {
+			identity.add(key.Signal, d.Count)
+		}
 		switch key.Signal {
 		case SignalTraceOp:
 			name := e.serviceName(key)
@@ -1021,26 +1187,44 @@ func (e *Engine) QueryTopology(ctx context.Context, q Query) (*TopologyResult, e
 			}
 			edgeAt(caller, callee).addDelta(d)
 		}
-	})
+	}, st)
 	if err != nil {
 		return nil, err
 	}
 	if hasStore {
+		snapshot, err := beginEndpointSnapshot(ctx, st, &sel, q.Services)
+		if err != nil {
+			return nil, err
+		}
+		defer snapshot.close()
+		name := e.nameByID
+		if snapshot.tx != nil {
+			name = func(id uint32) string { return snapshot.name(ctx, id) }
+		}
+		sumsFor := func(sel Selector, by GroupBy) ([]SumRow, error) {
+			if snapshot.tx != nil {
+				return sumSQLiteSnapshot(ctx, snapshot.tx, sel, by)
+			}
+			return sumStoreFrom(ctx, st, sel, by)
+		}
 		nodeSel := sel
 		nodeSel.Signal = SignalTraceOp
-		sums, err := e.sumStore(ctx, nodeSel, GroupByService)
+		sums, err := sumsFor(nodeSel, GroupByService)
 		if err != nil {
 			return nil, err
 		}
 		for _, r := range sums {
-			name := e.serviceNameByID(r.ServiceID)
+			name := name(r.ServiceID)
+			if identityMatchesFilter(name, filter) {
+				identity.add(SignalTraceOp, r.IdentityCount)
+			}
 			if !keep(name) {
 				continue
 			}
 			at(name).addSum(r)
 		}
-		if err := e.visitStoreSketches(ctx, sel, filter, func(serviceID uint32, sk *Sketch) {
-			name := e.serviceNameByID(serviceID)
+		if err := visitStoreSketchesFrom(ctx, st, snapshot.txQueryer(), name, sel, filter, func(serviceID uint32, sk *Sketch) {
+			name := name(serviceID)
 			if keep(name) {
 				at(name).mergeSketch(sk)
 			}
@@ -1053,17 +1237,24 @@ func (e *Engine) QueryTopology(ctx context.Context, q Query) (*TopologyResult, e
 		// selector — the only shape in which a NameID means one namespace.
 		edgeSel := sel
 		edgeSel.Signal = SignalServiceEdge
-		edgeSums, err := e.sumStore(ctx, edgeSel, GroupByService|GroupByName)
+		edgeSums, err := sumsFor(edgeSel, GroupByService|GroupByName)
 		if err != nil {
 			return nil, err
 		}
 		for _, r := range edgeSums {
-			caller, callee := e.nameByID(r.ServiceID), e.nameByID(r.NameID)
+			caller, callee := name(r.ServiceID), name(r.NameID)
+			if identityMatchesFilter(caller, filter) {
+				identity.add(SignalServiceEdge, r.IdentityCount)
+			}
 			if !keep(caller) || !keep(callee) {
 				continue
 			}
 			edgeAt(caller, callee).addSum(r)
 		}
+		if snapshot.err != nil {
+			return nil, snapshot.err
+		}
+		snapshot.close()
 	}
 
 	out := make([]ServiceStat, 0, len(nodes))
@@ -1090,11 +1281,12 @@ func (e *Engine) QueryTopology(ctx context.Context, q Query) (*TopologyResult, e
 	sort.Slice(out, func(i, j int) bool { return out[i].Service < out[j].Service })
 
 	return &TopologyResult{
-		Nodes:    out,
-		Edges:    topologyEdges(edges),
-		Coverage: CoverageFull,
-		Epoch:    own.Epoch,
-		Revision: own.Revision,
+		Nodes:            out,
+		Edges:            topologyEdges(edges),
+		Coverage:         identity.coverage(),
+		IdentityCoverage: identity,
+		Epoch:            own.Epoch,
+		Revision:         own.Revision,
 	}, nil
 }
 
@@ -1124,4 +1316,74 @@ func topologyEdges(acc map[topoPair]*dashAccum) []TopologyEdge {
 		return out[i].Target < out[j].Target
 	})
 	return out
+}
+
+// This handle is private to the three scalar/sketch endpoints. It does not
+// implement Store; non-SQLite stores retain their original query path.
+type endpointSnapshot struct {
+	tx    *sql.Tx
+	names map[uint32]string
+	err   error
+}
+
+func beginEndpointSnapshot(ctx context.Context, st Store, sel *Selector, services []string) (*endpointSnapshot, error) {
+	snap := &endpointSnapshot{}
+	sqlite, ok := st.(*SQLiteStore)
+	if !ok {
+		return snap, nil
+	}
+	tx, err := sqlite.reader.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, err
+	}
+	snap.tx = tx
+	snap.names = make(map[uint32]string)
+	if len(services) > 0 {
+		sel.ServiceIDs = []uint32{0}
+		seen := map[uint32]bool{}
+		for _, value := range append(append([]string(nil), services...), OtherValue) {
+			var id uint32
+			err := tx.QueryRowContext(ctx, `SELECT id FROM aggregate_dict WHERE tenant_id=? AND kind=? AND value=?`, sel.TenantID, KindService, []byte(value)).Scan(&id)
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
+			if err != nil {
+				snap.close()
+				return nil, err
+			}
+			if !seen[id] {
+				sel.ServiceIDs = append(sel.ServiceIDs, id)
+				seen[id] = true
+			}
+		}
+	}
+	return snap, nil
+}
+func (s *endpointSnapshot) close() {
+	if s.tx != nil {
+		_ = s.tx.Rollback()
+	}
+}
+func (s *endpointSnapshot) txQueryer() sqliteQueryer {
+	if s.tx == nil {
+		return nil
+	}
+	return s.tx
+}
+func (s *endpointSnapshot) name(ctx context.Context, id uint32) string {
+	if id == 0 || s.err != nil {
+		return ""
+	}
+	if name, ok := s.names[id]; ok {
+		return name
+	}
+	var value []byte
+	err := s.tx.QueryRowContext(ctx, `SELECT value FROM aggregate_dict WHERE id=?`, id).Scan(&value)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		s.err = err
+		return ""
+	}
+	name := string(value)
+	s.names[id] = name
+	return name
 }

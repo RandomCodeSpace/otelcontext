@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"time"
@@ -19,6 +20,14 @@ func setCoverage(w http.ResponseWriter, c aggregate.Coverage) {
 		return
 	}
 	w.Header().Set(aggregate.CoverageHeader, string(c))
+	if note := c.Note(); note != "" {
+		w.Header().Set("OtelContext-Coverage-Note", note)
+	}
+}
+
+func setIdentityCoverage(w http.ResponseWriter, coverage aggregate.IdentityCoverage) {
+	data, _ := json.Marshal(coverage)
+	w.Header().Set("OtelContext-Identity-Coverage", string(data))
 }
 
 // Range-clamp headers (#217). When an aggregate-mode request asks for more

@@ -52,6 +52,10 @@ import (
 // requires (#200). A v4 file has neither, and a binary that started GC against
 // a MAX(id)+1 reseed could re-mint an ID a finalized bucket still names, so the
 // fail-closed policy stands: run an older binary or accept the rebuild.
+//
+// Hourly rollups are a separately versioned, derived extension. They do not
+// change this version or the store UUID. Bucket invalidation triggers preserve
+// safety when a schema-v5 writer predating rollups writes this database.
 const StoreSchemaVersion = 5
 
 // Meta keys that carry monotonically increasing identity high-watermarks
@@ -426,6 +430,9 @@ type Selector struct {
 	Signals []Signal
 	// SeriesIDs, when non-empty, restricts the read to these series.
 	SeriesIDs []SeriesID
+	// ServiceIDs narrows the series membership before rows or sketches are
+	// decoded. A non-empty slice containing only zero matches nothing.
+	ServiceIDs []uint32
 	// Limit caps returned rows. Zero takes MaxReadRows; anything above it is
 	// clamped down, never up.
 	Limit int
@@ -479,6 +486,9 @@ type SumRow struct {
 	DurationCount     uint64
 	DurationSum       float64
 	LogCount          uint64
+	// IdentityCount counts points whose service, name or dimension tuple
+	// uses an overflow sentinel, independent of the requested grouping.
+	IdentityCount uint64
 }
 
 // MaxReadRows is the store-side cap on rows returned by one ReadBuckets call
@@ -507,6 +517,9 @@ func (s Selector) Validate() (int, error) {
 	}
 	if len(s.SeriesIDs) > MaxReadRows {
 		return 0, fmt.Errorf("%w: %d series ids, cap is %d", ErrSelectorUnbounded, len(s.SeriesIDs), MaxReadRows)
+	}
+	if len(s.ServiceIDs) > MaxReadRows {
+		return 0, fmt.Errorf("%w: %d service ids, cap is %d", ErrSelectorUnbounded, len(s.ServiceIDs), MaxReadRows)
 	}
 	if s.Signal != SignalUnspecified && len(s.Signals) > 0 {
 		return 0, fmt.Errorf("%w: Signal and Signals are mutually exclusive", ErrSelectorUnbounded)
@@ -590,9 +603,10 @@ type Store interface {
 	// makes a scalar dashboard total structurally impossible to truncate.
 	SumBuckets(ctx context.Context, sel Selector, by GroupBy) ([]SumRow, error)
 
-	// VisitSketches streams every sketch-bearing row matching sel — from
-	// BOTH durable tables, like ReadBuckets — to visit, in no particular
-	// order. It is the percentile path of the #197 read contract: a quantile
+	// VisitSketches visits all sketch contributions matching sel, in no
+	// particular order. Complete historical hours may be merged per series;
+	// boundaries, unavailable hours and deltas use original rows.
+	// It is the percentile path of the #197 read contract: a quantile
 	// sketch cannot be SUMmed in SQL, but its merge is commutative and
 	// associative, so no total order and no pagination are needed — one
 	// unordered pass replaces the sorted, keyset-paged drain that made a

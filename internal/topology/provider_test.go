@@ -177,3 +177,16 @@ func TestIdentityStringIsStable(t *testing.T) {
 		t.Fatalf("Identity.String() = %q, want boot-a:42", got)
 	}
 }
+
+func TestAggregateMetadataDisclosesIdentityLoss(t *testing.T) {
+	for _, dropped := range []uint64{0, 1} {
+		identity := aggregate.IdentityCoverage{TracePoints: 2, EdgePoints: 3, MetricPoints: 4, LogPoints: 5}
+		meta := aggregateMetadata(Identity{Epoch: "boot-a", Revision: 7}, aggregate.TopologySnapshot{IdentityCoverage: identity, DroppedOperations: dropped})
+		if meta.IdentityCoverage != identity || meta.Coverage == string(aggregate.CoverageFull) || meta.CoverageNote == "" {
+			t.Fatalf("identity loss hidden: %+v", meta)
+		}
+		if meta.Truncated != (dropped > 0) {
+			t.Fatalf("identity loss conflated with truncation: %+v", meta)
+		}
+	}
+}

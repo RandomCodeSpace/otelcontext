@@ -156,8 +156,8 @@ jobs:
             .post_restart_fingerprint.spans == 6 and
             .post_restart_fingerprint.logs == 6 and
             .post_restart_fingerprint.metric_buckets == 6 and
-            (.surfaces.mcp_tools | length) == 9 and
-            (.surfaces.mcp_calls | length) == 9 and
+            (.surfaces.mcp_tools | length) == 10 and
+            (.surfaces.mcp_calls | length) == 10 and
             .restore.source_fingerprint == .restore.restored_fingerprint and
             all(.assertions[]; .passed == true)
           ' "${RUNNER_TEMP}/database-proof/database-proof-v1.json"
@@ -311,8 +311,8 @@ jobs:
             .post_restart_fingerprint.spans == 6 and
             .post_restart_fingerprint.logs == 6 and
             .post_restart_fingerprint.metric_buckets == 6 and
-            (.surfaces.mcp_tools | length) == 9 and
-            (.surfaces.mcp_calls | length) == 9 and
+            (.surfaces.mcp_tools | length) == 10 and
+            (.surfaces.mcp_calls | length) == 10 and
             .restore.source_fingerprint == .restore.restored_fingerprint and
             all(.assertions[]; .passed == true)
           ' "${RUNNER_TEMP}/database-proof/database-proof-v1.json"
@@ -415,8 +415,8 @@ jobs:
             .driver == "mysql" and
             .tier == "preview" and
             .migration.state == "unverified-preview" and
-            (.surfaces.mcp_tools | length) == 9 and
-            (.surfaces.mcp_calls | length) == 9 and
+            (.surfaces.mcp_tools | length) == 10 and
+            (.surfaces.mcp_calls | length) == 10 and
             .restore.kind == "native-fresh-target" and
             .restore.source_fingerprint == .restore.restored_fingerprint and
             all(.assertions[]; .passed == true)
@@ -526,8 +526,8 @@ jobs:
             .driver == "mssql" and
             .tier == "experimental" and
             .migration.state == "unverified-preview" and
-            (.surfaces.mcp_tools | length) == 9 and
-            (.surfaces.mcp_calls | length) == 9 and
+            (.surfaces.mcp_tools | length) == 10 and
+            (.surfaces.mcp_calls | length) == 10 and
             .restore.kind == "native-fresh-target" and
             .restore.source_fingerprint == .restore.restored_fingerprint and
             all(.assertions[]; .passed == true)

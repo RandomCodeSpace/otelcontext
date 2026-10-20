@@ -446,6 +446,22 @@ func (c *Cache) Lookup(id uint32) (DictEntry, bool) {
 	return res.Lookup(id)
 }
 
+// FindID resolves an existing name without consuming dictionary capacity or
+// routing an unknown query value into the overflow sentinel.
+func (c *Cache) FindID(tenantID uint32, kind Kind, value string) (uint32, bool) {
+	if id, ok := c.lookupCached(dictScope{tenant: tenantID, kind: kind}, value); ok {
+		return id, true
+	}
+	if r, ok := c.reg.(identityFinder); ok {
+		return r.FindID(tenantID, kind, value)
+	}
+	return 0, false
+}
+
+type identityFinder interface {
+	FindID(tenantID uint32, kind Kind, value string) (uint32, bool)
+}
+
 // Len returns the number of cached entries across every scope. Diagnostic only.
 func (c *Cache) Len() int {
 	c.mu.RLock()
@@ -715,6 +731,13 @@ func (r *MemRegistrar) Lookup(id uint32) (DictEntry, bool) {
 	defer r.mu.Unlock()
 	e, ok := r.byID[id]
 	return e, ok
+}
+
+func (r *MemRegistrar) FindID(tenantID uint32, kind Kind, value string) (uint32, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	id, ok := r.ids[dictScope{tenant: tenantID, kind: kind}][value]
+	return id, ok
 }
 
 // Count returns the number of capacity-consuming entries in a (tenant, kind)

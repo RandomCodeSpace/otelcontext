@@ -121,8 +121,8 @@ func trySurfaceFingerprint(app *appProcess) (surfaceFingerprint, error) {
 		return surfaceFingerprint{}, err
 	}
 	fingerprint.MCPTools = tools
-	if len(tools) != 9 {
-		return surfaceFingerprint{}, fmt.Errorf("MCP tools=%v, want nine", tools)
+	if len(tools) != 10 {
+		return surfaceFingerprint{}, fmt.Errorf("MCP tools=%v, want ten", tools)
 	}
 	calls := []struct {
 		name string
@@ -169,6 +169,18 @@ func trySurfaceFingerprint(app *appProcess) (surfaceFingerprint, error) {
 		}
 		fingerprint.MCPCalls[tool] = mcpSurface{Succeeded: false}
 	}
+	text, succeeded, err := callMCPTool(baseURL+"/mcp", "get_log_summary", map[string]any{"service": "shutdown-proof"})
+	if err != nil {
+		return surfaceFingerprint{}, err
+	}
+	if app.mode == "aggregate" {
+		if !succeeded || text == "" {
+			return surfaceFingerprint{}, fmt.Errorf("MCP get_log_summary failed: %s", text)
+		}
+	} else if succeeded || text != "Error: aggregate log summary unavailable in this mode" {
+		return surfaceFingerprint{}, fmt.Errorf("MCP get_log_summary must report its unavailable aggregate source: %s", text)
+	}
+	fingerprint.MCPCalls["get_log_summary"] = mcpSurface{Succeeded: succeeded}
 	webSocketBody, err := readWebSocketSnapshot(baseURL + "/ws/events")
 	if err != nil {
 		return surfaceFingerprint{}, err
@@ -472,7 +484,7 @@ func TestBackupRestoreModeProof(t *testing.T) {
 			{Name: "main_and_mode_owned_state_equal", Passed: mainEqual},
 			{Name: "dlq_inventory_equal", Passed: dlqEqual},
 			{Name: "rest_surfaces_equal", Passed: reflect.DeepEqual(sourceSurfaces.REST, targetSurfaces.REST)},
-			{Name: "nine_mcp_tools_have_expected_responses", Passed: len(targetSurfaces.MCPTools) == 9 && len(targetSurfaces.MCPCalls) == 9},
+			{Name: "ten_mcp_tools_have_expected_responses", Passed: len(targetSurfaces.MCPTools) == 10 && len(targetSurfaces.MCPCalls) == 10},
 			{Name: "websocket_surface_equal", Passed: sourceSurfaces.WebSocket == targetSurfaces.WebSocket},
 			{Name: "all_surfaces_equal", Passed: surfacesEqual},
 			{Name: "lifecycle_fingerprint_equal", Passed: createReport.BackupID == restoreReport.BackupID && restoreReport.LifecycleFingerprint == manifest.LifecycleFingerprint},

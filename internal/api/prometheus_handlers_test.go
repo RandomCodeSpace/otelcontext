@@ -127,7 +127,7 @@ func TestPrometheusRetainedHostMetricsAndDiscovery(t *testing.T) {
 			return
 		}
 		query := r.Form.Get("query")
-		if !strings.Contains(query, `__name__="system.cpu.utilization"`) || !strings.Contains(query, `"host.name"="node-a"`) || !strings.Contains(query, `"host.name"="","host.id"="node-a"`) {
+		if !strings.Contains(query, `__name__="system.cpu.utilization"`) || !strings.Contains(query, `"host.id"="i-123"`) || !strings.Contains(query, `"host.id"="","host.name"="i-123"`) {
 			t.Errorf("host query=%s", query)
 		}
 		body := map[string]any{"status": "success", "data": map[string]any{"resultType": "matrix", "result": []any{map[string]any{
@@ -136,9 +136,9 @@ func TestPrometheusRetainedHostMetricsAndDiscovery(t *testing.T) {
 		}}}}
 		_ = json.NewEncoder(w).Encode(body)
 	}, 0)
-	params := url.Values{"name": {"system.cpu.utilization"}, "service_name": {"host/node-a"}, "start": {start.Format(time.RFC3339Nano)}, "end": {end.Format(time.RFC3339Nano)}}
+	params := url.Values{"name": {"system.cpu.utilization"}, "service_name": {"host/i-123"}, "start": {start.Format(time.RFC3339Nano)}, "end": {end.Format(time.RFC3339Nano)}}
 	w, buckets := getArray[views.MetricBucket](t, s.handleGetMetricBuckets, "/api/metrics?"+params.Encode(), "default")
-	if len(buckets) != 2 || buckets[0].ServiceName != "host/node-a" || buckets[0].Sum != 0.42 || buckets[0].Count != 1 || !buckets[0].TimeBucket.Equal(start) || !strings.Contains(buckets[0].AttributesJSON, `"host.name":"node-a"`) {
+	if len(buckets) != 2 || buckets[0].ServiceName != "host/i-123" || buckets[0].Sum != 0.42 || buckets[0].Count != 1 || !buckets[0].TimeBucket.Equal(start) || !strings.Contains(buckets[0].AttributesJSON, `"host.name":"node-a"`) {
 		t.Fatalf("buckets=%+v", buckets)
 	}
 	if w.Header().Get("OtelContext-Metric-Source") != "prometheus" || w.Header().Get("OtelContext-Data-Coverage") != "sampled" {
@@ -169,8 +169,8 @@ func TestPrometheusQuotedMetricSelector(t *testing.T) {
 	if len(selectors) != 3 || !strings.Contains(selectors[0], `cpu\"} or up or {__name__=\"`) {
 		t.Fatalf("unescaped matcher: %v", selectors)
 	}
-	if !strings.Contains(selectors[2], `"host.name"=""`) {
-		t.Fatalf("host-id fallback must require absent host.name: %s", selectors[2])
+	if !strings.Contains(selectors[2], `"host.id"=""`) {
+		t.Fatalf("host-name fallback must require absent host.id: %s", selectors[2])
 	}
 }
 

@@ -16,11 +16,9 @@ import (
 // stop sending traffic before the system fails outright.
 const readySaturationThreshold = 0.95
 
-// aggregateDBPingTimeout bounds the aggregate store reachability probe. Short
-// on purpose: a readiness request that waits on a database is a readiness
-// request an orchestrator will time out on anyway, and the answer it needs
-// ("this process cannot reach its aggregates right now") is the same either
-// way.
+// aggregateDBPingTimeout bounds the aggregate store reachability probe.
+// The production probe uses a separate read-only connection so long queries
+// cannot consume its pool slot. Genuine probe failures still fail readiness.
 const aggregateDBPingTimeout = 2 * time.Second
 
 // handleLive is a Kubernetes-style liveness probe.
@@ -176,7 +174,8 @@ func (s *Server) aggregateRuntimeChecks(ctx context.Context, checks map[string]s
 
 	// Reachability first: every other number below is read from memory, so
 	// this is the only probe that can tell an operator the store itself is
-	// gone. The read pool, not the writer — see SQLiteStore.PingContext.
+	// gone. Use SQLiteReadinessProbe for on-disk stores so this check does not
+	// compete with range queries or durable commits for a connection.
 	switch {
 	case s.aggregateDBPing == nil:
 		checks["aggregate_db"] = "skipped"

@@ -26,10 +26,6 @@ var cacheableTools = map[string]struct{}{
 	"get_service_health":   {},
 	"root_cause_analysis":  {},
 	"impact_analysis":      {},
-	// A completed trace's topology is immutable, so memoizing by trace_id is
-	// safe and high-hit for repeated drill-downs; only non-error results are
-	// cached, so "trace not found" is never memoized.
-	"trace_graph": {},
 }
 
 // isCacheable reports whether a tool name is on the cache whitelist.
@@ -108,7 +104,7 @@ func cacheKey(tenant, tool string, args map[string]any) string {
 // indicating cache hit. Expired entries return false (and are NOT lazily
 // evicted here — the next Set bound check handles eviction in bulk).
 func (c *resultCache) Get(tenant, tool string, args map[string]any) (ToolCallResult, bool) {
-	if c.disabled() || !isCacheable(tool) {
+	if c.disabled() || !isCacheable(tool) || hasExplicitRange(args) {
 		return ToolCallResult{}, false
 	}
 	k := cacheKey(tenant, tool, args)
@@ -128,7 +124,7 @@ func (c *resultCache) Get(tenant, tool string, args map[string]any) (ToolCallRes
 // oldest entries are dropped in one pass — a cheap eviction policy that
 // keeps the map size bounded without dragging in a full LRU list.
 func (c *resultCache) Set(tenant, tool string, args map[string]any, result ToolCallResult) {
-	if c.disabled() || !isCacheable(tool) {
+	if c.disabled() || !isCacheable(tool) || hasExplicitRange(args) {
 		return
 	}
 	k := cacheKey(tenant, tool, args)
@@ -170,4 +166,12 @@ func (c *resultCache) Stats() (size int) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return len(c.entries)
+}
+
+func hasExplicitRange(args map[string]any) bool {
+	_, start := args["start"]
+	_, end := args["end"]
+	_, since := args["since"]
+	_, lookback := args["time_range"]
+	return start || end || since || lookback
 }

@@ -717,7 +717,7 @@ func trySurfaces(app *appProcess, value fixture) (surfaceProof, error) {
 	if err != nil {
 		return surfaceProof{}, err
 	}
-	wantTools := []string{"get_anomaly_timeline", "get_service_health", "get_service_map", "impact_analysis", "promql_query", "promql_query_range", "root_cause_analysis", "search_logs", "trace_graph"}
+	wantTools := []string{"get_anomaly_timeline", "get_log_summary", "get_service_health", "get_service_map", "impact_analysis", "promql_query", "promql_query_range", "root_cause_analysis", "search_logs", "trace_graph"}
 	if !reflect.DeepEqual(tools, wantTools) {
 		return surfaceProof{}, fmt.Errorf("MCP tools=%v want=%v", tools, wantTools)
 	}
@@ -764,6 +764,15 @@ func trySurfaces(app *appProcess, value fixture) (surfaceProof, error) {
 		}
 		callProof[tool] = mcpCallProof{Succeeded: false, HasBody: true}
 	}
+	// This proof runs in legacy mode, where aggregate summaries are unavailable.
+	text, succeeded, err := callMCPTool(app.baseURL()+"/mcp", "get_log_summary", nil)
+	if err != nil {
+		return surfaceProof{}, err
+	}
+	if succeeded || text != "Error: aggregate log summary unavailable in this mode" {
+		return surfaceProof{}, fmt.Errorf("MCP get_log_summary must report its unavailable aggregate source: %s", text)
+	}
+	callProof["get_log_summary"] = mcpCallProof{Succeeded: false, HasBody: true}
 	webSockets := []string{"/ws", "/ws/events"}
 	if err := probeWebSocket(app.baseURL() + "/ws"); err != nil {
 		return surfaceProof{}, fmt.Errorf("websocket /ws handshake: %w", err)
@@ -1246,7 +1255,7 @@ func proveRestore(t *testing.T, source *appProcess, value fixture, sourceRows ro
 	if exit, err := target.stop(); err != nil || exit != 0 {
 		t.Fatalf("restored shutdown exit=%d err=%v\n%s", exit, err, target.log.String())
 	}
-	if !reflect.DeepEqual(sourceRows, restoredRows) || !reflect.DeepEqual(sourceSurfaces.MCPTools, restoredSurfaces.MCPTools) || len(restoredSurfaces.MCPCalls) != 9 {
+	if !reflect.DeepEqual(sourceRows, restoredRows) || !reflect.DeepEqual(sourceSurfaces.MCPTools, restoredSurfaces.MCPTools) || len(restoredSurfaces.MCPCalls) != 10 {
 		t.Fatalf("restored contract mismatch: source=%#v target=%#v", sourceRows, restoredRows)
 	}
 	manifestData, err := os.ReadFile(filepath.Join(createReport.Bundle, "manifest.json"))
@@ -1356,7 +1365,7 @@ func TestDatabaseLifecycle(t *testing.T) {
 	if !reflect.DeepEqual(preRestart, postRestart) {
 		t.Fatalf("restart fingerprint changed: before=%#v after=%#v", preRestart, postRestart)
 	}
-	if !reflect.DeepEqual(surfaces.MCPTools, restartSurfaces.MCPTools) || len(restartSurfaces.MCPCalls) != 9 {
+	if !reflect.DeepEqual(surfaces.MCPTools, restartSurfaces.MCPTools) || len(restartSurfaces.MCPCalls) != 10 {
 		t.Fatalf("restart surface contract changed: %#v", restartSurfaces)
 	}
 	restore := proveRestore(t, app, value, postRestart, restartSurfaces, proofDir)
@@ -1371,7 +1380,7 @@ func TestDatabaseLifecycle(t *testing.T) {
 		{Name: "six_logs_six_metric_series", Passed: postRestart.Logs == 6 && postRestart.MetricBuckets == 6},
 		{Name: "representative_rest_complete", Passed: len(restartSurfaces.RESTPaths) >= 9},
 		{Name: "both_websockets_complete", Passed: len(restartSurfaces.WebSockets) == 2},
-		{Name: "nine_mcp_tools_have_expected_responses", Passed: len(restartSurfaces.MCPTools) == 9 && len(restartSurfaces.MCPCalls) == 9},
+		{Name: "ten_mcp_tools_have_expected_responses", Passed: len(restartSurfaces.MCPTools) == 10 && len(restartSurfaces.MCPCalls) == 10},
 		{Name: "stale_rows_purged_live_rows_retained", Passed: reflect.DeepEqual(preRestart, postRestart)},
 		{Name: "graceful_restart_preserved_fingerprint", Passed: preRestart.Digest == postRestart.Digest},
 		{Name: "fresh_target_restore_preserved_fingerprint", Passed: restore.SourceFingerprint == restore.RestoredFingerprint},

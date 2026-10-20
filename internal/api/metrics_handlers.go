@@ -52,6 +52,7 @@ func (s *Server) handleGetTrafficMetrics(w http.ResponseWriter, r *http.Request)
 			return
 		}
 		setCoverage(w, res.Coverage)
+		setIdentityCoverage(w, res.IdentityCoverage)
 		w.Header().Set(httpconst.HeaderContentType, httpconst.ContentTypeJSON)
 		_ = json.NewEncoder(w).Encode(trafficPointsFromAggregate(res))
 		return

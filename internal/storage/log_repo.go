@@ -85,6 +85,8 @@ func (r *Repository) GetLogsV2(ctx context.Context, filter LogFilter) ([]Log, in
 	if useFTS5 {
 		base = base.Joins("JOIN "+fts5LogsTable+" ON logs.id = "+fts5LogsTable+".rowid").
 			Where(fts5LogsTable+" MATCH ?", matchExpr)
+	} else {
+		base = r.withLogTraceIndex(base, filter.TraceID)
 	}
 
 	base = applyLogFilterCriteria(base, filter)
@@ -125,6 +127,16 @@ func (r *Repository) GetLogsV2(ctx context.Context, filter LogFilter) ([]Log, in
 	return logs, total, nil
 }
 
+// Exact trace lookups must not walk the tenant/time index to satisfy ordering
+// or a time range. Keep SQLite on the existing trace index even without ANALYZE.
+// The identifier is fixed; traceID is only used to detect an exact-trace filter.
+func (r *Repository) withLogTraceIndex(query *gorm.DB, traceID string) *gorm.DB {
+	if traceID != "" && (r.driver == "" || strings.EqualFold(r.driver, "sqlite")) {
+		return query.Table("logs INDEXED BY idx_logs_trace_id")
+	}
+	return query
+}
+
 // applyLogFilterCriteria appends the non-search WHERE clauses that are common
 // to GetLogsV2 and its LIKE fallback. The Search clause is intentionally NOT
 // applied here — the two callers handle it differently (FTS5 MATCH vs LIKE).
@@ -154,6 +166,7 @@ func (r *Repository) getLogsV2LikeFallback(ctx context.Context, filter LogFilter
 	var logs []Log
 	var total int64
 	base := r.db.WithContext(ctx).Model(&Log{}).Where(sqlWhereTenantID, tenant)
+	base = r.withLogTraceIndex(base, filter.TraceID)
 	base = applyLogFilterCriteria(base, filter)
 	if filter.Search != "" {
 		search := "%" + filter.Search + "%"

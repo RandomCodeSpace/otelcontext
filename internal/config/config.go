@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"log"
+	"net/netip"
 	"net/url"
 	"os"
 	"sort"
@@ -111,6 +112,8 @@ type Config struct {
 
 	// API Protection
 	APIRateLimitRPS int
+	// Only these socket peers may supply a forwarded client IP for rate limits.
+	APITrustedProxyCIDRs []string
 
 	// Prometheus is an optional tenant-bound metric store and PromQL backend.
 	// Required mode makes backend availability part of ingest ACKs and readiness.
@@ -426,6 +429,15 @@ type Config struct {
 	AggregateMaxDimTuplesPerTenant int
 	AggregateMaxDimTuples          int
 
+	// Retained names span the full history, independently of active series.
+	// Both tenant and instance caps are finite; overflow remains explicit.
+	AggregateMaxOperationNamesPerTenant int
+	AggregateMaxOperationNames          int
+	AggregateMaxMetricNamesPerTenant    int
+	AggregateMaxMetricNames             int
+	AggregateMaxLogTemplatesPerTenant   int
+	AggregateMaxLogTemplates            int
+
 	// AggregateMetricDims is the parsed AGGREGATE_METRIC_DIMS config:
 	// map of metric name -> sorted list of OTLP attribute keys.
 	// Empty map when AGGREGATE_METRIC_DIMS is unset/empty.
@@ -475,7 +487,7 @@ type Config struct {
 	// usable volume capacity — a 4 GiB PVC does not become 8 GiB because the
 	// config says so.
 	DataDiskBudgetMB int    // Default 8192 (8 GiB)
-	DataDiskPath     string // Default ./data — any path on the data volume
+	DataDiskPath     string // Default ./data — directory containing all local application data
 
 	// Aggregate runtime readiness thresholds (#194 finding 18).
 	//
@@ -566,6 +578,7 @@ func Load(customPath string) (*Config, error) {
 
 		// API
 		APIRateLimitRPS:               getEnvInt("API_RATE_LIMIT_RPS", 100),
+		APITrustedProxyCIDRs:          splitCSV(getEnv("API_TRUSTED_PROXY_CIDRS", "")),
 		PrometheusURL:                 strings.TrimSpace(getEnv("PROMETHEUS_URL", "")),
 		PrometheusRequired:            getEnvBool("PROMETHEUS_REQUIRED", false),
 		PrometheusTenantID:            getEnv("PROMETHEUS_TENANT_ID", getEnv("DEFAULT_TENANT", "default")),
@@ -659,24 +672,30 @@ func Load(customPath string) (*Config, error) {
 		AggregateCommitMaxDeltas:        getEnvInt("AGGREGATE_COMMIT_MAX_DELTAS", 5000),
 		AggregateCommitMaxBytes:         getEnvInt("AGGREGATE_COMMIT_MAX_BYTES", 8*1024*1024),
 		AggregateCommitMaxPendingBytes:  getEnvInt("AGGREGATE_COMMIT_MAX_PENDING_BYTES", 64*1024*1024),
-		AggregateCommitMaxWaiters:       getEnvInt("AGGREGATE_COMMIT_MAX_WAITERS", 512),
+		AggregateCommitMaxWaiters:       getEnvInt("AGGREGATE_COMMIT_MAX_WAITERS", 1024),
 		AggregateCommitMaxPendingDeltas: getEnvInt("AGGREGATE_COMMIT_MAX_PENDING_DELTAS", 200000),
 		AggregateFinalizeIntervalSec:    getEnvInt("AGGREGATE_FINALIZE_INTERVAL_SEC", 30),
 		AggregateTopologyRestoreHorizon: getEnvDuration("AGGREGATE_TOPOLOGY_RESTORE_HORIZON", 30*time.Minute),
 
 		// Identity lifecycle (#200)
-		AggregateGCEnabled:             getEnvBool("AGGREGATE_GC_ENABLED", true),
-		AggregateMaxValueBytes:         getEnvInt("AGGREGATE_MAX_VALUE_BYTES", 512),
-		AggregateMaxTenantBytes:        getEnvInt("AGGREGATE_MAX_TENANT_BYTES", 128),
-		AggregateMaxTenants:            getEnvInt("AGGREGATE_MAX_TENANTS", 256),
-		AggregateMaxServicesPerTenant:  getEnvInt("AGGREGATE_MAX_SERVICES_PER_TENANT", 500),
-		AggregateMaxServices:           getEnvInt("AGGREGATE_MAX_SERVICES", 5000),
-		AggregateMaxDimKeysPerTenant:   getEnvInt("AGGREGATE_MAX_DIM_KEYS_PER_TENANT", 200),
-		AggregateMaxDimKeys:            getEnvInt("AGGREGATE_MAX_DIM_KEYS", 2000),
-		AggregateMaxDimValuesPerTenant: getEnvInt("AGGREGATE_MAX_DIM_VALUES_PER_TENANT", 5000),
-		AggregateMaxDimValues:          getEnvInt("AGGREGATE_MAX_DIM_VALUES", 50000),
-		AggregateMaxDimTuplesPerTenant: getEnvInt("AGGREGATE_MAX_DIM_TUPLES_PER_TENANT", 5000),
-		AggregateMaxDimTuples:          getEnvInt("AGGREGATE_MAX_DIM_TUPLES", 50000),
+		AggregateGCEnabled:                  getEnvBool("AGGREGATE_GC_ENABLED", true),
+		AggregateMaxValueBytes:              getEnvInt("AGGREGATE_MAX_VALUE_BYTES", 512),
+		AggregateMaxTenantBytes:             getEnvInt("AGGREGATE_MAX_TENANT_BYTES", 128),
+		AggregateMaxTenants:                 getEnvInt("AGGREGATE_MAX_TENANTS", 256),
+		AggregateMaxServicesPerTenant:       getEnvInt("AGGREGATE_MAX_SERVICES_PER_TENANT", 500),
+		AggregateMaxServices:                getEnvInt("AGGREGATE_MAX_SERVICES", 5000),
+		AggregateMaxDimKeysPerTenant:        getEnvInt("AGGREGATE_MAX_DIM_KEYS_PER_TENANT", 200),
+		AggregateMaxDimKeys:                 getEnvInt("AGGREGATE_MAX_DIM_KEYS", 2000),
+		AggregateMaxDimValuesPerTenant:      getEnvInt("AGGREGATE_MAX_DIM_VALUES_PER_TENANT", 5000),
+		AggregateMaxDimValues:               getEnvInt("AGGREGATE_MAX_DIM_VALUES", 50000),
+		AggregateMaxDimTuplesPerTenant:      getEnvInt("AGGREGATE_MAX_DIM_TUPLES_PER_TENANT", 5000),
+		AggregateMaxDimTuples:               getEnvInt("AGGREGATE_MAX_DIM_TUPLES", 50000),
+		AggregateMaxOperationNamesPerTenant: getEnvInt("AGGREGATE_MAX_OPERATION_NAMES_PER_TENANT", 10000),
+		AggregateMaxOperationNames:          getEnvInt("AGGREGATE_MAX_OPERATION_NAMES", 100000),
+		AggregateMaxMetricNamesPerTenant:    getEnvInt("AGGREGATE_MAX_METRIC_NAMES_PER_TENANT", 5000),
+		AggregateMaxMetricNames:             getEnvInt("AGGREGATE_MAX_METRIC_NAMES", 50000),
+		AggregateMaxLogTemplatesPerTenant:   getEnvInt("AGGREGATE_MAX_LOG_TEMPLATES_PER_TENANT", 5000),
+		AggregateMaxLogTemplates:            getEnvInt("AGGREGATE_MAX_LOG_TEMPLATES", 50000),
 		// Bounded exemplar retention (aggregate mode only)
 		ExemplarTracesPerServiceWindow: getEnvInt("EXEMPLAR_TRACES_PER_SERVICE_WINDOW", 25),
 		ExemplarTracesGlobalWindow:     getEnvInt("EXEMPLAR_TRACES_GLOBAL_WINDOW", 1500),
@@ -983,6 +1002,12 @@ func (c *Config) Validate() error {
 	if c.APIRateLimitRPS < 0 {
 		return fmt.Errorf("API_RATE_LIMIT_RPS must be >= 0, got %d", c.APIRateLimitRPS)
 	}
+	for _, cidr := range c.APITrustedProxyCIDRs {
+		prefix, err := netip.ParsePrefix(cidr)
+		if err != nil || (prefix.Addr().Is4In6() && prefix.Bits() < 96) {
+			return fmt.Errorf("API_TRUSTED_PROXY_CIDRS contains invalid CIDR %q", cidr)
+		}
+	}
 	if c.PrometheusRequired && c.PrometheusURL == "" {
 		return fmt.Errorf("PROMETHEUS_REQUIRED requires PROMETHEUS_URL")
 	}
@@ -1074,6 +1099,23 @@ func (c *Config) Validate() error {
 	}
 
 	// Validate global and per-signal caps
+	if c.AggregateMode != "legacy" {
+		for _, limit := range []struct {
+			name             string
+			tenant, instance int
+		}{
+			{"AGGREGATE_MAX_OPERATION_NAMES", c.AggregateMaxOperationNamesPerTenant, c.AggregateMaxOperationNames},
+			{"AGGREGATE_MAX_METRIC_NAMES", c.AggregateMaxMetricNamesPerTenant, c.AggregateMaxMetricNames},
+			{"AGGREGATE_MAX_LOG_TEMPLATES", c.AggregateMaxLogTemplatesPerTenant, c.AggregateMaxLogTemplates},
+		} {
+			if limit.tenant < 1 || limit.tenant > 1_000_000 {
+				return fmt.Errorf("%s_PER_TENANT must be between 1 and 1000000", limit.name)
+			}
+			if limit.instance < limit.tenant || limit.instance > 10_000_000 {
+				return fmt.Errorf("%s must cover its per-tenant cap and be <= 10000000", limit.name)
+			}
+		}
+	}
 	if c.AggregateMaxSeries < 1 {
 		return fmt.Errorf("AGGREGATE_MAX_SERIES must be >= 1, got %d", c.AggregateMaxSeries)
 	}

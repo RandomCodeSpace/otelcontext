@@ -94,7 +94,8 @@ func TestHostIdentityResolution(t *testing.T) {
 		want  string
 	}{
 		{"service.name wins over host", []*commonpb.KeyValue{stringAttr("host.name", "node-a"), stringAttr("service.name", "checkout")}, "checkout"},
-		{"host.name preferred over host.id", []*commonpb.KeyValue{stringAttr("host.id", "i-0abc"), stringAttr("host.name", "node-a")}, topology.HostPrefix + "node-a"},
+		{"host.id preferred over host.name", []*commonpb.KeyValue{stringAttr("host.id", "i-0abc"), stringAttr("host.name", "node-a")}, topology.HostPrefix + "i-0abc"},
+		{"host.id wins regardless of attribute order", []*commonpb.KeyValue{stringAttr("host.name", "node-a"), stringAttr("host.id", "i-0abc")}, topology.HostPrefix + "i-0abc"},
 		{"host.id when no host.name", []*commonpb.KeyValue{stringAttr("host.id", "i-0abc")}, topology.HostPrefix + "i-0abc"},
 		{"neither keeps unknown-service", []*commonpb.KeyValue{stringAttr("os.type", "linux")}, "unknown-service"},
 		{"empty resource keeps unknown-service", nil, "unknown-service"},

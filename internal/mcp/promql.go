@@ -150,23 +150,3 @@ func promTimestamp(v string) (float64, error) {
 	}
 	return n, nil
 }
-
-func boundedInt(args map[string]any, key string, def, lo, hi int) (int, error) {
-	raw, exists := args[key]
-	if !exists {
-		return def, nil
-	}
-	var n float64
-	switch v := raw.(type) {
-	case float64:
-		n = v
-	case int:
-		n = float64(v)
-	default:
-		return 0, fmt.Errorf("%s must be an integer", key)
-	}
-	if math.IsNaN(n) || math.IsInf(n, 0) || n != math.Trunc(n) || n < float64(lo) || n > float64(hi) {
-		return 0, fmt.Errorf("%s must be between %d and %d", key, lo, hi)
-	}
-	return int(n), nil
-}

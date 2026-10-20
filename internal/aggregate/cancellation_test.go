@@ -3,6 +3,7 @@ package aggregate
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
@@ -132,6 +133,15 @@ func TestVisitStoreSketchesCancelsAndJoinsSiblingReads(t *testing.T) {
 }
 
 func TestSQLiteSumBucketsPoolWaitHonorsCancellation(t *testing.T) {
+	for _, by := range []GroupBy{0, GroupByWindow} {
+		t.Run(fmt.Sprint(by), func(t *testing.T) {
+			testSQLiteSumBucketsPoolWaitCancellation(t, by)
+		})
+	}
+}
+
+func testSQLiteSumBucketsPoolWaitCancellation(t *testing.T, by GroupBy) {
+	t.Helper()
 	store := newTestStoreAt(t, filepath.Join(t.TempDir(), "aggregate.db"), StoreConfig{ReadPoolSize: 1})
 	held, err := store.reader.Conn(context.Background())
 	if err != nil {
@@ -142,7 +152,7 @@ func TestSQLiteSumBucketsPoolWaitHonorsCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() {
-		_, err := store.SumBuckets(ctx, Selector{TenantID: 1, Start: 300, End: 600}, 0)
+		_, err := store.SumBuckets(ctx, Selector{TenantID: 1, Start: 300, End: 600}, by)
 		result <- err
 	}()
 

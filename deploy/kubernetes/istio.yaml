@@ -1,0 +1,60 @@
+apiVersion: networking.istio.io/v1
+kind: Gateway
+metadata:
+  name: otelcontext
+spec:
+  # Operator value: match labels of the installed ingress gateway workload.
+  selector:
+    istio: replace-with-ingress-selector
+  servers:
+    - port: {number: 80, name: http, protocol: HTTP}
+      hosts: [replace-with-hostname.invalid]
+      tls:
+        httpsRedirect: true
+    - port: {number: 443, name: https, protocol: HTTPS}
+      hosts: [replace-with-hostname.invalid]
+      tls:
+        mode: SIMPLE
+        minProtocolVersion: TLSV1_2
+        # Existing TLS secret in the ingress gateway workload's namespace.
+        credentialName: replace-with-tls-secret
+---
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: otelcontext
+spec:
+  hosts: [replace-with-hostname.invalid]
+  gateways: [otelcontext]
+  http:
+    - name: otlp-grpc
+      match:
+        - port: 443
+          uri: {prefix: /opentelemetry.proto.collector.}
+      route:
+        - destination:
+            host: otelcontext
+            port: {number: 4317}
+      timeout: 30s
+      retries: {attempts: 0}
+    - name: otlp-http
+      match:
+        - port: 443
+          uri: {prefix: /v1/}
+      route:
+        - destination:
+            host: otelcontext
+            port: {number: 4318}
+      timeout: 30s
+      retries: {attempts: 0}
+    - name: mcp-ui-and-read-apis
+      match:
+        - port: 443
+          uri: {prefix: /}
+      route:
+        - destination:
+            host: otelcontext
+            port: {number: 8080}
+      # SSE and WebSockets need long-lived streams. Query work is bounded upstream.
+      timeout: 0s
+      retries: {attempts: 0}

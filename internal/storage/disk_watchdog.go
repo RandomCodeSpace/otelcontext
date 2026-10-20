@@ -2,8 +2,12 @@ package storage
 
 import (
 	"context"
+	"io/fs"
 	"log/slog"
 	"math"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -13,12 +17,10 @@ import (
 
 // Disk watchdog with staged shedding and hysteresis (#201 Q5).
 //
-// The 8 GiB data budget (#201 Q1) is a promise about a volume, not about a
-// table. Per-component gauges attribute what is on disk; the ENFORCEMENT
-// number is statfs on the data directory, because that is the only figure
-// that also counts WAL frames, SQLite temp files, free pages the file has not
-// given back, and anything else sharing the volume. A budget enforced against
-// summed file sizes is a budget that reports 60% while write() returns ENOSPC.
+// The application budget and filesystem availability are separate constraints.
+// Production samples the data directory (including WAL, temp and free database
+// pages) against its budget, and also reserves free filesystem headroom. Other
+// applications sharing a PVC filesystem must not consume this app's budget.
 //
 // What shedding does NOT do: it never converts a successful aggregate Export
 // into a retryable failure. Aggregate accounting is complete telemetry; raw
@@ -63,8 +65,7 @@ func (d DiskUsage) UsedBytes() int64 {
 // DiskWatchdogConfig configures a watchdog. Stat defaults to the platform
 // statfs; tests inject a fake.
 type DiskWatchdogConfig struct {
-	// Path is any path on the data volume. statfs reports the filesystem, not
-	// the path, so the data directory and the DB file give the same answer.
+	// Path contains all local application data covered by BudgetBytes.
 	Path string
 	// BudgetBytes is DATA_DISK_BUDGET_MB expressed in bytes.
 	BudgetBytes int64
@@ -72,6 +73,9 @@ type DiskWatchdogConfig struct {
 	Interval time.Duration
 	// Stat overrides the platform statfs. nil uses the real one.
 	Stat func(path string) (DiskUsage, error)
+	// DataUsage measures application bytes. Nil retains volume-only behavior
+	// for callers that intentionally dedicate the entire filesystem.
+	DataUsage func(path string) (int64, error)
 	// Metrics receives the disk gauges. nil is a no-op.
 	Metrics *telemetry.Metrics
 	// OnRawOff fires once on every transition INTO SheddingRawOff. It is where
@@ -90,12 +94,13 @@ type diskComponent struct {
 
 // DiskWatchdog samples the data volume and publishes a shedding state.
 type DiskWatchdog struct {
-	path     string
-	budget   int64
-	interval time.Duration
-	stat     func(string) (DiskUsage, error)
-	metrics  *telemetry.Metrics
-	onRawOff func()
+	path      string
+	budget    int64
+	interval  time.Duration
+	stat      func(string) (DiskUsage, error)
+	dataUsage func(string) (int64, error)
+	metrics   *telemetry.Metrics
+	onRawOff  func()
 
 	state atomic.Int32 // SheddingState
 	ratio atomic.Uint64
@@ -123,13 +128,14 @@ func NewDiskWatchdog(cfg DiskWatchdogConfig) *DiskWatchdog {
 		cfg.Path = "."
 	}
 	return &DiskWatchdog{
-		path:     cfg.Path,
-		budget:   cfg.BudgetBytes,
-		interval: cfg.Interval,
-		stat:     cfg.Stat,
-		metrics:  cfg.Metrics,
-		onRawOff: cfg.OnRawOff,
-		done:     make(chan struct{}),
+		path:      cfg.Path,
+		budget:    cfg.BudgetBytes,
+		interval:  cfg.Interval,
+		stat:      cfg.Stat,
+		dataUsage: cfg.DataUsage,
+		metrics:   cfg.Metrics,
+		onRawOff:  cfg.OnRawOff,
+		done:      make(chan struct{}),
 	}
 }
 
@@ -234,9 +240,28 @@ func (w *DiskWatchdog) Sample() SheddingState {
 
 	ceiling := w.ceiling(u)
 	used := u.UsedBytes()
+	usageFailed := false
+	if w.dataUsage != nil {
+		used, err = w.dataUsage(w.path)
+		if err != nil {
+			slog.Warn("disk watchdog: data usage failed, preserving application estimate", "path", w.path, "error", err)
+			used = w.used.Load()
+			usageFailed = true
+		}
+	}
 	ratio := 0.0
 	if ceiling > 0 {
 		ratio = float64(used) / float64(ceiling)
+		if w.dataUsage != nil {
+			// Enter raw-off when available space falls below 5% of this
+			// budget, even if another application filled the filesystem.
+			ratio = math.Max(ratio, 1-float64(u.AvailBytes)/float64(ceiling))
+		}
+	}
+	if usageFailed {
+		// An unavailable directory sample cannot clear existing pressure or
+		// suppress a successful statfs measurement of physical exhaustion.
+		ratio = math.Max(ratio, w.UsedRatio())
 	}
 	w.used.Store(used)
 	w.ratio.Store(math.Float64bits(ratio))
@@ -264,6 +289,97 @@ func (w *DiskWatchdog) Sample() SheddingState {
 		w.onRawOff()
 	}
 	return next
+}
+
+// DirectoryDataBytes counts regular files without following symlinks. Logical
+// sizes conservatively include sparse allocations and SQLite's reusable pages.
+// Files removed during a walk (e.g. a checkpointed WAL) may be skipped.
+func DirectoryDataBytes(path string) (int64, error) {
+	var total int64
+	err := filepath.WalkDir(path, func(name string, entry fs.DirEntry, walkErr error) error {
+		// ext4 creates a root-owned recovery directory on a fresh PVC.
+		// It is filesystem metadata, not application data; statfs still
+		// accounts for its effect on available space.
+		if name == filepath.Join(path, "lost+found") && entry != nil && entry.IsDir() {
+			return filepath.SkipDir
+		}
+		if walkErr != nil {
+			if name != path && os.IsNotExist(walkErr) {
+				return nil
+			}
+			return walkErr
+		}
+		if entry.Type().IsRegular() {
+			info, err := entry.Info()
+			if os.IsNotExist(err) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			if info.Size() > math.MaxInt64-total {
+				total = math.MaxInt64
+			} else {
+				total += info.Size()
+			}
+		}
+		return nil
+	})
+	return total, err
+}
+
+// ApplicationDataBytes includes explicitly configured data outside the main
+// directory, without charging overlapping paths twice. Missing optional files
+// (notably WAL/SHM sidecars) are normal. Configured root symlinks are resolved;
+// arbitrary links inside a directory are not followed.
+func ApplicationDataBytes(path string, additional ...string) (int64, error) {
+	paths := append([]string{path}, additional...)
+	roots := make([]string, 0, len(paths))
+	for i, p := range paths {
+		if p == "" {
+			continue
+		}
+		resolved, err := filepath.EvalSymlinks(p)
+		if err != nil {
+			if i > 0 && os.IsNotExist(err) {
+				continue
+			}
+			return 0, err
+		}
+		resolved, err = filepath.Abs(resolved)
+		if err != nil {
+			return 0, err
+		}
+		covered := false
+		for _, root := range roots {
+			if resolved == root || strings.HasPrefix(resolved, root+string(filepath.Separator)) {
+				covered = true
+				break
+			}
+		}
+		if covered {
+			continue
+		}
+		kept := roots[:0]
+		for _, root := range roots {
+			if !strings.HasPrefix(root, resolved+string(filepath.Separator)) {
+				kept = append(kept, root)
+			}
+		}
+		roots = append(kept, resolved)
+	}
+	var total int64
+	for _, root := range roots {
+		n, err := DirectoryDataBytes(root)
+		if err != nil {
+			return 0, err
+		}
+		if n > math.MaxInt64-total {
+			return math.MaxInt64, nil
+		}
+		total += n
+	}
+	return total, nil
 }
 
 // notify fans the new state out to observers under a snapshot of the slice, so

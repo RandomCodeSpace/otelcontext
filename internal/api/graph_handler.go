@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/RandomCodeSpace/otelcontext/internal/aggregate"
 	"github.com/RandomCodeSpace/otelcontext/internal/latency"
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
 	"github.com/RandomCodeSpace/otelcontext/internal/topology"
@@ -67,12 +68,13 @@ type SystemGraphResponse struct {
 	Nodes     []GraphNode   `json:"nodes"`
 	Edges     []GraphEdge   `json:"edges"`
 
-	Source       string `json:"source,omitempty"`
-	Coverage     string `json:"coverage,omitempty"`
-	CoverageNote string `json:"coverage_note,omitempty"`
-	Epoch        string `json:"epoch,omitempty"`
-	Revision     uint64 `json:"revision,omitempty"`
-	Truncated    bool   `json:"truncated,omitempty"`
+	Source           string                      `json:"source,omitempty"`
+	Coverage         string                      `json:"coverage,omitempty"`
+	CoverageNote     string                      `json:"coverage_note,omitempty"`
+	IdentityCoverage *aggregate.IdentityCoverage `json:"identity_coverage,omitempty"`
+	Epoch            string                      `json:"epoch,omitempty"`
+	Revision         uint64                      `json:"revision,omitempty"`
+	Truncated        bool                        `json:"truncated,omitempty"`
 
 	DroppedServices   uint64 `json:"dropped_services,omitempty"`
 	DroppedOperations uint64 `json:"dropped_operations,omitempty"`
@@ -188,6 +190,7 @@ func buildGraphFromTopology(snapshot topology.Snapshot) *SystemGraphResponse {
 		resp.Source = string(snapshot.Meta.Source)
 		resp.Coverage = snapshot.Meta.Coverage
 		resp.CoverageNote = snapshot.Meta.CoverageNote
+		resp.IdentityCoverage = &snapshot.Meta.IdentityCoverage
 		resp.Epoch = snapshot.Meta.Epoch
 		resp.Revision = snapshot.Meta.Revision
 		resp.Truncated = snapshot.Meta.Truncated

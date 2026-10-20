@@ -343,9 +343,8 @@ type Metrics struct {
 	// of DATA_DISK_BUDGET_MB and the usable volume capacity. A volume smaller
 	// than the configured budget does not grow because the config says so.
 	DiskBudgetBytes prometheus.Gauge
-	// DiskUsedBytes / DiskUsedRatio — statfs allocation on the data volume and
-	// its fraction of DiskBudgetBytes. This pair, not summed file sizes, is
-	// what the shedding ladder reads.
+	// DiskUsedBytes is application data size. DiskUsedRatio is the larger of
+	// application budget occupancy and filesystem free-space pressure.
 	DiskUsedBytes prometheus.Gauge
 	DiskUsedRatio prometheus.Gauge
 	// DiskComponentBytes / DiskComponentHighWaterBytes — per-tier attribution
@@ -829,11 +828,11 @@ func New() *Metrics {
 	})
 	m.DiskUsedBytes = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "otelcontext_disk_used_bytes",
-		Help: "statfs allocation on the data volume in bytes.",
+		Help: "Application data directory bytes, including database free pages and WAL sidecars.",
 	})
 	m.DiskUsedRatio = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "otelcontext_disk_used_ratio",
-		Help: "Data volume allocation as a fraction of the enforcement ceiling. Shedding starts at 0.90, raw-off at 0.95.",
+		Help: "Maximum of application bytes/budget and 1-filesystem available bytes/budget. Shedding starts at 0.90, raw-off at 0.95.",
 	})
 	m.DiskComponentBytes = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "otelcontext_disk_component_bytes",

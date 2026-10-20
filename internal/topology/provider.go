@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/RandomCodeSpace/otelcontext/internal/aggregate"
 	"github.com/RandomCodeSpace/otelcontext/internal/latency"
 )
 
@@ -50,10 +51,11 @@ type Metadata struct {
 	Revision     uint64    `json:"revision,omitempty"`
 	Truncated    bool      `json:"truncated,omitempty"`
 
-	DroppedServices   uint64 `json:"dropped_services,omitempty"`
-	DroppedOperations uint64 `json:"dropped_operations,omitempty"`
-	DroppedEdges      uint64 `json:"dropped_edges,omitempty"`
-	DroppedMetrics    uint64 `json:"dropped_metrics,omitempty"`
+	DroppedServices   uint64                     `json:"dropped_services,omitempty"`
+	DroppedOperations uint64                     `json:"dropped_operations,omitempty"`
+	DroppedEdges      uint64                     `json:"dropped_edges,omitempty"`
+	DroppedMetrics    uint64                     `json:"dropped_metrics,omitempty"`
+	IdentityCoverage  aggregate.IdentityCoverage `json:"identity_coverage"`
 }
 
 // Identity returns the ordering pair carried by this metadata.

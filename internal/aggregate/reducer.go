@@ -243,6 +243,15 @@ func (r *Reducer) delta(key SeriesKey, window int64) *AggregateDelta {
 // topology projection. Repeated calls for the same key are idempotent.
 func (r *Reducer) identify(key SeriesKey, window int64, id topoIdentity) {
 	swk := SeriesWindowKey{Key: key, WindowStart: window}
+	if _, exists := r.ids[swk]; exists {
+		return
+	}
+	// Distinct raw names can already share a dictionary overflow ID. Resolve
+	// the canonical identity once per reduced series instead of attributing
+	// all of its points to whichever raw name happened to arrive last.
+	if canonical, ok := r.eng.topoIdentityFor(key); ok {
+		id = canonical
+	}
 	if r.ids == nil {
 		r.ids = make(map[SeriesWindowKey]topoIdentity, 8)
 	}
@@ -251,7 +260,21 @@ func (r *Reducer) identify(key SeriesKey, window int64, id topoIdentity) {
 
 // topologyIDs returns the reducer's identity map. The engine folds it into the
 // topology projection after a successful apply.
-func (r *Reducer) topologyIDs() map[SeriesWindowKey]topoIdentity { return r.ids }
+func (r *Reducer) topologyIDs() map[SeriesWindowKey]topoIdentity {
+	for swk := range r.ids {
+		key, ok := r.eng.limiter.admittedKey(swk.Key, swk.WindowStart)
+		if !ok {
+			delete(r.ids, swk)
+			continue
+		}
+		if key != swk.Key {
+			if canonical, ok := r.eng.topoIdentityFor(key); ok {
+				r.ids[swk] = canonical
+			}
+		}
+	}
+	return r.ids
+}
 
 // admitPoint applies the window/lateness rules and updates the per-signal
 // counters. It reports ok=false when the point is excluded.
@@ -419,6 +442,7 @@ func (r *Reducer) ReduceLog(in LogInput) {
 	}
 	isError := tier >= SeverityTierError
 	r.delta(key, window).ObserveLog(in.Timestamp, isError)
+	r.identify(key, window, topoIdentity{Kind: topoLog, Tenant: in.Tenant, A: in.Service})
 	r.stats.Accepted[SignalLog]++
 	if isError {
 		r.countError(in.Service)

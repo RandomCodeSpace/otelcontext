@@ -1,0 +1,42 @@
+global:
+  scrape_interval: 30s
+  scrape_timeout: 10s
+  metric_name_validation_scheme: utf8
+
+otlp:
+  # Preserve host UI metric names. Queries must quote dotted labels/names.
+  # Producers must not reuse one name with different units or metric types.
+  translation_strategy: NoTranslation
+  keep_identifying_resource_attributes: true
+  promote_resource_attributes:
+    - service.name
+    - service.namespace
+    - service.instance.id
+    - service.version
+    - host.name
+    - host.id
+    - cloud.availability_zone
+    - cloud.region
+    - container.name
+    - deployment.environment.name
+    - k8s.cluster.name
+    - k8s.namespace.name
+    - k8s.pod.name
+    - k8s.pod.uid
+    - k8s.container.name
+    - k8s.deployment.name
+    - k8s.statefulset.name
+    - k8s.daemonset.name
+    - k8s.replicaset.name
+    - k8s.job.name
+    - k8s.cronjob.name
+
+storage:
+  tsdb:
+    out_of_order_time_window: 30m
+
+# Operational self-metrics only. Customer metrics arrive through native OTLP.
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: [localhost:9090]

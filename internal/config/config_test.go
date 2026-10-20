@@ -57,6 +57,12 @@ func baseValid() *Config {
 		AggregateSeriesPerTenantFraction:       0,
 		AggregateMaxProducerBaselinesPerSeries: 8,
 		AggregateMaxBaselines:                  0,
+		AggregateMaxOperationNamesPerTenant:    10000,
+		AggregateMaxOperationNames:             100000,
+		AggregateMaxMetricNamesPerTenant:       5000,
+		AggregateMaxMetricNames:                50000,
+		AggregateMaxLogTemplatesPerTenant:      5000,
+		AggregateMaxLogTemplates:               50000,
 		// Durable aggregate store defaults (#173)
 		AggregateDBPath:                 "./data/aggregate.db",
 		AggregateSynchronous:            "NORMAL",

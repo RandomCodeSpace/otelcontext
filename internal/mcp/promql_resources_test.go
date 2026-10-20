@@ -163,6 +163,127 @@ func TestPromQLCallTimeoutAndConcurrency(t *testing.T) {
 	<-srv.callSlots
 }
 func TestResourceListReadAndBounds(t *testing.T) {
+	p := &rangeTopology{}
+	srv := New("alpha", nil, nil, p)
+	listed := rpcRequest(t, srv, "resources/list", nil, "")
+	data, _ := json.Marshal(listed.Result)
+	if strings.Contains(string(data), `"uri":"OtelContext://metrics/prometheus"`) {
+		t.Fatal("unreadable scrape resource advertised")
+	}
+	out := rpcRequest(t, srv, "resources/read", map[string]any{"uri": resourceURIPrefix + "system/graph"}, "")
+	if out.Error != nil {
+		t.Fatalf("read failed: %+v", out.Error)
+	}
+	var body struct {
+		Contents []Resource `json:"contents"`
+	}
+	data, _ = json.Marshal(out.Result)
+	if err := json.Unmarshal(data, &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Contents) != 1 || !strings.Contains(body.Contents[0].Text, "old-service") || p.tenants[0] != "alpha" {
+		t.Fatalf("bad resource: %+v", body)
+	}
+	deadline := time.Now().Add(time.Second)
+	for srv.Stats().InFlight != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if srv.Stats().InFlight != 0 {
+		t.Fatal("timed out call did not release its slot")
+	}
+	srv.SetCacheTTL(0)
+	srv.SetCallLimit(1)
+	srv.callSlots <- struct{}{}
+	overloaded := rpcRequest(t, srv, "resources/read", map[string]any{"uri": resourceURIPrefix + "system/graph"}, "")
+	if overloaded.Error == nil || overloaded.Error.Code != ErrServerOverloaded {
+		t.Fatalf("resource bypassed call cap: %+v", overloaded)
+	}
+	<-srv.callSlots
+	unknown := rpcRequest(t, srv, "resources/read", map[string]any{"uri": "OtelContext://metrics/prometheus"}, "")
+	if unknown.Error == nil {
+		t.Fatal("unknown URI succeeded")
+	}
+	huge := &fakeMCPTopologyProvider{snapshot: topology.Snapshot{Nodes: []topology.Node{{Name: strings.Repeat("x", MaxToolResponseBytes+1)}}}}
+	srv = New("alpha", nil, nil, huge)
+	capped := rpcRequest(t, srv, "resources/read", map[string]any{"uri": resourceURIPrefix + "system/graph"}, "")
+	if capped.Error == nil {
+		t.Fatal("resource exceeded response cap")
+	}
+}
+
+func TestPromQLRangeDoesNotCache(t *testing.T) {
+	backend := &fakePromQL{raw: json.RawMessage(`{"status":"success","data":{"resultType":"matrix","result":[]}}`)}
+	srv := New("default", nil, nil, nil)
+	srv.SetPromQLQuerier(backend, "default")
+	args := map[string]any{"query": "up", "start": "1791700000", "end": "1791700060", "step": "1s"}
+	for i := 0; i < 2; i++ {
+		res := decodeRPCResult(t, rpcRequest(t, srv, "tools/call", ToolCallParams{Name: "promql_query_range", Arguments: args}, ""))
+		if res.IsError {
+			t.Fatalf("range failed: %+v", res)
+		}
+	}
+	if backend.calls != 2 || srv.Stats().CacheHits != 0 || srv.cache.Stats() != 0 {
+		t.Fatalf("range query was cached: backend calls=%d stats=%+v", backend.calls, srv.Stats())
+	}
+}
+
+func TestPromQLDiscoveryAndDisabledBackend(t *testing.T) {
+	srv := New("default", nil, nil, nil)
+	out := rpcRequest(t, srv, "tools/list", nil, "")
+	data, _ := json.Marshal(out.Result)
+	var listed struct {
+		Tools []Tool `json:"tools"`
+	}
+	if err := json.Unmarshal(data, &listed); err != nil {
+		t.Fatal(err)
+	}
+	if out.Error != nil || len(listed.Tools) != 10 {
+		t.Fatalf("tool discovery: %+v", out)
+	}
+	for _, name := range []string{"promql_query", "promql_query_range"} {
+		found := false
+		for _, tool := range listed.Tools {
+			if tool.Name == name {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("missing tool %s", name)
+		}
+		res := decodeRPCResult(t, rpcRequest(t, srv, "tools/call", ToolCallParams{Name: name}, ""))
+		if !res.IsError || !strings.Contains(res.Content[0].Text, "not configured") {
+			t.Fatalf("disabled %s: %+v", name, res)
+		}
+	}
+}
+
+type deadlineResourceTopology struct{ fakeMCPTopologyProvider }
+
+func (*deadlineResourceTopology) Snapshot(ctx context.Context, _ topology.Query) (topology.Snapshot, error) {
+	<-ctx.Done()
+	return topology.Snapshot{}, ctx.Err()
+}
+
+func TestResourceReadRespectsDeadline(t *testing.T) {
+	g := graphrag.New(nil, nil, nil, graphrag.DefaultConfig())
+	srv := New("default", nil, nil, &deadlineResourceTopology{})
+	srv.SetGraphRAG(g)
+	srv.SetAggregateMode(true)
+	srv.SetCallTimeout(10 * time.Millisecond)
+	out := rpcRequest(t, srv, "resources/read", map[string]any{"uri": resourceURIPrefix + "system/graph"}, "")
+	if out.Error == nil || (out.Error.Code != ErrCallTimeout && out.Error.Code != ErrInternalError) {
+		t.Fatalf("resource deadline not enforced: %+v", out)
+	}
+	deadline := time.Now().Add(time.Second)
+	for srv.Stats().InFlight != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if srv.Stats().InFlight != 0 {
+		t.Fatal("resource deadline left slot held")
+	}
+}
+
+func TestLegacyResourceListReadAndBounds(t *testing.T) {
 	g := graphrag.New(nil, nil, nil, graphrag.DefaultConfig())
 	g.ObserveSpanTopology("alpha", "trace", "span-alpha", "", "alpha-service")
 	g.ObserveSpanTopology("beta", "trace", "span-beta", "", "beta-service")
@@ -212,77 +333,5 @@ func TestResourceListReadAndBounds(t *testing.T) {
 	capped := rpcRequest(t, srv, "resources/read", map[string]any{"uri": resourceURIPrefix + "system/graph"}, "")
 	if capped.Error == nil {
 		t.Fatal("resource exceeded response cap")
-	}
-}
-
-func TestPromQLRangeDoesNotCache(t *testing.T) {
-	backend := &fakePromQL{raw: json.RawMessage(`{"status":"success","data":{"resultType":"matrix","result":[]}}`)}
-	srv := New("default", nil, nil, nil)
-	srv.SetPromQLQuerier(backend, "default")
-	args := map[string]any{"query": "up", "start": "1791700000", "end": "1791700060", "step": "1s"}
-	for i := 0; i < 2; i++ {
-		res := decodeRPCResult(t, rpcRequest(t, srv, "tools/call", ToolCallParams{Name: "promql_query_range", Arguments: args}, ""))
-		if res.IsError {
-			t.Fatalf("range failed: %+v", res)
-		}
-	}
-	if backend.calls != 2 || srv.Stats().CacheHits != 0 || srv.cache.Stats() != 0 {
-		t.Fatalf("range query was cached: backend calls=%d stats=%+v", backend.calls, srv.Stats())
-	}
-}
-
-func TestPromQLDiscoveryAndDisabledBackend(t *testing.T) {
-	srv := New("default", nil, nil, nil)
-	out := rpcRequest(t, srv, "tools/list", nil, "")
-	data, _ := json.Marshal(out.Result)
-	var listed struct {
-		Tools []Tool `json:"tools"`
-	}
-	if err := json.Unmarshal(data, &listed); err != nil {
-		t.Fatal(err)
-	}
-	if out.Error != nil || len(listed.Tools) != 9 {
-		t.Fatalf("tool discovery: %+v", out)
-	}
-	for _, name := range []string{"promql_query", "promql_query_range"} {
-		found := false
-		for _, tool := range listed.Tools {
-			if tool.Name == name {
-				found = true
-			}
-		}
-		if !found {
-			t.Fatalf("missing tool %s", name)
-		}
-		res := decodeRPCResult(t, rpcRequest(t, srv, "tools/call", ToolCallParams{Name: name}, ""))
-		if !res.IsError || !strings.Contains(res.Content[0].Text, "not configured") {
-			t.Fatalf("disabled %s: %+v", name, res)
-		}
-	}
-}
-
-type deadlineResourceTopology struct{ fakeMCPTopologyProvider }
-
-func (*deadlineResourceTopology) Snapshot(ctx context.Context, _ topology.Query) (topology.Snapshot, error) {
-	<-ctx.Done()
-	return topology.Snapshot{}, ctx.Err()
-}
-
-func TestResourceReadRespectsDeadline(t *testing.T) {
-	g := graphrag.New(nil, nil, nil, graphrag.DefaultConfig())
-	srv := New("default", nil, nil, &deadlineResourceTopology{})
-	srv.SetGraphRAG(g)
-	srv.SetAggregateMode(true)
-	srv.SetCallTimeout(10 * time.Millisecond)
-	out := rpcRequest(t, srv, "resources/read", map[string]any{"uri": resourceURIPrefix + "system/graph"}, "")
-	if out.Error == nil || (out.Error.Code != ErrCallTimeout && out.Error.Code != ErrInternalError) {
-		t.Fatalf("resource deadline not enforced: %+v", out)
-	}
-	deadline := time.Now().Add(time.Second)
-	for srv.Stats().InFlight != 0 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-	if srv.Stats().InFlight != 0 {
-		t.Fatal("resource deadline left slot held")
 	}
 }

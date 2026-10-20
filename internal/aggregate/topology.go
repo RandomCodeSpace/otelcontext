@@ -194,10 +194,11 @@ type TopologySnapshot struct {
 
 	// Dropped* count facts refused by the projection caps since startup.
 	// Non-zero means the topology is truncated and must be presented as such.
-	DroppedServices   uint64 `json:"dropped_services,omitempty"`
-	DroppedOperations uint64 `json:"dropped_operations,omitempty"`
-	DroppedEdges      uint64 `json:"dropped_edges,omitempty"`
-	DroppedMetrics    uint64 `json:"dropped_metrics,omitempty"`
+	DroppedServices   uint64           `json:"dropped_services,omitempty"`
+	DroppedOperations uint64           `json:"dropped_operations,omitempty"`
+	DroppedEdges      uint64           `json:"dropped_edges,omitempty"`
+	DroppedMetrics    uint64           `json:"dropped_metrics,omitempty"`
+	IdentityCoverage  IdentityCoverage `json:"identity_coverage"`
 }
 
 // Truncated reports whether any projection cap has refused a fact for this
@@ -226,10 +227,12 @@ const (
 	topoEdge
 	// topoMetric is a (service, metric) series.
 	topoMetric
+	// Logs contribute identity-loss accounting without becoming graph nodes.
+	topoLog
 )
 
 // topoIdentity is the string identity of one reduced series, recorded by the
-// reducer alongside its delta so the projection never reverses a dictionary ID.
+// reducer alongside its delta so folding does not need a dictionary lookup.
 type topoIdentity struct {
 	Kind topoKind
 	// Tenant is the tenant name. The series key carries only the interned
@@ -238,20 +241,16 @@ type topoIdentity struct {
 	Tenant string
 	// A is the service for services, operations and metrics, and the CALLER
 	// for edges. B is the operation, metric name, or CALLEE.
-	A string
-	B string
+	A               string
+	B               string
+	IdentityLimited bool
 }
 
 type topoPair struct{ a, b string }
 
-// topoIdentityFor derives the projection identity of a DURABLE series.
-//
-// The fold path never reverses a dictionary ID — the reducer records the
-// identity strings alongside the delta. Startup restore has no reducer to ask,
-// so it reverses IDs here, which is safe for exactly the reason the fold path
-// could not rely on: by the time recovery runs, the durable dictionary is
-// warm. A series whose names no longer resolve is refused rather than folded
-// under an invented name.
+// topoIdentityFor resolves the admitted dictionary identity for live reduction
+// and startup restore. Using canonical names preserves __other__ when distinct
+// raw names share a bounded identity. Unresolvable series are refused.
 func (e *Engine) topoIdentityFor(key SeriesKey) (topoIdentity, bool) {
 	var kind topoKind
 	switch key.Signal {
@@ -261,6 +260,8 @@ func (e *Engine) topoIdentityFor(key SeriesKey) (topoIdentity, bool) {
 		kind = topoEdge
 	case SignalMetric:
 		kind = topoMetric
+	case SignalLog:
+		kind = topoLog
 	default:
 		return topoIdentity{}, false
 	}
@@ -276,7 +277,7 @@ func (e *Engine) topoIdentityFor(key SeriesKey) (topoIdentity, bool) {
 		// service, so it folds as a service-only observation.
 		return topoIdentity{}, false
 	}
-	return topoIdentity{Kind: kind, Tenant: tenant, A: a, B: b}, true
+	return topoIdentity{Kind: kind, Tenant: tenant, A: a, B: b, IdentityLimited: e.identityLimited(key)}, true
 }
 
 type topoWindowState struct {
@@ -317,15 +318,17 @@ type tenantTopology struct {
 	droppedOperations uint64
 	droppedEdges      uint64
 	droppedMetrics    uint64
+	identityByWindow  map[int64]IdentityCoverage
 }
 
 func newTenantTopology() *tenantTopology {
 	return &tenantTopology{
-		services:      make(map[string]*topoEntry),
-		ops:           make(map[topoPair]*topoEntry),
-		edges:         make(map[topoPair]*topoEntry),
-		metrics:       make(map[topoPair]*topoEntry),
-		opsPerService: make(map[string]int),
+		services:         make(map[string]*topoEntry),
+		ops:              make(map[topoPair]*topoEntry),
+		edges:            make(map[topoPair]*topoEntry),
+		metrics:          make(map[topoPair]*topoEntry),
+		opsPerService:    make(map[string]int),
+		identityByWindow: make(map[int64]IdentityCoverage),
 	}
 }
 
@@ -400,6 +403,21 @@ func (p *topologyProjection) retainCutoff(now time.Time) int64 {
 // caps. It reports whether the projection actually changed.
 func (p *topologyProjection) foldOne(tt *tenantTopology, id topoIdentity, window int64, d *AggregateDelta) bool {
 	changed := false
+	if id.IdentityLimited {
+		identity := tt.identityByWindow[window]
+		switch id.Kind {
+		case topoTrace:
+			identity.add(SignalTraceOp, d.Count)
+		case topoEdge:
+			identity.add(SignalServiceEdge, d.Count)
+		case topoMetric:
+			identity.add(SignalMetric, d.Count)
+		case topoLog:
+			identity.add(SignalLog, d.Count)
+		}
+		tt.identityByWindow[window] = identity
+		changed = true
+	}
 	switch id.Kind {
 	case topoTrace:
 		if e, ok := p.serviceEntry(tt, id.A); ok {
@@ -565,6 +583,12 @@ func touchTimes(entry *topoEntry, d *AggregateDelta, window int64) {
 // entities that no longer hold any window. It reports whether the visible
 // replacement changed.
 func (p *topologyProjection) pruneTenantLocked(tt *tenantTopology, cutoff int64) (changed bool) {
+	for window := range tt.identityByWindow {
+		if window < cutoff {
+			delete(tt.identityByWindow, window)
+			changed = true
+		}
+	}
 	for name, e := range tt.services {
 		empty, pruned := pruneEntry(e, cutoff)
 		changed = changed || pruned
@@ -679,6 +703,12 @@ func (p *topologyProjection) Snapshot(tenant string, now time.Time) TopologySnap
 	snap.DroppedOperations = tt.droppedOperations
 	snap.DroppedEdges = tt.droppedEdges
 	snap.DroppedMetrics = tt.droppedMetrics
+	for _, identity := range tt.identityByWindow {
+		snap.IdentityCoverage.TracePoints += identity.TracePoints
+		snap.IdentityCoverage.EdgePoints += identity.EdgePoints
+		snap.IdentityCoverage.MetricPoints += identity.MetricPoints
+		snap.IdentityCoverage.LogPoints += identity.LogPoints
+	}
 
 	snap.Services = make([]TopologyService, 0, len(tt.services))
 	for name, e := range tt.services {

@@ -86,9 +86,9 @@ type RecoverOptions struct {
 const DefaultTopologyRestoreMaxRows = 20000
 
 // topologyRestoreSignals are the durable signals the projection is built from.
-// Log series are absent on purpose: the projection holds no log entities, so
-// reading them would be startup cost with no restored fact to show for it.
-var topologyRestoreSignals = []Signal{SignalTraceOp, SignalServiceEdge, SignalMetric}
+// Logs contribute identity-overflow coverage even though they have no topology
+// entity; restore them so restart does not erase that coverage warning.
+var topologyRestoreSignals = []Signal{SignalTraceOp, SignalServiceEdge, SignalMetric, SignalLog}
 
 // RecoveryGate reports whether startup recovery has completed. The readiness
 // probe holds /ready at 503 until Done() is true.

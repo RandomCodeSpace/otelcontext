@@ -296,8 +296,8 @@ jobs:
             .source_fingerprint == .target_fingerprint and
             .source_surfaces == .target_surfaces and
             .dlq_before == .dlq_after and
-            (.source_surfaces.mcp_tools | length) == 9 and
-            (.source_surfaces.mcp_calls | length) == 9 and
+            (.source_surfaces.mcp_tools | length) == 10 and
+            (.source_surfaces.mcp_calls | length) == 10 and
             (.assertions | length) >= 14 and
             all(.assertions[]; .passed == true)
           ' "${RUNNER_TEMP}/backup-proof/artifacts/${OTELCONTEXT_BACKUP_PROOF_MODE}.json"

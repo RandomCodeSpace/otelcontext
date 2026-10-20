@@ -581,6 +581,9 @@ func main() {
 	burst := flag.String("burst", "", "Burst multiplier and duration (e.g. '2x30s')")
 	duration := flag.Duration("duration", 60*time.Second, "Test duration")
 	insecure := flag.Bool("insecure", true, "Use insecure gRPC connection")
+	caFile := flag.String("tls-ca", "", "Direct engine: PEM CA file for verified TLS (-insecure=false)")
+	serverName := flag.String("tls-server-name", "", "Direct engine: TLS server name override")
+	hosts := flag.Int("hosts", 0, "Direct engine: distribute services across this many mocked hosts (0 disables host attributes)")
 	tenantID := flag.String("tenant-id", "", "x-tenant-id gRPC metadata value (empty = omit)")
 	warmup := flag.Duration("warmup", 5*time.Second, "Stagger window for producer startup")
 	direct := flag.Bool("direct", false, "Use the direct OTLP emission engine (measures per-Export ACK latency; required for the #173 release gates)")
@@ -595,7 +598,7 @@ func main() {
 	if *latencySentinel {
 		ctx, cancel := context.WithTimeout(context.Background(), *callTimeout)
 		defer cancel()
-		if err := emitLatencySentinel(ctx, *endpoint, *tenantID, *insecure, *reportPath); err != nil {
+		if err := emitLatencySentinel(ctx, *endpoint, *tenantID, *insecure, *caFile, *serverName, *reportPath); err != nil {
 			log.Fatalf("latency sentinel: %v", err)
 		}
 		return
@@ -604,8 +607,11 @@ func main() {
 	// Apply profile if set.
 	if *profile != "" {
 		switch *profile {
-		case "aggregate-acceptance":
+		case "aggregate-acceptance", "production-200":
 			*numServices = 150
+			if *profile == "production-200" {
+				*numServices = 200
+			}
 			// ~10k points/s split: 75% spans, 15% logs, 10% metrics = 7500/1500/1000
 			// Over 150 services: 50/10/6.67 per service
 			*rps = 50
@@ -647,7 +653,10 @@ func main() {
 			endpoint:    *endpoint,
 			tenantID:    *tenantID,
 			insecure:    *insecure,
+			caFile:      *caFile,
+			serverName:  *serverName,
 			services:    *numServices,
+			hosts:       *hosts,
 			spanRate:    float64(*rps),
 			logRate:     float64(*logsRate),
 			metricRate:  float64(*metricsRate),
@@ -667,6 +676,9 @@ func main() {
 			log.Fatalf("direct run failed: %v", err)
 		}
 		return
+	}
+	if *caFile != "" || *serverName != "" || *hosts != 0 {
+		log.Fatal("-tls-ca, -tls-server-name and -hosts require -direct")
 	}
 
 	// Suppress default OTel global TracerProvider noise.
