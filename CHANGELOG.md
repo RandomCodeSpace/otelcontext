@@ -20,6 +20,13 @@ This fix targets non-finite input samples. Overflow caused by extreme finite val
 
 ## [Unreleased]
 
+### Changed
+
+- Redesigned the web UI as three full-viewport pages that share one design system: Carbon palette, self-hosted Geist fonts, Lucide icons.
+  - **Overview** (`/`) is the new landing page. It shows a plain-language health summary, KPIs, the services that need attention, a domain map, services by health with per-instance pips, and storage and ingestion figures.
+  - **Service map** (`/service-map`) is a layered view with services, instances and hosts. Focusing a service shows its instances with instance-to-instance call edges and "runs on" links to their hosts.
+  - **Explorer**: the existing GraphRAG application map moved from `/` to `/explorer` and was restyled to match. Its deep links (`?service=`, `?tab=`, `?group=host`) are unchanged apart from the path.
+
 ## [v0.6.5] - 2026-10-20
 
 ### Fixed
