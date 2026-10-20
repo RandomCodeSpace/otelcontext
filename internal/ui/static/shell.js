@@ -129,8 +129,26 @@ export function sparkline(values, { width = 72, height = 24, tone = "ok", label 
   return node;
 }
 
+const pause = (ms, signal) => new Promise((resolve, reject) => {
+  if (signal?.aborted) return reject(signal.reason);
+  const timer = setTimeout(resolve, ms);
+  signal?.addEventListener("abort", () => { clearTimeout(timer); reject(signal.reason); }, { once: true });
+});
+
 // fetchJSON reads a same-origin JSON endpoint and surfaces the server's text on failure.
-export async function fetchJSON(path, { signal, timeoutMs = 10000 } = {}) {
+// 502/504 are retried twice: the server answers 504 while a startup rebuild holds SQLite.
+export async function fetchJSON(path, options = {}) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fetchOnce(path, options);
+    } catch (error) {
+      if (attempt >= 2 || (error.status !== 502 && error.status !== 504)) throw error;
+      await pause(1000 * (attempt + 1), options.signal);
+    }
+  }
+}
+
+async function fetchOnce(path, { signal, timeoutMs = 10000 } = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   const abort = () => controller.abort();

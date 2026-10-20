@@ -110,6 +110,7 @@
   fill: var(--tx-2); font: 400 var(--fs-xs) var(--font-mono); text-anchor: middle;
   paint-order: stroke; stroke: var(--bg-1); stroke-width: 4px; stroke-linejoin: round;
 }
+.atlas-plate { fill: var(--bg-1); }
 .atlas-node { cursor: pointer; }
 .atlas-node:focus { outline: none; }
 .atlas-node:focus-visible .atlas-focus { opacity: 1; }

@@ -87,7 +87,8 @@ function model() {
   const sys = state.data.sys;
   const services = (sys?.nodes || []).filter((n) => n.kind !== "host").map((n) => ({
     name: n.id,
-    tone: toneFromStatus(n.status),
+    // A graph node with no traffic has no measured health; the server scores it 0 ("critical") until metrics arrive.
+    tone: n.metrics?.span_count_1h > 0 || n.metrics?.request_rate_rps > 0 ? toneFromStatus(n.status) : "unk",
     m: n.metrics || {},
     alerts: n.alerts || [],
     hosts: n.hosts || [],
@@ -157,7 +158,11 @@ function renderHeader(m) {
   const healthy = m.services.filter((s) => s.tone === "ok").length;
   const parts = [];
   if (!total) parts.push("No services are reporting yet. Send OTLP traces to see reliability here.");
-  else if (!crit.length && !warn.length) parts.push("All " + plural(total, "service") + " healthy.");
+  else if (!crit.length && !warn.length) {
+    const idle = total - healthy;
+    parts.push(!idle ? "All " + plural(total, "service") + " healthy." : !healthy ? "No traffic observed yet for " + plural(total, "service") + "." :
+      fmtNumber(healthy) + " of " + plural(total, "service") + " healthy; " + fmtNumber(idle) + " reporting no traffic.");
+  }
   else {
     parts.push(fmtNumber(healthy) + " of " + plural(total, "service") + " healthy. ");
     if (crit.length) parts.push(...nameList(crit), (crit.length === 1 ? " is" : " are") + " critical");
@@ -525,6 +530,9 @@ function disc(d) {
   }
   g.append(svg("circle", { r: d.r - 6, class: "atlas-core" }));
   g.append(svg("text", { class: "atlas-count", "dominant-baseline": "central", "font-size": Math.round(Math.max(11, Math.min(16, d.r * 0.42))) }, fmtNumber(d.total)));
+  // A solid plate keeps edges that pass under the label from showing between glyphs.
+  const plate = d.label.length * 6.6 + 8;
+  g.append(svg("rect", { class: "atlas-plate", x: (-plate / 2).toFixed(1), y: d.r + 5, width: plate.toFixed(1), height: 14, rx: 2 }));
   g.append(svg("text", { class: "atlas-label", y: d.r + 15 }, d.label));
   link.append(g);
   return link;
