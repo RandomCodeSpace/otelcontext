@@ -6,8 +6,6 @@
 name: Scorecard supply-chain security
 
 on:
-  push:
-    branches: [main]
   schedule:
     # Mondays 06:00 UTC
     - cron: "0 6 * * 1"

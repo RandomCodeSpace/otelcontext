@@ -4,8 +4,8 @@
 # embedded by Go, so releases do not require a frontend build or detached
 # release commit.
 #
-# The tag is created only when HEAD equals origin/main and every status check
-# that branch protection requires on main reports "success" for that commit.
+# The tag is created only when HEAD equals protected origin/main and the latest
+# push-to-main CI run reports a successful main validation for that exact commit.
 # The tag is annotated, pushed once, and never moved or reused; a failed
 # candidate gets a new version. `--release` creates a DRAFT GitHub release
 # with notes and no artifacts. The release workflow (.github/workflows/
@@ -60,59 +60,11 @@ fi
 
 REPO="$(gh repo view --json nameWithOwner --jq .nameWithOwner)" || fail "cannot resolve the GitHub repository (is gh authenticated?)"
 
-# Every context branch protection requires on main must report "success" for
-# HEAD. Workflow jobs report as check-runs; external analyzers (SonarCloud)
-# report as commit statuses. Missing, pending, skipped, or failed refuses.
-echo "▸ checking required status checks for $SHA on $REPO…"
-required_raw="$(gh api "repos/$REPO/branches/main" --jq '.protection.required_status_checks.contexts[]')" \
-  || fail "cannot read required status checks for main"
-mapfile -t required <<<"$required_raw"
-[ -n "${required[0]:-}" ] || fail "main has no required status checks; refusing to tag unprotected source"
-runs_raw="$(gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100" --paginate \
-  --jq '.check_runs[] | "\(.name)\t\(.status)\t\(.conclusion // "none")"')" \
-  || fail "cannot list check-runs for $SHA"
-statuses_raw="$(gh api "repos/$REPO/commits/$SHA/status" \
-  --jq '.statuses[] | "\(.context)\t\(.state)"')" \
-  || fail "cannot read commit statuses for $SHA"
-mapfile -t runs <<<"$runs_raw"
-mapfile -t statuses <<<"$statuses_raw"
-
-blocked=()
-for ctx in "${required[@]}"; do
-  found=0
-  verdict=""
-  for line in "${runs[@]}"; do
-    [ -n "$line" ] || continue
-    IFS=$'\t' read -r name status conclusion <<<"$line"
-    [ "$name" = "$ctx" ] || continue
-    found=1
-    if [ "$status" != "completed" ]; then
-      verdict="$status"
-    elif [ "$conclusion" != "success" ]; then
-      verdict="$conclusion"
-    fi
-  done
-  for line in "${statuses[@]}"; do
-    [ -n "$line" ] || continue
-    IFS=$'\t' read -r name state <<<"$line"
-    [ "$name" = "$ctx" ] || continue
-    found=1
-    [ "$state" = "success" ] || verdict="$state"
-  done
-  if [ "$found" -eq 0 ]; then
-    verdict="missing"
-  fi
-  if [ -z "$verdict" ]; then
-    echo "  ✓ $ctx"
-  else
-    echo "  ✗ $ctx ($verdict)"
-    blocked+=("$ctx ($verdict)")
-  fi
-done
-if [ "${#blocked[@]}" -gt 0 ]; then
-  fail "refusing to tag $SHA: required check not successful: ${blocked[*]}"
-fi
-echo "✓ all ${#required[@]} required checks succeeded for $SHA"
+# PR gates run before merge. The exact merged source gets the lightweight main
+# validation; full integration proofs run at the tag before publication.
+echo "▸ checking exact-main validation for $SHA on $REPO…"
+GITHUB_REPOSITORY="$REPO" bash scripts/check-release-source.sh "$SHA"
+echo "✓ main validation succeeded for $SHA"
 
 # Release with the same patched toolchain used by CI, without auto-selection.
 export GOTOOLCHAIN=local

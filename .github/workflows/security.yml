@@ -1,30 +1,34 @@
 name: Security (OSS-CLI)
 # OSS-CLI security stack per RAN-53 AC #5 (mirrors codeiq RAN-46 path B).
-# Replaces CodeQL + OWASP Dependency-Check. SonarCloud was originally
-# replaced too but was reinstated as a required external gate on
-# 2026-04-28 (board reversal); it runs via the SonarCloud GitHub App,
-# not as a job in this workflow.
+# CodeQL and SonarCloud are managed by their GitHub integrations.
+# PRs run the secret scan here; the full scanner set runs at release and
+# on scheduled/manual runs.
 #
 # Five independent jobs surface supply-chain and static-analysis signals.
 # All actions SHA-pinned per Scorecard `Pinned-Dependencies`. Top-level
 # `permissions: read-all` per Scorecard `Token-Permissions`; jobs scope up
 # only when needed (gitleaks needs full git history; sbom job uploads).
 on:
-  push:
-    branches: [main]
   pull_request:
     branches: [main]
+  workflow_call:
+  workflow_dispatch:
   schedule:
     - cron: '21 4 * * 1'  # Mondays 04:21 UTC — catch newly-disclosed CVEs
 
 # Workflow-level default: minimum needed for actions/checkout. Each job
 # declares the additional narrow scopes (security-events: write for SARIF
 # uploaders, contents: write for SBOM artifact upload) it actually needs.
+concurrency:
+  group: security-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
 jobs:
   osv-scanner:
+    if: ${{ github.event_name != 'pull_request' }}
     name: OSV-Scanner (SCA)
     runs-on: ubuntu-latest
     permissions:
@@ -51,6 +55,7 @@ jobs:
         run: ./osv-scanner --lockfile=go.mod
 
   trivy:
+    if: ${{ github.event_name != 'pull_request' }}
     name: Trivy (filesystem + container scan)
     runs-on: ubuntu-latest
     permissions:
@@ -66,6 +71,7 @@ jobs:
           ignore-unfixed: true
 
   semgrep:
+    if: ${{ github.event_name != 'pull_request' }}
     name: Semgrep (SAST)
     runs-on: ubuntu-latest
     permissions:
@@ -117,6 +123,7 @@ jobs:
         run: ./gitleaks detect --source . --redact --no-banner --exit-code 1
 
   sbom:
+    if: ${{ github.event_name != 'pull_request' }}
     name: SBOM (SPDX + CycloneDX)
     runs-on: ubuntu-latest
     permissions:

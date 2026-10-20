@@ -24,6 +24,27 @@ import (
 // exact name or by the suffix after the last " / ".
 var requiredLimitedProductionJobs = []string{
 	"source identity",
+	"race tests",
+	"topology proof · legacy",
+	"topology proof · aggregate-shadow",
+	"topology proof · aggregate",
+	"latency proof · legacy",
+	"latency proof · aggregate-shadow",
+	"latency proof · aggregate",
+	"shutdown proof · legacy",
+	"shutdown proof · aggregate-shadow",
+	"shutdown proof · aggregate",
+	"backup proof · legacy",
+	"backup proof · aggregate-shadow",
+	"backup proof · aggregate",
+	"database backup proof · postgres-16",
+	"database backup proof · mysql-8.4",
+	"database backup proof · sqlserver-2022",
+	"OSV-Scanner (SCA)",
+	"Trivy (filesystem + container scan)",
+	"Semgrep (SAST)",
+	"Gitleaks (secret scan)",
+	"SBOM (SPDX + CycloneDX)",
 	"verify signed assets",
 	"database proof · sqlite",
 	"database proof · postgres-16",
@@ -350,10 +371,17 @@ func limitedProductionFailures(tag, sha string, source sourceIdentity, assets re
 	if source.RefType != "tag" {
 		failures = append(failures, fmt.Sprintf("source: ref_type %q is not \"tag\"", source.RefType))
 	}
+	mainValidated := false
 	for _, check := range source.RequiredChecks {
+		if check.Name == "main validation" && check.Conclusion == "success" {
+			mainValidated = true
+		}
 		if check.Conclusion != "success" {
 			failures = append(failures, fmt.Sprintf("required check %q conclusion %s", check.Name, orMissing(check.Conclusion)))
 		}
+	}
+	if !mainValidated {
+		failures = append(failures, "source: successful main validation missing")
 	}
 	if assets.Tag != tag {
 		failures = append(failures, fmt.Sprintf("release assets: tag %q does not match candidate tag %q", assets.Tag, tag))

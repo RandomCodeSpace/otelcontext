@@ -179,12 +179,9 @@ func TestManifestBlocked(t *testing.T) {
 			name: "failed required check",
 			overrides: func(t *testing.T) map[string]string {
 				return map[string]string{"source": rewriteJSON(t, filepath.Join(fixture, "source-identity-v1.json"), func(doc map[string]any) {
-					for _, c := range doc["required_checks"].([]any) {
-						check := c.(map[string]any)
-						if check["name"] == "SonarCloud Code Analysis" {
-							check["conclusion"] = "failure"
-						}
-					}
+					doc["required_checks"] = append(doc["required_checks"].([]any), map[string]any{
+						"name": "SonarCloud Code Analysis", "conclusion": "failure",
+					})
 				})}
 			},
 			want: `required check "SonarCloud Code Analysis" conclusion failure`,
@@ -240,6 +237,52 @@ func TestManifestBlocked(t *testing.T) {
 				t.Fatalf("blocking_failures = %q, want exactly [%q]", lp.BlockingFailures, tc.want)
 			}
 		})
+	}
+}
+
+// Every moved check must still block publication. Testing the complete required
+// set catches omissions when a matrix or reusable workflow changes.
+func TestManifestRequiredJobsFailClosed(t *testing.T) {
+	var source sourceIdentity
+	var assets releaseAssetsSummary
+	for name, target := range map[string]any{
+		"source-identity-v1.json": &source, "release-assets-v1.json": &assets,
+	} {
+		data, err := os.ReadFile(filepath.Join("testdata", "dry-run", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(data, target); err != nil {
+			t.Fatal(err)
+		}
+	}
+	jobs := make([]manifestJob, len(requiredLimitedProductionJobs))
+	for i, name := range requiredLimitedProductionJobs {
+		jobs[i] = manifestJob{Name: "caller / " + name, Conclusion: "success"}
+	}
+	if failures := limitedProductionFailures(dryRunTag, dryRunSha, source, assets, jobs); len(failures) != 0 {
+		t.Fatalf("successful fixture blocked: %v", failures)
+	}
+	for i, name := range requiredLimitedProductionJobs {
+		t.Run(name, func(t *testing.T) {
+			for _, status := range []string{"failure", "cancelled", "skipped", ""} {
+				broken := append([]manifestJob(nil), jobs...)
+				broken[i].Conclusion = status
+				if failures := limitedProductionFailures(dryRunTag, dryRunSha, source, assets, broken); len(failures) == 0 {
+					t.Fatalf("%s with status %q must block", name, status)
+				}
+			}
+			missing := append([]manifestJob(nil), jobs[:i]...)
+			missing = append(missing, jobs[i+1:]...)
+			if failures := limitedProductionFailures(dryRunTag, dryRunSha, source, assets, missing); len(failures) == 0 {
+				t.Fatalf("missing %s must block", name)
+			}
+		})
+	}
+	source.RequiredChecks = nil
+	failures := limitedProductionFailures(dryRunTag, dryRunSha, source, assets, jobs)
+	if len(failures) != 1 || failures[0] != "source: successful main validation missing" {
+		t.Fatalf("missing exact-main gate must block: %v", failures)
 	}
 }
 
