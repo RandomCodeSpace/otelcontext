@@ -1,475 +1,1767 @@
 import { CARD_WIDTH, CARD_HEIGHT, layoutGraph } from "./map-layout.js";
+import {
+  $, element, svg, icon, TONE_ICON, TONE_LABEL, toneFromErrorRate, toneRank, toneIcon, badge,
+  fmtNumber, fmtRate, fmtPercent, fmtMs, fmtAgo, sparkline, initShell,
+} from "./shell.js";
 
-const $ = (id) => document.getElementById(id);
-const NS = "http://www.w3.org/2000/svg";
+const RANGES = { "15m": 15, "1h": 60, "6h": 360, "24h": 1440 };
+const REFRESH_MS = 60000;
+const HEX64 = /^[a-f0-9]{64}$/;
+// Scene geometry in SVG user units, on the 4px grid.
+const SW = 152, SH = 56, ROW_GAP = 12, COL_GAP = 28, COL_GAP_INST = 88;
+const PW = 136, PH = 24, PILL_GAP = 4, GROUP_HEAD = 24, GROUP_PAD = 8, GROUP_GAP = 12;
+const HW = 168, HOST_GAP = 12, HOST_ROW_GAP = 16, PIP = 8, PIP_ROW = 12;
+const LANE_HEAD = 44, LANE_FOOT = 28, HINT_H = 32;
+const FONT = { name: "500 13px Geist", sub: "11px Geist", mono: "11px 'Geist Mono'", small: "10px 'Geist Mono'" };
+const TONES = ["ok", "warn", "crit", "unk"];
+
 const state = {
-  mode: "services", environment: undefined, minutes: 15, focus: "", hops: 1,
-  start: "", end: "", catalog: null, graph: null, selected: null,
-  request: 0, controller: null, refreshController: null, refreshRequest: 0,
-  hosts: false, layout: null, view: null, dragging: null,
+  range: "15m", env: undefined, mode: "services", focus: "", focusName: "", hops: 1, namespace: "", query: "",
+  layers: { services: true, instances: true, hosts: true },
+  catalog: null, svc: null, inst: null, focusGraph: null, hosts: [],
+  start: "", end: "", updated: 0, loading: false, loadingFull: false, failure: null, refreshFailed: false, notice: "",
+  selected: null, hover: null, tab: "overview",
+  scene: null, sceneKey: "", view: { x: 0, y: 0, k: 1 },
+  gen: 0, controller: null, traffic: new Map(), trafficController: null,
+  drawer: null, opener: null,
 };
-const number = (n, digits = 0) => Number.isFinite(n) ? n.toLocaleString(undefined, { maximumFractionDigits: digits }) : "—";
-const envLabel = (env) => env === undefined ? "All environments" : env || "Unknown";
-const bytes = (n) => {
-  if (!Number.isFinite(n) || n < 0) return "Unavailable";
-  if (n >= 1024 ** 3) return number(n / 1024 ** 3, 2) + " GiB";
-  if (n >= 1024 ** 2) return number(n / 1024 ** 2, 2) + " MiB";
-  return n >= 1024 ? number(n / 1024, 2) + " KiB" : number(n) + " B";
-};
-const compact = (s, n = 24) => s.length > n ? s.slice(0, n - 1) + "…" : s;
-const put = (id, text) => { $(id).textContent = text; };
-const launch = (promise) => { promise.catch(showError); };
 
-function element(tag, className, text) {
-  const node = document.createElement(tag);
-  if (className) node.className = className;
-  if (text !== undefined) node.textContent = text;
-  return node;
-}
+const canvas = $("canvas");
+const map = $("map");
+const mqInspector = matchMedia("(max-width: 1279px)");
+const mqRail = matchMedia("(max-width: 1023px)");
+const mqCompact = matchMedia("(max-width: 560px)");
 
-function svgElement(tag, attrs = {}, text) {
-  const node = document.createElementNS(NS, tag);
-  for (const [key, value] of Object.entries(attrs)) node.setAttribute(key, String(value));
-  if (text !== undefined) node.textContent = text;
-  return node;
-}
+const unique = (items) => [...new Set(items)];
+const clamp = (n, lo, hi) => Math.min(hi, Math.max(lo, n));
+const finite = (n) => typeof n === "number" && Number.isFinite(n);
+const toneOf = (node) => toneFromErrorRate(node?.error_rate, node?.requests);
+const worst = (tones) => tones.filter((t) => t !== "unk").sort((a, b) => toneRank(a) - toneRank(b))[0] || "unk";
+const envLabel = (env) => env === undefined ? "All environments" : env || "Unknown environment";
+const nsLabel = (ns) => ns || "No namespace";
+// Errors first, then error ratio, then volume: "which connection hurts most".
+const byErrorContribution = (a, b) => (b.errors || 0) - (a.errors || 0) || (b.error_rate || 0) - (a.error_rate || 0) || (b.calls || 0) - (a.calls || 0);
 
-function svgText(parent, x, y, text, size = 12, fill = "#e1ebf6") {
-  parent.append(svgElement("text", { x, y, "font-size": size, fill }, text));
-}
+// ---------- Reads ----------
 
-function action(node, label, callback) {
-  node.setAttribute("role", "button");
-  node.setAttribute("tabindex", "0");
-  node.setAttribute("aria-label", label);
-  node.addEventListener("click", callback);
-  node.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" || e.key === " ") {
-      e.preventDefault();
-      callback();
+const delay = (ms, signal) => new Promise((resolve, reject) => {
+  const timer = setTimeout(resolve, ms);
+  signal.addEventListener("abort", () => { clearTimeout(timer); reject(signal.reason); }, { once: true });
+});
+
+// fetchJSON in shell.js does not expose Retry-After, which topology reads need on 429.
+async function getJSON(path, signal) {
+  for (let attempt = 0; ; attempt++) {
+    const response = await fetch(path, {
+      signal: AbortSignal.any([signal, AbortSignal.timeout(10000)]),
+      cache: "no-store", credentials: "same-origin", headers: { Accept: "application/json" },
+    });
+    if (response.status === 429 && attempt < 3) {
+      await delay(clamp(Number(response.headers.get("Retry-After")) || 1, 1, 10) * 1000, signal);
+      continue;
     }
-  });
-}
-
-function showError(error) {
-  if (error?.name === "AbortError") return;
-  $("error").hidden = false;
-  put("error", error?.message || "The request could not complete. Refresh to try again.");
-  put("connection", "Read failed");
-}
-
-async function fetchJSON(path, signal) {
-  const response = await fetch(path, {
-    signal, headers: { Accept: "application/json" }, cache: "no-store", credentials: "same-origin",
-  });
-  if (!response.ok) {
-    const message = (await response.text()).slice(0, 500).trim();
-    throw new Error(message || "HTTP " + response.status);
+    if (!response.ok) {
+      const error = new Error((await response.text()).slice(0, 300).trim() || "HTTP " + response.status);
+      error.status = response.status;
+      throw error;
+    }
+    return response.json();
   }
-  return response.json();
-}
-
-function rangeParams() {
-  return new URLSearchParams({ start: state.start, end: state.end });
-}
-
-function newRange() {
-  const end = new Date();
-  state.end = end.toISOString();
-  state.start = new Date(end.getTime() - state.minutes * 60000).toISOString();
 }
 
 function validNodes(nodes, cap) {
   return Array.isArray(nodes) && nodes.length <= cap && nodes.every((n) =>
-    n && /^[a-f0-9]{64}$/.test(n.id) && typeof n.name === "string" && n.name.length <= 255 &&
+    n && HEX64.test(n.id) && HEX64.test(n.service_id) && typeof n.name === "string" && n.name.length <= 255 &&
     typeof n.environment === "string" && Array.isArray(n.hosts) && n.hosts.length <= 20 &&
     n.hosts.every((h) => typeof h === "string" && h.length <= 255));
 }
 
-async function refresh() {
-  const generation = ++state.refreshRequest;
-  state.refreshController?.abort();
-  state.refreshController = new AbortController();
-  const refreshController = state.refreshController;
-  const signal = refreshController.signal;
-  state.controller?.abort();
-  state.request++;
-  $("refresh").disabled = true;
-  $("error").hidden = true;
-  newRange();
-  const timer = setTimeout(() => refreshController.abort(), 8000);
-  try {
-    const [catalogResult, runtimeResult] = await Promise.allSettled([
-      fetchJSON("/api/topology/catalog?" + rangeParams(), signal),
-      fetchJSON("/api/stats/runtime", signal),
-    ]);
-    if (generation !== state.refreshRequest) return;
-    if (runtimeResult.status === "fulfilled") renderRuntime(runtimeResult.value);
-    else {
-      renderRuntimeUnavailable();
-      showError(runtimeResult.reason);
-    }
-    if (catalogResult.status !== "fulfilled") throw catalogResult.reason;
-    const catalog = catalogResult.value;
-    if (!validNodes(catalog.services, 1000) || !Array.isArray(catalog.environments) ||
-        !catalog.environments.every((e) => typeof e === "string" && e.length <= 255)) {
-      throw new Error("Invalid topology catalog response.");
-    }
-    if (!state.catalog && catalog.environments.length) state.environment = catalog.environments[0];
-    state.catalog = catalog;
-    renderCatalog();
-    dirtyFilters();
-    await requestGraph();
-    if (generation === state.refreshRequest) put("refresh-time", "Refreshed " + new Date().toLocaleTimeString() + " · manual refresh");
-  } catch (error) {
-    if (generation !== state.refreshRequest) return;
-    showError(error.name === "AbortError" ? new Error("Refresh timed out. Try again.") : error);
-    if (!state.graph) emptyMap("Topology unavailable", "Refresh after checking the server status.");
-  } finally {
-    clearTimeout(timer);
-    if (generation === state.refreshRequest) $("refresh").disabled = false;
+function normalizeNodes(nodes) {
+  for (const n of nodes) {
+    n.namespace = typeof n.namespace === "string" ? n.namespace : "";
+    n.instance = typeof n.instance === "string" ? n.instance : "";
+    n.instances = Array.isArray(n.instances) ? n.instances : [];
   }
+  return nodes;
 }
 
-function renderCatalog() {
-  const c = state.catalog;
-  put("total-services", number(c.service_names));
-  put("total-instances", number(c.instances));
-  put("total-hosts", number(c.hosts));
-  put("identity-count-note", c.unresolved ? number(c.unresolved) + " additional identities unresolved" : "Known instance identities");
-  $("env").replaceChildren(new Option("All environments", "*"));
-  for (const env of c.environments) $("env").append(new Option(envLabel(env), JSON.stringify(env)));
-  $("env").value = state.environment === undefined ? "*" : JSON.stringify(state.environment);
-  if ($("env").selectedIndex < 0) {
-    $("env").append(new Option(envLabel(state.environment), JSON.stringify(state.environment)));
-    $("env").value = JSON.stringify(state.environment);
+function checkGraph(graph) {
+  if (!graph || !validNodes(graph.nodes, 100) || !Array.isArray(graph.edges) || graph.edges.length > 200 ||
+      !graph.meta || typeof graph.meta !== "object") throw new Error("Invalid topology graph response.");
+  const ids = new Set(graph.nodes.map((n) => n.id));
+  if (graph.edges.some((e) => !e || typeof e.id !== "string" || !ids.has(e.source) || !ids.has(e.target))) {
+    throw new Error("Topology graph contains an unresolved endpoint.");
   }
-  renderList();
+  normalizeNodes(graph.nodes);
+  return graph;
 }
 
-function renderList() {
-  const query = $("search").value.trim().toLowerCase();
-  const items = (state.catalog?.services || []).filter((s) =>
-    (state.environment === undefined || s.environment === state.environment) &&
-    (s.name + " " + s.namespace).toLowerCase().includes(query));
-  $("service-list").replaceChildren();
-  put("catalog-count", items.length + " services");
-  for (const service of items.slice(0, 100)) {
-    const button = element("button", "service-row" + (state.focus === service.id ? " selected" : ""));
-    button.append(element("span", "name", service.name));
-    button.append(element("span", "count", number(service.instance_count) + " inst."));
-    button.title = [service.namespace, service.name, envLabel(service.environment)].filter(Boolean).join(" · ");
-    button.addEventListener("click", () => {
-      state.focus = service.id;
-      state.selected = null;
-      launch(requestGraph());
-    });
-    $("service-list").append(button);
+function checkCatalog(catalog) {
+  if (!catalog || !validNodes(catalog.services, 1000) || !Array.isArray(catalog.environments) ||
+      !catalog.environments.every((e) => typeof e === "string" && e.length <= 255)) {
+    throw new Error("Invalid topology catalog response.");
   }
-  if (!items.length) $("service-list").append(element("p", "no-list", "No matching services"));
-  put("feedback", items.length > 100 ? "First 100 matches. Refine your search." :
-    state.catalog?.truncated ? "Catalog limited to 1,000 service groups." : "");
+  normalizeNodes(catalog.services);
+  return catalog;
 }
 
-function dirtyFilters() {
-  const value = $("env").value;
-  const environment = value === "*" ? undefined : JSON.parse(value);
-  const changed = environment !== state.environment || Number($("time").value) !== state.minutes;
-  $("apply").disabled = !changed;
-  put("query-state", changed ? "Filters changed · apply to update" :
-    envLabel(state.environment) + " · " + $("time").selectedOptions[0].text.toLowerCase());
-  $("query-state").className = "query-state" + (changed ? " dirty" : "");
+const checkHosts = (hosts) => Array.isArray(hosts) ? hosts.filter((h) => h && typeof h.name === "string" &&
+  h.name.length <= 255 && Array.isArray(h.services) && h.services.every((s) => typeof s === "string")).slice(0, 2000) : [];
+
+function setRange() {
+  const end = new Date();
+  state.end = end.toISOString();
+  state.start = new Date(end.getTime() - RANGES[state.range] * 60000).toISOString();
 }
 
-async function requestGraph() {
-  const generation = ++state.request;
+function graphURL(params) {
+  const query = new URLSearchParams({ start: state.start, end: state.end, limit: "100", ...params });
+  if (state.env !== undefined) query.set("environment", state.env);
+  return "/api/topology/graph?" + query;
+}
+
+async function load({ full = true, refit = true } = {}) {
+  const gen = ++state.gen;
   state.controller?.abort();
   const controller = new AbortController();
   state.controller = controller;
-  const params = rangeParams();
-  params.set("mode", state.mode);
-  params.set("hops", String(state.hops));
-  params.set("limit", "40");
-  if (state.environment !== undefined) params.set("environment", state.environment);
-  if (state.focus) params.set("service_id", state.focus);
-  $("error").hidden = true;
-  $("canvas").setAttribute("aria-busy", "true");
-  $("services").setAttribute("aria-pressed", String(state.mode === "services"));
-  $("instances").setAttribute("aria-pressed", String(state.mode === "instances"));
-  put("env-badge", envLabel(state.environment));
-  const focused = state.catalog?.services.find((s) => s.id === state.focus);
-  put("scope", focused ? focused.name + " · " + state.hops + "-hop neighborhood" : "Environment overview");
-  renderList();
-  emptyMap("Loading scoped topology…", "Only summaries for this environment and neighborhood are requested.");
-  const timer = setTimeout(() => controller.abort(), 8000);
+  const { signal } = controller;
+  if (full || !state.start) setRange();
+  state.notice = "";
+  state.loading = true;
+  state.loadingFull = full;
+  if (full) state.traffic.clear();
+  renderStatus();
+  if (!state.scene) showState("loading");
+  canvas.setAttribute("aria-busy", "true");
   try {
-    const graph = await fetchJSON("/api/topology/graph?" + params, controller.signal);
-    if (generation !== state.request) return;
-    if (!validNodes(graph.nodes, 100) || !Array.isArray(graph.edges) || graph.edges.length > 200 || !graph.meta) {
-      throw new Error("Invalid topology graph response.");
+    if (full) {
+      const range = new URLSearchParams({ start: state.start, end: state.end });
+      const [catalog, svcGraph, instGraph, hosts] = await Promise.all([
+        getJSON("/api/topology/catalog?" + range, signal),
+        getJSON(graphURL({ mode: "services" }), signal),
+        getJSON(graphURL({ mode: "instances" }), signal),
+        getJSON("/api/hosts", signal).catch((error) => {
+          if (signal.aborted) throw error;
+          return [];
+        }),
+      ]);
+      state.catalog = checkCatalog(catalog);
+      state.svc = checkGraph(svcGraph);
+      state.inst = checkGraph(instGraph);
+      state.hosts = checkHosts(hosts);
     }
-    const ids = new Set(graph.nodes.map((n) => n.id));
-    if (graph.edges.some((e) => !e || !ids.has(e.source) || !ids.has(e.target))) throw new Error("Graph contains an unresolved endpoint.");
-    state.graph = graph;
-    state.layout = layoutGraph(graph.nodes, graph.edges, { ranker: "network-simplex", ranksep: 52, nodesep: 38 });
-    state.view = null;
-    if (!graph.nodes.some((n) => n.id === state.selected?.id) && !graph.edges.some((e) => e.id === state.selected?.id)) {
-      const incoming = new Set(graph.edges.map((edge) => edge.target));
-      const initial = graph.nodes.find((node) => node.service_id === state.focus) ||
-        graph.nodes.find((node) => !incoming.has(node.id)) || graph.nodes[0];
-      state.selected = initial ? { kind: "node", id: initial.id } : null;
+    resolveFocusName();
+    state.focusGraph = state.focus ? checkGraph(await getJSON(graphURL({ mode: "instances", service_id: state.focus, hops: String(state.hops) }), signal)) : null;
+    if (state.focusGraph && !state.focusGraph.nodes.length && !state.svc.nodes.some((n) => n.service_id === state.focus)) {
+      state.notice = "That service has no topology in this range and environment.";
+      state.focus = "";
+      state.focusGraph = null;
     }
-    put("connection", "Connected");
-    renderGraph();
-    renderInspector();
+    if (gen !== state.gen) return;
+    state.failure = null;
+    state.refreshFailed = false;
+    if (full) state.updated = Date.now();
   } catch (error) {
-    if (generation !== state.request) return;
-    state.graph = null;
-    state.selected = null;
-    renderInspector();
-    emptyMap("Topology could not load", error.name === "AbortError" ? "The request timed out. Refresh to retry." : error.message);
-    showError(error.name === "AbortError" ? new Error("Topology request timed out.") : error);
+    if (gen !== state.gen || error.name === "AbortError") return;
+    const failure = error.name === "TimeoutError" ? new Error("The topology request timed out.") : error;
+    if (!full && failure.status !== 503) {
+      // Keep the last good map; a half-focused view would mislead.
+      state.notice = "The neighbourhood could not load: " + failure.message;
+      state.focus = "";
+      state.focusGraph = null;
+    } else if (state.svc && failure.status !== 503) state.refreshFailed = true;
+    else state.failure = failure;
   } finally {
-    clearTimeout(timer);
-    if (generation === state.request) $("canvas").removeAttribute("aria-busy");
+    if (gen === state.gen) {
+      state.loading = false;
+      canvas.removeAttribute("aria-busy");
+      renderAll({ refit });
+    }
   }
 }
 
-function emptyMap(title, description) {
-  const empty = element("div", "empty");
-  empty.append(element("b", "", title), element("p", "", description));
-  $("canvas").replaceChildren(empty);
+function resolveFocusName() {
+  if (!state.focusName || !state.catalog) return;
+  const matches = state.catalog.services.filter((s) => s.name === state.focusName);
+  const match = matches.find((s) => state.env === undefined || s.environment === state.env) || matches[0];
+  if (match) state.focus = match.service_id;
+  else state.notice = "No service named “" + state.focusName + "” in this range.";
+  state.focusName = "";
 }
 
-function fitView() {
-  if (!state.layout) return;
-  const bounds = state.layout.bounds;
-  state.view = { x: -15, y: -15, width: Math.max(350, bounds.width + 30), height: Math.max(180, bounds.height + 30) };
-  updateView();
+// ---------- URL state ----------
+
+function readURL() {
+  const params = new URLSearchParams(location.search);
+  if (RANGES[params.get("range")]) state.range = params.get("range");
+  if (params.get("mode") === "instances") state.mode = "instances";
+  if (params.get("hops") === "2") state.hops = 2;
+  state.namespace = (params.get("namespace") || "").slice(0, 255);
+  if (params.has("env")) {
+    try {
+      const env = JSON.parse(params.get("env"));
+      if (typeof env === "string" && env.length <= 255) state.env = env;
+    } catch { /* ignore a malformed shared link */ }
+  }
+  const service = params.get("service") || "";
+  if (HEX64.test(service)) state.focus = service;
+  else state.focusName = (params.get("service_name") || "").slice(0, 255);
+  if ((state.focus || state.focusName) && !params.has("mode")) state.mode = "instances";
 }
 
-function updateView() {
-  const svg = $("canvas").querySelector("svg");
-  if (svg && state.view) {
-    const v = state.view;
-    svg.setAttribute("viewBox", [v.x, v.y, v.width, v.height].join(" "));
+function writeURL() {
+  const params = new URLSearchParams();
+  if (state.focus) params.set("service", state.focus);
+  if (state.namespace && !state.focus) params.set("namespace", state.namespace);
+  if (state.mode !== "services") params.set("mode", state.mode);
+  if (state.env !== undefined) params.set("env", JSON.stringify(state.env));
+  if (state.range !== "15m") params.set("range", state.range);
+  if (state.hops !== 1) params.set("hops", String(state.hops));
+  const query = params.toString();
+  history.replaceState(null, "", location.pathname + (query ? "?" + query : ""));
+}
+
+// ---------- Scope ----------
+
+function serviceFromInstances(serviceId, nodes) {
+  const members = nodes.filter((n) => n.service_id === serviceId);
+  if (!members.length) return null;
+  const requests = members.reduce((sum, n) => sum + (n.requests || 0), 0);
+  const errors = members.reduce((sum, n) => sum + (n.errors || 0), 0);
+  const weighted = members.reduce((sum, n) => sum + (n.avg_latency_ms || 0) * (n.requests || 0), 0);
+  return {
+    ...members[0], id: serviceId, instance: "", identity: "service", instances: members.map((n) => n.id),
+    instance_count: members.length, unresolved_count: 0, hosts: unique(members.flatMap((n) => n.hosts)),
+    requests, errors, request_rate_rps: members.reduce((sum, n) => sum + (n.request_rate_rps || 0), 0),
+    avg_latency_ms: requests ? weighted / requests : 0, error_rate: requests ? errors / requests : 0,
+  };
+}
+
+// Service-level edges keyed by service_id, from the services read or folded from instance calls.
+function serviceEdges(ids, instNodes, instEdges) {
+  if (state.svc) {
+    const serviceOf = new Map(state.svc.nodes.map((n) => [n.id, n.service_id]));
+    return state.svc.edges.map((e) => ({ ...e, source: serviceOf.get(e.source), target: serviceOf.get(e.target) }))
+      .filter((e) => ids.has(e.source) && ids.has(e.target));
+  }
+  const serviceOf = new Map(instNodes.map((n) => [n.id, n.service_id]));
+  const folded = new Map();
+  for (const e of instEdges) {
+    const key = serviceOf.get(e.source) + ">" + serviceOf.get(e.target);
+    const edge = folded.get(key) || { id: key, source: serviceOf.get(e.source), target: serviceOf.get(e.target), calls: 0, errors: 0, request_rate_rps: 0, duration: 0 };
+    edge.calls += e.calls || 0;
+    edge.errors += e.errors || 0;
+    edge.request_rate_rps += e.request_rate_rps || 0;
+    edge.duration += (e.avg_latency_ms || 0) * (e.calls || 0);
+    folded.set(key, edge);
+  }
+  return [...folded.values()].map((e) => ({ ...e, avg_latency_ms: e.calls ? e.duration / e.calls : 0, error_rate: e.calls ? e.errors / e.calls : 0 }));
+}
+
+function scope() {
+  const svcNodes = state.svc?.nodes || [];
+  const svcById = new Map(svcNodes.map((n) => [n.service_id, n]));
+  const focused = Boolean(state.focus && state.focusGraph);
+  let services, instNodes = [], instEdges = [], meta = state.svc?.meta;
+  if (focused) {
+    const graph = state.focusGraph;
+    const ids = unique([state.focus, ...graph.nodes.map((n) => n.service_id)]);
+    services = ids.map((id) => svcById.get(id) || serviceFromInstances(id, graph.nodes)).filter(Boolean);
+    instNodes = graph.nodes;
+    instEdges = graph.edges;
+    if (state.mode === "instances") meta = graph.meta;
+  } else {
+    services = svcNodes.filter((n) => !state.namespace || n.namespace === state.namespace);
+    const ids = new Set(services.map((s) => s.service_id));
+    instNodes = (state.inst?.nodes || []).filter((n) => ids.has(n.service_id));
+    const instIds = new Set(instNodes.map((n) => n.id));
+    instEdges = (state.inst?.edges || []).filter((e) => instIds.has(e.source) && instIds.has(e.target));
+    if (state.mode === "instances") meta = state.inst?.meta || meta;
+  }
+  const ids = new Set(services.map((s) => s.service_id));
+  return {
+    focused, services, instNodes, instEdges, meta,
+    svcEdges: serviceEdges(ids, instNodes, instEdges),
+    showInstances: state.mode === "instances",
+  };
+}
+
+// ---------- Text fitting ----------
+
+const ruler = document.createElement("canvas").getContext("2d");
+function fit(text, width, font) {
+  ruler.font = font;
+  if (ruler.measureText(text).width <= width) return text;
+  let lo = 0, hi = text.length;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (ruler.measureText(text.slice(0, mid) + "…").width <= width) lo = mid;
+    else hi = mid - 1;
+  }
+  return text.slice(0, lo) + "…";
+}
+const textWidth = (text, font) => { ruler.font = font; return ruler.measureText(text).width; };
+
+function shortInstance(node) {
+  const id = node.instance;
+  if (!id) return node.identity === "host_workload" ? node.hosts[0] || "host workload" : "unresolved";
+  return id.startsWith(node.name + "-") && id.length > node.name.length + 1 ? id.slice(node.name.length + 1) : id;
+}
+
+// ---------- Layout ----------
+
+let layoutMemo = { key: "", value: null };
+
+// Dagre owns ranks and crossing order. Each rank column is then re-packed:
+// cards and the long-edge waypoints between them keep dagre's order and a
+// quarter of its slack, so the lane stays dense enough to read when fitted.
+function serviceLayout(services, edges, gap) {
+  const key = gap + "|" + services.map((s) => s.service_id).sort().join() + "|" + edges.map((e) => e.source + ">" + e.target).sort().join();
+  if (layoutMemo.key === key) return layoutMemo.value;
+  const out = layoutGraph(services.map((s) => ({ id: s.service_id })), edges.map((e) => ({ source: e.source, target: e.target })),
+    { ranker: "network-simplex", ranksep: 64, nodesep: 8, edgesep: 8, marginx: 0, marginy: 0 });
+  const xs = unique([...out.positions.values()].map((p) => Math.round(p.x))).sort((a, b) => a - b);
+  const column = (x) => xs.findIndex((c) => Math.abs(x - c) < 1);
+  const center = (i) => i * (SW + gap) + SW / 2;
+  const scaleY = (SH + ROW_GAP) / (CARD_HEIGHT + 8);
+  const columns = xs.map(() => []);
+  const cards = new Map();
+  for (const [id, p] of out.positions) {
+    const item = { orig: p.y * scaleY, h: SH };
+    columns[column(p.x)].push(item);
+    cards.set(id, { col: column(p.x), item });
+  }
+  const routes = new Map();
+  for (const e of edges) {
+    const raw = out.routes.get(e.source + ">" + e.target) || [];
+    // Waypoints in card columns route long edges between cards; dagre's label slots are dropped.
+    const via = raw.slice(1, -1).filter((p) => column(p.x) >= 0).map((p) => {
+      const item = { orig: p.y * scaleY, h: 0 };
+      columns[column(p.x)].push(item);
+      return { col: column(p.x), item };
+    });
+    routes.set(e.source + ">" + e.target, via);
+  }
+  for (const list of columns) {
+    list.sort((a, b) => a.orig - b.orig);
+    list.forEach((item, i) => {
+      if (!i) { item.y = item.orig; return; }
+      const prev = list[i - 1];
+      const min = prev.h / 2 + (prev.h && item.h ? ROW_GAP : 8) + item.h / 2;
+      item.y = prev.y + min + Math.max(0, item.orig - prev.orig - min) / 4;
+    });
+    const shift = list.reduce((sum, item) => sum + item.orig - item.y, 0) / Math.max(1, list.length);
+    for (const item of list) item.y += shift;
+  }
+  const top = Math.min(...columns.flat().map((item) => item.y - item.h / 2));
+  const placed = new Map([...cards].map(([id, c]) => [id, { cx: center(c.col), cy: c.item.y - top, col: c.col }]));
+  const placedRoutes = new Map([...routes].map(([k, via]) => [k, via.map((v) => ({ x: center(v.col), y: v.item.y - top }))]));
+  const height = Math.max(SH, ...columns.flat().map((item) => item.y - top + Math.max(item.h / 2, 8)));
+  const value = { cards: placed, routes: placedRoutes, columns: Math.max(1, xs.length), center, height, width: center(Math.max(0, xs.length - 1)) + SW / 2 };
+  layoutMemo = { key, value };
+  return value;
+}
+
+// Horizontal-tangent cubic through each waypoint: reads as a calm left-to-right flow.
+function flow(points) {
+  let d = "M" + points[0].x + " " + points[0].y;
+  for (let i = 1; i < points.length; i++) {
+    const a = points[i - 1], b = points[i];
+    const dx = (b.x - a.x) / 2;
+    d += ` C${a.x + dx} ${a.y} ${b.x - dx} ${b.y} ${b.x} ${b.y}`;
+  }
+  return d;
+}
+
+// Route between two boxes {x, y, w, h}: forward, backward, or same column (loop right).
+function link(from, to, via = []) {
+  const fy = from.y + from.h / 2, ty = to.y + to.h / 2;
+  if (to.x >= from.x + from.w) {
+    const mid = via.flatMap((p) => [{ x: p.x - SW / 2 - 4, y: p.y }, { x: p.x + SW / 2 + 4, y: p.y }]);
+    return flow([{ x: from.x + from.w, y: fy }, ...mid, { x: to.x, y: ty }]);
+  }
+  if (to.x + to.w <= from.x) {
+    const mid = via.flatMap((p) => [{ x: p.x + SW / 2 + 4, y: p.y }, { x: p.x - SW / 2 - 4, y: p.y }]);
+    return flow([{ x: from.x, y: fy }, ...mid, { x: to.x + to.w, y: ty }]);
+  }
+  const sx = from.x + from.w, ex = to.x + to.w, bulge = Math.max(sx, ex) + 32 + Math.abs(ty - fy) / 4;
+  return `M${sx} ${fy} C${bulge} ${fy} ${bulge} ${ty} ${ex} ${ty}`;
+}
+
+// Place hosts at the mean x of what runs on them, then resolve overlaps; wrap when too wide.
+function placeHosts(hosts, width) {
+  const step = HW + HOST_GAP;
+  const sorted = [...hosts].sort((a, b) => a.want - b.want || a.name.localeCompare(b.name));
+  const perRow = Math.max(1, Math.floor((width + HOST_GAP) / step), Math.ceil(sorted.length / Math.ceil(sorted.length / 6)));
+  if (sorted.length <= perRow) {
+    let x = -Infinity;
+    for (const h of sorted) { h.x = Math.max(h.want - HW / 2, x + step); x = h.x; }
+    let limit = width - HW;
+    for (let i = sorted.length - 1; i >= 0; i--) { sorted[i].x = Math.min(sorted[i].x, limit); limit = sorted[i].x - step; }
+    const shift = Math.min(0, sorted[0]?.x ?? 0);
+    for (const h of sorted) { h.x -= shift; h.row = 0; }
+    return 1;
+  }
+  const rows = Math.ceil(sorted.length / perRow);
+  sorted.forEach((h, i) => {
+    const row = Math.floor(i / perRow);
+    const count = Math.min(perRow, sorted.length - row * perRow);
+    h.row = row;
+    h.x = (width - (count * step - HOST_GAP)) / 2 + (i - row * perRow) * step;
+  });
+  return rows;
+}
+
+function buildScene(extras = {}, head = LANE_HEAD) {
+  const sc = scope();
+  const tonesBy = new Map();
+  for (const n of sc.instNodes) tonesBy.set(n.service_id, [...(tonesBy.get(n.service_id) || []), toneOf(n)]);
+  const gap = sc.showInstances ? COL_GAP_INST : COL_GAP;
+  const layout = sc.services.length ? serviceLayout(sc.services, sc.svcEdges, gap) : null;
+  const scene = { ...sc, lanes: [], cards: [], groups: [], pills: [], hostChips: [], edges: [], iedges: [], runs: [], hint: null };
+  let y = 0;
+  const lane = (key, label, height) => {
+    const top = y;
+    const extra = extras[key] || 0;
+    const contentTop = top + head + extra / 2;
+    y = contentTop + height + LANE_FOOT + extra / 2;
+    scene.lanes.push({ key, label, top, bottom: y, contentTop, contentBottom: contentTop + height });
+    return contentTop;
+  };
+
+  if (layout && state.layers.services) {
+    const top = lane("services", "Services", layout.height);
+    for (const s of sc.services) {
+      const c = layout.cards.get(s.service_id);
+      const tones = tonesBy.get(s.service_id) || [];
+      const count = Math.max(s.instance_count || 0, tones.length);
+      scene.cards.push({ node: s, x: c.cx - SW / 2, y: top + c.cy - SH / 2, w: SW, h: SH, col: c.col, tone: toneOf(s),
+        pips: [...tones, ...Array(Math.max(0, count - tones.length)).fill("unk")], focus: s.service_id === state.focus && sc.focused });
+    }
+    const cardOf = new Map(scene.cards.map((c) => [c.node.service_id, c]));
+    const maxRate = Math.max(1e-9, ...sc.svcEdges.map((e) => e.request_rate_rps || 0));
+    for (const e of sc.svcEdges) {
+      const via = layout.routes.get(e.source + ">" + e.target).map((p) => ({ x: p.x, y: top + p.y }));
+      scene.edges.push({ edge: e, d: link(cardOf.get(e.source), cardOf.get(e.target), via), tone: toneFromErrorRate(e.error_rate, e.calls),
+        width: 1.25 + 2.25 * Math.sqrt((e.request_rate_rps || 0) / maxRate) });
+    }
+  }
+
+  const pillOf = new Map();
+  if (state.layers.instances && layout) {
+    if (sc.showInstances && sc.instNodes.length) {
+      const columns = new Map();
+      for (const s of sc.services) {
+        const members = sc.instNodes.filter((n) => n.service_id === s.service_id)
+          .sort((a, b) => shortInstance(a).localeCompare(shortInstance(b), undefined, { numeric: true }));
+        if (!members.length) continue;
+        const c = layout.cards.get(s.service_id);
+        columns.set(c.col, [...(columns.get(c.col) || []), { s, members, cy: c.cy }]);
+      }
+      const heights = [...columns.values()].map((list) => list.reduce((sum, g) =>
+        sum + GROUP_HEAD + g.members.length * (PH + PILL_GAP) - PILL_GAP + GROUP_PAD + GROUP_GAP, -GROUP_GAP));
+      const top = lane("instances", "Instances", Math.max(0, ...heights));
+      for (const [col, list] of columns) {
+        let gy = top;
+        for (const { s, members } of list.sort((a, b) => a.cy - b.cy)) {
+          const x = layout.center(col) - SW / 2;
+          const h = GROUP_HEAD + members.length * (PH + PILL_GAP) - PILL_GAP + GROUP_PAD;
+          scene.groups.push({ node: s, x, y: gy, w: SW, h, focus: s.service_id === state.focus && sc.focused,
+            label: s.name, count: members.length + (members.length === 1 ? " instance" : " instances") });
+          members.forEach((n, i) => {
+            const pill = { node: n, x: x + (SW - PW) / 2, y: gy + GROUP_HEAD + i * (PH + PILL_GAP), w: PW, h: PH, tone: toneOf(n), col };
+            scene.pills.push(pill);
+            pillOf.set(n.id, pill);
+          });
+          gy += h + GROUP_GAP;
+        }
+      }
+      const maxRate = Math.max(1e-9, ...sc.instEdges.map((e) => e.request_rate_rps || 0));
+      for (const e of sc.instEdges) {
+        const from = pillOf.get(e.source), to = pillOf.get(e.target);
+        if (!from || !to) continue;
+        scene.iedges.push({ edge: e, d: link(from, to), tone: toneFromErrorRate(e.error_rate, e.calls), width: 1 + Math.sqrt((e.request_rate_rps || 0) / maxRate) });
+      }
+    } else {
+      const top = lane("instances", "Instances", HINT_H);
+      const count = sc.instNodes.length;
+      scene.hint = {
+        y: top + HINT_H / 2,
+        text: sc.showInstances ? "No instance identities reported in this scope" :
+          sc.focused ? count + " instances in this neighbourhood · switch to Instances to expand them" :
+          "Select a service to expand its instances",
+      };
+    }
+  }
+
+  const width = Math.max(layout?.width || 0, SW);
+  if (state.layers.hosts) {
+    const byName = new Map(state.hosts.map((h) => [h.name, h]));
+    const linked = new Map();
+    const want = (host, x, tone) => {
+      const entry = linked.get(host) || { name: host, xs: [], tones: [] };
+      entry.xs.push(x);
+      if (tone) entry.tones.push(tone);
+      linked.set(host, entry);
+    };
+    if (scene.pills.length) {
+      for (const p of scene.pills) for (const h of p.node.hosts) want(h, p.x + PW / 2, p.tone);
+    } else {
+      const names = new Set(sc.services.map((s) => s.name));
+      const cardX = new Map(scene.cards.map((c) => [c.node.service_id, c.x + SW / 2]));
+      const fallbackX = width / 2;
+      for (const s of sc.services) for (const h of s.hosts) want(h, cardX.get(s.service_id) ?? fallbackX);
+      for (const h of state.hosts) {
+        const on = sc.services.filter((s) => h.services.includes(s.name) && names.has(s.name));
+        for (const s of on) if (!s.hosts.includes(h.name)) want(h.name, cardX.get(s.service_id) ?? fallbackX);
+      }
+      for (const n of sc.instNodes) for (const h of n.hosts) if (linked.has(h)) linked.get(h).tones.push(toneOf(n));
+    }
+    const chips = [...linked.values()].map((h) => ({ ...h, info: byName.get(h.name), want: h.xs.reduce((a, b) => a + b, 0) / h.xs.length }));
+    if (chips.length) {
+      const rows = placeHosts(chips, width);
+      const pipCols = Math.floor((HW - 20) / PIP);
+      const pipRows = clamp(Math.max(...chips.map((h) => Math.ceil(h.tones.length / pipCols))), 1, 2);
+      const hh = 36 + pipRows * PIP_ROW;
+      const top = lane("hosts", "Hosts", rows * hh + (rows - 1) * HOST_ROW_GAP);
+      for (const h of chips) {
+        scene.hostChips.push({ ...h, y: top + h.row * (hh + HOST_ROW_GAP), w: HW, h: hh, tone: h.tones.length ? worst(h.tones) : "unk", pipCols, pipRows });
+      }
+      if (scene.pills.length) {
+        const chipOf = new Map(scene.hostChips.map((c) => [c.name, c]));
+        const bend = scene.lanes.find((l) => l.key === "instances").contentBottom + 12;
+        for (const p of scene.pills) for (const name of p.node.hosts) {
+          const chip = chipOf.get(name);
+          if (chip) scene.runs.push({ key: "r:" + p.node.id + "|" + name, d: runsPath(p.x + PW / 2, p.y + PH, chip, bend) });
+        }
+      }
+    } else {
+      const top = lane("hosts", "Hosts", HINT_H);
+      scene.hostHint = { y: top + HINT_H / 2, text: "No host placement reported for this scope" };
+    }
+  }
+
+  const xs = [0, width, ...scene.hostChips.map((h) => h.x + HW)];
+  scene.bounds = { x: Math.min(...xs), y: 0, width: Math.max(...xs) - Math.min(...xs), height: y };
+  scene.width = width;
+  return scene;
+}
+
+function runsPath(x, y, chip, bend) {
+  const hx = chip.x + chip.w / 2;
+  const mid = bend + (chip.y - bend) / 2;
+  return `M${x} ${y} V${bend} C${x} ${mid} ${hx} ${mid} ${hx} ${chip.y}`;
+}
+
+// ---------- Scene rendering ----------
+
+// Nested <svg> icons ignore CSS sizing inside an SVG scene; size them explicitly.
+function place(node, x, y, size = 14) {
+  for (const [k, v] of Object.entries({ x, y, width: size, height: size, viewBox: "0 0 24 24" })) node.setAttribute(k, v);
+  return node;
+}
+
+function pips(list, x, y, cap) {
+  const g = svg("g", { class: "pip-row", transform: `translate(${x} ${y})` });
+  const shown = list.length > cap ? list.slice(0, cap - 1) : list;
+  shown.forEach((tone, i) => g.append(svg("rect", { class: "pip p-" + tone, x: i * PIP, y: 0, width: 6, height: 10, rx: 1 })));
+  if (list.length > cap) g.append(svg("text", { class: "t-small", x: shown.length * PIP + 2, y: 9 }, "+" + (list.length - shown.length)));
+  return g;
+}
+
+function nodeGroup(key, x, y, label, className) {
+  return svg("g", { class: "node " + className, transform: `translate(${x} ${y})`, "data-key": key, tabindex: 0, role: "button", "aria-label": label });
+}
+
+function drawCard(c) {
+  const s = c.node;
+  const metric = s.requests ? fmtRate(s.request_rate_rps) + " · " + fmtPercent(s.error_rate) : "no traffic";
+  const label = [s.name, nsLabel(s.namespace), TONE_LABEL[c.tone], s.requests ? fmtRate(s.request_rate_rps) + ", " + fmtPercent(s.error_rate) + " errors" : "no traffic",
+    c.pips.length + (c.pips.length === 1 ? " instance" : " instances")].join(", ");
+  const g = nodeGroup("s:" + s.service_id, c.x, c.y, label, "svc t-" + c.tone + (c.focus ? " is-focus" : ""));
+  if (c.tone === "crit") g.append(svg("rect", { class: "halo", x: -4, y: -4, width: SW + 8, height: SH + 8, rx: 6 }));
+  g.append(svg("rect", { class: "box", width: SW, height: SH, rx: 4 }));
+  g.append(place(icon(TONE_ICON[c.tone], "ic ic-sm tone-" + c.tone), 10, 8));
+  g.append(svg("text", { class: "t-name", x: 30, y: 20 }, fit(s.name, SW - 40, FONT.name)));
+  g.append(svg("text", { class: "t-sub", x: 30, y: 33 }, fit(nsLabel(s.namespace), SW - 40, FONT.sub)));
+  const metricWidth = textWidth(metric, FONT.small);
+  g.append(svg("text", { class: "t-small t-metric" + (c.tone === "crit" || c.tone === "warn" ? " tone-" + c.tone : ""), x: SW - 10, y: 47, "text-anchor": "end" }, metric));
+  g.append(pips(c.pips, 10, 38, clamp(Math.floor((SW - 28 - metricWidth) / PIP), 2, 12)));
+  g.append(svg("title", {}, [s.name, nsLabel(s.namespace), envLabel(s.environment)].join(" · ")));
+  return g;
+}
+
+function drawPill(p) {
+  const n = p.node;
+  const label = "Instance " + (n.instance || shortInstance(n)) + " of " + n.name + ", " + TONE_LABEL[p.tone] + ", average " + fmtMs(n.avg_latency_ms) + (n.hosts[0] ? ", on " + n.hosts[0] : "");
+  const g = nodeGroup("i:" + n.id, p.x, p.y, label, "inst t-" + p.tone);
+  g.append(svg("rect", { class: "box", width: PW, height: PH, rx: 4 }));
+  g.append(place(icon(TONE_ICON[p.tone], "ic ic-xs tone-" + p.tone), 8, 6, 12));
+  const latency = n.requests ? fmtMs(n.avg_latency_ms) : "—";
+  g.append(svg("text", { class: "t-small t-metric", x: PW - 8, y: 16, "text-anchor": "end" }, latency));
+  g.append(svg("text", { class: "t-mono", x: 26, y: 16 }, fit(shortInstance(n), PW - 42 - textWidth(latency, FONT.small), FONT.mono)));
+  g.append(svg("title", {}, [n.instance || shortInstance(n), n.hosts.join(", ") || "host unknown", "avg " + latency].join(" · ")));
+  return g;
+}
+
+function drawHost(h) {
+  const count = h.info?.service_count;
+  const label = "Host " + h.name + ", " + TONE_LABEL[h.tone] + (finite(count) ? ", " + count + " services" : "") + ", " + h.tones.length + " instances in view";
+  const g = nodeGroup("h:" + h.name, h.x, h.y, label, "host t-" + h.tone);
+  if (h.tone === "crit") g.append(svg("rect", { class: "halo", x: -4, y: -4, width: h.w + 8, height: h.h + 8, rx: 6 }));
+  g.append(svg("rect", { class: "box", width: h.w, height: h.h, rx: 4 }));
+  g.append(place(icon(TONE_ICON[h.tone], "ic ic-sm tone-" + h.tone), 10, 9));
+  const side = finite(count) ? count + " svc" : "";
+  const sideWidth = side ? textWidth(side, FONT.small) + 8 : 0;
+  g.append(svg("text", { class: "t-mono t-host", x: 30, y: 20 }, fit(h.name, h.w - 40 - sideWidth, FONT.mono)));
+  if (side) g.append(svg("text", { class: "t-small t-metric", x: h.w - 10, y: 20, "text-anchor": "end" }, side));
+  const matrix = svg("g", { class: "pip-row", transform: "translate(10 30)" });
+  const cap = h.pipCols * h.pipRows;
+  const tones = [...h.tones].sort((a, b) => toneRank(a) - toneRank(b));
+  const shown = tones.length > cap ? tones.slice(0, cap - 1) : tones;
+  shown.forEach((tone, i) => matrix.append(svg("rect", { class: "pip p-" + tone, x: (i % h.pipCols) * PIP, y: Math.floor(i / h.pipCols) * PIP_ROW, width: 6, height: 10, rx: 1 })));
+  if (tones.length > cap) matrix.append(svg("text", { class: "t-small", x: (shown.length % h.pipCols) * PIP + 2, y: Math.floor(shown.length / h.pipCols) * PIP_ROW + 9 }, "+" + (tones.length - shown.length)));
+  if (!tones.length) matrix.append(svg("text", { class: "t-small t-faint", x: 0, y: 9 }, "no instance data"));
+  g.append(matrix);
+  g.append(svg("title", {}, [h.name, h.info?.last_seen ? "seen " + fmtAgo(h.info.last_seen) : ""].filter(Boolean).join(" · ")));
+  return g;
+}
+
+function drawEdge(key, item, name) {
+  const g = svg("g", { class: "edge t-" + item.tone, "data-key": key });
+  g.append(svg("path", { class: "hit", d: item.d }));
+  g.append(svg("path", { class: "line" + (item.tone === "crit" && key.startsWith("e:") ? " edge-hot" : ""), d: item.d, "stroke-width": item.width.toFixed(2), "marker-end": "url(#mk-" + item.tone + ")" }));
+  g.append(svg("title", {}, name + " · " + fmtRate(item.edge.request_rate_rps) + " · " + fmtPercent(item.edge.error_rate) + " errors · avg " + fmtMs(item.edge.avg_latency_ms)));
+  return g;
+}
+
+function marker(tone) {
+  const m = svg("marker", { id: "mk-" + tone, class: "mk mk-" + tone, viewBox: "0 0 10 10", refX: 9, refY: 5, markerWidth: 7, markerHeight: 7, markerUnits: "userSpaceOnUse", orient: "auto" });
+  m.append(svg("path", { d: "M1 1L9 5L1 9Z" }));
+  return m;
+}
+
+function renderScene(scene) {
+  const defs = svg("defs");
+  for (const tone of [...TONES, "lit", "strong"]) defs.append(marker(tone));
+  const world = svg("g", { class: "world" });
+  const lanes = svg("g", { class: "lanes" });
+  scene.lanes.forEach((lane, i) => {
+    if (i) lanes.append(svg("line", { class: "lane-rule", x1: -100000, x2: 100000, y1: lane.top, y2: lane.top }));
+  });
+  const nameOf = new Map(scene.instNodes.map((n) => [n.id, n.name + " " + shortInstance(n)]));
+  for (const s of scene.services) nameOf.set(s.service_id, s.name);
+  const groups = svg("g", { class: "groups" });
+  for (const gr of scene.groups) {
+    const g = svg("g", { class: "group" + (gr.focus ? " is-focus" : ""), "data-key": "g:" + gr.node.service_id });
+    g.append(svg("rect", { x: gr.x - 0.5, y: gr.y - 0.5, width: gr.w + 1, height: gr.h + 1, rx: 4 }));
+    const countWidth = textWidth(gr.count, FONT.small);
+    g.append(svg("text", { class: "t-group-name", x: gr.x + 8, y: gr.y + 16 }, fit(gr.label, gr.w - 24 - countWidth, FONT.sub)));
+    g.append(svg("text", { class: "t-group", x: gr.x + gr.w - 8, y: gr.y + 16, "text-anchor": "end" }, gr.count));
+    groups.append(g);
+  }
+  const runs = svg("g", { class: "runs" });
+  for (const r of scene.runs) runs.append(svg("path", { class: "run", d: r.d, "data-key": r.key }));
+  const live = svg("g", { class: "runs runs-live" });
+  const links = svg("g", { class: "links" });
+  const edges = svg("g", { class: "edges" });
+  const order = (a, b) => toneRank(b.tone) - toneRank(a.tone);
+  for (const e of [...scene.edges].sort(order)) edges.append(drawEdge("e:" + e.edge.id, e, nameOf.get(e.edge.source) + " → " + nameOf.get(e.edge.target)));
+  for (const e of [...scene.iedges].sort(order)) edges.append(drawEdge("x:" + e.edge.id, e, nameOf.get(e.edge.source) + " → " + nameOf.get(e.edge.target)));
+  const nodes = svg("g", { class: "nodes" });
+  for (const c of scene.cards) nodes.append(drawCard(c));
+  for (const p of scene.pills) nodes.append(drawPill(p));
+  for (const h of scene.hostChips) nodes.append(drawHost(h));
+  const hints = svg("g", { class: "hints" });
+  for (const hint of [scene.hint, scene.hostHint].filter(Boolean)) {
+    hints.append(svg("text", { class: "t-hint", x: scene.width / 2, y: hint.y + 4, "text-anchor": "middle" }, hint.text));
+  }
+  world.append(lanes, groups, runs, live, links, edges, nodes, hints);
+  map.replaceChildren(defs, world);
+  scene.world = world;
+  scene.live = live;
+  scene.links = links;
+  $("lane-labels").replaceChildren(...scene.lanes.map((lane) => element("span", "lane-label eyebrow", lane.label)));
+}
+
+// ---------- Highlight ----------
+
+const keyOf = (prefix, id) => prefix + ":" + id;
+
+function related(key) {
+  const sc = state.scene;
+  const lit = new Set([key]);
+  const kind = key[0], id = key.slice(2);
+  const pillsOf = (test) => sc.pills.filter((p) => test(p.node));
+  const lightPill = (p) => {
+    lit.add(keyOf("i", p.node.id));
+    for (const h of p.node.hosts) { lit.add(keyOf("h", h)); lit.add("r:" + p.node.id + "|" + h); }
+  };
+  const lightIEdges = (test) => {
+    for (const e of sc.iedges) if (test(e.edge)) { lit.add(keyOf("x", e.edge.id)); lit.add(keyOf("i", e.edge.source)); lit.add(keyOf("i", e.edge.target)); }
+  };
+  if (kind === "s") {
+    lit.add(keyOf("g", id));
+    for (const e of sc.edges) if (e.edge.source === id || e.edge.target === id) {
+      lit.add(keyOf("e", e.edge.id)); lit.add(keyOf("s", e.edge.source)); lit.add(keyOf("s", e.edge.target));
+    }
+    const own = pillsOf((n) => n.service_id === id);
+    own.forEach(lightPill);
+    const ids = new Set(own.map((p) => p.node.id));
+    lightIEdges((e) => ids.has(e.source) || ids.has(e.target));
+    if (!sc.pills.length) for (const h of hostsOfService(id)) lit.add(keyOf("h", h));
+  } else if (kind === "i") {
+    const pill = sc.pills.find((p) => p.node.id === id);
+    if (pill) { lightPill(pill); lit.add(keyOf("s", pill.node.service_id)); lit.add(keyOf("g", pill.node.service_id)); }
+    lightIEdges((e) => e.source === id || e.target === id);
+  } else if (kind === "h") {
+    if (sc.pills.length) {
+      for (const p of pillsOf((n) => n.hosts.includes(id))) { lightPill(p); lit.add(keyOf("s", p.node.service_id)); lit.add(keyOf("g", p.node.service_id)); }
+    } else for (const s of servicesOnHost(id)) lit.add(keyOf("s", s.service_id));
+  } else if (kind === "e") {
+    const e = sc.edges.find((item) => item.edge.id === id)?.edge;
+    if (e) {
+      lit.add(keyOf("s", e.source)); lit.add(keyOf("s", e.target));
+      const serviceOf = new Map(sc.pills.map((p) => [p.node.id, p.node.service_id]));
+      lightIEdges((x) => serviceOf.get(x.source) === e.source && serviceOf.get(x.target) === e.target);
+    }
+  } else if (kind === "x") {
+    const e = sc.iedges.find((item) => item.edge.id === id)?.edge;
+    if (e) for (const end of [e.source, e.target]) {
+      const pill = sc.pills.find((p) => p.node.id === end);
+      if (pill) { lightPill(pill); lit.add(keyOf("s", pill.node.service_id)); }
+    }
+  }
+  return lit;
+}
+
+function hostsOfService(serviceId) {
+  const s = state.scene.services.find((item) => item.service_id === serviceId);
+  if (!s) return [];
+  return unique([...s.hosts, ...state.hosts.filter((h) => h.services.includes(s.name)).map((h) => h.name)])
+    .filter((h) => state.scene.hostChips.some((c) => c.name === h));
+}
+
+function servicesOnHost(host) {
+  const info = state.hosts.find((h) => h.name === host);
+  return state.scene.services.filter((s) => s.hosts.includes(host) || info?.services.includes(s.name));
+}
+
+function paint() {
+  const sc = state.scene;
+  if (!sc) return;
+  const selected = state.selected;
+  const active = state.hover || selected;
+  const lit = active ? related(active) : null;
+  for (const el of map.querySelectorAll("[data-key]")) {
+    const key = el.dataset.key;
+    el.classList.toggle("is-dim", Boolean(lit) && !lit.has(key));
+    el.classList.toggle("is-lit", Boolean(lit) && lit.has(key));
+    el.classList.toggle("is-selected", key === selected);
+  }
+  // Placement connectors at service granularity exist only for the active element.
+  sc.live.replaceChildren();
+  sc.links.replaceChildren();
+  if (!active) return;
+  const kind = active[0], id = active.slice(2);
+  const cardOf = new Map(sc.cards.map((c) => [c.node.service_id, c]));
+  const chipOf = new Map(sc.hostChips.map((c) => [c.name, c]));
+  const above = sc.lanes.find((l) => l.key === "instances") || sc.lanes.find((l) => l.key === "services");
+  const bend = above ? above.contentBottom + 12 : 0;
+  if (!sc.pills.length) {
+    const pairs = kind === "s" ? hostsOfService(id).map((h) => [id, h]) : kind === "h" ? servicesOnHost(id).map((s) => [s.service_id, id]) : [];
+    for (const [serviceId, host] of pairs) {
+      const card = cardOf.get(serviceId), chip = chipOf.get(host);
+      if (card && chip) sc.live.append(svg("path", { class: "run is-lit", d: runsPath(card.x + SW / 2, card.y + SH, chip, Math.max(bend, card.y + SH + 8)) }));
+    }
+  }
+  const serviceId = kind === "s" ? id : kind === "i" ? sc.pills.find((p) => p.node.id === id)?.node.service_id : null;
+  const card = cardOf.get(serviceId), group = sc.groups.find((g) => g.node.service_id === serviceId);
+  if (card && group) sc.links.append(svg("path", { class: "group-link", d: groupLink(card, group) }));
+  for (const focus of sc.cards.filter((c) => c.focus && c.node.service_id !== serviceId)) {
+    const g = sc.groups.find((item) => item.node.service_id === focus.node.service_id);
+    if (g) sc.links.append(svg("path", { class: "group-link", d: groupLink(focus, g) }));
   }
 }
 
-function zoom(factor) {
-  if (!state.view) return;
+// A card's own group may sit below other cards of its column; route around them on the left.
+function groupLink(card, group) {
+  const blocked = state.scene.cards.some((c) => c !== card && c.col === card.col && c.y > card.y) ||
+    state.scene.groups.some((g) => g !== group && g.x === group.x && g.y < group.y);
+  const cx = card.x + SW / 2;
+  if (!blocked) return `M${cx} ${card.y + SH} V${group.y}`;
+  const gutter = card.x - 12;
+  return `M${card.x} ${card.y + SH / 2} H${gutter} V${group.y + GROUP_HEAD / 2} H${group.x}`;
+}
+
+// ---------- View ----------
+
+function applyView() {
+  const sc = state.scene;
+  if (!sc) return;
+  const { x, y, k } = state.view;
+  sc.world.setAttribute("transform", `translate(${x} ${y}) scale(${k})`);
+  const labels = $("lane-labels").children;
+  sc.lanes.forEach((lane, i) => { labels[i].style.transform = `translateY(${Math.round(y + lane.top * k + 10)}px)`; });
+}
+
+function sceneKey(scene) {
+  return [state.mode, state.focus, state.hops, state.namespace, state.env, JSON.stringify(state.layers),
+    scene.cards.map((c) => c.node.service_id).join(), scene.pills.length, scene.hostChips.length].join("|");
+}
+
+// Lanes stretch to fill the canvas, in proportion to their content, so the
+// bands never stop short of the bottom edge. Phones keep a legible floor scale
+// and open on the most important card; the rest is a pan away.
+function layoutAndFit(refit) {
+  const rect = canvas.getBoundingClientRect();
+  if (!rect.width || !rect.height) return;
+  const phone = rect.width < 720;
+  const pad = phone ? 12 : 16;
+  const scaleFor = (b) => {
+    const fit = clamp(Math.min((rect.width - pad * 2) / Math.max(1, b.width), rect.height / Math.max(1, b.height)), 0.2, 1);
+    return phone ? Math.max(fit, 0.6) : fit;
+  };
+  let scene = buildScene();
+  let k = refit || !state.scene ? scaleFor(scene.bounds) : state.view.k;
+  const head = Math.max(LANE_HEAD, 36 / k);
+  scene = buildScene({}, head);
+  if (refit || !state.scene) k = scaleFor(scene.bounds);
+  const spare = rect.height / k - scene.bounds.height;
+  if (spare > 1 && scene.lanes.length) {
+    const weights = scene.lanes.map((l) => [l.key, l.contentBottom - l.contentTop + 24]);
+    const total = weights.reduce((sum, [, w]) => sum + w, 0);
+    scene = buildScene(Object.fromEntries(weights.map(([key, w]) => [key, spare * w / total])), head);
+  }
+  renderScene(scene);
+  state.scene = scene;
+  if (refit) {
+    const b = scene.bounds;
+    let x = (rect.width - b.width * k) / 2 - b.x * k;
+    if (b.width * k > rect.width - pad * 2) {
+      const anchor = scene.cards.find((c) => c.focus) || [...scene.cards].sort((a, c) => toneRank(a.tone) - toneRank(c.tone))[0];
+      if (anchor) x = clamp(rect.width / 2 - (anchor.x + anchor.w / 2) * k, rect.width - pad - (b.x + b.width) * k, pad - b.x * k);
+    }
+    state.view = { k, x: Math.round(x), y: 0 };
+  }
+  applyView();
+  paint();
+}
+
+function zoomAt(factor, cx, cy) {
   const v = state.view;
-  const width = Math.max(100, Math.min(20000, v.width * factor));
-  const height = v.height * width / v.width;
-  state.view = { x: v.x + (v.width - width) / 2, y: v.y + (v.height - height) / 2, width, height };
-  updateView();
+  const k = clamp(v.k * factor, 0.15, 2.5);
+  const f = k / v.k;
+  state.view = { k, x: cx - (cx - v.x) * f, y: cy - (cy - v.y) * f };
+  applyView();
 }
 
-function renderGraph() {
-  const graph = state.graph;
-  if (!graph) return;
-  put("graph-count", graph.nodes.length + " nodes · " + graph.edges.length + " call edges");
-  put("bounds", graph.nodes.length + " of " + graph.meta.available_nodes + " scoped nodes shown. " +
-    (graph.meta.truncated ? "Result limited; focus a service or shorten the range." : "Select a node or edge to inspect."));
-  put("coverage-label", (graph.meta.coverage === "limited" ? "Limited" : "Observed") + " topology · five-minute resolution");
-  const range = new Date(graph.meta.start).toLocaleString() + " – " + new Date(graph.meta.end).toLocaleString();
-  put("coverage-note", graph.meta.note + " Effective buckets: " + range + ". " +
-    number(graph.meta.pending_parent_spans) + " parent joins pending process-wide; " +
-    number(graph.meta.process_dropped) + " observations limited and " + number(graph.meta.process_unmatched) + " joins expired process-wide. " +
-    (graph.meta.flush_failed ? "Last persistence attempt failed." : ""));
-  $("coverage-label").classList.toggle("identity-warning", graph.meta.coverage === "limited");
-  if (!graph.nodes.length) {
-    emptyMap("No resources in this scope", "Send telemetry with service.name and service.instance.id. Missing environment attributes appear under Unknown. Existing pre-upgrade history has no instance identity.");
-    return;
-  }
-  const svg = svgElement("svg", { role: "group", "aria-label": "Observed " + state.mode + " calls in " + envLabel(state.environment) });
-  const defs = svgElement("defs");
-  const marker = svgElement("marker", { id: "call-arrow", viewBox: "0 0 10 10", refX: 9, refY: 5, markerWidth: 6, markerHeight: 6, orient: "auto" });
-  marker.append(svgElement("path", { d: "M0 0L10 5L0 10Z", fill: "#8db8e3" }));
-  defs.append(marker);
-  svg.append(defs);
-  const byID = new Map(graph.nodes.map((n) => [n.id, n]));
-  for (const edge of graph.edges) {
-    const points = state.layout.routes.get(edge.source + ">" + edge.target);
-    if (!points?.length) continue;
-    const d = points.map((p, i) => (i ? "L" : "M") + p.x + " " + p.y).join(" ");
-    const group = svgElement("g", { class: "graph-edge" + (state.selected?.id === edge.id ? " selected" : ""), "data-id": edge.id });
-    group.append(svgElement("path", { d, fill: "none", stroke: "transparent", "stroke-width": 18 }));
-    group.append(svgElement("path", { class: "visible-edge", d, fill: "none", stroke: "#6f9ec9", "stroke-width": 2, "marker-end": "url(#call-arrow)" }));
-    const middle = points[Math.floor(points.length / 2)];
-    group.append(svgElement("rect", { x: middle.x - 29, y: middle.y - 20, width: 60, height: 18, rx: 4, fill: "#142434" }));
-    svgText(group, middle.x - 25, middle.y - 7, number(edge.request_rate_rps, 2) + "/s", 13, "#b4d1eb");
-    action(group, byID.get(edge.source).name + " calls " + byID.get(edge.target).name, () => select("edge", edge.id));
-    svg.append(group);
-  }
-  for (const node of graph.nodes) {
-    const pos = state.layout.positions.get(node.id);
-    const group = svgElement("g", { class: "graph-node" + (state.selected?.id === node.id ? " selected" : ""), "data-id": node.id,
-      transform: "translate(" + (pos.x - CARD_WIDTH / 2) + " " + (pos.y - CARD_HEIGHT / 2) + ")" });
-    group.append(svgElement("rect", { class: "box", width: CARD_WIDTH, height: CARD_HEIGHT, rx: 7, fill: state.selected?.id === node.id ? "#233d56" : "#1c2c3d", stroke: "#46647f" }));
-    group.append(svgElement("circle", { cx: 14, cy: 19, r: 3, fill: node.errors ? "#efb655" : node.requests ? "#6ed3b1" : "#94a8ba" }));
-    svgText(group, 24, 23, compact(node.name, 18), 18);
-    const label = state.mode === "instances" ? node.instance || (node.identity === "host_workload" ? "Host + workload identity" :
-      node.hosts.length ? "Host: " + node.hosts[0] + " (unresolved)" : "Unresolved instance") :
-      number(node.instance_count) + (node.instance_count === 1 ? " instance" : " instances") +
-        (node.unresolved_count ? " · " + node.unresolved_count + " unresolved" : "");
-    svgText(group, 12, 43, compact(label, 26), 13, "#aec5dc");
-    svgText(group, 12, 61, state.hosts ? compact(node.hosts.join(", ") || "Host unknown", 30) :
-      compact([node.namespace, envLabel(node.environment)].filter(Boolean).join(" · "), 26), 13, "#94afc7");
-    svgText(group, 12, 77, node.requests ? number(node.request_rate_rps, 2) + "/s · " + number(node.error_rate * 100, 2) + "% err" : "No entry spans observed", 13, "#bdcfe1");
-    group.append(svgElement("title", {}, [node.name, node.instance, node.namespace, envLabel(node.environment), ...node.hosts].filter(Boolean).join(" · ")));
-    action(group, node.name + (node.instance ? " instance " + node.instance : "") + " in " + envLabel(node.environment), () => select("node", node.id));
-    svg.append(group);
-  }
-  $("canvas").replaceChildren(svg);
-  if (!state.view) fitView();
-  else updateView();
+function zoomCenter(factor) {
+  const rect = canvas.getBoundingClientRect();
+  zoomAt(factor, rect.width / 2, rect.height / 2);
 }
 
-function select(kind, id) {
-  const restoreFocus = document.activeElement?.getAttribute("data-id") === id;
-  state.selected = { kind, id };
-  renderGraph();
-  renderInspector();
-  if (restoreFocus) $("canvas").querySelector('[data-id="' + id + '"]')?.focus();
+// ---------- States ----------
+
+function showState(kind, error) {
+  const box = $("map-state");
+  box.hidden = !kind;
+  if (!kind) return box.replaceChildren();
+  if (kind === "loading") {
+    const skeleton = element("div", "skel");
+    for (const label of ["Services", "Instances", "Hosts"]) {
+      const lane = element("div", "skel-lane");
+      const row = element("div", "skel-row");
+      for (let i = 0; i < (label === "Instances" ? 7 : 5); i++) row.append(element("i", "skeleton"));
+      lane.append(element("span", "eyebrow", label), row);
+      skeleton.append(lane);
+    }
+    skeleton.setAttribute("aria-label", "Loading topology");
+    skeleton.setAttribute("role", "status");
+    return box.replaceChildren(skeleton);
+  }
+  const panel = element("div", "state");
+  const actions = element("div", "state-actions");
+  if (kind === "unavailable") {
+    panel.append(icon("database", "ic state-ic"), element("b", "", "Instance topology is unavailable on this storage driver"),
+      element("p", "", "The layered map needs SQLite or PostgreSQL. The Explorer still shows the service graph for every driver."));
+    const link = element("a", "btn", "Open Explorer");
+    link.href = "/explorer";
+    link.append(icon("arrow-right", "ic ic-sm"));
+    actions.append(link);
+  } else if (kind === "empty") {
+    panel.append(icon("radio", "ic state-ic"), element("b", "", "Waiting for telemetry"),
+      element("p", "", "Send OTLP traces with service.name and service.instance.id. Services, instances and hosts appear here within a minute."));
+  } else if (kind === "quiet") {
+    panel.append(icon("clock", "ic state-ic"), element("b", "", "No traffic in this range"),
+      element("p", "", "Services are known, but none reported spans in the selected range and environment. Widen the range or pick another environment."));
+  } else {
+    const message = error?.status === 429 ? "Every topology query slot stayed busy through several retries. Try again in a few seconds." :
+      error?.message || "The request did not complete.";
+    panel.append(icon("wifi-off", "ic state-ic tone-crit"), element("b", "", "The topology could not load"), element("p", "", message));
+    const retry = element("button", "btn", "Retry");
+    retry.type = "button";
+    retry.prepend(icon("rotate-ccw", "ic ic-sm"));
+    retry.addEventListener("click", () => load());
+    actions.append(retry);
+  }
+  if (actions.childElementCount) panel.append(actions);
+  panel.setAttribute("role", kind === "error" ? "alert" : "status");
+  box.replaceChildren(panel);
+}
+
+// ---------- Top bar, toolbar and rail ----------
+
+function renderStatus() {
+  const label = $("updated");
+  const seconds = Math.round((Date.now() - state.updated) / 1000);
+  label.textContent = state.loading && !state.updated ? "Loading…" : state.refreshFailed ? "Refresh failed" :
+    !state.updated ? "Not loaded" : seconds < 60 ? "Updated " + seconds + "s ago" : "Updated " + fmtAgo(state.updated);
+  $("refresh").classList.toggle("is-spinning", state.loading);
+  $("refresh").classList.toggle("tone-crit", state.refreshFailed);
+}
+
+function renderControls() {
+  const env = $("env");
+  env.replaceChildren(new Option("All environments", "*"));
+  for (const e of state.catalog?.environments || []) env.append(new Option(e || "Unknown environment", JSON.stringify(e)));
+  env.value = state.env === undefined ? "*" : JSON.stringify(state.env);
+  if (env.selectedIndex < 0) {
+    env.append(new Option(envLabel(state.env), JSON.stringify(state.env)));
+    env.value = JSON.stringify(state.env);
+  }
+  for (const b of document.querySelectorAll("[data-range]")) b.setAttribute("aria-pressed", String(b.dataset.range === state.range));
+  for (const b of document.querySelectorAll("[data-mode]")) b.setAttribute("aria-pressed", String(b.dataset.mode === state.mode));
+  $("hops-field").hidden = !state.focus;
+  $("hops").value = String(state.hops);
+  const crumbs = element("ol");
+  const focused = state.focus ? lookup().service(state.focus) : null;
+  const namespace = focused ? focused.namespace : state.namespace;
+  const step = (label, action, current) => {
+    const li = element("li");
+    if (current) {
+      const span = element("span", "crumb-current", label);
+      span.setAttribute("aria-current", "page");
+      span.title = label;
+      li.append(span);
+    } else {
+      const b = element("button", "crumb", label);
+      b.type = "button";
+      b.title = label;
+      b.addEventListener("click", action);
+      li.append(b);
+    }
+    return li;
+  };
+  crumbs.append(step("All services", () => { state.namespace = ""; unfocus(); }, !namespace && !focused));
+  if (namespace) crumbs.append(step(namespace, () => { state.namespace = namespace; unfocus(); }, !focused));
+  if (focused) crumbs.append(step(focused.name, null, true));
+  $("crumbs").replaceChildren(crumbs);
+}
+
+function share(tones) {
+  const total = tones.length || 1;
+  const bar = element("span", "hbar");
+  bar.setAttribute("aria-hidden", "true");
+  for (const tone of ["ok", "unk", "warn", "crit"]) {
+    const n = tones.filter((t) => t === tone).length;
+    if (!n) continue;
+    const part = element("i", "hb-" + tone);
+    part.style.width = (n / total * 100) + "%";
+    bar.append(part);
+  }
+  return bar;
+}
+
+function renderRail() {
+  const sc = state.scene;
+  const serviceTones = (sc?.services || []).map(toneOf);
+  const instanceTones = sc?.pills.length ? sc.pills.map((p) => p.tone) : (sc?.cards || []).flatMap((c) => c.pips);
+  const hostTones = (sc?.hostChips || []).map((h) => h.tone);
+  const instanceCount = sc?.pills.length || (sc?.services || []).reduce((sum, s) => sum + (s.instance_count || 0), 0);
+  const layers = [
+    ["services", "Services", "boxes", sc?.services.length || 0, serviceTones],
+    ["instances", "Instances", "box", instanceCount, instanceTones],
+    ["hosts", "Hosts", "server", sc?.hostChips.length || 0, hostTones],
+  ].map(([key, label, glyph, count, tones]) => {
+    const b = element("button", "layer");
+    b.type = "button";
+    b.setAttribute("aria-pressed", String(state.layers[key]));
+    const bad = tones.filter((t) => t === "crit").length || tones.filter((t) => t === "warn").length;
+    const badTone = tones.includes("crit") ? "crit" : "warn";
+    b.setAttribute("aria-label", `${label} lane, ${count}${bad ? ", " + bad + " " + TONE_LABEL[badTone].toLowerCase() : ""}, ${state.layers[key] ? "visible" : "hidden"}`);
+    const row = element("span", "layer-row");
+    row.append(icon(glyph, "ic ic-sm layer-ic"), element("span", "layer-name", label), element("span", "spacer"));
+    if (bad) row.append(badge(badTone, String(bad)));
+    row.append(element("span", "layer-count num", state.svc && !state.failure ? fmtNumber(count) : "—"));
+    b.append(row, share(tones));
+    b.addEventListener("click", () => {
+      state.layers[key] = !state.layers[key];
+      renderAll({ refit: true });
+    });
+    return b;
+  });
+  $("layers").replaceChildren(...layers);
+
+  const all = state.svc?.nodes || [];
+  const namespaces = new Map();
+  for (const s of all) namespaces.set(s.namespace, [...(namespaces.get(s.namespace) || []), toneOf(s)]);
+  const domains = [...namespaces].sort((a, b) => toneRank(worst(a[1])) - toneRank(worst(b[1])) || a[0].localeCompare(b[0])).map(([ns, tones]) => {
+    const b = element("button", "row-btn");
+    b.type = "button";
+    b.setAttribute("aria-pressed", String(!state.focus && state.namespace === ns));
+    b.append(toneIcon(worst(tones)), element("span", "row-name", nsLabel(ns)), element("span", "row-count num", tones.length));
+    b.title = nsLabel(ns);
+    b.addEventListener("click", () => {
+      state.namespace = state.namespace === ns && !state.focus ? "" : ns;
+      state.selected = null;
+      unfocus();
+    });
+    const li = element("li");
+    li.append(b);
+    return li;
+  });
+  $("domains").replaceChildren(...(domains.length ? domains : [element("li", "list-empty", state.svc ? "No services yet" : "—")]));
+  renderResults();
+}
+
+function renderResults() {
+  const query = state.query.trim().toLowerCase();
+  const matches = (state.svc?.nodes || []).filter((s) => (s.name + " " + s.namespace).toLowerCase().includes(query))
+    .sort((a, b) => toneRank(toneOf(a)) - toneRank(toneOf(b)) || a.name.localeCompare(b.name));
+  const items = matches.slice(0, 60).map((s) => {
+    const b = element("button", "row-btn");
+    b.type = "button";
+    b.title = s.name + " · " + nsLabel(s.namespace);
+    b.setAttribute("aria-pressed", String(state.focus === s.service_id));
+    b.append(toneIcon(toneOf(s)), element("span", "row-name", s.name), element("span", "row-meta", s.namespace));
+    b.addEventListener("click", () => focusService(s.service_id));
+    const li = element("li");
+    li.append(b);
+    return li;
+  });
+  if (matches.length > items.length) items.push(element("li", "list-empty", (matches.length - items.length) + " more · refine the search"));
+  $("results").replaceChildren(...(items.length ? items : [element("li", "list-empty", query ? "No matching services" : "—")]));
+}
+
+// ---------- Inspector ----------
+
+function lookup() {
+  const sc = state.scene;
+  const instances = new Map([...(state.inst?.nodes || []), ...(state.focusGraph?.nodes || [])].map((n) => [n.id, n]));
+  const iedges = new Map([...(state.inst?.edges || []), ...(state.focusGraph?.edges || [])].map((e) => [e.id, e]));
+  return {
+    service: (id) => sc?.services.find((s) => s.service_id === id) || state.svc?.nodes.find((s) => s.service_id === id),
+    instance: (id) => instances.get(id),
+    edge: (id) => sc?.svcEdges.find((e) => e.id === id),
+    iedge: (id) => iedges.get(id),
+    instancesOf: (serviceId) => [...instances.values()].filter((n) => n.service_id === serviceId)
+      .sort((a, b) => shortInstance(a).localeCompare(shortInstance(b), undefined, { numeric: true })),
+    allInstances: () => [...instances.values()],
+    allIEdges: () => [...iedges.values()],
+  };
+}
+
+function tile(label, value, tone, spark, note) {
+  const t = element("div", "tile");
+  t.append(element("span", "tile-label", label));
+  const v = element("b", "tile-value num" + (tone === "warn" || tone === "crit" ? " tone-" + tone : ""), value);
+  t.append(v);
+  if (spark) t.append(spark);
+  else if (note) t.append(element("span", "tile-note", note));
+  return t;
+}
+
+function section(title, ...children) {
+  const s = element("section", "insp-sec");
+  s.append(element("h3", "eyebrow", title), ...children);
+  return s;
+}
+
+function details(summary, pairs) {
+  const d = element("details", "insp-details");
+  d.append(element("summary", "", summary));
+  const dl = element("dl", "kv");
+  for (const [k, v] of pairs) {
+    if (v === undefined || v === null || v === "") continue;
+    dl.append(element("dt", "", k), element("dd", "", v));
+  }
+  d.append(dl);
+  return d;
+}
+
+function selectable(node, key) {
+  if (!state.scene || !map.querySelector(`[data-key="${CSS.escape(key)}"]`)) return node;
+  node.setAttribute("role", "button");
+  node.tabIndex = 0;
+  const choose = () => {
+    select(key);
+    $("insp-body").focus({ preventScroll: true });
+  };
+  node.addEventListener("click", choose);
+  node.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); choose(); }
+  });
+  return node;
+}
+
+function instanceTable(rows) {
+  if (!rows.length) return element("p", "insp-empty", "No instance identities in view for this range.");
+  const table = element("table", "table");
+  const head = element("tr");
+  for (const [label, right] of [["Instance"], ["Host"], ["Err", true], ["Avg", true]]) {
+    const th = element("th", right ? "r" : "", label);
+    th.scope = "col";
+    head.append(th);
+  }
+  const thead = element("thead");
+  thead.append(head);
+  const body = element("tbody");
+  for (const n of rows) {
+    const tone = toneOf(n);
+    const tr = element("tr");
+    const name = element("span", "cell-name");
+    name.append(toneIcon(tone), element("span", "mono", shortInstance(n)));
+    name.title = n.instance || shortInstance(n);
+    const first = element("td");
+    first.append(name);
+    const host = element("td", "mono cell-dim", n.hosts[0] || "—");
+    host.title = n.hosts.join(", ");
+    tr.append(first, host, element("td", "r" + (tone === "crit" || tone === "warn" ? " tone-" + tone : ""), n.requests ? fmtPercent(n.error_rate) : "—"),
+      element("td", "r", n.requests ? fmtMs(n.avg_latency_ms) : "—"));
+    body.append(selectable(tr, "i:" + n.id));
+  }
+  table.append(thead, body);
+  const wrap = element("div", "table-wrap");
+  wrap.append(table);
+  return wrap;
+}
+
+function callList(edges, nameOf, prefix) {
+  if (!edges.length) return element("p", "insp-empty", "No observed calls in this range.");
+  const list = element("ul", "calls");
+  for (const e of edges) {
+    const tone = toneFromErrorRate(e.error_rate, e.calls);
+    const li = element("li", "call");
+    const names = element("span", "call-names");
+    names.append(toneIcon(tone), element("span", "call-a", nameOf(e.source)), icon("arrow-right", "ic ic-xs call-arrow"), element("span", "call-b", nameOf(e.target)));
+    names.title = nameOf(e.source) + " → " + nameOf(e.target);
+    const stats = element("span", "call-stats num");
+    stats.append(element("span", "", fmtRate(e.request_rate_rps)), element("span", tone === "crit" || tone === "warn" ? "tone-" + tone : "", fmtPercent(e.error_rate)));
+    li.title = names.title + " · avg " + fmtMs(e.avg_latency_ms);
+    li.append(names, stats);
+    list.append(selectable(li, prefix + ":" + e.id));
+  }
+  return list;
+}
+
+function trafficTiles(s) {
+  const tone = toneOf(s);
+  const series = state.traffic.get(trafficKey(s.name));
+  const counts = series?.map((p) => p.count);
+  const errors = series?.map((p) => p.count ? p.error_count / p.count : 0);
+  const tiles = element("div", "tiles");
+  tiles.append(
+    tile("Requests", s.requests ? fmtRate(s.request_rate_rps) : "—", "ok", counts ? sparkline(counts, { width: 88, height: 20, label: "Requests per minute" }) : null, "per second"),
+    tile("Errors", s.requests ? fmtPercent(s.error_rate) : "—", tone, errors ? sparkline(errors, { width: 88, height: 20, tone, label: "Error ratio per minute" }) : null, "of requests"),
+    tile("Avg latency", s.requests ? fmtMs(s.avg_latency_ms) : "—", "ok", null, "mean, not p99"),
+  );
+  return tiles;
+}
+
+function metricTiles(item, rateLabel = "Requests") {
+  const tone = toneFromErrorRate(item.error_rate, item.requests ?? item.calls);
+  const has = (item.requests ?? item.calls) > 0;
+  const tiles = element("div", "tiles");
+  tiles.append(
+    tile(rateLabel, has ? fmtRate(item.request_rate_rps) : "—", "ok", null, "per second"),
+    tile("Errors", has ? fmtPercent(item.error_rate) : "—", tone, null, fmtNumber(item.errors || 0) + " of " + fmtNumber(item.requests ?? item.calls ?? 0)),
+    tile("Avg latency", has ? fmtMs(item.avg_latency_ms) : "—", "ok", null, "mean, not p99"),
+  );
+  return tiles;
+}
+
+function chipButton(label, key, glyph) {
+  const b = element("button", "btn btn-sm chip");
+  b.type = "button";
+  b.append(icon(glyph, "ic ic-xs"), element("span", "", label));
+  b.title = label;
+  b.addEventListener("click", () => select(key));
+  return b;
+}
+
+function focusButton(s) {
+  const focused = state.focus === s.service_id;
+  const b = element("button", "btn btn-sm", focused ? "Clear focus" : "Focus service");
+  b.type = "button";
+  b.prepend(icon(focused ? "x" : "focus", "ic ic-sm"));
+  b.addEventListener("click", () => focused ? unfocus() : focusService(s.service_id));
+  return b;
+}
+
+function inspectorHead(tone, kind, title, closable) {
+  const h = $("insp-head");
+  const titles = element("div", "insp-titles");
+  titles.append(element("span", "eyebrow", kind));
+  const h2 = element("h2", "insp-title", title);
+  h2.id = "insp-title";
+  h2.title = title;
+  titles.append(h2);
+  h.replaceChildren(tone ? toneIcon(tone, "ic insp-ic") : icon("layers", "ic insp-ic tone-faint"), titles);
+  if (tone) h.append(badge(tone));
+  const close = element("button", "btn btn-ghost btn-icon btn-sm insp-close");
+  close.type = "button";
+  close.setAttribute("aria-label", closable ? "Clear selection" : "Close inspector");
+  close.append(icon("x", "ic"));
+  close.addEventListener("click", () => closable ? clearSelection() : closeDrawer());
+  close.classList.toggle("drawer-only", !closable);
+  h.append(close);
+}
+
+function explorerLinks(name, host) {
+  const links = [];
+  const add = (label, href) => {
+    const a = element("a", "insp-link", label);
+    a.href = href;
+    a.append(icon("arrow-right", "ic ic-xs"));
+    links.push(a);
+  };
+  if (name) {
+    add("Root cause in Explorer", "/explorer?" + new URLSearchParams({ service: name, tab: "why" }));
+    add("Impact", "/explorer?" + new URLSearchParams({ service: name, tab: "impact" }));
+  } else if (host) add("Host in Explorer", "/explorer?" + new URLSearchParams({ host }));
+  else add("Open Explorer", "/explorer");
+  $("insp-links").replaceChildren(...links);
+}
+
+function renderCoverage() {
+  const meta = state.scene?.meta;
+  const line = $("coverage");
+  if (!meta) { line.textContent = ""; return; }
+  const parts = [meta.coverage === "limited" ? "Limited coverage" : "Observed coverage"];
+  if (finite(meta.resolution_seconds)) parts.push(Math.round(meta.resolution_seconds / 60) + "-min buckets");
+  if (meta.truncated) parts.push("result truncated");
+  if (meta.flush_failed) parts.push("last flush failed");
+  line.textContent = parts.join(" · ");
+  line.title = typeof meta.note === "string" ? meta.note : "";
+  line.classList.toggle("tone-warn", meta.coverage === "limited" || Boolean(meta.truncated) || Boolean(meta.flush_failed));
+}
+
+function setTabs(enabled) {
+  $("insp-tabs").hidden = !enabled;
+  for (const tab of $("insp-tabs").querySelectorAll("[role=tab]")) {
+    const on = tab.dataset.tab === state.tab;
+    tab.setAttribute("aria-selected", String(on));
+    tab.tabIndex = on ? 0 : -1;
+    if (on) $("insp-body").setAttribute("aria-labelledby", tab.id);
+  }
+  if (!enabled) $("insp-body").setAttribute("aria-labelledby", "insp-title");
 }
 
 function renderInspector() {
-  const graph = state.graph;
-  const node = state.selected?.kind === "node" ? graph?.nodes.find((n) => n.id === state.selected.id) : null;
-  const edge = state.selected?.kind === "edge" ? graph?.edges.find((e) => e.id === state.selected.id) : null;
-  const source = edge ? graph.nodes.find((n) => n.id === edge.source) : null;
-  const target = edge ? graph.nodes.find((n) => n.id === edge.target) : null;
-  const selected = node || edge;
-  put("inspect-kind", edge ? "Selected call edge" : state.mode === "instances" ? "Selected instance" : "Selected service");
-  put("inspect-name", edge ? source.name + " → " + target.name : node?.name || "Select a node or edge");
-  put("inspect-env", node ? envLabel(node.environment) : edge ? envLabel(source.environment) + " → " + envLabel(target.environment) : "—");
-  put("inspect-id", edge ? (source.instance || source.name) + " → " + (target.instance || target.name) :
-    node ? node.instance || number(node.instance_count) + (node.instance_count === 1 ? " known instance" : " known instances") : "");
-  const requests = node?.requests ?? edge?.calls ?? 0;
-  const uncertain = node?.unresolved_count > 0 || graph?.meta.coverage === "limited";
-  put("inspect-status", !selected ? "No selection" : uncertain ? "Limited evidence" : selected.errors ? "Errors observed" : requests ? "No observed errors" : "No entry spans");
-  $("inspect-status").className = "pill" + (uncertain || selected?.errors ? " warn" : "");
-  put("attr-label", edge ? "Call count" : "Hosts · latest placement");
-  put("inspect-host", edge ? number(edge.calls) : node?.hosts.join(", ") || "Unknown");
-  put("inspect-coverage", node?.unresolved_count ? "Instance identity incomplete" : graph?.meta.coverage || "—");
-  put("rate-label", edge ? "Calls / sec" : "Entry spans / sec");
-  put("inspect-rate", requests ? number(selected.request_rate_rps, 2) : "—");
-  put("inspect-lat", requests ? number(selected.avg_latency_ms, 2) + " ms" : "—");
-  put("inspect-err", requests ? number(selected.error_rate * 100, 2) + "%" : "—");
-  put("relation", edge ? "Observed trace parent–child relationship. Sharing a host never creates a call edge." :
-    node?.unresolved_count ? "Supply service.instance.id, or host identity plus pod/container/process identity, to distinguish copies reliably." :
-    "Node rates use server/consumer spans and root spans. Select a call edge for its latency and errors.");
-  $("drill").disabled = !selected || !!edge && state.mode === "instances";
-  put("drill", state.mode === "instances" && node ? "Back to service view →" : "Inspect instances →");
-  const attrs = node ? {
-    "service.name": node.name, "service.namespace": node.namespace || null,
-    "deployment.environment.name": node.environment || null,
-    "service.instance.id": node.instance || null, "identity": node.identity,
-    "latest_hosts": node.hosts, "known_instances": node.instance_count, "unresolved_identities": node.unresolved_count,
-  } : edge ? { source: source.id, target: target.id, calls: edge.calls, errors: edge.errors, evidence: "trace parent-child" } : {};
-  put("attributes", JSON.stringify(attrs, null, 2));
-}
+  const body = $("insp-body");
+  const find = lookup();
+  // A focused service is the inspector's subject until something else is selected.
+  const key = state.selected || (state.focus ? "s:" + state.focus : null);
+  const kind = key?.[0], id = key?.slice(2);
+  const nameOf = (nodeId) => {
+    const n = find.instance(nodeId);
+    return n ? shortInstance(n) : find.service(nodeId)?.name || "unknown";
+  };
+  const serviceName = (serviceId) => find.service(serviceId)?.name || "unknown";
+  const parts = [];
+  renderCoverage();
 
-function renderRuntime(data) {
-  const s = data.storage, e = data.exports;
-  if (!s || !e) throw new Error("Invalid runtime stats response.");
-  put("mode", data.mode ? data.mode + " mode" : "Mode unavailable");
-  put("retention", data.retention_days ? "Retention configured: " + data.retention_days + " days" : "Retention unavailable");
-  put("total-exports", number(e.trace_exports + e.metric_exports + e.log_exports));
-  put("total-storage", s.complete ? bytes(s.total_bytes) : "Unavailable");
-  put("storage-total", s.complete ? bytes(s.total_bytes) + " on disk" : "Incomplete measurement");
-  put("storage-main", bytes(s.main_bytes));
-  put("storage-aggregate", bytes(s.aggregate_bytes));
-  put("storage-sidecars", bytes(s.sidecar_bytes));
-  put("disk-free", Number.isFinite(s.free_bytes) ? bytes(s.free_bytes) + " free · main filesystem" : "Free space unavailable");
-  put("storage-note", s.note);
-  $("storage-bar").replaceChildren();
-  if (s.complete && s.total_bytes > 0) {
-    for (const [size, color] of [[s.main_bytes, "#76b6ff"], [s.aggregate_bytes, "#66c7b4"], [s.sidecar_bytes, "#d7ad68"]]) {
-      const part = element("i");
-      part.style.width = Math.max(0, Math.min(100, size / s.total_bytes * 100)) + "%";
-      part.style.background = color;
-      $("storage-bar").append(part);
+  if (kind === "s" && find.service(id)) {
+    const s = find.service(id);
+    const tone = toneOf(s);
+    inspectorHead(tone, "Service", s.name, Boolean(state.selected));
+    setTabs(true);
+    explorerLinks(s.name);
+    if (state.tab === "overview") {
+      const actions = element("div", "insp-actions");
+      actions.append(focusButton(s), element("span", "insp-meta", fmtNumber(s.instance_count) + (s.instance_count === 1 ? " instance" : " instances") + " · " + fmtNumber(s.hosts.length) + (s.hosts.length === 1 ? " host" : " hosts")));
+      parts.push(trafficTiles(s), actions, section("Instances", instanceTable(find.instancesOf(id))), details("Identity & evidence", [
+        ["Environment", envLabel(s.environment)], ["Namespace", nsLabel(s.namespace)], ["Service id", s.service_id],
+        ["Hosts", s.hosts.join(", ") || "Unknown"], ["Identity", s.identity], ["Unresolved", s.unresolved_count ? fmtNumber(s.unresolved_count) + " identities" : "None"],
+        ["Coverage", "Rates count server, consumer and root spans in five-minute buckets. Sparklines use per-minute trace counts."],
+      ]));
+    } else if (state.tab === "instances") {
+      parts.push(instanceTable(find.instancesOf(id)));
+    } else {
+      parts.push(callList((state.scene?.svcEdges || []).filter((e) => e.source === id || e.target === id).sort(byErrorContribution), serviceName, "e"));
     }
+  } else if (kind === "i" && find.instance(id)) {
+    const n = find.instance(id);
+    const tone = toneOf(n);
+    inspectorHead(tone, "Instance · " + n.name, n.instance || shortInstance(n), true);
+    setTabs(true);
+    explorerLinks(n.name);
+    if (state.tab === "overview") {
+      const chips = element("div", "insp-actions");
+      chips.append(chipButton(n.name, "s:" + n.service_id, "boxes"));
+      for (const h of n.hosts) chips.append(chipButton(h, "h:" + h, "server"));
+      parts.push(metricTiles(n), chips, details("Identity & evidence", [
+        ["service.instance.id", n.instance || "Not reported"], ["Service", n.name], ["Namespace", nsLabel(n.namespace)],
+        ["Environment", envLabel(n.environment)], ["Hosts", n.hosts.join(", ") || "Unknown"], ["Identity", n.identity],
+        ["Coverage", "Host placement is the latest reported value."],
+      ]));
+    } else if (state.tab === "instances") {
+      parts.push(instanceTable(find.instancesOf(n.service_id)));
+    } else {
+      parts.push(callList(find.allIEdges().filter((e) => e.source === id || e.target === id).sort(byErrorContribution), nameOf, "x"));
+    }
+  } else if (kind === "h" && state.scene?.hostChips.some((h) => h.name === id)) {
+    const chip = state.scene.hostChips.find((h) => h.name === id);
+    const info = chip.info;
+    const onHost = find.allInstances().filter((n) => n.hosts.includes(id) && state.scene.services.some((s) => s.service_id === n.service_id))
+      .sort((a, b) => toneRank(toneOf(a)) - toneRank(toneOf(b)) || a.name.localeCompare(b.name));
+    inspectorHead(chip.tone, "Host", id, true);
+    setTabs(true);
+    explorerLinks(null, id);
+    if (state.tab === "overview") {
+      const tiles = element("div", "tiles");
+      tiles.append(tile("Services", finite(info?.service_count) ? fmtNumber(info.service_count) : "—", "ok", null, "all environments"),
+        tile("Instances", fmtNumber(onHost.length), chip.tone, null, "in this view"),
+        tile("Last seen", info?.last_seen ? fmtAgo(info.last_seen) : "—", "ok", null, "latest report"));
+      const services = element("ul", "calls");
+      const names = info?.services?.length ? info.services : unique(onHost.map((n) => n.name));
+      for (const name of names) {
+        const s = state.scene.services.find((item) => item.name === name);
+        const li = element("li", "call");
+        const label = element("span", "call-names");
+        label.append(s ? toneIcon(toneOf(s)) : icon("circle-dashed", "ic ic-sm tone-unk"), element("span", "call-a", name));
+        li.append(label, element("span", "call-stats num", s ? fmtPercent(s.error_rate) : "out of scope"));
+        services.append(s ? selectable(li, "s:" + s.service_id) : li);
+      }
+      parts.push(tiles, section("Services on this host", services), section("Instances", instanceTable(onHost)));
+    } else if (state.tab === "instances") {
+      parts.push(instanceTable(onHost));
+    } else {
+      const ids = new Set(onHost.map((n) => n.id));
+      parts.push(callList(find.allIEdges().filter((e) => ids.has(e.source) || ids.has(e.target)).sort(byErrorContribution), nameOf, "x"));
+    }
+  } else if (kind === "e" && find.edge(id)) {
+    const e = find.edge(id);
+    const tone = toneFromErrorRate(e.error_rate, e.calls);
+    const a = serviceName(e.source), b = serviceName(e.target);
+    inspectorHead(tone, "Call", a + " → " + b, true);
+    setTabs(true);
+    explorerLinks(b);
+    const serviceOf = new Map(find.allInstances().map((n) => [n.id, n.service_id]));
+    const instanceCalls = find.allIEdges().filter((x) => serviceOf.get(x.source) === e.source && serviceOf.get(x.target) === e.target).sort(byErrorContribution);
+    if (state.tab === "overview") {
+      const chips = element("div", "insp-actions");
+      chips.append(chipButton(a, "s:" + e.source, "boxes"), icon("arrow-right", "ic ic-sm tone-faint"), chipButton(b, "s:" + e.target, "boxes"));
+      parts.push(metricTiles({ ...e, requests: e.calls }, "Calls"), chips, details("Identity & evidence", [
+        ["Calls", fmtNumber(e.calls)], ["Errors", fmtNumber(e.errors)], ["Instance pairs", fmtNumber(instanceCalls.length)],
+        ["Evidence", "Observed trace parent–child spans. Sharing a host never creates a call."],
+      ]));
+    } else if (state.tab === "instances") {
+      parts.push(instanceTable([...find.instancesOf(e.source), ...find.instancesOf(e.target)]));
+    } else {
+      parts.push(callList(instanceCalls, nameOf, "x"));
+    }
+  } else if (kind === "x" && find.iedge(id)) {
+    const e = find.iedge(id);
+    const tone = toneFromErrorRate(e.error_rate, e.calls);
+    const a = find.instance(e.source), b = find.instance(e.target);
+    inspectorHead(tone, "Instance call", shortInstance(a) + " → " + shortInstance(b), true);
+    setTabs(true);
+    explorerLinks(b.name);
+    if (state.tab === "overview") {
+      const chips = element("div", "insp-actions");
+      chips.append(chipButton(a.name + " " + shortInstance(a), "i:" + a.id, "box"), icon("arrow-right", "ic ic-sm tone-faint"), chipButton(b.name + " " + shortInstance(b), "i:" + b.id, "box"));
+      parts.push(metricTiles({ ...e, requests: e.calls }, "Calls"), chips, details("Identity & evidence", [
+        ["Caller", a.instance || shortInstance(a)], ["Caller host", a.hosts.join(", ") || "Unknown"],
+        ["Callee", b.instance || shortInstance(b)], ["Callee host", b.hosts.join(", ") || "Unknown"],
+        ["Calls", fmtNumber(e.calls)], ["Errors", fmtNumber(e.errors)],
+      ]));
+    } else if (state.tab === "instances") {
+      parts.push(instanceTable([a, b]));
+    } else {
+      parts.push(callList(find.allIEdges().filter((x) => find.instance(x.source)?.service_id === a.service_id && find.instance(x.target)?.service_id === b.service_id).sort(byErrorContribution), nameOf, "x"));
+    }
+  } else {
+    if (state.selected) state.selected = null;
+    const sc = state.scene;
+    const focused = state.focus ? find.service(state.focus) : null;
+    inspectorHead(null, "Scope · " + envLabel(state.env), focused ? focused.name + " neighbourhood" : state.namespace ? nsLabel(state.namespace) : "All services", false);
+    setTabs(false);
+    explorerLinks(focused?.name);
+    if (!state.svc || state.failure) {
+      const tiles = element("div", "tiles");
+      tiles.append(tile("Services", "—", "ok"), tile("Instances", "—", "ok"), tile("Hosts", "—", "ok"));
+      body.replaceChildren(tiles);
+      return;
+    }
+    const services = sc?.services || [];
+    const unhealthy = services.filter((s) => ["crit", "warn"].includes(toneOf(s)))
+      .sort((a, b) => toneRank(toneOf(a)) - toneRank(toneOf(b)) || b.error_rate - a.error_rate).slice(0, 6);
+    const tiles = element("div", "tiles");
+    tiles.append(tile("Services", fmtNumber(services.length), "ok", null, unhealthy.length ? unhealthy.length + " need attention" : "all quiet"),
+      tile("Instances", fmtNumber(services.reduce((sum, s) => sum + (s.instance_count || 0), 0)), "ok", null, "known identities"),
+      tile("Hosts", fmtNumber(sc?.hostChips.length || 0), "ok", null, "latest placement"));
+    const attention = element("ul", "calls");
+    for (const s of unhealthy) {
+      const li = element("li", "call");
+      const label = element("span", "call-names");
+      label.append(toneIcon(toneOf(s)), element("span", "call-a", s.name), element("span", "call-ns", s.namespace));
+      label.title = s.name;
+      const stats = element("span", "call-stats num");
+      stats.append(element("span", "tone-" + toneOf(s), fmtPercent(s.error_rate)), element("span", "", fmtMs(s.avg_latency_ms)));
+      li.append(label, stats);
+      attention.append(selectable(li, "s:" + s.service_id));
+    }
+    const nameById = (sid) => serviceName(sid);
+    const hot = (sc?.svcEdges || []).filter((e) => e.errors > 0).sort(byErrorContribution).slice(0, 6);
+    parts.push(tiles,
+      section("Needs attention", unhealthy.length ? attention : element("p", "insp-empty", "No degraded or critical services in this scope.")),
+      section("Hot connections", hot.length ? callList(hot, nameById, "e") : element("p", "insp-empty", "No failing calls in this scope.")));
   }
-  put("trace-exports", number(e.trace_exports));
-  put("metric-exports", number(e.metric_exports));
-  put("log-exports", number(e.log_exports));
-  put("failed-exports", number(e.rejected_exports));
-  put("ack-p99", e.latency_samples ? number(e.ack_p99_ms, 2) + " ms" : "Unavailable");
-  put("queue-usage", data.queue_ratio === null ? "Unavailable" : number(data.queue_ratio * 100, 1) + "%");
-  put("app-memory", bytes(data.heap_bytes));
-  put("latency-note", e.latency_note + " Samples: " + number(e.latency_samples) + ".");
+  body.replaceChildren(...parts);
 }
 
-function renderRuntimeUnavailable() {
-  for (const id of ["total-exports", "total-storage", "storage-total", "storage-main", "storage-aggregate", "storage-sidecars", "disk-free",
-    "trace-exports", "metric-exports", "log-exports", "failed-exports", "ack-p99", "queue-usage", "app-memory"]) put(id, "Unavailable");
-  $("storage-bar").replaceChildren();
+const trafficKey = (name) => [name, state.start, state.end].join("|");
+
+async function loadTraffic(name) {
+  const key = trafficKey(name);
+  if (state.traffic.has(key)) return;
+  state.trafficController?.abort();
+  const controller = new AbortController();
+  state.trafficController = controller;
+  try {
+    const series = await getJSON("/api/metrics/traffic?" + new URLSearchParams({ start: state.start, end: state.end, service_name: name }), controller.signal);
+    if (!Array.isArray(series)) return;
+    state.traffic.set(key, series.filter((p) => p && finite(p.count) && finite(p.error_count)).slice(-240));
+    const subject = state.selected || (state.focus ? "s:" + state.focus : "");
+    if (subject.startsWith("s:") && lookup().service(subject.slice(2))?.name === name) renderInspector();
+  } catch {
+    // Sparklines are optional; the tiles already carry the topology values.
+  }
 }
 
-$("env").addEventListener("change", dirtyFilters);
-$("time").addEventListener("change", dirtyFilters);
-$("search").addEventListener("input", renderList);
-$("apply").addEventListener("click", () => {
-  state.environment = $("env").value === "*" ? undefined : JSON.parse($("env").value);
-  state.minutes = Number($("time").value);
+// ---------- Selection, focus and drawers ----------
+
+function select(key, { open = true } = {}) {
+  state.selected = key;
+  paint();
+  renderInspector();
+  if (key.startsWith("s:")) {
+    const s = lookup().service(key.slice(2));
+    if (s) loadTraffic(s.name);
+  }
+  if (open && mqInspector.matches) openDrawer("inspector");
+}
+
+function clearSelection() {
+  const lost = $("inspector").contains(document.activeElement) || document.activeElement === document.body;
+  state.selected = null;
+  state.hover = null;
+  state.tab = "overview";
+  paint();
+  renderInspector();
+  if (state.drawer === "inspector") closeDrawer();
+  else if (lost) canvas.focus();
+}
+
+function focusService(id) {
+  state.focus = id;
+  state.selected = null;
+  state.tab = "overview";
+  state.mode = "instances";
+  state.notice = "";
+  closeDrawer();
+  writeURL();
+  load({ full: false, refit: true });
+}
+
+function unfocus() {
+  // A pending focus read is obsolete; a full refresh re-reads state.focus when it lands.
+  if (state.loading && !state.loadingFull) {
+    state.gen++;
+    state.controller?.abort();
+    state.loading = false;
+    canvas.removeAttribute("aria-busy");
+  }
+  state.focus = "";
+  state.focusGraph = null;
+  renderAll({ refit: true });
+}
+
+function drawerPanel(name) {
+  return name === "rail" ? $("rail") : $("inspector");
+}
+
+function openDrawer(name) {
+  if (state.drawer === name) return;
+  if (state.drawer) closeDrawer(false);
+  state.drawer = name;
+  state.opener = document.activeElement;
+  $("main").classList.add(name + "-open");
+  $("scrim").hidden = false;
+  syncDrawers();
+  (name === "rail" ? $("rail-open") : $("insp-open")).setAttribute("aria-expanded", "true");
+  const panel = drawerPanel(name);
+  requestAnimationFrame(() => panel.querySelector(".insp-close, .drawer-close, button, a, input")?.focus());
+}
+
+function closeDrawer(restore = true) {
+  if (!state.drawer) return;
+  const name = state.drawer;
+  state.drawer = null;
+  $("main").classList.remove(name + "-open");
+  $("scrim").hidden = true;
+  (name === "rail" ? $("rail-open") : $("insp-open")).setAttribute("aria-expanded", "false");
+  syncDrawers();
+  if (restore && state.opener?.isConnected) state.opener.focus();
+  else if (restore) canvas.focus();
+  state.opener = null;
+}
+
+function syncDrawers() {
+  if (state.drawer === "rail" && !mqRail.matches) closeDrawer(false);
+  if (state.drawer === "inspector" && !mqInspector.matches) closeDrawer(false);
+  $("rail").inert = mqRail.matches && state.drawer !== "rail";
+  $("inspector").inert = mqInspector.matches && state.drawer !== "inspector";
+  $("inspector").classList.toggle("is-drawer", mqInspector.matches);
+}
+
+// The environment control moves into the rail where the top bar has no room.
+function placeEnvironment() {
+  const field = $("env-field");
+  if (mqCompact.matches) $("rail-env").append(field);
+  else document.querySelector(".topbar-tools").prepend(field);
+  $("rail-env").hidden = !mqCompact.matches;
+}
+
+// ---------- Render all ----------
+
+function renderAll({ refit = false } = {}) {
+  renderStatus();
+  // A shared link may name a namespace this range no longer has.
+  if (state.namespace && !state.svc?.nodes.some((n) => n.namespace === state.namespace)) state.namespace = "";
+  const empty = state.svc && !state.svc.nodes.length && !state.focusGraph?.nodes.length;
+  if (state.failure) {
+    const unavailable = state.failure.status === 503 && /unavailable/i.test(state.failure.message);
+    showState(unavailable ? "unavailable" : "error", state.failure);
+  } else if (empty) {
+    showState(state.catalog?.services.length ? "quiet" : "empty");
+  } else if (state.svc) {
+    showState(null);
+  }
+  if (state.svc && !state.failure && !empty) {
+    const before = state.sceneKey;
+    layoutAndFit(refit || !state.scene);
+    state.sceneKey = sceneKey(state.scene);
+    if (!refit && before && before !== state.sceneKey) layoutAndFit(true);
+  }
+  renderControls();
+  renderRail();
+  renderInspector();
+  const note = $("map-note");
+  const meta = state.scene?.meta;
+  const instances = state.mode === "instances";
+  const message = state.notice || (instances && meta?.truncated ?
+    "Truncated: " + fmtNumber(state.scene.pills.length) + " of " + fmtNumber(meta.available_nodes) + " instances, " +
+      fmtNumber(state.scene.iedges.length) + " call edges. " + (state.focus ? "Use 1 hop or a shorter range." : "Focus a service for complete instance calls.") : "");
+  note.textContent = message;
+  note.hidden = !message || Boolean(state.failure);
+  writeURL();
+  const subject = state.selected || (state.focus ? "s:" + state.focus : "");
+  if (subject.startsWith("s:")) {
+    const s = lookup().service(subject.slice(2));
+    if (s) loadTraffic(s.name);
+  }
+}
+
+// ---------- Events ----------
+
+function hoverKey(target) {
+  const el = target?.closest?.("[data-key]");
+  if (!el) return null;
+  const key = el.dataset.key;
+  if (key.startsWith("g:")) return "s:" + key.slice(2);
+  return key.startsWith("r:") ? null : key;
+}
+
+map.addEventListener("pointerover", (e) => {
+  if (e.pointerType === "touch" || dragging) return;
+  const key = hoverKey(e.target);
+  if (key === state.hover) return;
+  state.hover = key;
+  paint();
+});
+map.addEventListener("pointerleave", () => { if (state.hover) { state.hover = null; paint(); } });
+map.addEventListener("focusin", (e) => { state.hover = hoverKey(e.target); paint(); });
+map.addEventListener("focusout", () => { state.hover = null; paint(); });
+map.addEventListener("click", (e) => {
+  const key = hoverKey(e.target);
+  if (key) select(key);
+  else if (state.selected) clearSelection();
+});
+map.addEventListener("dblclick", (e) => {
+  const key = hoverKey(e.target);
+  if (key?.startsWith("s:")) focusService(key.slice(2));
+});
+map.addEventListener("keydown", (e) => {
+  const key = hoverKey(e.target);
+  if (!key || (e.key !== "Enter" && e.key !== " ")) return;
+  e.preventDefault();
+  select(key);
+});
+
+// Pan with one pointer, pinch with two. Capture only once a drag starts so clicks still land on nodes.
+const pointers = new Map();
+let dragging = false, gesture = null;
+canvas.addEventListener("pointerdown", (e) => {
+  if (e.button !== 0 || e.target.closest(".zoom, .map-state, .map-note")) return;
+  pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  const points = [...pointers.values()];
+  const view = { ...state.view };
+  gesture = points.length === 2 ? {
+    pinch: true, view, distance: Math.hypot(points[0].x - points[1].x, points[0].y - points[1].y) || 1,
+    mid: { x: (points[0].x + points[1].x) / 2, y: (points[0].y + points[1].y) / 2 },
+  } : { pinch: false, view, x: e.clientX, y: e.clientY };
+});
+canvas.addEventListener("pointermove", (e) => {
+  if (!pointers.has(e.pointerId) || !gesture) return;
+  pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  const rect = canvas.getBoundingClientRect();
+  if (gesture.pinch && pointers.size === 2) {
+    const [a, b] = [...pointers.values()];
+    const k = clamp(gesture.view.k * Math.hypot(a.x - b.x, a.y - b.y) / gesture.distance, 0.15, 2.5);
+    const mid = { x: (a.x + b.x) / 2 - rect.left, y: (a.y + b.y) / 2 - rect.top };
+    const origin = { x: gesture.mid.x - rect.left, y: gesture.mid.y - rect.top };
+    const f = k / gesture.view.k;
+    state.view = { k, x: mid.x - (origin.x - gesture.view.x) * f, y: mid.y - (origin.y - gesture.view.y) * f };
+    dragging = true;
+    applyView();
+    return;
+  }
+  const dx = e.clientX - gesture.x, dy = e.clientY - gesture.y;
+  if (!dragging && Math.hypot(dx, dy) < 4) return;
+  if (!dragging) {
+    dragging = true;
+    canvas.setPointerCapture(e.pointerId);
+    canvas.classList.add("is-panning");
+    if (state.hover) { state.hover = null; paint(); }
+  }
+  state.view = { ...gesture.view, x: gesture.view.x + dx, y: gesture.view.y + dy };
+  applyView();
+});
+for (const type of ["pointerup", "pointercancel"]) canvas.addEventListener(type, (e) => {
+  pointers.delete(e.pointerId);
+  if (pointers.size) return;
+  gesture = null;
+  canvas.classList.remove("is-panning");
+  if (dragging) setTimeout(() => { dragging = false; });
+});
+canvas.addEventListener("click", (e) => { if (dragging) e.stopPropagation(); }, true);
+canvas.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  const rect = canvas.getBoundingClientRect();
+  zoomAt(Math.exp(-e.deltaY * (e.ctrlKey ? 0.01 : 0.0015)), e.clientX - rect.left, e.clientY - rect.top);
+}, { passive: false });
+canvas.addEventListener("keydown", (e) => {
+  if (e.target !== canvas) return;
+  const pan = { ArrowLeft: [64, 0], ArrowRight: [-64, 0], ArrowUp: [0, 64], ArrowDown: [0, -64] }[e.key];
+  if (pan) {
+    e.preventDefault();
+    state.view = { ...state.view, x: state.view.x + pan[0], y: state.view.y + pan[1] };
+    applyView();
+  } else if (e.key === "+" || e.key === "=") zoomCenter(1.2);
+  else if (e.key === "-") zoomCenter(1 / 1.2);
+  else if (e.key === "0") layoutAndFit(true);
+});
+
+$("zoom-in").addEventListener("click", () => zoomCenter(1.2));
+$("zoom-out").addEventListener("click", () => zoomCenter(1 / 1.2));
+$("zoom-fit").addEventListener("click", () => layoutAndFit(true));
+$("refresh").addEventListener("click", () => load());
+$("env").addEventListener("change", () => {
+  state.env = $("env").value === "*" ? undefined : JSON.parse($("env").value);
   state.focus = "";
   state.selected = null;
-  dirtyFilters();
-  launch(refresh());
+  load();
 });
-for (const mode of ["services", "instances"]) $(mode).addEventListener("click", () => {
-  if (state.mode === mode) return;
-  state.mode = mode;
-  state.selected = null;
-  launch(requestGraph());
+for (const b of document.querySelectorAll("[data-range]")) b.addEventListener("click", () => {
+  if (state.range === b.dataset.range) return;
+  state.range = b.dataset.range;
+  load();
 });
-$("depth").addEventListener("change", () => { state.hops = Number($("depth").value); launch(requestGraph()); });
-$("hosts").addEventListener("change", () => { state.hosts = $("hosts").checked; renderGraph(); });
-$("show-group").addEventListener("click", () => {
-  state.focus = "";
-  $("search").value = "";
-  state.selected = null;
-  launch(requestGraph());
+for (const b of document.querySelectorAll("[data-mode]")) b.addEventListener("click", () => {
+  if (state.mode === b.dataset.mode) return;
+  state.mode = b.dataset.mode;
+  renderAll({ refit: true });
 });
-$("drill").addEventListener("click", () => {
-  const node = state.graph?.nodes.find((n) => n.id === state.selected?.id);
-  const edge = state.graph?.edges.find((e) => e.id === state.selected?.id);
-  const target = node || state.graph?.nodes.find((n) => n.id === edge?.target);
-  if (!target) return;
-  state.focus = target.service_id;
-  state.mode = state.mode === "instances" && node ? "services" : "instances";
-  state.selected = null;
-  launch(requestGraph());
+$("hops").addEventListener("change", () => {
+  state.hops = Number($("hops").value) === 2 ? 2 : 1;
+  writeURL();
+  load({ full: false });
 });
-$("refresh").addEventListener("click", () => launch(refresh()));
-$("zoom-fit").addEventListener("click", fitView);
-$("zoom-in").addEventListener("click", () => zoom(.8));
-$("zoom-out").addEventListener("click", () => zoom(1.25));
-$("canvas").addEventListener("pointerdown", (event) => {
-  if (!state.view || event.target.closest("[role=button]") || event.button !== 0) return;
-  state.dragging = { x: event.clientX, y: event.clientY, view: { ...state.view } };
-  $("canvas").setPointerCapture(event.pointerId);
+$("search").addEventListener("input", () => { state.query = $("search").value; renderResults(); });
+$("search").addEventListener("keydown", (e) => {
+  if (e.key !== "Enter") return;
+  const first = $("results").querySelector("button");
+  if (first) { e.preventDefault(); first.click(); }
 });
-$("canvas").addEventListener("pointermove", (event) => {
-  if (!state.dragging) return;
-  const d = state.dragging;
-  const rect = $("canvas").getBoundingClientRect();
-  const scale = Math.max(d.view.width / rect.width, d.view.height / rect.height);
-  state.view = { ...d.view, x: d.view.x - (event.clientX - d.x) * scale, y: d.view.y - (event.clientY - d.y) * scale };
-  updateView();
+
+const tabs = [...$("insp-tabs").querySelectorAll("[role=tab]")];
+for (const tab of tabs) {
+  tab.addEventListener("click", () => { state.tab = tab.dataset.tab; renderInspector(); });
+  tab.addEventListener("keydown", (e) => {
+    const index = tabs.indexOf(tab);
+    const next = { ArrowRight: index + 1, ArrowLeft: index - 1, Home: 0, End: tabs.length - 1 }[e.key];
+    if (next === undefined) return;
+    e.preventDefault();
+    const target = tabs[(next + tabs.length) % tabs.length];
+    state.tab = target.dataset.tab;
+    renderInspector();
+    target.focus();
+  });
+}
+
+$("rail-open").addEventListener("click", () => state.drawer === "rail" ? closeDrawer() : openDrawer("rail"));
+$("insp-open").addEventListener("click", () => state.drawer === "inspector" ? closeDrawer() : openDrawer("inspector"));
+for (const b of document.querySelectorAll("[data-close]")) b.addEventListener("click", () => closeDrawer());
+$("scrim").addEventListener("click", () => closeDrawer());
+
+document.addEventListener("keydown", (e) => {
+  const typing = e.target.closest?.("input, select, textarea");
+  if (e.key === "/" && !typing && !e.metaKey && !e.ctrlKey) {
+    e.preventDefault();
+    if (mqRail.matches) openDrawer("rail");
+    requestAnimationFrame(() => $("search").focus());
+  } else if (e.key === "Escape") {
+    if (typing === $("search") && $("search").value) return;
+    if (state.drawer) closeDrawer();
+    else if (state.selected) clearSelection();
+  }
 });
-for (const type of ["pointerup", "pointercancel", "lostpointercapture"]) $("canvas").addEventListener(type, () => { state.dragging = null; });
-$("canvas").addEventListener("keydown", (event) => {
-  if (!state.view || event.target !== $("canvas")) return;
-  const directions = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
-  const direction = directions[event.key];
-  if (!direction) return;
-  event.preventDefault();
-  state.view.x += direction[0] * state.view.width * .1;
-  state.view.y += direction[1] * state.view.height * .1;
-  updateView();
+
+for (const mq of [mqInspector, mqRail]) mq.addEventListener("change", syncDrawers);
+mqCompact.addEventListener("change", placeEnvironment);
+
+let resizeTimer = 0;
+new ResizeObserver(() => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => { if (state.scene) layoutAndFit(true); }, 120);
+}).observe(canvas);
+
+setInterval(() => {
+  renderStatus();
+  if (!document.hidden && !state.loading && state.updated && Date.now() - state.updated >= REFRESH_MS) load({ refit: false });
+}, 5000);
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && state.updated && Date.now() - state.updated >= REFRESH_MS && !state.loading) load({ refit: false });
 });
-launch(refresh());
+
+initShell();
+readURL();
+placeEnvironment();
+syncDrawers();
+renderRail();
+renderInspector();
+document.fonts.load(FONT.name).then(() => document.fonts.load(FONT.mono)).catch(() => null).finally(() => load());
