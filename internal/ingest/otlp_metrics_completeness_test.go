@@ -1,7 +1,11 @@
 package ingest
 
 import (
+	"bytes"
 	"context"
+	"math"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +15,7 @@ import (
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	metricspb "go.opentelemetry.io/proto/otlp/metrics/v1"
 	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
+	"google.golang.org/protobuf/proto"
 )
 
 // #199 Q5: the OTLP metrics Export tells the client exactly how many data
@@ -212,5 +217,59 @@ func TestRejectionMessageIsBounded(t *testing.T) {
 	}
 	if m.total != want {
 		t.Errorf("total = %d, want %d", m.total, want)
+	}
+}
+
+func TestExportNonFiniteNumberPoints(t *testing.T) {
+	for _, kind := range []string{"gauge", "sum"} {
+		for _, forwarded := range []bool{false, true} {
+			name := kind
+			if forwarded {
+				name += "_forwarded"
+			}
+			t.Run(name, func(t *testing.T) {
+				now := time.Now().UTC()
+				s := metricsExportServer(t, now)
+				if forwarded {
+					attachPrometheus(t, s, "default", true, func(w http.ResponseWriter, r *http.Request) {})
+				}
+				m := gaugeMetricPoints("test.value", 5, now)
+				values := []float64{42, math.NaN(), math.Inf(1), math.Inf(-1), math.NaN()}
+				for i, p := range m.GetGauge().DataPoints {
+					p.Value = &metricspb.NumberDataPoint_AsDouble{AsDouble: values[i]}
+				}
+				// A gap marker is neither recorded nor rejected, even if its placeholder is NaN.
+				m.GetGauge().DataPoints[4].Flags = otlpDataPointNoRecordedValue
+				if kind == "sum" {
+					m.Data = &metricspb.Metric_Sum{Sum: &metricspb.Sum{AggregationTemporality: metricspb.AggregationTemporality_AGGREGATION_TEMPORALITY_CUMULATIVE, DataPoints: m.GetGauge().DataPoints}}
+				}
+				body, err := proto.Marshal(metricsRequest(m))
+				if err != nil {
+					t.Fatal(err)
+				}
+				req := httptest.NewRequest(http.MethodPost, "/v1/metrics", bytes.NewReader(body))
+				req.Header.Set("Content-Type", "application/x-protobuf")
+				rec := httptest.NewRecorder()
+				NewHTTPHandler(nil, nil, s).handleMetrics(rec, req)
+				if rec.Code != http.StatusOK {
+					t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+				}
+				var resp colmetricspb.ExportMetricsServiceResponse
+				if err := proto.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+					t.Fatal(err)
+				}
+				want := int64(3)
+				if forwarded {
+					want = 0
+				}
+				if resp.GetPartialSuccess().GetRejectedDataPoints() != want || !strings.Contains(resp.GetPartialSuccess().GetErrorMessage(), kind+"/non_finite_value=3") {
+					t.Fatalf("unexpected partial success: %v", &resp)
+				}
+				count, _ := s.aggregateEngine.Snapshot().Totals(aggregate.SignalMetric)
+				if count != 1 {
+					t.Fatalf("accepted metric points=%d, want 1", count)
+				}
+			})
+		}
 	}
 }

@@ -482,9 +482,9 @@ func (s *MetricsServer) exportMetrics(ctx context.Context, req *colmetricspb.Exp
 			for _, m := range scopeMetrics.Metrics {
 				switch data := m.Data.(type) {
 				case *metricspb.Metric_Gauge:
-					s.exportNumberPoints(reducer, m, data.Gauge.GetDataPoints(), serviceName, tenantID, producerIdentity, resourceAttrs)
+					s.exportNumberPoints(reducer, m, data.Gauge.GetDataPoints(), serviceName, tenantID, producerIdentity, resourceAttrs, pointRejections)
 				case *metricspb.Metric_Sum:
-					s.exportNumberPoints(reducer, m, data.Sum.GetDataPoints(), serviceName, tenantID, producerIdentity, resourceAttrs)
+					s.exportNumberPoints(reducer, m, data.Sum.GetDataPoints(), serviceName, tenantID, producerIdentity, resourceAttrs, pointRejections)
 				case *metricspb.Metric_Histogram:
 					// Distribution points have no legacy consumer: the TSDB
 					// ring buffer holds scalars only. They exist for aggregate
@@ -599,6 +599,7 @@ func (s *MetricsServer) exportNumberPoints(
 	serviceName, tenantID string,
 	producerIdentity aggregate.ResourceIdentity,
 	resourceAttrs []*commonpb.KeyValue,
+	rejected *metricRejections,
 ) {
 	// In AGGREGATE_MODE=aggregate main.go constructs neither the TSDB
 	// aggregator nor the metric callback, and this collapses to zero: no
@@ -608,7 +609,7 @@ func (s *MetricsServer) exportNumberPoints(
 	legacy := s.aggregator != nil || s.metricCallback != nil
 
 	for _, p := range points {
-		if p == nil {
+		if p == nil || p.Flags&otlpDataPointNoRecordedValue != 0 {
 			continue
 		}
 		var val float64
@@ -624,7 +625,7 @@ func (s *MetricsServer) exportNumberPoints(
 		// 0. Aggregate accounting, ahead of every other consumer.
 		if reducer != nil {
 			temporality, monotonic := aggregateTemporality(m)
-			reducer.ReduceMetricPoint(aggregate.MetricInput{
+			res := reducer.ReduceMetricPoint(aggregate.MetricInput{
 				Tenant:      tenantID,
 				Service:     serviceName,
 				Name:        m.Name,
@@ -639,6 +640,14 @@ func (s *MetricsServer) exportNumberPoints(
 				// dimension the point lacks (#279).
 				ResourceAttributes: resourceAttrs,
 			})
+			kind := pointTypeGauge
+			if m.GetSum() != nil {
+				kind = pointTypeSum
+			}
+			rejected.record(s.metrics, kind, res)
+			if res.Rejected() {
+				continue
+			}
 		}
 
 		if !legacy {

@@ -10,6 +10,14 @@ version identifier (`git rev-parse HEAD`). Per-tag release notes are published o
 This file's `Unreleased` section tracks what has landed on `main` since the
 most recently published tag.
 
+## [0.6.6-alpha.1] - 2026-10-20
+
+### Fixed
+
+- Reject incoming NaN and infinite gauge/sum samples before aggregate reduction, so they cannot poison a shared SQLite commit. Report exact OTLP partial-success counts, or a projection warning when a PromQL backend already accepted the samples. Honor `NO_RECORDED_VALUE` gap markers.
+
+This feature-branch alpha targets non-finite input samples. Overflow caused by extreme finite values during aggregate merging remains outside this fix. No database migration is required.
+
 ## [Unreleased]
 
 ## [v0.6.5] - 2026-10-20
