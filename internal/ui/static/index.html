@@ -27,10 +27,90 @@
         <button class="btn btn-ghost btn-icon" id="theme-button" type="button" aria-label="Switch to light theme"><svg class="ic" aria-hidden="true"><use href="/static/icons.svg#i-sun"/></svg></button>
       </div>
     </header>
+
     <main id="main" class="overview">
-      <!-- Overview content: owned by overview.js / overview.css. -->
-      <h1 class="sr-only">Reliability overview</h1>
-      <section aria-labelledby="platform-heading"><h2 id="platform-heading">Storage & ingestion</h2></section>
+      <header class="ov-head">
+        <div class="ov-title">
+          <h1>Reliability overview <span class="ov-range" id="range-label">· last hour</span></h1>
+          <p class="ov-summary" id="summary" aria-live="polite"><span class="skeleton">Reading service health across the system</span></p>
+        </div>
+        <div class="ov-actions">
+          <div class="seg" id="range-seg" role="group" aria-label="Time range">
+            <button type="button" data-range="15m" aria-pressed="false">15m</button>
+            <button type="button" data-range="1h" aria-pressed="true">1h</button>
+            <button type="button" data-range="6h" aria-pressed="false">6h</button>
+            <button type="button" data-range="24h" aria-pressed="false">24h</button>
+          </div>
+          <span class="live is-off" id="live" role="status">Connecting</span>
+          <a class="btn btn-primary ov-investigate" id="investigate" href="/explorer" hidden><svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#i-crosshair"/></svg><span id="investigate-label">Investigate</span></a>
+        </div>
+      </header>
+
+      <section class="kpis" aria-label="Key indicators">
+        <article class="panel kpi" id="kpi-health">
+          <div class="kpi-top"><h2 class="kpi-label">Healthy services</h2><div class="kpi-aside" id="kpi-health-aside"></div></div>
+          <p class="kpi-value num" id="kpi-health-value"><span class="skeleton">00/00</span></p>
+          <p class="kpi-context" id="kpi-health-context"><span class="skeleton">Loading</span></p>
+        </article>
+        <article class="panel kpi" id="kpi-errors">
+          <div class="kpi-top"><h2 class="kpi-label">Error rate</h2><div class="kpi-aside" id="kpi-errors-aside"></div></div>
+          <p class="kpi-value num" id="kpi-errors-value"><span class="skeleton">0.00%</span></p>
+          <p class="kpi-context" id="kpi-errors-context"><span class="skeleton">Loading</span></p>
+        </article>
+        <article class="panel kpi" id="kpi-latency">
+          <div class="kpi-top"><h2 class="kpi-label">p99 latency</h2><div class="kpi-aside" id="kpi-latency-aside"></div></div>
+          <p class="kpi-value num" id="kpi-latency-value"><span class="skeleton">000 ms</span></p>
+          <p class="kpi-context" id="kpi-latency-context"><span class="skeleton">Loading</span></p>
+        </article>
+        <article class="panel kpi" id="kpi-instances">
+          <div class="kpi-top"><h2 class="kpi-label">Instances</h2><div class="kpi-aside" id="kpi-instances-aside"></div></div>
+          <p class="kpi-value num" id="kpi-instances-value"><span class="skeleton">000</span></p>
+          <p class="kpi-context" id="kpi-instances-context"><span class="skeleton">Loading</span></p>
+        </article>
+      </section>
+
+      <section class="attention" aria-labelledby="attention-heading">
+        <div class="attention-head">
+          <h2 class="eyebrow" id="attention-heading">Needs attention</h2>
+          <span class="badge" id="attention-count" hidden></span>
+        </div>
+        <div class="attention-list" id="attention-list"></div>
+      </section>
+
+      <div class="ov-grid">
+        <section class="panel atlas" aria-labelledby="atlas-heading">
+          <div class="panel-head">
+            <h2 id="atlas-heading">Service map <span class="head-muted">by domain</span></h2>
+            <span class="spacer"></span>
+            <a class="btn btn-ghost btn-sm" href="/service-map">Open map<svg class="ic ic-xs" aria-hidden="true"><use href="/static/icons.svg#i-arrow-up-right"/></svg></a>
+          </div>
+          <div class="atlas-canvas" id="atlas"></div>
+        </section>
+
+        <section class="panel services" aria-labelledby="services-heading">
+          <div class="panel-head">
+            <h2 id="services-heading">Services by health</h2>
+            <span class="head-count num" id="services-count"></span>
+            <span class="spacer"></span>
+            <label class="field services-filter">
+              <svg class="ic ic-sm" aria-hidden="true"><use href="/static/icons.svg#i-search"/></svg>
+              <span class="sr-only">Filter services</span>
+              <input id="services-filter" type="search" placeholder="Filter" autocomplete="off" spellcheck="false">
+            </label>
+          </div>
+          <div class="panel-scroll" id="services-body"></div>
+          <p class="panel-foot" id="services-note" hidden></p>
+        </section>
+
+        <section class="panel storage" aria-labelledby="platform-heading">
+          <div class="panel-head">
+            <h2 id="platform-heading">Storage & ingestion</h2>
+            <span class="spacer"></span>
+            <span class="badge" id="storage-mode" hidden></span>
+          </div>
+          <div class="panel-scroll storage-body" id="storage-body"></div>
+        </section>
+      </div>
     </main>
   </div>
 </body>
