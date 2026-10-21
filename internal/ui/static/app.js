@@ -1260,13 +1260,22 @@ function routedPath(points) {
 function placeEdgeLabels(labels, positions) {
   if (!labels.length) return;
   const lines = [...dom.edges.querySelectorAll(".graph-edge, .runs-on-edge")];
-  const samples = new Map(lines.map((line) => {
-    const length = line.getTotalLength();
-    const points = [];
-    for (let at = 0; at <= length; at += 3) points.push(line.getPointAtLength(at));
-    return [line, points];
-  }));
   const overlaps = (a, b) => a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height;
+  // Sampling paths with getPointAtLength froze the host map for over a second;
+  // clipping each path's flattened segments against the plate is exact enough.
+  const polylines = new Map(lines.map((line) => {
+    const points = pathPolyline(line.getAttribute("d") || "");
+    const xs = points.map((point) => point.x);
+    const ys = points.map((point) => point.y);
+    const box = { x: Math.min(...xs), y: Math.min(...ys), width: Math.max(...xs) - Math.min(...xs), height: Math.max(...ys) - Math.min(...ys) };
+    return [line, { points, box }];
+  }));
+  // Inclusive, so a straight horizontal or vertical path (a zero-height or zero-width box) still counts.
+  const near = (rect, box) => rect.x <= box.x + box.width && box.x <= rect.x + rect.width && rect.y <= box.y + box.height && box.y <= rect.y + rect.height;
+  const crosses = (line, rect) => {
+    const { points, box } = polylines.get(line);
+    return near(rect, box) && points.some((point, index) => index > 0 && segmentHitsRect(points[index - 1], point, rect));
+  };
   // Cards carry an 8px margin so a plate never hides an arrowhead.
   const taken = [...positions.values()].map((point) => ({ x: point.x - CARD_WIDTH / 2 - 8, y: point.y - CARD_HEIGHT / 2 - 8, width: CARD_WIDTH + 16, height: CARD_HEIGHT + 16 }));
   for (const { line, texts, dimmed } of labels) {
@@ -1282,8 +1291,7 @@ function placeEdgeLabels(labels, positions) {
         const plate = { x: at.x - width / 2, y: at.y - height / 2, width, height };
         const clear = { x: plate.x - 2, y: plate.y - 2, width: width + 4, height: height + 4 };
         if (taken.some((box) => overlaps(clear, box))) continue;
-        if (lines.some((other) => other !== line && samples.get(other).some((point) =>
-          point.x > clear.x && point.x < clear.x + clear.width && point.y > clear.y && point.y < clear.y + clear.height))) continue;
+        if (lines.some((other) => other !== line && crosses(other, clear))) continue;
         // Neighbouring labels keep a clear gap so each reads as its own edge's.
         taken.push({ x: plate.x - 3, y: plate.y - 3, width: width + 6, height: height + 6 });
         dom.edges.appendChild(svgElement("rect", { class: "edge-label-plate", ...plate, rx: 2, "data-edge": line.dataset.edge || "", "aria-hidden": "true" }));
@@ -1295,6 +1303,48 @@ function placeEdgeLabels(labels, positions) {
       }
     }
   }
+}
+
+// pathPolyline flattens a routedPath (M, L and Q only); each rounded corner
+// becomes four chords, under a pixel from the drawn curve.
+function pathPolyline(d) {
+  const points = [];
+  for (const [, command, args] of d.matchAll(/([MLQ])([^MLQ]*)/g)) {
+    const n = args.trim().split(/[\s,]+/).map(Number);
+    const from = points[points.length - 1];
+    if (command !== "Q" || !from) {
+      points.push({ x: n[0], y: n[1] });
+      continue;
+    }
+    for (const t of [0.25, 0.5, 0.75, 1]) {
+      const u = 1 - t;
+      points.push({ x: u * u * from.x + 2 * u * t * n[0] + t * t * n[2], y: u * u * from.y + 2 * u * t * n[1] + t * t * n[3] });
+    }
+  }
+  return points;
+}
+
+// segmentHitsRect clips segment a→b against rect (Liang–Barsky).
+function segmentHitsRect(a, b, rect) {
+  let enter = 0;
+  let exit = 1;
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  for (const [p, q] of [[-dx, a.x - rect.x], [dx, rect.x + rect.width - a.x], [-dy, a.y - rect.y], [dy, rect.y + rect.height - a.y]]) {
+    if (p === 0) {
+      if (q < 0) return false;
+      continue;
+    }
+    const t = q / p;
+    if (p < 0) {
+      if (t > exit) return false;
+      enter = Math.max(enter, t);
+    } else {
+      if (t < enter) return false;
+      exit = Math.min(exit, t);
+    }
+  }
+  return true;
 }
 
 function edgeEvidence(edge) {
