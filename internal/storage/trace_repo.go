@@ -397,11 +397,12 @@ type serviceMapSpanRow struct {
 	Duration     int64
 }
 
-// SpansByStartTime names the spans table for a read bounded by a start_time
-// range. Without ANALYZE stats SQLite prefers the tenant_id equality index and
-// walks every span the tenant ever kept (seconds at 1.4M rows, holding the only
-// connection); the start_time range is the selective one.
-func SpansByStartTime(db *gorm.DB) string {
+// SpansByStartTimeAllTenants names the spans table for a read bounded only by
+// a start_time range, with no tenant filter. Without ANALYZE stats SQLite walks
+// a tenant-prefixed index end to end for it; the start_time range is the
+// selective one. Tenant-scoped ranges need no hint: the planner picks
+// idx_spans_tenant_start (tenant_id, start_time) on its own.
+func SpansByStartTimeAllTenants(db *gorm.DB) string {
 	if db.Dialector.Name() == "sqlite" {
 		return "spans INDEXED BY idx_spans_start_time"
 	}
@@ -440,7 +441,7 @@ func (r *Repository) GetServiceMapMetrics(ctx context.Context, start, end time.T
 		Select("span_id, COALESCE(parent_span_id, ''), COALESCE(service_name, ''), COALESCE(duration, 0)").
 		Where(sqlWhereTenantID, tenant)
 	if !start.IsZero() && !end.IsZero() {
-		edgeQuery = edgeQuery.Table(SpansByStartTime(r.db)).Where("start_time BETWEEN ? AND ?", start, end)
+		edgeQuery = edgeQuery.Where("start_time BETWEEN ? AND ?", start, end)
 	}
 	rows, err := edgeQuery.Limit(serviceMapSpanLimit).Rows()
 	if err != nil {

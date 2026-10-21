@@ -137,6 +137,9 @@ func schemaSpec(version int) map[string]tableSpec {
 	if version >= 4 {
 		spanIndexes["idx_spans_start_time"] = indexSpec{columns: []string{"start_time"}}
 	}
+	if version >= 7 {
+		spanIndexes["idx_spans_tenant_start"] = indexSpec{columns: []string{"tenant_id", "start_time"}}
+	}
 	spec := map[string]tableSpec{
 		"traces": {
 			columns: traceColumns,

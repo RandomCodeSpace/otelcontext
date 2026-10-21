@@ -590,6 +590,8 @@ If the edge Collector applies tail-sampling, set `SAMPLING_RATE=1.0` on OtelCont
 5. Run `otelcontext migrate up`, then rerun `otelcontext migrate status` and require `result=ready`.
 6. Start the new binary with `DB_AUTOMIGRATE=false`. Watch `/ready`, `OtelContext_db_up`, and `retention_*` metrics for the first hour.
 
+**Main schema 7 (`spans-tenant-start-index`).** Adds only `idx_spans_tenant_start` on `spans (tenant_id, start_time)` for SQLite and PostgreSQL, so tenant-scoped span windows (GraphRAG rebuild, service-map edges) seek one tenant's range instead of reading every tenant's rows in the window. Rows, FTS objects and the migration 1–6 ledger entries are unchanged. With `DB_AUTOMIGRATE=false`, startup on a version-6 database refuses with `state=behind expected=7 actual=6`; stop writers, back up, run `otelcontext migrate up`, and confirm `migrate status` reports `state=exact expected=7 actual=7`. The index is built inside the migration transaction (plain `CREATE INDEX`, not `CONCURRENTLY`), so on PostgreSQL writes to `spans` block for the build; that is why writers are stopped first. Allow free space for the index plus its build sort and journal: on a 1M-span SQLite fixture (730 MB) the build took about 2.3 s and the file grew by 47.7 MB (6.5%). MySQL and SQL Server get the same index name from AutoMigrate. An older schema-6 binary refuses the upgraded ledger; roll back by restoring the pre-migration backup.
+
 For automation, `migrate status` exits `0` for exact, `10` for empty, `11` for unmanaged, `12` for behind, `13` for ahead, `14` for dirty, `15` for incompatible, and `16` for an unverified preview driver. Command-usage errors exit `2`.
 
 If the new version fails to start:
