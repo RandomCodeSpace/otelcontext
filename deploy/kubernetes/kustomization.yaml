@@ -20,4 +20,4 @@ images:
     newTag: operator-build-required
   - name: otelcontext-prometheus
     newName: registry.invalid/otelcontext-prometheus
-    newTag: 3.15.0-go1.26.9-xnet0.60.0
+    newTag: 3.15.0-go1.26.10-xnet0.60.0
