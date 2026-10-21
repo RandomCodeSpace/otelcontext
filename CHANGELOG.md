@@ -10,21 +10,16 @@ version identifier (`git rev-parse HEAD`). Per-tag release notes are published o
 This file's `Unreleased` section tracks what has landed on `main` since the
 most recently published tag.
 
-## [0.6.6] - 2026-10-20
-
-### Fixed
-
-- Reject incoming NaN and infinite gauge/sum samples before aggregate reduction, so they cannot poison a shared SQLite commit. Report exact OTLP partial-success counts, or a projection warning when a PromQL backend already accepted the samples. Honor `NO_RECORDED_VALUE` gap markers.
-
-This fix targets non-finite input samples. Overflow caused by extreme finite values during aggregate merging remains outside this fix. No database migration is required.
-
 ## [Unreleased]
+
+## [0.6.6] - 2026-10-21
+
+Main schema advances from 6 to **7**: run `otelcontext migrate up` before starting the new binary. See the [v0.6.6 release notes](docs/release-notes/v0.6.6-ui-redesign-ingest-hardening.md) for upgrade, rollback and client-visible changes.
 
 ### Changed
 
 - **Main schema 7** adds `idx_spans_tenant_start` on `spans (tenant_id, start_time)`, so tenant-scoped span windows seek one tenant's rows instead of every tenant's rows in the window. Existing SQLite and PostgreSQL databases require `otelcontext migrate up` with writers stopped; a schema-6 binary refuses the upgraded ledger. See `docs/OPERATIONS.md`.
 - OTLP spans and log records with malformed IDs are refused instead of stored. A span needs a 16-byte trace ID and an 8-byte span ID, neither all zero, and an empty or valid parent span ID. A log record's IDs may be empty, but present ones must be valid. A span link with a malformed ID is dropped and its span kept. Refused records reach nothing downstream, are counted exactly in `partial_success` (`rejected_spans`, `rejected_log_records`) with a reason, and on `otelcontext_ingest_rejected_total{signal,reason="invalid_id"}`. The rest of the batch is accepted and clients must not retry it.
-
 - Redesigned the web UI as three full-viewport pages that share one design system: Carbon palette, self-hosted Geist fonts, Lucide icons.
   - **Overview** (`/`) is the new landing page. It shows a plain-language health summary, KPIs, the services that need attention, a domain map, services by health with per-instance pips, and storage and ingestion figures.
   - **Service map** (`/service-map`) is a layered view with services, instances and hosts. Focusing a service shows its instances with instance-to-instance call edges and "runs on" links to their hosts.
@@ -33,8 +28,9 @@ This fix targets non-finite input samples. Overflow caused by extreme finite val
 
 ### Fixed
 
+- Reject incoming NaN and infinite gauge/sum samples before aggregate reduction, so they cannot poison a shared SQLite commit. Report exact OTLP partial-success counts, or a projection warning when a PromQL backend already accepted the samples. Honor `NO_RECORDED_VALUE` gap markers. Overflow caused by extreme finite values during aggregate merging remains outside this fix.
 - OTLP/HTTP JSON requests now read `traceId`, `spanId` and `parentSpanId` as hex, as the OTLP specification requires. Before, they were read as base64, so spec-compliant JSON exporters lost every span from the instance map. Clients that sent base64 IDs are still accepted. Unknown JSON fields are now ignored, as the specification requires, instead of failing the request with 400. Protobuf requests were never affected.
-- On SQLite, the in-memory graph rebuild, its tenant discovery and the `/api/system/graph` service-map query no longer scan every span a tenant has retained (about 5 s at 1.4M spans) while holding the only database connection: the rebuild every 60 s, and the service-map query on the first request after startup. Topology reads stalled for up to 5 s and returned 504. Tenant-scoped reads use the new schema-7 index below; tenant discovery uses the `start_time` index.
+- On SQLite, the in-memory graph rebuild, its tenant discovery and the `/api/system/graph` service-map query no longer scan every span a tenant has retained (about 5 s at 1.4M spans) while holding the only database connection: the rebuild every 60 s, and the service-map query on the first request after startup. Topology reads stalled for up to 5 s and returned 504. Tenant-scoped reads use the schema-7 index above; tenant discovery uses the `start_time` index.
 - The Explorer's minimap, legend and zoom controls moved into a footer below the map, so they no longer cover service cards. Edge labels sit on their own edge on an opaque plate, clear of other edges, cards and labels; a label with no clear spot falls back to its call count or is left off, and the edge's tooltip keeps the full text. The minimap follows the graph's shape, so host layouts stay readable, and its viewport box is always fully drawn.
 - Services seen only by the pre-sample topology observer no longer report `critical` right after startup. They now report the health of a service with no failures until real measurements arrive.
 
