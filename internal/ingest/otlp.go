@@ -682,6 +682,22 @@ func (s *MetricsServer) exportNumberPoints(
 
 // Export handles incoming OTLP trace data.
 func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceServiceRequest) (response *coltracepb.ExportTraceServiceResponse, exportErr error) {
+	// Refuse malformed ids once, before anything else sees the request:
+	// sampler, topology observer, instance graph, reducer, pipeline, DLQ.
+	req, refusedSpans, droppedLinks := sanitizeTraceRequest(req)
+	// Counted only on a response: a retried, failed Export would count twice.
+	defer func() {
+		if response == nil || (refusedSpans == 0 && droppedLinks == 0) {
+			return
+		}
+		s.metrics.RecordIngestRejected("traces", invalidIDReason, refusedSpans)
+		if response.PartialSuccess == nil {
+			response.PartialSuccess = &coltracepb.ExportTracePartialSuccess{}
+		}
+		response.PartialSuccess.RejectedSpans += int64(refusedSpans)
+		msg := strings.TrimSpace(invalidIDMessage(refusedSpans, "spans refused") + " " + invalidIDMessage(droppedLinks, "span links dropped"))
+		response.PartialSuccess.ErrorMessage = strings.TrimSpace(response.PartialSuccess.ErrorMessage + " " + msg)
+	}()
 	start := time.Now()
 	defer func() {
 		if exportErr == nil && s.instanceGraph != nil {
@@ -1193,6 +1209,20 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 
 // Export handles incoming OTLP log data.
 func (s *LogsServer) Export(ctx context.Context, req *collogspb.ExportLogsServiceRequest) (response *collogspb.ExportLogsServiceResponse, exportErr error) {
+	// Refuse malformed ids once, before anything else sees the request.
+	req, refusedLogs := sanitizeLogsRequest(req)
+	// Counted only on a response: a retried, failed Export would count twice.
+	defer func() {
+		if response == nil || refusedLogs == 0 {
+			return
+		}
+		s.metrics.RecordIngestRejected("logs", invalidIDReason, refusedLogs)
+		if response.PartialSuccess == nil {
+			response.PartialSuccess = &collogspb.ExportLogsPartialSuccess{}
+		}
+		response.PartialSuccess.RejectedLogRecords += int64(refusedLogs)
+		response.PartialSuccess.ErrorMessage = strings.TrimSpace(response.PartialSuccess.ErrorMessage + " " + invalidIDMessage(refusedLogs, "log records refused"))
+	}()
 	start := time.Now()
 	defer func() { s.metrics.RecordExportResult("logs", exportErr == nil, time.Since(start)) }()
 	defer func() { s.metrics.ObserveIngestDuration("logs", time.Since(start)) }()

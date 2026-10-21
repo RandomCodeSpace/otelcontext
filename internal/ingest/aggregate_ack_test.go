@@ -126,8 +126,8 @@ func ackErrorSpanRequest(n int, ts time.Time) *coltracepb.ExportTraceServiceRequ
 	spans := make([]*tracepb.Span, 0, n)
 	for i := range n {
 		spans = append(spans, &tracepb.Span{
-			TraceId:           []byte(fmt.Sprintf("%032d", i)),
-			SpanId:            []byte(fmt.Sprintf("%016d", i)),
+			TraceId:           []byte(fmt.Sprintf("%016d", i)),
+			SpanId:            []byte(fmt.Sprintf("%08d", i)),
 			Name:              "GET /checkout",
 			Kind:              tracepb.Span_SPAN_KIND_SERVER,
 			StartTimeUnixNano: uint64(ts.UnixNano()), // #nosec G115 -- test timestamps are positive

@@ -38,11 +38,11 @@ func TestMigrationCLIStatusAndUpHaveStableOperatorOutput(t *testing.T) {
 	configureMigrationCLI(t, filepath.Join(dir, "main.db"), aggregate.ModeLegacy, filepath.Join(dir, "aggregate.db"))
 
 	code, stdout, stderr := runMigrationCLIForTest(t, "migrate", "status")
-	if code != schemamigrate.ExitEmpty || stderr != "" || !strings.Contains(stdout, "main state=empty expected=6 actual=none") || !strings.Contains(stdout, "result=action-required") {
+	if code != schemamigrate.ExitEmpty || stderr != "" || !strings.Contains(stdout, "main state=empty expected=7 actual=none") || !strings.Contains(stdout, "result=action-required") {
 		t.Fatalf("empty status code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
 	code, stdout, stderr = runMigrationCLIForTest(t, "migrate", "up")
-	if code != 0 || stderr != "" || !strings.Contains(stdout, "main state=exact expected=6 actual=6") || !strings.Contains(stdout, "result=ready") {
+	if code != 0 || stderr != "" || !strings.Contains(stdout, "main state=exact expected=7 actual=7") || !strings.Contains(stdout, "result=ready") {
 		t.Fatalf("up code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
 	code, stdout, stderr = runMigrationCLIForTest(t, "migrate", "status")

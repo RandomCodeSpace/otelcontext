@@ -414,10 +414,11 @@ func TestGetServiceMapMetrics_EdgeRowLimit(t *testing.T) {
 	}
 }
 
-// TestGetServiceMapMetrics_SQLiteEdgeQueryUsesStartTimeIndex guards the plan:
-// without ANALYZE stats the ranged edge scan walked the tenant_id index over
-// every span the tenant kept (4.6s at 1.4M rows vs 32ms).
-func TestGetServiceMapMetrics_SQLiteEdgeQueryUsesStartTimeIndex(t *testing.T) {
+// TestGetServiceMapMetrics_SQLiteEdgeQueryUsesTenantStartIndex guards the
+// plan: without ANALYZE stats the ranged edge scan walked the tenant_id index
+// over every span the tenant kept (4.6s at 1.4M rows vs 32ms), and a bare
+// start_time index reads every tenant's rows in the range.
+func TestGetServiceMapMetrics_SQLiteEdgeQueryUsesTenantStartIndex(t *testing.T) {
 	repo := newTestRepo(t)
 	seedServiceMapFixture(t, repo)
 	start, end := serviceMapFixtureWindow()
@@ -439,8 +440,8 @@ func TestGetServiceMapMetrics_SQLiteEdgeQueryUsesStartTimeIndex(t *testing.T) {
 	if err := repo.db.Raw("EXPLAIN QUERY PLAN "+edgeSQL, vars...).Scan(&plan).Error; err != nil {
 		t.Fatalf("explain %q: %v", edgeSQL, err)
 	}
-	if len(plan) == 0 || !strings.Contains(plan[0].Detail, "idx_spans_start_time") {
-		t.Fatalf("edge query plan = %+v for %q, want idx_spans_start_time", plan, edgeSQL)
+	if len(plan) != 1 || !strings.Contains(plan[0].Detail, "SEARCH spans USING INDEX idx_spans_tenant_start (tenant_id=? AND start_time>? AND start_time<?)") {
+		t.Fatalf("edge query plan = %+v for %q, want idx_spans_tenant_start", plan, edgeSQL)
 	}
 }
 

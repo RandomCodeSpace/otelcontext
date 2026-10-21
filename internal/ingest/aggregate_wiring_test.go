@@ -70,7 +70,7 @@ func aggSpanRequest(spansPerService int, ts time.Time) *coltracepb.ExportTraceSe
 		for i := 0; i < spansPerService; i++ {
 			status := &tracepb.Status{Code: tracepb.Status_STATUS_CODE_OK}
 			spans = append(spans, &tracepb.Span{
-				TraceId:           []byte(fmt.Sprintf("%016d%016d", si, i)),
+				TraceId:           []byte(fmt.Sprintf("%08d%08d", si, i)),
 				SpanId:            []byte(fmt.Sprintf("%08d", i)),
 				Name:              operations[i%len(operations)],
 				Kind:              tracepb.Span_SPAN_KIND_SERVER,

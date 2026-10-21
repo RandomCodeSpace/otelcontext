@@ -3,6 +3,7 @@ package graphrag
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -145,17 +146,30 @@ func TestRebuild_FullWindowAfterEviction(t *testing.T) {
 	}
 }
 
-// TestRebuild_SQLiteUsesStartTimeIndex guards the plan, not just the result:
-// on SQLite without ANALYZE stats the tenant_id index scanned every span the
-// tenant ever kept, holding the single connection for seconds per tick. Both
-// the tenant discovery and the per-tenant rebuild run on every tick.
-func TestRebuild_SQLiteUsesStartTimeIndex(t *testing.T) {
+// TestRebuild_SQLiteSpanScanIndexes guards the plans, not just the result:
+// on SQLite without ANALYZE stats a tenant-prefixed index walked every span
+// the tenant (or, for discovery, every tenant) ever kept, holding the single
+// connection for seconds per tick. Tenant discovery has no tenant filter and
+// must range over idx_spans_start_time. The per-tenant rebuild must seek its
+// own window on idx_spans_tenant_start, not read every tenant's in-window rows
+// (here tenant-b's 500) and filter them.
+func TestRebuild_SQLiteSpanScanIndexes(t *testing.T) {
 	repo := newTestRepo(t)
 	g := New(repo, nil, nil, DefaultConfig())
 	t.Cleanup(g.Stop)
-	seedSpan(t, repo, "orders", "s-plan", time.Now().Add(-time.Minute))
+	now := time.Now()
+	seedSpan(t, repo, "orders", "s-plan", now.Add(-time.Minute))
+	busy := make([]storage.Span, 500)
+	for i := range busy {
+		start := now.Add(-time.Duration(i) * time.Second)
+		busy[i] = storage.Span{TenantID: "tenant-b", TraceID: fmt.Sprintf("tb-%d", i), SpanID: fmt.Sprintf("sb-%d", i),
+			ServiceName: "noisy", StartTime: start, EndTime: start}
+	}
+	if err := repo.DB().CreateInBatches(busy, 100).Error; err != nil {
+		t.Fatal(err)
+	}
 
-	plans := map[string]string{}
+	var discovery, tenantA []string
 	if err := repo.DB().Callback().Query().After("gorm:query").Register("test:capture_rebuild_plan", func(db *gorm.DB) {
 		sql := db.Statement.SQL.String()
 		if !strings.Contains(sql, "FROM spans") && !strings.Contains(sql, "FROM `spans`") {
@@ -163,20 +177,29 @@ func TestRebuild_SQLiteUsesStartTimeIndex(t *testing.T) {
 		}
 		var rows []struct{ Detail string }
 		db.Session(&gorm.Session{NewDB: true, SkipHooks: true}).Raw("EXPLAIN QUERY PLAN "+sql, db.Statement.Vars...).Scan(&rows)
+		plan := sql + "\n"
 		for _, r := range rows {
-			plans[sql] += r.Detail + "\n"
+			plan += r.Detail + "\n"
+		}
+		switch {
+		case !strings.Contains(sql, "tenant_id ="):
+			discovery = append(discovery, plan)
+		case slices.Contains(db.Statement.Vars, any(storage.DefaultTenantID)):
+			tenantA = append(tenantA, plan)
 		}
 	}); err != nil {
 		t.Fatal(err)
 	}
 
 	g.rebuildAllTenantsFromDB(context.Background())
-	if len(plans) < 2 {
-		t.Fatalf("want tenant discovery and rebuild queries, captured %q", plans)
+	if len(discovery) != 1 || len(tenantA) != 1 {
+		t.Fatalf("want one discovery and one default-tenant rebuild query, got %q / %q", discovery, tenantA)
 	}
-	for sql, plan := range plans {
-		if !strings.Contains(plan, "idx_spans_start_time") {
-			t.Errorf("plan does not use idx_spans_start_time:\n%s\n%s", sql, plan)
-		}
+	if !strings.Contains(discovery[0], "idx_spans_start_time") {
+		t.Errorf("tenant discovery does not use idx_spans_start_time:\n%s", discovery[0])
+	}
+	if !strings.Contains(tenantA[0], "SEARCH spans USING INDEX idx_spans_tenant_start (tenant_id=? AND start_time>?)") ||
+		strings.Contains(tenantA[0], "TEMP B-TREE") {
+		t.Errorf("tenant rebuild does not seek idx_spans_tenant_start in start_time order:\n%s", tenantA[0])
 	}
 }

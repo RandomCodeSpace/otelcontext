@@ -42,6 +42,8 @@ HTTP :8080 ◄── REST API ◄───────────┘
 
 Both paths delegate to the same `Export()` methods — zero business logic duplication. By default `Export()` parses the OTLP request and hands a `Batch` to the async ingest `Pipeline` (`internal/ingest/pipeline.go`); a worker pool persists Trace→Span→Log in order. With `INGEST_ASYNC_ENABLED=false` the pipeline is bypassed and `Export()` writes inline (legacy path).
 
+OTLP/JSON trace and span IDs are hex per the spec (`unmarshalOTLPJSON` restores IDs protojson reads as base64; base64 senders still work). The first statement of the trace and log `Export()` refuses records with malformed IDs (`internal/ingest/otlp_ids.go`): a span needs a 16-byte trace ID and 8-byte span ID, neither all zero, and an empty or valid parent; a log's IDs may be empty, but present ones must be valid; a bad span link is dropped and its span kept. Refused records reach nothing downstream (sampler, topology observer, instance graph, reducer, pipeline, DLQ), are counted in `partial_success` and, only when the Export succeeds, on `otelcontext_ingest_rejected_total{signal,reason="invalid_id"}`.
+
 ### Multi-tenancy
 
 Tenant identity flows into the request context on every write and read. An

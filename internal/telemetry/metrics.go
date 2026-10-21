@@ -190,6 +190,11 @@ type Metrics struct {
 	// is accepted as sent; the count tells an operator a client is minting
 	// host entities by hand. Label signal=traces|logs|metrics.
 	IngestReservedServicePrefixTotal *prometheus.CounterVec
+	// IngestRejectedTotal — OTLP spans and log records refused at the top of
+	// Export and reported in partial_success, by signal=traces|logs and
+	// reason. Today the only reason is invalid_id (trace_id/span_id not
+	// 16/8 non-zero bytes). A refused record reaches nothing downstream.
+	IngestRejectedTotal *prometheus.CounterVec
 
 	// HTTPOTLPThrottledTotal — count of HTTP 429s issued by the OTLP HTTP
 	// receiver when the async ingest pipeline is full. Mirrors the gRPC
@@ -673,6 +678,10 @@ func New() *Metrics {
 		Name: "otelcontext_ingest_reserved_service_prefix_total",
 		Help: "Resources whose client-declared service.name starts with the reserved host/ prefix. The name is accepted as sent. signal=traces|logs|metrics.",
 	}, []string{"signal"})
+	m.IngestRejectedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "otelcontext_ingest_rejected_total",
+		Help: "OTLP spans and log records refused at Export and reported in partial_success. signal=traces|logs, reason=invalid_id.",
+	}, []string{"signal", "reason"})
 	m.AggregateInputPointsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "otelcontext_aggregate_input_points_total",
 		Help: "Points offered to the aggregate reducer, per signal, counted before sampling and severity gates.",
@@ -921,6 +930,14 @@ func (m *Metrics) RecordReservedServicePrefix(signal string) {
 		return
 	}
 	m.IngestReservedServicePrefixTotal.WithLabelValues(signal).Inc()
+}
+
+// RecordIngestRejected counts n OTLP records refused at Export. Nil-safe.
+func (m *Metrics) RecordIngestRejected(signal, reason string, n int) {
+	if m == nil || m.IngestRejectedTotal == nil || n <= 0 {
+		return
+	}
+	m.IngestRejectedTotal.WithLabelValues(signal, reason).Add(float64(n))
 }
 
 // RecordExemplarEligible implements ingest.ExemplarMetrics.
