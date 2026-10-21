@@ -2555,7 +2555,8 @@ function bindEvents() {
     if (!rect.width || !rect.height) return;
     const view = state.viewBox;
     const width = Math.min(view.width, rect.width);
-    const height = width * rect.height / rect.width;
+    // Same arithmetic as setViewBox, so an unchanged aspect cannot drift x/y by rounding.
+    const height = width / (rect.width / rect.height);
     let x = view.x + (view.width - width) / 2;
     let y = view.y + (view.height - height) / 2;
     const selected = state.layout.positions.get(state.selected);
