@@ -193,7 +193,7 @@ func (g *GraphRAG) rebuildAllTenantsFromDB(ctx context.Context) {
 	// back to DefaultTenantID so pre-multi-tenant data still rebuilds.
 	var tenantIDs []string
 	if err := g.repo.DB().
-		Table("spans").
+		Table(storage.SpansByStartTime(g.repo.DB())).
 		Where("start_time > ?", since).
 		Distinct("tenant_id").
 		Pluck("tenant_id", &tenantIDs).Error; err != nil {
@@ -259,16 +259,9 @@ func (g *GraphRAG) rebuildFromDBForTenant(_ context.Context, tenant string, sinc
 	since = incrementalSince(stores, since)
 
 	db := g.repo.DB()
-	table := "spans"
-	if db.Dialector.Name() == "sqlite" {
-		// Without ANALYZE stats SQLite takes the tenant_id equality index and
-		// walks every span the tenant has (5 s at 1.4M rows, holding the only
-		// connection); the start_time range is the selective one.
-		table = "spans INDEXED BY idx_spans_start_time"
-	}
 	var rows []spanRow
 	err := db.
-		Table(table).
+		Table(storage.SpansByStartTime(db)).
 		Select("span_id, parent_span_id, service_name, operation_name, duration, trace_id, status, start_time").
 		Where("start_time > ? AND tenant_id = ?", since, tenant).
 		Order("start_time ASC").

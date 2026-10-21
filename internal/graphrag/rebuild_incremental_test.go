@@ -147,30 +147,36 @@ func TestRebuild_FullWindowAfterEviction(t *testing.T) {
 
 // TestRebuild_SQLiteUsesStartTimeIndex guards the plan, not just the result:
 // on SQLite without ANALYZE stats the tenant_id index scanned every span the
-// tenant ever kept, holding the single connection for seconds per tick.
+// tenant ever kept, holding the single connection for seconds per tick. Both
+// the tenant discovery and the per-tenant rebuild run on every tick.
 func TestRebuild_SQLiteUsesStartTimeIndex(t *testing.T) {
 	repo := newTestRepo(t)
 	g := New(repo, nil, nil, DefaultConfig())
 	t.Cleanup(g.Stop)
 	seedSpan(t, repo, "orders", "s-plan", time.Now().Add(-time.Minute))
 
-	var plans []string
+	plans := map[string]string{}
 	if err := repo.DB().Callback().Query().After("gorm:query").Register("test:capture_rebuild_plan", func(db *gorm.DB) {
 		sql := db.Statement.SQL.String()
-		if !strings.Contains(sql, "parent_span_id") {
+		if !strings.Contains(sql, "FROM spans") && !strings.Contains(sql, "FROM `spans`") {
 			return
 		}
 		var rows []struct{ Detail string }
 		db.Session(&gorm.Session{NewDB: true, SkipHooks: true}).Raw("EXPLAIN QUERY PLAN "+sql, db.Statement.Vars...).Scan(&rows)
 		for _, r := range rows {
-			plans = append(plans, r.Detail)
+			plans[sql] += r.Detail + "\n"
 		}
 	}); err != nil {
 		t.Fatal(err)
 	}
 
-	g.rebuildFromDBForTenant(context.Background(), storage.DefaultTenantID, time.Now().Add(-time.Hour))
-	if !strings.Contains(strings.Join(plans, "\n"), "idx_spans_start_time") {
-		t.Fatalf("rebuild plan does not use idx_spans_start_time: %q", plans)
+	g.rebuildAllTenantsFromDB(context.Background())
+	if len(plans) < 2 {
+		t.Fatalf("want tenant discovery and rebuild queries, captured %q", plans)
+	}
+	for sql, plan := range plans {
+		if !strings.Contains(plan, "idx_spans_start_time") {
+			t.Errorf("plan does not use idx_spans_start_time:\n%s\n%s", sql, plan)
+		}
 	}
 }
