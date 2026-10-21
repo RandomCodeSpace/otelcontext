@@ -12,6 +12,10 @@ most recently published tag.
 
 ## [Unreleased]
 
+### Security
+
+- Build with Go 1.26.10 (`go.mod`, both Containerfile builders, and the bundled Prometheus image tag `3.15.0-go1.26.10-xnet0.60.0`). It fixes [GO-2026-6809](https://pkg.go.dev/vuln/GO-2026-6809) (CVE-2026-111943): `crypto/x509` `Certificate.Verify` now distrusts known-compromised intermediate certificates, which affects outbound TLS verification such as PostgreSQL `verify-full` and Azure Entra. v0.6.6 was tagged before the advisory was published and is not published; use this release instead.
+
 ## [0.6.6] - 2026-10-21
 
 Main schema advances from 6 to **7**: run `otelcontext migrate up` before starting the new binary. See the [v0.6.6 release notes](docs/release-notes/v0.6.6-ui-redesign-ingest-hardening.md) for upgrade, rollback and client-visible changes.

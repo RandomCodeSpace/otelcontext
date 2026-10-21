@@ -53,7 +53,7 @@ The current application initializes its version from Go module build information
 so a source-built container reports `local`; the supplied release version lives
 in the OCI label. A linker override cannot change that initializer.
 
-The builder is Go **1.26.9**, pinned by its multi-platform image digest. It stays
+The builder is Go **1.26.10**, pinned by its multi-platform image digest; 1.26.10 fixes [GO-2026-6809](https://pkg.go.dev/vuln/GO-2026-6809) in `crypto/x509`. It stays
 below the operator's Go 1.27.1 ceiling. Go 1.25.13 and Go 1.27.1 are not acceptable
 build toolchains for this profile. `go.mod` supplies the same exact version to CI,
 and the release script refuses a different local version. `x/net` is 0.60.0;
