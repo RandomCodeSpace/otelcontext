@@ -12,6 +12,20 @@ most recently published tag.
 
 ## [Unreleased]
 
+## [0.6.8] - 2026-10-21
+
+No schema change. Upgrade from v0.6.7 by replacing the binary; from older releases follow the v0.6.7 notes.
+
+### Fixed
+
+- The instance call graph no longer freezes once it holds 20,000 entities (instances plus directed instance pairs). Before, entities stayed in memory for the whole `HOT_RETENTION_DAYS`, so with a few hundred instances and normal pod churn the bound filled and every new instance and call edge was refused until restart. At the bound, flushed entities idle for at least 15 minutes are now forgotten from memory, least recently seen first; their rows and buckets stay in the database. A live set that genuinely exceeds the bound is still refused and counted. Startup reloads the most recently seen 20,000 rows instead of refusing to start when more are retained.
+- "Limited coverage" on the service map now means observed data is missing from the answer: a loss inside the requested range, a failed flush, or the 50,000-row read bound. The display limits (100 nodes, 200 edges) still set `truncated` and show "result truncated", but no longer mark coverage limited, so a map with more than 100 services is no longer always "limited". Lifetime loss counters no longer mark every later answer limited.
+
+### Added
+
+- `/api/topology/graph` metadata breaks losses down by reason: `process_drop_reasons` (`invalid_identity`, `out_of_window`, `unknown_entity`, `invalid_span`, `entity_cap`, `children_cap`, `pending_cap`), `process_unmatched_reasons` (`expired`: the parent span did not arrive within five minutes; `evicted`: the 100,000-span join buffer was full; `unknown_endpoint`), and `last_loss`. The service-map coverage tooltip lists them.
+- `otelcontext_instance_graph_lost_total{kind="dropped"|"unmatched",reason}` and `otelcontext_instance_graph_size{kind="spans"|"waiting"|"entities"|"pending"}`, sampled on each five-second flush, so the join buffer and entity bound can be watched before they fill.
+
 ## [0.6.7] - 2026-10-21
 
 Includes every v0.6.6 change; v0.6.6 was tagged but never published. Upgrading from v0.6.4 or v0.6.5 advances the main schema from 6 to **7** (older releases migrate through every intermediate version): follow the [v0.6.6 release notes](docs/release-notes/v0.6.6-ui-redesign-ingest-hardening.md) and run `otelcontext migrate up` before starting the new binary.

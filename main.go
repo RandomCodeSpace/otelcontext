@@ -563,6 +563,7 @@ func main() {
 		if err != nil {
 			fatal("instance topology could not be reloaded", err)
 		}
+		instanceGraph.SetMetrics(metrics)
 		traceServer.SetInstanceGraph(instanceGraph)
 		logsServer.SetInstanceGraph(instanceGraph)
 		metricsServer.SetInstanceGraph(instanceGraph)

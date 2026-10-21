@@ -326,6 +326,12 @@ type Metrics struct {
 	// ResourceRegistryOverflowTotal — registrations DROPPED by a per-tenant
 	// registry bound (kind=host|pair). Never merged into a shared host.
 	ResourceRegistryOverflowTotal *prometheus.CounterVec
+	// InstanceGraphLostTotal — spans or joins the instance call graph lost,
+	// by kind (dropped|unmatched) and reason (topology.Drop*/Unmatched*).
+	InstanceGraphLostTotal *prometheus.CounterVec
+	// InstanceGraphSize — instance graph occupancy sampled on each flush:
+	// kind=spans|waiting|entities|pending.
+	InstanceGraphSize *prometheus.GaugeVec
 	// --- Bounded exemplar retention (AGGREGATE_MODE=aggregate) ---
 	// ExemplarEligibleTotal — telemetry that qualified for raw retention,
 	// per signal and priority class. Eligible is not retained: the gap between
@@ -816,6 +822,14 @@ func New() *Metrics {
 		Name: "otelcontext_resource_registry_overflow_total",
 		Help: "Resource registrations dropped by a per-tenant registry bound (kind=host|pair). Overflow is never merged into a shared host.",
 	}, []string{"tenant", "kind"})
+	m.InstanceGraphLostTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "otelcontext_instance_graph_lost_total",
+		Help: "Spans (kind=dropped) or parent/child joins (kind=unmatched) the instance call graph lost, by reason.",
+	}, []string{"kind", "reason"})
+	m.InstanceGraphSize = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "otelcontext_instance_graph_size",
+		Help: "Instance call graph occupancy sampled on each flush: kind=spans (join buffer, cap 100000), waiting (parents awaited), entities (nodes plus instance pairs, cap 20000), pending (unflushed buckets, cap 20000).",
+	}, []string{"kind"})
 	m.ExemplarEligibleTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "otelcontext_exemplar_eligible_total",
 		Help: "Telemetry eligible for raw exemplar retention, by signal and priority class (error|slow|healthy|warn). Eligible is not retained.",
@@ -903,6 +917,25 @@ func (m *Metrics) SetResourceRegistryEntries(tenant, kind string, n int) {
 		return
 	}
 	m.ResourceRegistryEntries.WithLabelValues(tenant, kind).Set(float64(n))
+}
+
+// RecordInstanceGraphLoss counts one instance-graph loss. Nil-safe.
+func (m *Metrics) RecordInstanceGraphLoss(kind, reason string) {
+	if m == nil {
+		return
+	}
+	m.InstanceGraphLostTotal.WithLabelValues(kind, reason).Inc()
+}
+
+// SetInstanceGraphSize publishes instance-graph occupancy. Nil-safe.
+func (m *Metrics) SetInstanceGraphSize(spans, waiting, entities, pending int) {
+	if m == nil {
+		return
+	}
+	m.InstanceGraphSize.WithLabelValues("spans").Set(float64(spans))
+	m.InstanceGraphSize.WithLabelValues("waiting").Set(float64(waiting))
+	m.InstanceGraphSize.WithLabelValues("entities").Set(float64(entities))
+	m.InstanceGraphSize.WithLabelValues("pending").Set(float64(pending))
 }
 
 // RecordMetricSketchDropped counts one histogram point kept for its scalars

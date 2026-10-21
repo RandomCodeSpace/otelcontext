@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -115,5 +116,39 @@ func TestInstanceGraphRetentionAndQueryValidation(t *testing.T) {
 	q.End = at.Add(25 * time.Hour)
 	if _, err := g.Snapshot(ctx, "alpha", q); err == nil {
 		t.Fatal("unbounded historical query allowed")
+	}
+}
+
+func TestInstanceGraphLossReasonsAndRangedCoverage(t *testing.T) {
+	g := newTestInstanceGraph(t)
+	ctx := context.Background()
+	start := time.Now()
+	clock := start
+	g.now = func() time.Time { return clock }
+	at := start.Truncate(GraphWindow)
+	id := g.Register(InstanceIdentity{Tenant: "alpha", Service: "orders", Instance: "one"}, SignalTraces, at)
+	g.Observe(id, strings.Repeat("1", 32), strings.Repeat("2", 16), strings.Repeat("3", 16), at, 1000, true, false)
+	g.Observe("missing", strings.Repeat("1", 32), strings.Repeat("4", 16), "", at, 1000, true, false)
+	clock = start.Add(graphSpanTTL + time.Second)
+	g.mu.Lock()
+	g.expireSpans(clock)
+	g.mu.Unlock()
+	q := InstanceQuery{Start: at, End: at.Add(GraphWindow), Mode: "instances", Hops: 1, Limit: 40}
+	snap, err := g.Snapshot(ctx, "alpha", q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := snap.Meta
+	if m.DropReasons[DropUnknownEntity] != 1 || m.MissReasons[UnmatchedExpired] != 1 || m.Dropped != 1 || m.Unmatched != 1 {
+		t.Fatalf("loss reasons: drops=%v misses=%v", m.DropReasons, m.MissReasons)
+	}
+	if m.Coverage != "limited" || m.LastLoss == nil {
+		t.Fatalf("loss inside range must limit coverage: %+v", m)
+	}
+	// A loss before the requested range no longer marks later answers.
+	q.Start = clock.Truncate(GraphWindow).Add(GraphWindow) // queries snap to windows
+	q.End = q.Start.Add(GraphWindow)
+	if snap, err = g.Snapshot(ctx, "alpha", q); err != nil || snap.Meta.Coverage != "observed" {
+		t.Fatalf("stale loss limited coverage: %+v %v", snap.Meta, err)
 	}
 }
