@@ -14,7 +14,7 @@
   </p>
 </div>
 
-![Traces, logs, and metrics flowing through OtelContext into a connected service map](docs/assets/otelcontext-overview.webp)
+![OtelContext Overview: service health, the services that need attention, a map of service domains, and storage and ingestion figures](docs/assets/otelcontext-overview.webp)
 
 OtelContext helps you answer the question that starts most incidents: **what is broken, and what does it affect?** Send it standard OpenTelemetry data and it connects service relationships, errors, latency, logs, and traces in a map built for investigation.
 
