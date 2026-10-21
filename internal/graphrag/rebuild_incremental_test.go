@@ -3,10 +3,12 @@ package graphrag
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
+	"gorm.io/gorm"
 )
 
 // seedSpan inserts one span row for the default tenant.
@@ -140,5 +142,35 @@ func TestRebuild_FullWindowAfterEviction(t *testing.T) {
 	g.rebuildAllTenantsFromDB(ctx)
 	if len(g.ServiceMap(tctx, 0)) == 0 {
 		t.Fatalf("evicted tenant not rebuilt with full window")
+	}
+}
+
+// TestRebuild_SQLiteUsesStartTimeIndex guards the plan, not just the result:
+// on SQLite without ANALYZE stats the tenant_id index scanned every span the
+// tenant ever kept, holding the single connection for seconds per tick.
+func TestRebuild_SQLiteUsesStartTimeIndex(t *testing.T) {
+	repo := newTestRepo(t)
+	g := New(repo, nil, nil, DefaultConfig())
+	t.Cleanup(g.Stop)
+	seedSpan(t, repo, "orders", "s-plan", time.Now().Add(-time.Minute))
+
+	var plans []string
+	if err := repo.DB().Callback().Query().After("gorm:query").Register("test:capture_rebuild_plan", func(db *gorm.DB) {
+		sql := db.Statement.SQL.String()
+		if !strings.Contains(sql, "parent_span_id") {
+			return
+		}
+		var rows []struct{ Detail string }
+		db.Session(&gorm.Session{NewDB: true, SkipHooks: true}).Raw("EXPLAIN QUERY PLAN "+sql, db.Statement.Vars...).Scan(&rows)
+		for _, r := range rows {
+			plans = append(plans, r.Detail)
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	g.rebuildFromDBForTenant(context.Background(), storage.DefaultTenantID, time.Now().Add(-time.Hour))
+	if !strings.Contains(strings.Join(plans, "\n"), "idx_spans_start_time") {
+		t.Fatalf("rebuild plan does not use idx_spans_start_time: %q", plans)
 	}
 }

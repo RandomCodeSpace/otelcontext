@@ -317,6 +317,9 @@ func (s *ServiceStore) EnsureService(name string, ts time.Time) bool {
 		Name:      name,
 		FirstSeen: ts,
 		LastSeen:  ts,
+		// No observations yet: score what the zeroed aggregates score, not the
+		// zero value, which every reader maps to "critical".
+		HealthScore: computeHealth(0, 0),
 		LatencyProvenance: &latency.Provenance{P99: &latency.Percentile{
 			Status: latency.StatusUnavailable,
 			Method: latency.MethodAverageMultiplier,

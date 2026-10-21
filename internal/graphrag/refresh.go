@@ -258,9 +258,17 @@ func (g *GraphRAG) rebuildFromDBForTenant(_ context.Context, tenant string, sinc
 
 	since = incrementalSince(stores, since)
 
+	db := g.repo.DB()
+	table := "spans"
+	if db.Dialector.Name() == "sqlite" {
+		// Without ANALYZE stats SQLite takes the tenant_id equality index and
+		// walks every span the tenant has (5 s at 1.4M rows, holding the only
+		// connection); the start_time range is the selective one.
+		table = "spans INDEXED BY idx_spans_start_time"
+	}
 	var rows []spanRow
-	err := g.repo.DB().
-		Table("spans").
+	err := db.
+		Table(table).
 		Select("span_id, parent_span_id, service_name, operation_name, duration, trace_id, status, start_time").
 		Where("start_time > ? AND tenant_id = ?", since, tenant).
 		Order("start_time ASC").

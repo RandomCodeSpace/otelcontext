@@ -12,6 +12,9 @@ import (
 
 	"github.com/RandomCodeSpace/otelcontext/internal/authn"
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
+	"go.opentelemetry.io/collector/pdata/plog/plogotlp"
+	"go.opentelemetry.io/collector/pdata/pmetric/pmetricotlp"
+	"go.opentelemetry.io/collector/pdata/ptrace/ptraceotlp"
 	collogspb "go.opentelemetry.io/proto/otlp/collector/logs/v1"
 	colmetricspb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
 	coltracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
@@ -301,13 +304,49 @@ func (h *HTTPHandler) unmarshal(r *http.Request, body []byte, msg proto.Message)
 			return fmt.Errorf("failed to unmarshal protobuf: %w", err)
 		}
 	case contentTypeJSON:
-		if err := protojson.Unmarshal(body, msg); err != nil {
+		if err := unmarshalOTLPJSON(body, msg); err != nil {
 			return fmt.Errorf("failed to unmarshal JSON: %w", err)
 		}
 	default:
 		return fmt.Errorf("unsupported Content-Type: %s", ct)
 	}
 	return nil
+}
+
+// unmarshalOTLPJSON decodes OTLP/JSON with the collector's pdata codec, which
+// reads trace and span IDs as hex per the spec; protojson reads them as base64.
+// Bodies pdata refuses fall back to protojson so clients that sent base64 IDs
+// keep working: a hex ID never has a valid base64 ID's length, so the two
+// encodings cannot be confused.
+func unmarshalOTLPJSON(body []byte, msg proto.Message) error {
+	var wire []byte
+	var err error
+	switch msg.(type) {
+	case *coltracepb.ExportTraceServiceRequest:
+		req := ptraceotlp.NewExportRequest()
+		if err = req.UnmarshalJSON(body); err == nil {
+			wire, err = req.MarshalProto()
+		}
+	case *collogspb.ExportLogsServiceRequest:
+		req := plogotlp.NewExportRequest()
+		if err = req.UnmarshalJSON(body); err == nil {
+			wire, err = req.MarshalProto()
+		}
+	case *colmetricspb.ExportMetricsServiceRequest:
+		req := pmetricotlp.NewExportRequest()
+		if err = req.UnmarshalJSON(body); err == nil {
+			wire, err = req.MarshalProto()
+		}
+	default:
+		return protojson.Unmarshal(body, msg)
+	}
+	if err != nil {
+		if legacyErr := protojson.Unmarshal(body, msg); legacyErr != nil {
+			return err
+		}
+		return nil
+	}
+	return proto.Unmarshal(wire, msg)
 }
 
 // writeResponse marshals and writes the OTLP response.
