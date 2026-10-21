@@ -6,6 +6,7 @@ import (
 	"math"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -410,6 +411,36 @@ func TestGetServiceMapMetrics_EdgeRowLimit(t *testing.T) {
 	}
 	if calls > 3 {
 		t.Fatalf("edge pass exceeded the row limit: %+v", got.Edges)
+	}
+}
+
+// TestGetServiceMapMetrics_SQLiteEdgeQueryUsesStartTimeIndex guards the plan:
+// without ANALYZE stats the ranged edge scan walked the tenant_id index over
+// every span the tenant kept (4.6s at 1.4M rows vs 32ms).
+func TestGetServiceMapMetrics_SQLiteEdgeQueryUsesStartTimeIndex(t *testing.T) {
+	repo := newTestRepo(t)
+	seedServiceMapFixture(t, repo)
+	start, end := serviceMapFixtureWindow()
+
+	var sql string
+	var vars []any
+	if err := repo.db.Callback().Row().After("gorm:row").Register("test_capture_edge_sql", func(db *gorm.DB) {
+		sql, vars = db.Statement.SQL.String(), db.Statement.Vars
+	}); err != nil {
+		t.Fatalf("register callback: %v", err)
+	}
+	t.Cleanup(func() { _ = repo.db.Callback().Row().Remove("test_capture_edge_sql") })
+
+	if _, err := repo.GetServiceMapMetrics(context.Background(), start, end); err != nil {
+		t.Fatalf("GetServiceMapMetrics: %v", err)
+	}
+	edgeSQL := sql
+	var plan []struct{ Detail string }
+	if err := repo.db.Raw("EXPLAIN QUERY PLAN "+edgeSQL, vars...).Scan(&plan).Error; err != nil {
+		t.Fatalf("explain %q: %v", edgeSQL, err)
+	}
+	if len(plan) == 0 || !strings.Contains(plan[0].Detail, "idx_spans_start_time") {
+		t.Fatalf("edge query plan = %+v for %q, want idx_spans_start_time", plan, edgeSQL)
 	}
 }
 

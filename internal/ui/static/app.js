@@ -473,6 +473,9 @@ function setConnection(status, label) {
 }
 
 function showToast(message) {
+  // Sit one gap above the map footer, whose top is the bottom of the map SVG.
+  const map = dom.canvas.hidden ? null : dom.map.getBoundingClientRect();
+  dom.toast.style.setProperty("--toast-bottom", map?.height ? document.documentElement.clientHeight - map.bottom + 8 + "px" : "");
   dom.toast.textContent = message;
   dom.toast.hidden = false;
   window.clearTimeout(showToast.timer);
@@ -1251,6 +1254,99 @@ function routedPath(points) {
   return path + " L" + end.x + "," + end.y;
 }
 
+// Each label sits on its own edge on an opaque plate, at the first point from
+// the middle outward whose plate clears every other line, card and label. A
+// label with no clear spot is omitted; the edge title and evidence list keep it.
+function placeEdgeLabels(labels, positions) {
+  if (!labels.length) return;
+  const lines = [...dom.edges.querySelectorAll(".graph-edge, .runs-on-edge")];
+  const overlaps = (a, b) => a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height;
+  // Sampling paths with getPointAtLength froze the host map for over a second;
+  // clipping each path's flattened segments against the plate is exact enough.
+  const polylines = new Map(lines.map((line) => {
+    const points = pathPolyline(line.getAttribute("d") || "");
+    const xs = points.map((point) => point.x);
+    const ys = points.map((point) => point.y);
+    const box = { x: Math.min(...xs), y: Math.min(...ys), width: Math.max(...xs) - Math.min(...xs), height: Math.max(...ys) - Math.min(...ys) };
+    return [line, { points, box }];
+  }));
+  // Inclusive, so a straight horizontal or vertical path (a zero-height or zero-width box) still counts.
+  const near = (rect, box) => rect.x <= box.x + box.width && box.x <= rect.x + rect.width && rect.y <= box.y + box.height && box.y <= rect.y + rect.height;
+  const crosses = (line, rect) => {
+    const { points, box } = polylines.get(line);
+    return near(rect, box) && points.some((point, index) => index > 0 && segmentHitsRect(points[index - 1], point, rect));
+  };
+  // Cards carry an 8px margin so a plate never hides an arrowhead.
+  const taken = [...positions.values()].map((point) => ({ x: point.x - CARD_WIDTH / 2 - 8, y: point.y - CARD_HEIGHT / 2 - 8, width: CARD_WIDTH + 16, height: CARD_HEIGHT + 16 }));
+  for (const { line, texts, dimmed } of labels) {
+    const length = line.getTotalLength();
+    // A crowded edge falls back to its call count before it loses the label.
+    place: for (const text of texts) {
+      // Geist Mono advances 0.6em; 12px text plus 6px padding a side.
+      const width = text.length * 7.2 + 12;
+      const height = 18;
+      for (let step = 0; step <= 26; step += 1) {
+        const share = 0.5 + (step % 2 ? 1 : -1) * Math.ceil(step / 2) * 0.03;
+        const at = line.getPointAtLength(length * share);
+        const plate = { x: at.x - width / 2, y: at.y - height / 2, width, height };
+        const clear = { x: plate.x - 2, y: plate.y - 2, width: width + 4, height: height + 4 };
+        if (taken.some((box) => overlaps(clear, box))) continue;
+        if (lines.some((other) => other !== line && crosses(other, clear))) continue;
+        // Neighbouring labels keep a clear gap so each reads as its own edge's.
+        taken.push({ x: plate.x - 3, y: plate.y - 3, width: width + 6, height: height + 6 });
+        dom.edges.appendChild(svgElement("rect", { class: "edge-label-plate", ...plate, rx: 2, "data-edge": line.dataset.edge || "", "aria-hidden": "true" }));
+        const label = svgElement("text", { class: "edge-label", x: at.x, y: at.y, "dominant-baseline": "central", "aria-hidden": "true" });
+        label.textContent = text;
+        if (dimmed) label.classList.add("is-dimmed");
+        dom.edges.appendChild(label);
+        break place;
+      }
+    }
+  }
+}
+
+// pathPolyline flattens a routedPath (M, L and Q only); each rounded corner
+// becomes four chords, under a pixel from the drawn curve.
+function pathPolyline(d) {
+  const points = [];
+  for (const [, command, args] of d.matchAll(/([MLQ])([^MLQ]*)/g)) {
+    const n = args.trim().split(/[\s,]+/).map(Number);
+    const from = points[points.length - 1];
+    if (command !== "Q" || !from) {
+      points.push({ x: n[0], y: n[1] });
+      continue;
+    }
+    for (const t of [0.25, 0.5, 0.75, 1]) {
+      const u = 1 - t;
+      points.push({ x: u * u * from.x + 2 * u * t * n[0] + t * t * n[2], y: u * u * from.y + 2 * u * t * n[1] + t * t * n[3] });
+    }
+  }
+  return points;
+}
+
+// segmentHitsRect clips segment a→b against rect (Liang–Barsky).
+function segmentHitsRect(a, b, rect) {
+  let enter = 0;
+  let exit = 1;
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  for (const [p, q] of [[-dx, a.x - rect.x], [dx, rect.x + rect.width - a.x], [-dy, a.y - rect.y], [dy, rect.y + rect.height - a.y]]) {
+    if (p === 0) {
+      if (q < 0) return false;
+      continue;
+    }
+    const t = q / p;
+    if (p < 0) {
+      if (t > exit) return false;
+      enter = Math.max(enter, t);
+    } else {
+      if (t < enter) return false;
+      exit = Math.min(exit, t);
+    }
+  }
+  return true;
+}
+
 function edgeEvidence(edge) {
   if (!(Number(edge.call_count) > 0)) return formatCount(edge.call_count) + " calls · latency and errors not reported";
   return formatCount(edge.call_count) + " calls · " + formatMs(edge.avg_latency_ms) + " average · " + formatRatio(edge.error_rate, 1) + " errors";
@@ -1309,6 +1405,12 @@ function renderGraph() {
   dom.graphDescription.textContent = "Application call flow from left to right. Arrowheads point to downstream dependencies. Select a named service or a connection to inspect it."
     + (state.groupBy === "host" ? " Dashed lines show host placement, not application calls." : "");
   dom.minimap.setAttribute("viewBox", [bounds.x, bounds.y, bounds.width, bounds.height].join(" "));
+  // Keep the minimap width and follow the graph's aspect between 48 and 96px, so tall host layouts are not crushed.
+  const minimapWidth = parseFloat(getComputedStyle(dom.minimapButton).width) || 144;
+  const minimapHeight = Math.round(Math.min(96, Math.max(48, minimapWidth * bounds.height / (bounds.width || 1))) / 4) * 4;
+  dom.minimapButton.style.height = minimapHeight + "px";
+  const minimapRadius = Math.max(12, 1.5 / Math.min(minimapWidth / (bounds.width || 1), minimapHeight / (bounds.height || 1)));
+  const labels = [];
   const searchMatches = graphSearchMatches();
   const impact = state.impactRoot ? downstreamDepths(state.impactRoot, state.graph.edges, 5) : null;
   const neighbors = state.selected ? scopeNeighbors(state.selected, state.graph.edges, "neighbors") : null;
@@ -1344,11 +1446,9 @@ function renderGraph() {
     // Edge evidence stays accessible on every connection. Print labels only
     // where the map's spacing can support them without covering other nodes.
     if ((edges.length <= 20 || related || selected) && points.length > 1) {
-      const middle = points[Math.floor(points.length / 2)];
-      const label = svgElement("text", { class: "edge-label", x: middle.x, y: middle.y - 9, "text-anchor": "middle", "aria-hidden": "true" });
-      label.textContent = formatCount(edge.call_count) + " calls · " + (Number(edge.call_count) > 0 ? formatMs(edge.avg_latency_ms) : "latency not reported");
-      if (line.classList.contains("is-dim")) label.classList.add("is-dimmed");
-      dom.edges.appendChild(label);
+      const calls = formatCount(edge.call_count) + " calls";
+      labels.push({ line, dimmed: line.classList.contains("is-dim"),
+        texts: [calls + " · " + (Number(edge.call_count) > 0 ? formatMs(edge.avg_latency_ms) : "latency not reported"), calls] });
     }
     dom.minimapEdges.appendChild(svgElement("path", { class: "minimap-edge", d: routedPath(points) }));
   }
@@ -1389,8 +1489,9 @@ function renderGraph() {
     if (hostNode) group.appendChild(svgElement("path", { class: "host-symbol", d: "M178 10 L185 17 L178 24 L171 17 Z" }));
     activateWithKeyboard(group, () => hostNode ? openHost(hostName) : openInspector(node.id));
     dom.nodes.appendChild(group);
-    dom.minimapNodes.appendChild(svgElement("circle", { class: "minimap-node", cx: point.x, cy: point.y, r: 12, "data-status": status }));
+    dom.minimapNodes.appendChild(svgElement("circle", { class: "minimap-node", cx: point.x, cy: point.y, r: minimapRadius, "data-status": status }));
   }
+  placeEdgeLabels(labels, positions);
   if (fit) fitGraph();
   else renderMinimapViewport();
   if (restoreNode) dom.nodes.querySelector('[data-service="' + CSS.escape(restoreNode) + '"]')?.focus({ preventScroll: true });
@@ -2222,10 +2323,29 @@ function fitGraph() {
 }
 
 function renderMinimapViewport() {
-  dom.minimapViewport.setAttribute("x", String(state.viewBox.x));
-  dom.minimapViewport.setAttribute("y", String(state.viewBox.y));
-  dom.minimapViewport.setAttribute("width", String(state.viewBox.width));
-  dom.minimapViewport.setAttribute("height", String(state.viewBox.height));
+  let { x, y, width, height } = state.viewBox;
+  const box = dom.minimap.viewBox.baseVal;
+  const frame = dom.minimap.getBoundingClientRect();
+  if (box && box.width && box.height && frame.width && frame.height) {
+    // Clamp to the minimap's visible area, inset by half the 1.5px stroke, so all four edges stay drawn.
+    const scale = Math.min(frame.width / box.width, frame.height / box.height);
+    const inset = 0.75 / scale;
+    const left = box.x + (box.width - frame.width / scale) / 2 + inset;
+    const top = box.y + (box.height - frame.height / scale) / 2 + inset;
+    const right = left + frame.width / scale - 2 * inset;
+    const bottom = top + frame.height / scale - 2 * inset;
+    const clamp = (value, low, high) => Math.min(high, Math.max(low, value));
+    const x2 = clamp(x + width, left, right);
+    const y2 = clamp(y + height, top, bottom);
+    x = clamp(x, left, right);
+    y = clamp(y, top, bottom);
+    width = x2 - x;
+    height = y2 - y;
+  }
+  dom.minimapViewport.setAttribute("x", String(x));
+  dom.minimapViewport.setAttribute("y", String(y));
+  dom.minimapViewport.setAttribute("width", String(width));
+  dom.minimapViewport.setAttribute("height", String(height));
 }
 
 function svgPoint(svg, clientX, clientY) {
@@ -2555,7 +2675,8 @@ function bindEvents() {
     if (!rect.width || !rect.height) return;
     const view = state.viewBox;
     const width = Math.min(view.width, rect.width);
-    const height = width * rect.height / rect.width;
+    // Same arithmetic as setViewBox, so an unchanged aspect cannot drift x/y by rounding.
+    const height = width / (rect.width / rect.height);
     let x = view.x + (view.width - width) / 2;
     let y = view.y + (view.height - height) / 2;
     const selected = state.layout.positions.get(state.selected);

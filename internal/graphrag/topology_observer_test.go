@@ -36,6 +36,25 @@ func TestObserveSpanTopology_EdgeSurvivesSampling(t *testing.T) {
 	}
 }
 
+// TestObserveSpanTopology_UnobservedServiceIsNotCritical guards the cold-start
+// false alarm: a service known only to the observer has no failures to report.
+func TestObserveSpanTopology_UnobservedServiceIsNotCritical(t *testing.T) {
+	g := newTestGraphRAG(t)
+	tenant := storage.DefaultTenantID
+	g.ObserveSpanTopology(tenant, "trace-1", "span-checkout", "", "checkout")
+
+	ctx := storage.WithTenantContext(context.Background(), tenant)
+	for _, entry := range g.ServiceMap(ctx, 0) {
+		if entry.Service.Name == "checkout" {
+			if entry.Service.HealthScore != 1 {
+				t.Fatalf("HealthScore = %g, want 1 for a service with no observations", entry.Service.HealthScore)
+			}
+			return
+		}
+	}
+	t.Fatal("checkout absent from service map")
+}
+
 // TestObserveSpanTopology_UnknownParentNoEdge confirms that a child whose
 // parent span has not been observed yet produces no edge (we cannot attribute
 // the call to a source service). It must not panic or fabricate an edge.

@@ -26,6 +26,14 @@ This fix targets non-finite input samples. Overflow caused by extreme finite val
   - **Overview** (`/`) is the new landing page. It shows a plain-language health summary, KPIs, the services that need attention, a domain map, services by health with per-instance pips, and storage and ingestion figures.
   - **Service map** (`/service-map`) is a layered view with services, instances and hosts. Focusing a service shows its instances with instance-to-instance call edges and "runs on" links to their hosts.
   - **Explorer**: the existing GraphRAG application map moved from `/` to `/explorer` and was restyled to match. Its deep links (`?service=`, `?tab=`, `?group=host`) are unchanged apart from the path.
+- The README hero image is now a screenshot of the Overview page.
+
+### Fixed
+
+- OTLP/HTTP JSON requests now read `traceId`, `spanId` and `parentSpanId` as hex, as the OTLP specification requires. Before, they were read as base64, so spec-compliant JSON exporters lost every span from the instance map. Clients that sent base64 IDs are still accepted. Unknown JSON fields are now ignored, as the specification requires, instead of failing the request with 400. Protobuf requests were never affected.
+- On SQLite, the in-memory graph rebuild, its tenant discovery and the `/api/system/graph` service-map query now read spans through the `start_time` index. Before, they scanned every span the tenant had retained (about 5 s at 1.4M spans) while holding the only database connection: the rebuild every 60 s, and the service-map query on the first request after startup. Topology reads stalled for up to 5 s and returned 504. No database migration is required.
+- The Explorer's minimap, legend and zoom controls moved into a footer below the map, so they no longer cover service cards. Edge labels sit on their own edge on an opaque plate, clear of other edges, cards and labels; a label with no clear spot falls back to its call count or is left off, and the edge's tooltip keeps the full text. The minimap follows the graph's shape, so host layouts stay readable, and its viewport box is always fully drawn.
+- Services seen only by the pre-sample topology observer no longer report `critical` right after startup. They now report the health of a service with no failures until real measurements arrive.
 
 ## [v0.6.5] - 2026-10-20
 
