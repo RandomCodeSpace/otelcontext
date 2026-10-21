@@ -6,8 +6,6 @@ const SVG_NS = "http://www.w3.org/2000/svg";
 const STATUS_ICON = { healthy: "circle-check", degraded: "triangle-alert", critical: "octagon-x", unknown: "circle-dashed" };
 const POLL_INTERVAL_MS = 30000;
 const TOOL_CACHE_MS = 300000;
-// An explicit Fit may shrink the map this far to show all of it.
-const MIN_FIT_SCALE = 0.4;
 const HOST_PREFIX = "host/";
 // HOST_NAME_PATTERN bounds what the page accepts as a host name from the URL
 // or a response before it builds a request URL from it.
@@ -2247,7 +2245,7 @@ function setViewBox(next) {
   const rect = dom.map.getBoundingClientRect();
   const aspect = rect.width && rect.height ? rect.width / rect.height : next.width / next.height;
   const bounds = state.layout ? state.layout.bounds : { width: 1000, height: 1000 };
-  const maxWidth = state.groupBy === "host" ? Math.max(1400, bounds.width * 2, bounds.height * aspect * 2) : rect.width / MIN_FIT_SCALE;
+  const maxWidth = state.groupBy === "host" ? Math.max(1400, bounds.width * 2, bounds.height * aspect * 2) : rect.width;
   const width = Math.max(260, Math.min(maxWidth, next.width));
   const height = width / aspect;
   state.viewBox = { x: next.x, y: next.y, width, height };
@@ -2255,16 +2253,16 @@ function setViewBox(next) {
   renderMinimapViewport();
 }
 
-function fitGraph(whole = false) {
+function fitGraph() {
   if (!state.layout) return;
   const rect = dom.map.getBoundingClientRect();
   if (!rect.width || !rect.height) { state.pendingFit = true; return; }
   const bounds = state.layout.bounds;
   const aspect = rect.width / rect.height;
   const fittedWidth = Math.max(bounds.width, bounds.height * aspect) * 1.06;
-  // Automatic fits keep names and edge evidence at their CSS size and pan a
-  // larger neighborhood; the explicit Fit command shows the whole graph.
-  const width = Math.min(fittedWidth, whole ? rect.width / MIN_FIT_SCALE : rect.width);
+  // Full-system coverage belongs to the atlas. Keep names and edge evidence
+  // at their CSS size; pan a larger neighborhood instead of shrinking text.
+  const width = Math.min(fittedWidth, rect.width);
   const height = width / aspect;
   const center = !state.selectedEdge && state.layout.positions.get(state.selected || state.focusRoot);
   const origin = (start, size, viewport, focus) => size <= viewport || !center
@@ -2508,9 +2506,9 @@ function bindEvents() {
   dom.hostGroup.addEventListener("click", () => setGroupBy(state.groupBy === "host" ? "service" : "host"));
   dom.zoomIn.addEventListener("click", () => zoomAt(0.8));
   dom.zoomOut.addEventListener("click", () => zoomAt(1.25));
-  dom.fit.addEventListener("click", () => fitGraph(true));
+  dom.fit.addEventListener("click", () => fitGraph());
   dom.minimapButton.addEventListener("click", (event) => {
-    if (!event.detail) { fitGraph(true); return; }
+    if (!event.detail) { fitGraph(); return; }
     const center = svgPoint(dom.minimap, event.clientX, event.clientY);
     if (!center) return;
     setViewBox({ x: center.x - state.viewBox.width / 2, y: center.y - state.viewBox.height / 2,
@@ -2589,7 +2587,7 @@ function bindEvents() {
     }
     if (event.key.toLowerCase() === "f" && !editable && !event.ctrlKey && !event.metaKey && !event.altKey) {
       event.preventDefault();
-      fitGraph(true);
+      fitGraph();
       return;
     }
     if (event.key.toLowerCase() === "h" && !editable && !event.ctrlKey && !event.metaKey && !event.altKey) {

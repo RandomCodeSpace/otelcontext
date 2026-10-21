@@ -432,8 +432,7 @@ func verifyApplicationMapOverview(t *testing.T, page applicationMapPage, count i
 	mapClick(t, ctx, "#overview-grid .overview-card[data-neighborhood] .overview-open")
 	requireJS(t, ctx, `document.querySelector("#system-overview").hidden && !document.querySelector("#canvas-wrap").hidden && document.querySelectorAll("#graph-nodes .service-node").length <= 8 && !!document.querySelector('#neighborhood-list .neighborhood-row[aria-current="true"]')`, 5*time.Second)
 	mapClick(t, ctx, "#fit-button")
-	// The explicit Fit shows the whole neighborhood, shrinking it no further than 0.4x.
-	requireJS(t, ctx, `(() => { const view = document.querySelector("#service-map").getBoundingClientRect(); const scale = Math.hypot(document.querySelector("#graph-nodes .node-label").getScreenCTM().a, document.querySelector("#graph-nodes .node-label").getScreenCTM().b); return scale >= 0.399 && (scale < 0.401 || [...document.querySelectorAll("#graph-nodes .service-node")].every(node => { const rect = node.getBoundingClientRect(); return rect.left >= view.left && rect.right <= view.right && rect.top >= view.top && rect.bottom <= view.bottom; })); })()`, 5*time.Second)
+	requireJS(t, ctx, `[...document.querySelectorAll("#graph-nodes .node-label")].every(label => parseFloat(getComputedStyle(label).fontSize) * Math.hypot(label.getScreenCTM().a,label.getScreenCTM().b) >= 13)`, 5*time.Second)
 }
 
 func verifyNeighborhoodEvidence(t *testing.T, page applicationMapPage) {
