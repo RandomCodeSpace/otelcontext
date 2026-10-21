@@ -30,8 +30,8 @@ This fix targets non-finite input samples. Overflow caused by extreme finite val
 
 ### Fixed
 
-- OTLP/HTTP JSON requests now read `traceId`, `spanId` and `parentSpanId` as hex, as the OTLP specification requires. Before, they were read as base64, so spec-compliant JSON exporters lost every span from the instance map. Clients that sent base64 IDs are still accepted. Protobuf requests were never affected.
-- On SQLite, the in-memory graph rebuild now reads spans through the `start_time` index. Before, it scanned every span the tenant had retained (about 5 s at 1.4M spans) every 60 s while holding the only database connection, so topology reads returned 504 for several seconds after startup. No database migration is required.
+- OTLP/HTTP JSON requests now read `traceId`, `spanId` and `parentSpanId` as hex, as the OTLP specification requires. Before, they were read as base64, so spec-compliant JSON exporters lost every span from the instance map. Clients that sent base64 IDs are still accepted. Unknown JSON fields are now ignored, as the specification requires, instead of failing the request with 400. Protobuf requests were never affected.
+- On SQLite, the in-memory graph rebuild, its tenant discovery and the `/api/system/graph` service-map query now read spans through the `start_time` index. Before, they scanned every span the tenant had retained (about 5 s at 1.4M spans) while holding the only database connection: the rebuild every 60 s, and the service-map query on the first request after startup. Topology reads stalled for up to 5 s and returned 504. No database migration is required.
 - Services seen only by the pre-sample topology observer no longer report `critical` right after startup. They now report the health of a service with no failures until real measurements arrive.
 
 ## [v0.6.5] - 2026-10-20
