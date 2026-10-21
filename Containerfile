@@ -1,5 +1,6 @@
 # Patched Go toolchain, pinned multi-platform index. No runtime OS packages.
-FROM golang:1.26.10@sha256:5c3f3f28a273c9b61698b2d34f18375929790ab1f1d3835d032d21e2b31eae0c AS build
+# golang:1.26.10
+FROM golang@sha256:5c3f3f28a273c9b61698b2d34f18375929790ab1f1d3835d032d21e2b31eae0c AS build
 ENV CGO_ENABLED=0 GOTOOLCHAIN=local
 WORKDIR /src
 COPY go.mod go.sum ./

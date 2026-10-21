@@ -1,6 +1,7 @@
 # Stable Prometheus source with only the required Go/x/net security updates.
 # The official v3.15.0 binaries use vulnerable go1.27.1 and x/net v0.58.0.
-FROM golang:1.26.10@sha256:5c3f3f28a273c9b61698b2d34f18375929790ab1f1d3835d032d21e2b31eae0c AS build
+# golang:1.26.10
+FROM golang@sha256:5c3f3f28a273c9b61698b2d34f18375929790ab1f1d3835d032d21e2b31eae0c AS build
 ENV CGO_ENABLED=0 GOTOOLCHAIN=local
 WORKDIR /src
 ADD --checksum=sha256:eee7ec029ffdba7d9ee59171cad5ddaff10e71514b0bae1a6fde6dc1ae99e181 https://codeload.github.com/prometheus/prometheus/tar.gz/5241a27fe3c6983549fccc32f6e65917408c63cd /source.tar.gz
