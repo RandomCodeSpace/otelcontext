@@ -385,6 +385,7 @@ button.host-heading:hover { background: var(--bg-2); }
   paint-order: stroke; stroke: var(--bg-0); stroke-linejoin: round; stroke-width: 4px;
   text-anchor: middle; pointer-events: none;
 }
+.edge-label-plate { fill: var(--bg-0); pointer-events: none; }
 .graph-edge.is-dim,
 .edge-label.is-dimmed { opacity: .2; }
 
@@ -439,7 +440,7 @@ button.host-heading:hover { background: var(--bg-2); }
   background: var(--bg-0); border: 1px solid var(--bd-2); border-radius: var(--r-md);
 }
 #service-minimap { display: block; width: 100%; height: 100%; }
-.minimap-edge { fill: none; stroke: var(--edge); stroke-width: 3; }
+.minimap-edge { fill: none; stroke: var(--edge); stroke-width: 1; vector-effect: non-scaling-stroke; }
 .minimap-node { fill: var(--unk); }
 .minimap-node[data-status="healthy"] { fill: var(--ok); }
 .minimap-node[data-status="degraded"] { fill: var(--warn); }
@@ -713,10 +714,10 @@ button.host-heading:hover { background: var(--bg-2); }
 .shortcut-list dt { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s-1); color: var(--tx-3); font-size: var(--fs-xs); }
 .shortcut-list dd { color: var(--tx-2); font-size: var(--fs-sm); }
 
-/* Above the minimap and zoom controls, inside the map column. */
+/* showToast() sets --toast-bottom to sit above the map footer, inside the map column. */
 .toast {
   position: fixed; z-index: 60; right: var(--s-3); max-width: 360px;
-  bottom: calc(var(--s-3) + var(--h-ctl) + var(--s-2) + 96px + var(--s-2));
+  bottom: var(--toast-bottom, var(--s-3));
   padding: var(--s-2) var(--s-3);
   background: var(--bg-2); border: 1px solid var(--bd-2); border-radius: var(--r-md);
   box-shadow: var(--shadow-pop); color: var(--tx-1); font-size: var(--fs-sm);
@@ -822,7 +823,7 @@ button.host-heading:hover { background: var(--bg-2); }
   }
   .inspector-body { padding-bottom: max(var(--s-6), env(safe-area-inset-bottom)); }
 
-  .toast { right: var(--s-3); left: var(--s-3); bottom: var(--s-3); max-width: none; }
+  .toast { right: var(--s-3); left: var(--s-3); max-width: none; }
 }
 
 @media (max-width: 420px) {

@@ -6,6 +6,8 @@ const SVG_NS = "http://www.w3.org/2000/svg";
 const STATUS_ICON = { healthy: "circle-check", degraded: "triangle-alert", critical: "octagon-x", unknown: "circle-dashed" };
 const POLL_INTERVAL_MS = 30000;
 const TOOL_CACHE_MS = 300000;
+// An explicit Fit may shrink the map this far to show all of it.
+const MIN_FIT_SCALE = 0.4;
 const HOST_PREFIX = "host/";
 // HOST_NAME_PATTERN bounds what the page accepts as a host name from the URL
 // or a response before it builds a request URL from it.
@@ -473,6 +475,9 @@ function setConnection(status, label) {
 }
 
 function showToast(message) {
+  // Sit one gap above the map footer, whose top is the bottom of the map SVG.
+  const map = dom.canvas.hidden ? null : dom.map.getBoundingClientRect();
+  dom.toast.style.setProperty("--toast-bottom", map?.height ? document.documentElement.clientHeight - map.bottom + 8 + "px" : "");
   dom.toast.textContent = message;
   dom.toast.hidden = false;
   window.clearTimeout(showToast.timer);
@@ -1251,6 +1256,49 @@ function routedPath(points) {
   return path + " L" + end.x + "," + end.y;
 }
 
+// Each label sits on its own edge on an opaque plate, at the first point from
+// the middle outward whose plate clears every other line, card and label. A
+// label with no clear spot is omitted; the edge title and evidence list keep it.
+function placeEdgeLabels(labels, positions) {
+  if (!labels.length) return;
+  const lines = [...dom.edges.querySelectorAll(".graph-edge, .runs-on-edge")];
+  const samples = new Map(lines.map((line) => {
+    const length = line.getTotalLength();
+    const points = [];
+    for (let at = 0; at <= length; at += 3) points.push(line.getPointAtLength(at));
+    return [line, points];
+  }));
+  const overlaps = (a, b) => a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height;
+  // Cards carry an 8px margin so a plate never hides an arrowhead.
+  const taken = [...positions.values()].map((point) => ({ x: point.x - CARD_WIDTH / 2 - 8, y: point.y - CARD_HEIGHT / 2 - 8, width: CARD_WIDTH + 16, height: CARD_HEIGHT + 16 }));
+  for (const { line, texts, dimmed } of labels) {
+    const length = line.getTotalLength();
+    // A crowded edge falls back to its call count before it loses the label.
+    place: for (const text of texts) {
+      // Geist Mono advances 0.6em; 12px text plus 6px padding a side.
+      const width = text.length * 7.2 + 12;
+      const height = 18;
+      for (let step = 0; step <= 26; step += 1) {
+        const share = 0.5 + (step % 2 ? 1 : -1) * Math.ceil(step / 2) * 0.03;
+        const at = line.getPointAtLength(length * share);
+        const plate = { x: at.x - width / 2, y: at.y - height / 2, width, height };
+        const clear = { x: plate.x - 2, y: plate.y - 2, width: width + 4, height: height + 4 };
+        if (taken.some((box) => overlaps(clear, box))) continue;
+        if (lines.some((other) => other !== line && samples.get(other).some((point) =>
+          point.x > clear.x && point.x < clear.x + clear.width && point.y > clear.y && point.y < clear.y + clear.height))) continue;
+        // Neighbouring labels keep a clear gap so each reads as its own edge's.
+        taken.push({ x: plate.x - 3, y: plate.y - 3, width: width + 6, height: height + 6 });
+        dom.edges.appendChild(svgElement("rect", { class: "edge-label-plate", ...plate, rx: 2, "data-edge": line.dataset.edge || "", "aria-hidden": "true" }));
+        const label = svgElement("text", { class: "edge-label", x: at.x, y: at.y, "dominant-baseline": "central", "aria-hidden": "true" });
+        label.textContent = text;
+        if (dimmed) label.classList.add("is-dimmed");
+        dom.edges.appendChild(label);
+        break place;
+      }
+    }
+  }
+}
+
 function edgeEvidence(edge) {
   if (!(Number(edge.call_count) > 0)) return formatCount(edge.call_count) + " calls · latency and errors not reported";
   return formatCount(edge.call_count) + " calls · " + formatMs(edge.avg_latency_ms) + " average · " + formatRatio(edge.error_rate, 1) + " errors";
@@ -1309,6 +1357,12 @@ function renderGraph() {
   dom.graphDescription.textContent = "Application call flow from left to right. Arrowheads point to downstream dependencies. Select a named service or a connection to inspect it."
     + (state.groupBy === "host" ? " Dashed lines show host placement, not application calls." : "");
   dom.minimap.setAttribute("viewBox", [bounds.x, bounds.y, bounds.width, bounds.height].join(" "));
+  // Keep the minimap width and follow the graph's aspect between 48 and 96px, so tall host layouts are not crushed.
+  const minimapWidth = parseFloat(getComputedStyle(dom.minimapButton).width) || 144;
+  const minimapHeight = Math.round(Math.min(96, Math.max(48, minimapWidth * bounds.height / (bounds.width || 1))) / 4) * 4;
+  dom.minimapButton.style.height = minimapHeight + "px";
+  const minimapRadius = Math.max(12, 1.5 / Math.min(minimapWidth / (bounds.width || 1), minimapHeight / (bounds.height || 1)));
+  const labels = [];
   const searchMatches = graphSearchMatches();
   const impact = state.impactRoot ? downstreamDepths(state.impactRoot, state.graph.edges, 5) : null;
   const neighbors = state.selected ? scopeNeighbors(state.selected, state.graph.edges, "neighbors") : null;
@@ -1344,11 +1398,9 @@ function renderGraph() {
     // Edge evidence stays accessible on every connection. Print labels only
     // where the map's spacing can support them without covering other nodes.
     if ((edges.length <= 20 || related || selected) && points.length > 1) {
-      const middle = points[Math.floor(points.length / 2)];
-      const label = svgElement("text", { class: "edge-label", x: middle.x, y: middle.y - 9, "text-anchor": "middle", "aria-hidden": "true" });
-      label.textContent = formatCount(edge.call_count) + " calls · " + (Number(edge.call_count) > 0 ? formatMs(edge.avg_latency_ms) : "latency not reported");
-      if (line.classList.contains("is-dim")) label.classList.add("is-dimmed");
-      dom.edges.appendChild(label);
+      const calls = formatCount(edge.call_count) + " calls";
+      labels.push({ line, dimmed: line.classList.contains("is-dim"),
+        texts: [calls + " · " + (Number(edge.call_count) > 0 ? formatMs(edge.avg_latency_ms) : "latency not reported"), calls] });
     }
     dom.minimapEdges.appendChild(svgElement("path", { class: "minimap-edge", d: routedPath(points) }));
   }
@@ -1389,8 +1441,9 @@ function renderGraph() {
     if (hostNode) group.appendChild(svgElement("path", { class: "host-symbol", d: "M178 10 L185 17 L178 24 L171 17 Z" }));
     activateWithKeyboard(group, () => hostNode ? openHost(hostName) : openInspector(node.id));
     dom.nodes.appendChild(group);
-    dom.minimapNodes.appendChild(svgElement("circle", { class: "minimap-node", cx: point.x, cy: point.y, r: 12, "data-status": status }));
+    dom.minimapNodes.appendChild(svgElement("circle", { class: "minimap-node", cx: point.x, cy: point.y, r: minimapRadius, "data-status": status }));
   }
+  placeEdgeLabels(labels, positions);
   if (fit) fitGraph();
   else renderMinimapViewport();
   if (restoreNode) dom.nodes.querySelector('[data-service="' + CSS.escape(restoreNode) + '"]')?.focus({ preventScroll: true });
@@ -2194,7 +2247,7 @@ function setViewBox(next) {
   const rect = dom.map.getBoundingClientRect();
   const aspect = rect.width && rect.height ? rect.width / rect.height : next.width / next.height;
   const bounds = state.layout ? state.layout.bounds : { width: 1000, height: 1000 };
-  const maxWidth = state.groupBy === "host" ? Math.max(1400, bounds.width * 2, bounds.height * aspect * 2) : rect.width;
+  const maxWidth = state.groupBy === "host" ? Math.max(1400, bounds.width * 2, bounds.height * aspect * 2) : rect.width / MIN_FIT_SCALE;
   const width = Math.max(260, Math.min(maxWidth, next.width));
   const height = width / aspect;
   state.viewBox = { x: next.x, y: next.y, width, height };
@@ -2202,16 +2255,16 @@ function setViewBox(next) {
   renderMinimapViewport();
 }
 
-function fitGraph() {
+function fitGraph(whole = false) {
   if (!state.layout) return;
   const rect = dom.map.getBoundingClientRect();
   if (!rect.width || !rect.height) { state.pendingFit = true; return; }
   const bounds = state.layout.bounds;
   const aspect = rect.width / rect.height;
   const fittedWidth = Math.max(bounds.width, bounds.height * aspect) * 1.06;
-  // Full-system coverage belongs to the atlas. Keep names and edge evidence
-  // at their CSS size; pan a larger neighborhood instead of shrinking text.
-  const width = Math.min(fittedWidth, rect.width);
+  // Automatic fits keep names and edge evidence at their CSS size and pan a
+  // larger neighborhood; the explicit Fit command shows the whole graph.
+  const width = Math.min(fittedWidth, whole ? rect.width / MIN_FIT_SCALE : rect.width);
   const height = width / aspect;
   const center = !state.selectedEdge && state.layout.positions.get(state.selected || state.focusRoot);
   const origin = (start, size, viewport, focus) => size <= viewport || !center
@@ -2222,10 +2275,29 @@ function fitGraph() {
 }
 
 function renderMinimapViewport() {
-  dom.minimapViewport.setAttribute("x", String(state.viewBox.x));
-  dom.minimapViewport.setAttribute("y", String(state.viewBox.y));
-  dom.minimapViewport.setAttribute("width", String(state.viewBox.width));
-  dom.minimapViewport.setAttribute("height", String(state.viewBox.height));
+  let { x, y, width, height } = state.viewBox;
+  const box = dom.minimap.viewBox.baseVal;
+  const frame = dom.minimap.getBoundingClientRect();
+  if (box && box.width && box.height && frame.width && frame.height) {
+    // Clamp to the minimap's visible area, inset by half the 1.5px stroke, so all four edges stay drawn.
+    const scale = Math.min(frame.width / box.width, frame.height / box.height);
+    const inset = 0.75 / scale;
+    const left = box.x + (box.width - frame.width / scale) / 2 + inset;
+    const top = box.y + (box.height - frame.height / scale) / 2 + inset;
+    const right = left + frame.width / scale - 2 * inset;
+    const bottom = top + frame.height / scale - 2 * inset;
+    const clamp = (value, low, high) => Math.min(high, Math.max(low, value));
+    const x2 = clamp(x + width, left, right);
+    const y2 = clamp(y + height, top, bottom);
+    x = clamp(x, left, right);
+    y = clamp(y, top, bottom);
+    width = x2 - x;
+    height = y2 - y;
+  }
+  dom.minimapViewport.setAttribute("x", String(x));
+  dom.minimapViewport.setAttribute("y", String(y));
+  dom.minimapViewport.setAttribute("width", String(width));
+  dom.minimapViewport.setAttribute("height", String(height));
 }
 
 function svgPoint(svg, clientX, clientY) {
@@ -2436,9 +2508,9 @@ function bindEvents() {
   dom.hostGroup.addEventListener("click", () => setGroupBy(state.groupBy === "host" ? "service" : "host"));
   dom.zoomIn.addEventListener("click", () => zoomAt(0.8));
   dom.zoomOut.addEventListener("click", () => zoomAt(1.25));
-  dom.fit.addEventListener("click", () => fitGraph());
+  dom.fit.addEventListener("click", () => fitGraph(true));
   dom.minimapButton.addEventListener("click", (event) => {
-    if (!event.detail) { fitGraph(); return; }
+    if (!event.detail) { fitGraph(true); return; }
     const center = svgPoint(dom.minimap, event.clientX, event.clientY);
     if (!center) return;
     setViewBox({ x: center.x - state.viewBox.width / 2, y: center.y - state.viewBox.height / 2,
@@ -2517,7 +2589,7 @@ function bindEvents() {
     }
     if (event.key.toLowerCase() === "f" && !editable && !event.ctrlKey && !event.metaKey && !event.altKey) {
       event.preventDefault();
-      fitGraph();
+      fitGraph(true);
       return;
     }
     if (event.key.toLowerCase() === "h" && !editable && !event.ctrlKey && !event.metaKey && !event.altKey) {
