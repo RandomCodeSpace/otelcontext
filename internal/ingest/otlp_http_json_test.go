@@ -2,6 +2,7 @@ package ingest
 
 import (
 	"bytes"
+	"encoding/hex"
 	"testing"
 
 	collogspb "go.opentelemetry.io/proto/otlp/collector/logs/v1"
@@ -33,6 +34,42 @@ func TestUnmarshalOTLPJSON_HexIDs(t *testing.T) {
 	}
 	if got := span.ParentSpanId; len(got) != 8 || got[7] != 0x73 {
 		t.Fatalf("ParentSpanId = %x, want eee19b7ec3c1b173", got)
+	}
+}
+
+// TestUnmarshalOTLPJSON_HexIDsSurvivePdataRefusal: pdata refuses a JSON null
+// that protojson accepts, and protojson then read the hex IDs as base64 —
+// 24/12 garbage bytes stored as 48/24-char IDs.
+func TestUnmarshalOTLPJSON_HexIDsSurvivePdataRefusal(t *testing.T) {
+	body := []byte(`{"resourceSpans":[{"scopeSpans":[{"spans":[{
+		"traceId":"5b8efff798038103d269b633813fc60c",
+		"spanId":"eee19b7ec3c1b174",
+		"parentSpanId":null,
+		"name":"op","kind":2,
+		"links":[{"traceId":"0af7651916cd43dd8448eb211c80319c","spanId":"B7AD6B7169203331"}],
+		"startTimeUnixNano":"1544712660000000000","endTimeUnixNano":"1544712661000000000"}]}]}]}`)
+
+	var req coltracepb.ExportTraceServiceRequest
+	if err := unmarshalOTLPJSON(body, &req); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	span := req.ResourceSpans[0].ScopeSpans[0].Spans[0]
+	link := span.Links[0]
+	for name, got := range map[string][]byte{"traceId": span.TraceId, "spanId": span.SpanId, "link.traceId": link.TraceId, "link.spanId": link.SpanId} {
+		want := map[string]string{"traceId": "5b8efff798038103d269b633813fc60c", "spanId": "eee19b7ec3c1b174",
+			"link.traceId": "0af7651916cd43dd8448eb211c80319c", "link.spanId": "b7ad6b7169203331"}[name]
+		if hex.EncodeToString(got) != want {
+			t.Errorf("%s = %x, want %s", name, got, want)
+		}
+	}
+
+	logBody := []byte(`{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"traceId":"5b8efff798038103d269b633813fc60c","spanId":"eee19b7ec3c1b174","droppedAttributesCount":1.0}]}]}]}`)
+	var logReq collogspb.ExportLogsServiceRequest
+	if err := unmarshalOTLPJSON(logBody, &logReq); err != nil {
+		t.Fatalf("unmarshal logs: %v", err)
+	}
+	if got := hex.EncodeToString(logReq.ResourceLogs[0].ScopeLogs[0].LogRecords[0].TraceId); got != "5b8efff798038103d269b633813fc60c" {
+		t.Errorf("log traceId = %s", got)
 	}
 }
 

@@ -3,6 +3,8 @@ package ingest
 import (
 	"compress/gzip"
 	"context"
+	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -23,6 +25,7 @@ import (
 	grpcstatus "google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
 // defaultRetryAfterSeconds is the Retry-After value advertised when the
@@ -316,8 +319,8 @@ func (h *HTTPHandler) unmarshal(r *http.Request, body []byte, msg proto.Message)
 // unmarshalOTLPJSON decodes OTLP/JSON with the collector's pdata codec, which
 // reads trace and span IDs as hex per the spec; protojson reads them as base64.
 // Bodies pdata refuses fall back to protojson so clients that sent base64 IDs
-// keep working: a hex ID never has a valid base64 ID's length, so the two
-// encodings cannot be confused.
+// keep working. pdata also refuses bodies for reasons unrelated to IDs (a JSON
+// null, 1.0 for an integer), so the fallback re-reads hex IDs: see rehexIDs.
 func unmarshalOTLPJSON(body []byte, msg proto.Message) error {
 	var wire []byte
 	var err error
@@ -344,9 +347,37 @@ func unmarshalOTLPJSON(body []byte, msg proto.Message) error {
 		if legacyErr := protojson.Unmarshal(body, msg); legacyErr != nil {
 			return err
 		}
+		rehexIDs(msg.ProtoReflect())
 		return nil
 	}
 	return proto.Unmarshal(wire, msg)
+}
+
+// rehexIDs restores IDs protojson read as base64 from hex text. A 32/16-char
+// hex ID decodes to 24/12 bytes, never a valid trace/span ID length, and
+// re-encoding those bytes yields the original hex text exactly.
+func rehexIDs(m protoreflect.Message) {
+	m.Range(func(fd protoreflect.FieldDescriptor, v protoreflect.Value) bool {
+		switch name := fd.Name(); {
+		case fd.Kind() == protoreflect.BytesKind && (name == "trace_id" || name == "span_id" || name == "parent_span_id"):
+			hexLen := 12
+			if name == "trace_id" {
+				hexLen = 24
+			}
+			if len(v.Bytes()) == hexLen {
+				if id, err := hex.DecodeString(base64.StdEncoding.EncodeToString(v.Bytes())); err == nil {
+					m.Set(fd, protoreflect.ValueOfBytes(id))
+				}
+			}
+		case fd.Message() != nil && fd.IsList():
+			for i, list := 0, v.List(); i < list.Len(); i++ {
+				rehexIDs(list.Get(i).Message())
+			}
+		case fd.Message() != nil && !fd.IsMap():
+			rehexIDs(v.Message())
+		}
+		return true
+	})
 }
 
 // writeResponse marshals and writes the OTLP response.
