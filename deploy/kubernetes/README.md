@@ -164,6 +164,12 @@ time, temporary space, and retained size on the full raw fixture remain unmeasur
 and are not included in the capacity figures above. An older version-3 binary
 refuses the upgraded ledger; retain the pre-migration backup for rollback.
 
+Main schema version 7 adds `idx_spans_tenant_start` on `spans (tenant_id,
+start_time)` so tenant-scoped span windows seek one tenant's range. The upgrade
+step is the same: stop writers, back up, run the new image's `migrate up`. On a
+1M-span SQLite fixture the build took about 2.3 s and added 6.5% to the file;
+see `docs/OPERATIONS.md`. A version-6 binary refuses the upgraded ledger.
+
 `HOT_RETENTION_DAYS=7` and `EXEMPLAR_RETENTION_DAYS=7` retain aggregate evidence
 and **selected raw examples**, respectively. Raw payload is capped at 512 KiB per
 global five-minute window and 128 KiB per service window. Seven days contains
