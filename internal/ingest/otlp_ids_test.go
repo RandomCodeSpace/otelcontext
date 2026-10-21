@@ -14,6 +14,8 @@ import (
 	collogspb "go.opentelemetry.io/proto/otlp/collector/logs/v1"
 	coltracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 )
@@ -232,5 +234,41 @@ func TestMalformedIDsMergeWithAggregateWarningAndCount(t *testing.T) {
 	}
 	if got := counterAt(t, m.IngestRejectedTotal, "logs", invalidIDReason); got != 1 {
 		t.Fatalf("logs counter = %v, want 1", got)
+	}
+}
+
+// A retryable failure must not count: the client's retry would count the same
+// refused records a second time.
+func TestMalformedIDsCountedOnceAcrossRetry(t *testing.T) {
+	now := time.Now().UTC()
+	m := ackTestMetrics("invalid_ids_retry")
+	m.IngestRejectedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "test_ingest_rejected_total_invalid_ids_retry",
+	}, []string{"signal", "reason"})
+	p := saturatedPipeline(t, m, nil)
+	srv := NewTraceServer(nil, m, aggTestConfig())
+	srv.SetPipeline(p)
+
+	req := ackErrorSpanRequest(1, now)
+	bad := proto.Clone(req.ResourceSpans[0].ScopeSpans[0].Spans[0]).(*tracepb.Span)
+	bad.SpanId = make([]byte, spanIDLen)
+	req.ResourceSpans[0].ScopeSpans[0].Spans = append(req.ResourceSpans[0].ScopeSpans[0].Spans, bad)
+
+	if _, err := srv.Export(context.Background(), req); status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("first Export err = %v, want ResourceExhausted", err)
+	}
+	if got := counterAt(t, m.IngestRejectedTotal, "traces", invalidIDReason); got != 0 {
+		t.Fatalf("counter after failed Export = %v, want 0", got)
+	}
+	drainOne(t, p)
+	resp, err := srv.Export(context.Background(), req)
+	if err != nil {
+		t.Fatalf("retry Export: %v", err)
+	}
+	if resp.GetPartialSuccess().GetRejectedSpans() != 1 {
+		t.Fatalf("partial_success = %v, want rejected=1", resp.GetPartialSuccess())
+	}
+	if got := counterAt(t, m.IngestRejectedTotal, "traces", invalidIDReason); got != 1 {
+		t.Fatalf("counter after retry = %v, want 1", got)
 	}
 }

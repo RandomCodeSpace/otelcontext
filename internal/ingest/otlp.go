@@ -685,11 +685,12 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 	// Refuse malformed ids once, before anything else sees the request:
 	// sampler, topology observer, instance graph, reducer, pipeline, DLQ.
 	req, refusedSpans, droppedLinks := sanitizeTraceRequest(req)
-	s.metrics.RecordIngestRejected("traces", invalidIDReason, refusedSpans)
+	// Counted only on a response: a retried, failed Export would count twice.
 	defer func() {
 		if response == nil || (refusedSpans == 0 && droppedLinks == 0) {
 			return
 		}
+		s.metrics.RecordIngestRejected("traces", invalidIDReason, refusedSpans)
 		if response.PartialSuccess == nil {
 			response.PartialSuccess = &coltracepb.ExportTracePartialSuccess{}
 		}
@@ -1210,11 +1211,12 @@ func (s *TraceServer) Export(ctx context.Context, req *coltracepb.ExportTraceSer
 func (s *LogsServer) Export(ctx context.Context, req *collogspb.ExportLogsServiceRequest) (response *collogspb.ExportLogsServiceResponse, exportErr error) {
 	// Refuse malformed ids once, before anything else sees the request.
 	req, refusedLogs := sanitizeLogsRequest(req)
-	s.metrics.RecordIngestRejected("logs", invalidIDReason, refusedLogs)
+	// Counted only on a response: a retried, failed Export would count twice.
 	defer func() {
 		if response == nil || refusedLogs == 0 {
 			return
 		}
+		s.metrics.RecordIngestRejected("logs", invalidIDReason, refusedLogs)
 		if response.PartialSuccess == nil {
 			response.PartialSuccess = &collogspb.ExportLogsPartialSuccess{}
 		}
