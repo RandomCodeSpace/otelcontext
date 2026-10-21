@@ -9,10 +9,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"sync"
 	"time"
 
 	"github.com/RandomCodeSpace/otelcontext/internal/storage"
+	"github.com/RandomCodeSpace/otelcontext/internal/telemetry"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -25,6 +27,27 @@ const (
 	graphMaxSpans      = 100000
 	graphMaxChildren   = 256
 	graphSpanTTL       = 5 * time.Minute
+	// At the entity bound, the least recently seen flushed entities idle for
+	// graphEvictMinIdle are forgotten in memory (rows and buckets stay in the
+	// database) so new instances and pairs are not refused for the whole
+	// retention period.
+	graphEvictBatch   = graphMaxEntities / 10
+	graphEvictMinIdle = 15 * time.Minute
+)
+
+// Loss reasons, reported per reason in the graph metadata and on
+// otelcontext_instance_graph_lost_total{kind,reason}.
+const (
+	DropInvalidIdentity = "invalid_identity" // empty tenant/service or over-length value
+	DropOutOfWindow     = "out_of_window"    // older than retention or more than 2m in the future
+	DropUnknownEntity   = "unknown_entity"   // span for a resource that was never admitted
+	DropInvalidSpan     = "invalid_span"     // ID length or duration out of range
+	DropEntityCap       = "entity_cap"       // graphMaxEntities reached
+	DropChildrenCap     = "children_cap"     // graphMaxChildren waiting on one parent
+	DropPendingCap      = "pending_cap"      // graphMaxPending unflushed buckets
+	UnmatchedExpired    = "expired"          // parent did not arrive within graphSpanTTL
+	UnmatchedEvicted    = "evicted"          // span buffer full; child evicted before its parent arrived
+	UnmatchedEndpoint   = "unknown_endpoint" // an endpoint entity was pruned before the join
 )
 
 // InstanceIdentity never derives environment from a host name. Explicit
@@ -105,8 +128,13 @@ type InstanceGraph struct {
 	waiting   map[graphSpanKey]map[graphSpanKey]struct{}
 	dropped   uint64
 	unmatched uint64
+	drops     map[string]uint64
+	misses    map[string]uint64
+	lastLoss  time.Time
+	lastEvict time.Time
 	lastFlush time.Time
 	flushErr  bool
+	metrics   *telemetry.Metrics
 }
 
 func NewInstanceGraph(ctx context.Context, db *gorm.DB, retention time.Duration) (*InstanceGraph, error) {
@@ -118,19 +146,42 @@ func NewInstanceGraph(ctx context.Context, db *gorm.DB, retention time.Duration)
 		entities: make(map[string]*graphEntity), pending: make(map[graphBucketKey]storage.TopologyBucket),
 		spans: make(map[graphSpanKey]*list.Element), order: list.New(),
 		waiting: make(map[graphSpanKey]map[graphSpanKey]struct{}),
+		drops:   make(map[string]uint64), misses: make(map[string]uint64),
 	}
+	// Eviction leaves more retained rows than the bound; reload the most
+	// recently seen ones.
 	var rows []storage.TopologyEntity
 	if err := db.WithContext(ctx).Where("last_seen >= ?", time.Now().Add(-retention).Unix()).
-		Order("id").Limit(graphMaxEntities + 1).Find(&rows).Error; err != nil {
+		Order("last_seen DESC, id").Limit(graphMaxEntities).Find(&rows).Error; err != nil {
 		return nil, fmt.Errorf("load instance topology: %w", err)
-	}
-	if len(rows) > graphMaxEntities {
-		return nil, errors.New("retained instance topology exceeds entity bound")
 	}
 	for _, row := range rows {
 		g.entities[row.ID] = &graphEntity{row: row}
 	}
 	return g, nil
+}
+
+// SetMetrics wires loss counters and size gauges. Call before ingestion starts.
+func (g *InstanceGraph) SetMetrics(m *telemetry.Metrics) {
+	if g != nil {
+		g.metrics = m
+	}
+}
+
+// Caller holds mu.
+func (g *InstanceGraph) drop(reason string) {
+	g.dropped++
+	g.drops[reason]++
+	g.lastLoss = g.now()
+	g.metrics.RecordInstanceGraphLoss("dropped", reason)
+}
+
+// Caller holds mu.
+func (g *InstanceGraph) miss(reason string) {
+	g.unmatched++
+	g.misses[reason]++
+	g.lastLoss = g.now()
+	g.metrics.RecordInstanceGraphLoss("unmatched", reason)
 }
 
 func (g *InstanceGraph) acquire(ctx context.Context) error {
@@ -151,8 +202,12 @@ func (g *InstanceGraph) Register(i InstanceIdentity, signal Signal, at time.Time
 	row, ok := i.entity(at)
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if !ok || at.Before(g.now().Add(-g.retention)) || at.After(g.now().Add(2*time.Minute)) {
-		g.dropped++
+	if !ok {
+		g.drop(DropInvalidIdentity)
+		return ""
+	}
+	if at.Before(g.now().Add(-g.retention)) || at.After(g.now().Add(2*time.Minute)) {
+		g.drop(DropOutOfWindow)
 		return ""
 	}
 	row.Signals = int64(signal)
@@ -181,11 +236,37 @@ func (g *InstanceGraph) admit(row storage.TopologyEntity) bool {
 		return true
 	}
 	if len(g.entities) >= graphMaxEntities {
-		g.dropped++
+		g.evictStale()
+	}
+	if len(g.entities) >= graphMaxEntities {
+		g.drop(DropEntityCap)
 		return false
 	}
 	g.entities[row.ID] = &graphEntity{row: row, revision: 1, dirty: true}
 	return true
+}
+
+// evictStale forgets up to graphEvictBatch flushed entities idle for at least
+// graphEvictMinIdle, least recently seen first. It scans at most once per
+// second, so a live set that genuinely exceeds the bound costs one scan per
+// second rather than one per refused admission. Caller holds mu.
+func (g *InstanceGraph) evictStale() {
+	now := g.now()
+	if now.Sub(g.lastEvict) < time.Second {
+		return
+	}
+	g.lastEvict = now
+	cutoff := now.Add(-graphEvictMinIdle).Unix()
+	var stale []*graphEntity
+	for _, e := range g.entities {
+		if !e.dirty && e.row.LastSeen < cutoff {
+			stale = append(stale, e)
+		}
+	}
+	sort.Slice(stale, func(i, j int) bool { return stale[i].row.LastSeen < stale[j].row.LastSeen })
+	for _, e := range stale[:min(len(stale), graphEvictBatch)] {
+		delete(g.entities, e.row.ID)
+	}
 }
 
 // Observe records one successfully accepted span before exemplar filtering.
@@ -199,9 +280,16 @@ func (g *InstanceGraph) Observe(entity, traceID, spanID, parentID string, at tim
 	defer g.mu.Unlock()
 	e := g.entities[entity]
 	now := g.now()
-	if e == nil || len(traceID) != 32 || len(spanID) != 16 || (parentID != "" && len(parentID) != 16) ||
-		at.Before(now.Add(-g.retention)) || at.After(now.Add(2*time.Minute)) || micros < 0 || micros > int64((24*time.Hour)/time.Microsecond) {
-		g.dropped++
+	switch {
+	case e == nil:
+		g.drop(DropUnknownEntity)
+		return
+	case len(traceID) != 32 || len(spanID) != 16 || (parentID != "" && len(parentID) != 16) ||
+		micros < 0 || micros > int64((24*time.Hour)/time.Microsecond):
+		g.drop(DropInvalidSpan)
+		return
+	case at.Before(now.Add(-g.retention)) || at.After(now.Add(2*time.Minute)):
+		g.drop(DropOutOfWindow)
 		return
 	}
 	key := graphSpanKey{e.row.TenantID, traceID, spanID}
@@ -228,7 +316,7 @@ func (g *InstanceGraph) Observe(entity, traceID, spanID, parentID string, at tim
 		} else {
 			pending := g.waiting[s.parent]
 			if len(pending) >= graphMaxChildren {
-				g.dropped++
+				g.drop(DropChildrenCap)
 			} else {
 				if pending == nil {
 					pending = make(map[graphSpanKey]struct{})
@@ -245,22 +333,24 @@ func (g *InstanceGraph) Observe(entity, traceID, spanID, parentID string, at tim
 	}
 	delete(g.waiting, key)
 	for len(g.spans) > graphMaxSpans {
-		g.removeOldestSpan()
+		g.removeOldestSpan(UnmatchedEvicted)
 	}
 }
 
 func (g *InstanceGraph) expireSpans(now time.Time) {
 	for g.order.Len() > 0 && now.Sub(g.order.Back().Value.(graphSpan).arrival) > graphSpanTTL {
-		g.removeOldestSpan()
+		g.removeOldestSpan(UnmatchedExpired)
 	}
 }
 
-func (g *InstanceGraph) removeOldestSpan() {
+// removeOldestSpan counts reason only when the span was a child still
+// waiting for its parent; a matched or root span leaves silently.
+func (g *InstanceGraph) removeOldestSpan(reason string) {
 	el := g.order.Back()
 	s := el.Value.(graphSpan)
 	if pending := g.waiting[s.parent]; pending != nil {
 		if _, exists := pending[s.key]; exists {
-			g.unmatched++
+			g.miss(reason)
 		}
 		delete(pending, s.key)
 		if len(pending) == 0 {
@@ -277,7 +367,7 @@ func (g *InstanceGraph) connect(parent, child graphSpan) {
 	}
 	source, target := g.entities[parent.entity], g.entities[child.entity]
 	if source == nil || target == nil {
-		g.unmatched++
+		g.miss(UnmatchedEndpoint)
 		return
 	}
 	// Keep endpoint metadata for as long as a retained call references it.
@@ -311,7 +401,7 @@ func (g *InstanceGraph) add(id string, at time.Time, delta storage.TopologyBucke
 	key := graphBucketKey{id, at.Truncate(GraphWindow).Unix()}
 	b, exists := g.pending[key]
 	if !exists && len(g.pending) >= graphMaxPending {
-		g.dropped++
+		g.drop(DropPendingCap)
 		return
 	}
 	b.EntityID, b.WindowStart = id, key.start
@@ -343,6 +433,7 @@ func (g *InstanceGraph) Flush(ctx context.Context) error {
 	for _, b := range g.pending {
 		buckets = append(buckets, b)
 	}
+	g.metrics.SetInstanceGraphSize(len(g.spans), len(g.waiting), len(g.entities), len(g.pending))
 	g.mu.Unlock()
 	err := g.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if len(rows) > 0 {

@@ -1412,7 +1412,10 @@ function renderCoverage() {
   if (meta.truncated) parts.push("result truncated");
   if (meta.flush_failed) parts.push("last flush failed");
   line.textContent = parts.join(" · ");
-  line.title = typeof meta.note === "string" ? meta.note : "";
+  const losses = [["Dropped", meta.process_drop_reasons], ["Unmatched", meta.process_unmatched_reasons]]
+    .flatMap(([kind, reasons]) => Object.entries(reasons && typeof reasons === "object" ? reasons : {})
+      .filter(([, n]) => finite(n) && n > 0).map(([reason, n]) => `${kind} ${reason.replaceAll("_", " ")}: ${n}`));
+  line.title = [typeof meta.note === "string" ? meta.note : "", ...losses].filter(Boolean).join("\n");
   line.classList.toggle("tone-warn", meta.coverage === "limited" || Boolean(meta.truncated) || Boolean(meta.flush_failed));
 }
 

@@ -2,6 +2,7 @@ package topology
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -143,7 +144,7 @@ func TestInstanceGraphPendingBoundsAndCancellation(t *testing.T) {
 	g.mu.Lock()
 	g.add("new", at, storage.TopologyBucket{Spans: 1})
 	g.mu.Unlock()
-	if len(g.pending) != graphMaxPending || g.dropped != 1 {
+	if len(g.pending) != graphMaxPending || g.dropped != 1 || g.drops[DropPendingCap] != 1 {
 		t.Fatal("pending cardinality not bounded")
 	}
 	if err := g.acquire(context.Background()); err != nil {
@@ -211,4 +212,57 @@ func TestInstanceGraphObservationDuringFlushIsNotLostOrDoubleCounted(t *testing.
 		t.Fatal(err)
 	}
 	check(reopened)
+}
+
+func TestInstanceGraphEvictsStaleEntitiesAtBound(t *testing.T) {
+	g := newTestInstanceGraph(t)
+	now := time.Now()
+	g.now = func() time.Time { return now }
+	fill := func(lastSeen time.Time, dirty bool) {
+		clear(g.entities)
+		for i := range graphMaxEntities {
+			id := fmt.Sprintf("old-%05d", i)
+			g.entities[id] = &graphEntity{row: storage.TopologyEntity{ID: id, TenantID: "alpha", LastSeen: lastSeen.Unix() + int64(i)}, dirty: dirty}
+		}
+	}
+	// A live set at the bound is refused, never churned.
+	fill(now, false)
+	if id := g.Register(InstanceIdentity{Tenant: "alpha", Service: "orders", Instance: "fresh"}, SignalTraces, now); id != "" || g.drops[DropEntityCap] != 1 {
+		t.Fatalf("live entities evicted: id=%q drops=%v", id, g.drops)
+	}
+	// Unflushed entities are never evicted either: their rows are not durable yet.
+	fill(now.Add(-time.Hour), true)
+	g.lastEvict = time.Time{}
+	if id := g.Register(InstanceIdentity{Tenant: "alpha", Service: "orders", Instance: "fresh"}, SignalTraces, now); id != "" {
+		t.Fatal("dirty entity evicted")
+	}
+	// Idle flushed entities make room, oldest first.
+	fill(now.Add(-time.Hour), false)
+	g.lastEvict = time.Time{}
+	id := g.Register(InstanceIdentity{Tenant: "alpha", Service: "orders", Instance: "fresh"}, SignalTraces, now)
+	if id == "" || len(g.entities) != graphMaxEntities-graphEvictBatch+1 {
+		t.Fatalf("stale entities not evicted: id=%q entities=%d", id, len(g.entities))
+	}
+	if g.entities["old-00000"] != nil || g.entities[fmt.Sprintf("old-%05d", graphEvictBatch)] == nil {
+		t.Fatal("eviction did not take the least recently seen first")
+	}
+}
+
+func TestInstanceGraphReloadKeepsMostRecentEntities(t *testing.T) {
+	g := newTestInstanceGraph(t)
+	now := time.Now().Unix()
+	rows := make([]storage.TopologyEntity, graphMaxEntities+5)
+	for i := range rows {
+		rows[i] = storage.TopologyEntity{ID: fmt.Sprintf("e-%05d", i), TenantID: "alpha", LastSeen: now - int64(len(rows)-i)}
+	}
+	if err := g.db.CreateInBatches(rows, 500).Error; err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := NewInstanceGraph(context.Background(), g.db, g.retention)
+	if err != nil {
+		t.Fatalf("retained rows past the bound must not refuse startup: %v", err)
+	}
+	if len(reopened.entities) != graphMaxEntities || reopened.entities["e-00004"] != nil || reopened.entities["e-00005"] == nil {
+		t.Fatalf("reload kept %d entities, not the most recent", len(reopened.entities))
+	}
 }

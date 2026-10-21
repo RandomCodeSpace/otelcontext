@@ -3,6 +3,7 @@ package topology
 import (
 	"context"
 	"errors"
+	"maps"
 	"sort"
 	"time"
 
@@ -53,19 +54,22 @@ type InstanceEdge struct {
 }
 
 type InstanceMetadata struct {
-	Start          time.Time `json:"start"`
-	End            time.Time `json:"end"`
-	ResolutionS    int       `json:"resolution_seconds"`
-	Coverage       string    `json:"coverage"`
-	Note           string    `json:"note"`
-	Truncated      bool      `json:"truncated"`
-	AvailableNodes int       `json:"available_nodes"`
-	ReadRows       int       `json:"read_rows"`
-	PendingSpans   int       `json:"pending_parent_spans"`
-	Dropped        uint64    `json:"process_dropped"`
-	Unmatched      uint64    `json:"process_unmatched"`
-	LastFlush      time.Time `json:"last_flush"`
-	FlushFailed    bool      `json:"flush_failed"`
+	Start          time.Time         `json:"start"`
+	End            time.Time         `json:"end"`
+	ResolutionS    int               `json:"resolution_seconds"`
+	Coverage       string            `json:"coverage"`
+	Note           string            `json:"note"`
+	Truncated      bool              `json:"truncated"`
+	AvailableNodes int               `json:"available_nodes"`
+	ReadRows       int               `json:"read_rows"`
+	PendingSpans   int               `json:"pending_parent_spans"`
+	Dropped        uint64            `json:"process_dropped"`
+	Unmatched      uint64            `json:"process_unmatched"`
+	DropReasons    map[string]uint64 `json:"process_drop_reasons"`
+	MissReasons    map[string]uint64 `json:"process_unmatched_reasons"`
+	LastLoss       *time.Time        `json:"last_loss,omitempty"`
+	LastFlush      time.Time         `json:"last_flush"`
+	FlushFailed    bool              `json:"flush_failed"`
 }
 
 type InstanceSnapshot struct {
@@ -225,7 +229,15 @@ func (g *InstanceGraph) Snapshot(ctx context.Context, tenant string, q InstanceQ
 	}
 	meta := InstanceMetadata{Start: q.Start, End: q.End, ResolutionS: int(GraphWindow.Seconds()), Coverage: "observed",
 		Note:    "Best-effort pre-sampling topology; five-minute buckets. Flushes every five seconds; a crash may lose the unflushed interval. Parent joins expire after five minutes and do not survive restart. Counters are deduplicated only within that correlation window. Host placement is the latest reported value.",
-		Dropped: g.dropped, Unmatched: g.unmatched, LastFlush: g.lastFlush, FlushFailed: g.flushErr}
+		Dropped: g.dropped, Unmatched: g.unmatched, LastFlush: g.lastFlush, FlushFailed: g.flushErr,
+		DropReasons: maps.Clone(g.drops), MissReasons: maps.Clone(g.misses)}
+	// Counters are process-lifetime; only a loss inside the requested range
+	// limits this answer's coverage.
+	lostInRange := !g.lastLoss.IsZero() && !g.lastLoss.Before(q.Start)
+	if !g.lastLoss.IsZero() {
+		last := g.lastLoss
+		meta.LastLoss = &last
+	}
 	for _, children := range g.waiting {
 		meta.PendingSpans += len(children)
 	}
@@ -287,6 +299,7 @@ func (g *InstanceGraph) Snapshot(ctx context.Context, tenant string, q InstanceQ
 		t.DurationMicros += b.DurationMicros
 		totals[b.EntityID] = t
 	}
+	readCapped := false
 	for offset := 0; offset < len(ids); offset += 400 {
 		if err := ctx.Err(); err != nil {
 			return out, err
@@ -300,7 +313,7 @@ func (g *InstanceGraph) Snapshot(ctx context.Context, tenant string, q InstanceQ
 		for _, b := range rows {
 			meta.ReadRows++
 			if meta.ReadRows > graphReadRows {
-				meta.ReadRows, meta.Truncated = graphReadRows, true
+				meta.ReadRows, meta.Truncated, readCapped = graphReadRows, true, true
 				break
 			}
 			fold(b)
@@ -392,7 +405,9 @@ func (g *InstanceGraph) Snapshot(ctx context.Context, tenant string, q InstanceQ
 	if len(out.Edges) > 200 {
 		out.Edges, meta.Truncated = out.Edges[:200], true
 	}
-	if meta.Truncated || meta.Dropped > 0 || meta.Unmatched > 0 || meta.FlushFailed {
+	// Node and edge limits are presentation (meta.truncated); coverage is
+	// limited only when observed data is missing from the totals.
+	if readCapped || lostInRange || meta.FlushFailed {
 		meta.Coverage = "limited"
 	}
 	out.Meta = meta
